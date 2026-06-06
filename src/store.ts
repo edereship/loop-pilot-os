@@ -348,4 +348,59 @@ export class SqliteStore {
       .all(n) as RawSessionRow[];
     return rows.map(toSessionRow);
   }
+
+  // ---- notification intents ----
+  recordIntent(payload: string, slackConfigured: boolean, now: string): number {
+    // Slack 未設定なら delivered_slack=1（=配信不要）で記録（カーネル §4）
+    const deliveredSlack = slackConfigured ? 0 : 1;
+    const info = this.db
+      .prepare(
+        `INSERT INTO notification_intent
+           (created_at, payload, delivered_console, delivered_slack, attempts)
+         VALUES (?, ?, 0, ?, 0)`,
+      )
+      .run(now, payload, deliveredSlack);
+    return Number(info.lastInsertRowid);
+  }
+
+  markDelivered(id: number, channel: "console" | "slack"): void {
+    const column =
+      channel === "console" ? "delivered_console" : "delivered_slack";
+    const info = this.db
+      .prepare(`UPDATE notification_intent SET ${column} = 1 WHERE id = ?`)
+      .run(id);
+    if (info.changes !== 1) {
+      throw new Error(
+        `markDelivered affected ${info.changes} rows for intent id=${id}`,
+      );
+    }
+  }
+
+  bumpAttempts(id: number): void {
+    const info = this.db
+      .prepare(
+        `UPDATE notification_intent SET attempts = attempts + 1 WHERE id = ?`,
+      )
+      .run(id);
+    if (info.changes !== 1) {
+      throw new Error(
+        `bumpAttempts affected ${info.changes} rows for intent id=${id}`,
+      );
+    }
+  }
+
+  undeliveredIntents(): Array<{
+    id: number;
+    payload: string;
+    attempts: number;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, payload, attempts FROM notification_intent
+         WHERE delivered_console = 0 OR delivered_slack = 0
+         ORDER BY id ASC`,
+      )
+      .all() as Array<{ id: number; payload: string; attempts: number }>;
+    return rows;
+  }
 }

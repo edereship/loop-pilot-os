@@ -275,3 +275,56 @@ describe("SqliteStore: session", () => {
     expect(store.recentSessions(2).map((s) => s.id)).toEqual([b1.id, a2.id]);
   });
 });
+
+describe("SqliteStore: notification intents", () => {
+  const payload = JSON.stringify({
+    kind: "halted",
+    reason: "task_cap",
+    detail: "reached 3",
+  });
+
+  // 仕様§10/カーネル §4: Slack 設定時は delivered_slack=0 で記録、未配信に出る
+  it("recordIntent (slack configured) lists the intent as undelivered until both channels marked", () => {
+    const store = newStore();
+    const id = store.recordIntent(payload, true, "2026-06-06T00:00:00.000Z");
+    expect(id).toBe(1);
+
+    let pending = store.undeliveredIntents();
+    expect(pending).toEqual([{ id, payload, attempts: 0 }]);
+
+    store.bumpAttempts(id);
+    pending = store.undeliveredIntents();
+    expect(pending).toEqual([{ id, payload, attempts: 1 }]);
+
+    store.markDelivered(id, "console");
+    // console 済みでも slack 未配信なら依然 undelivered
+    expect(store.undeliveredIntents().map((i) => i.id)).toEqual([id]);
+
+    store.markDelivered(id, "slack");
+    // 両チャネル配信済み → undelivered から消える
+    expect(store.undeliveredIntents()).toEqual([]);
+  });
+
+  // カーネル §4: Slack 未設定なら delivered_slack=1（=配信不要）で記録される
+  it("recordIntent (slack NOT configured) marks slack as already-delivered", () => {
+    const store = newStore();
+    const id = store.recordIntent(payload, false, "2026-06-06T00:00:00.000Z");
+    // slack は配信不要扱い。console を配信すれば undelivered から消える
+    expect(store.undeliveredIntents().map((i) => i.id)).toEqual([id]);
+    store.markDelivered(id, "console");
+    expect(store.undeliveredIntents()).toEqual([]);
+  });
+
+  // 複数 intent は記録順（id 昇順）で未配信列挙される
+  it("undeliveredIntents lists multiple pending intents in id order", () => {
+    const store = newStore();
+    const p1 = JSON.stringify({ kind: "idle", detail: "queue empty" });
+    const p2 = JSON.stringify({ kind: "run_started", detail: "boot" });
+    const id1 = store.recordIntent(p1, false, "2026-06-06T00:00:00.000Z");
+    const id2 = store.recordIntent(p2, true, "2026-06-06T00:00:01.000Z");
+    expect(store.undeliveredIntents()).toEqual([
+      { id: id1, payload: p1, attempts: 0 },
+      { id: id2, payload: p2, attempts: 0 },
+    ]);
+  });
+});
