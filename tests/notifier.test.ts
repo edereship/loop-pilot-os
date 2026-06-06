@@ -85,4 +85,97 @@ describe("ConsoleSlackNotifier", () => {
     // console は必ず出る
     expect(logs.length).toBe(1);
   });
+
+  // 3回連続失敗(非2xx): throw せず、attempts=3、delivered_slack=0 のまま残る。
+  it("retries 3 times on persistent non-2xx, never throws, leaves intent undelivered to Slack", async () => {
+    const { fn, calls } = makeFetch([
+      { ok: false, status: 500 },
+      { ok: false, status: 500 },
+      { ok: false, status: 500 },
+    ]);
+    const sleeps: number[] = [];
+    const sleep = (ms: number) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    };
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      "https://hooks.slack.test/abc",
+      log,
+      fn,
+      sleep,
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    // throw しないこと
+    await expect(
+      notifier.notify({ kind: "halted", reason: "task_cap", detail: "3/3" }),
+    ).resolves.toBeUndefined();
+
+    // 3回 POST した
+    expect(calls.length).toBe(3);
+    // 指数バックオフ: 試行間の sleep は2回（1000ms, 2000ms）。最終失敗後は待たない。
+    expect(sleeps).toEqual([1000, 2000]);
+
+    // console は必達
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain("3/3");
+
+    // Slack 未達: undelivered に1件残り attempts=3
+    const undelivered = store.undeliveredIntents();
+    expect(undelivered.length).toBe(1);
+    expect(undelivered[0].attempts).toBe(3);
+    const event = JSON.parse(undelivered[0].payload);
+    expect(event.kind).toBe("halted");
+  });
+
+  // network エラー(throw)が続いても notify は throw しない。
+  it("swallows network errors across all attempts without throwing", async () => {
+    const { fn, calls } = makeFetch(["throw", "throw", "throw"]);
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      "https://hooks.slack.test/abc",
+      log,
+      fn,
+      instantSleep(),
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await expect(
+      notifier.notify({ kind: "idle", detail: "queue empty" }),
+    ).resolves.toBeUndefined();
+
+    expect(calls.length).toBe(3);
+    expect(store.undeliveredIntents().length).toBe(1);
+  });
+
+  // 2回目で成功: それ以降リトライせず delivered_slack=1、attempts=2。
+  it("succeeds on the second attempt and stops retrying", async () => {
+    const { fn, calls } = makeFetch([
+      { ok: false, status: 503 },
+      { ok: true, status: 200 },
+    ]);
+    const sleeps: number[] = [];
+    const sleep = (ms: number) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    };
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      "https://hooks.slack.test/abc",
+      log,
+      fn,
+      sleep,
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await notifier.notify({ kind: "run_started", detail: "pid 7" });
+
+    // 2回だけ POST（3回目はしない）
+    expect(calls.length).toBe(2);
+    // 1回目失敗後に1回だけ待つ
+    expect(sleeps).toEqual([1000]);
+    // 配信完了 → 未配信なし
+    expect(store.undeliveredIntents().length).toBe(0);
+  });
 });

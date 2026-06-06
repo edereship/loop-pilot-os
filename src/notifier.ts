@@ -1,6 +1,11 @@
 import type { SqliteStore } from "./store.js";
 import type { Notifier, NotifyEvent } from "./types.js";
 
+/** Slack へ POST する最大試行回数（カーネル §10: リトライ3回）。 */
+const SLACK_MAX_ATTEMPTS = 3;
+/** 指数バックオフの基準ミリ秒（試行 n 回目失敗後に base * 2^(n-1) 待つ）。 */
+const SLACK_BACKOFF_BASE_MS = 1000;
+
 /**
  * NotifyEvent を「絵文字付き日本語」の1行テキストへ整形する。
  * console / Slack の双方で同じ文面を使う（仕様 §10）。
@@ -65,26 +70,33 @@ export class ConsoleSlackNotifier implements Notifier {
   }
 
   /**
-   * Slack へ {text} を **単発** POST する。2xx で delivered_slack=1。
-   * 失敗しても throw しない（bumpAttempts のみ／人間の出番通知は console で既に届いている）。
-   * ※ リトライ／指数バックオフは Step 7 のテスト追加時に実装する。
+   * Slack へ {text} を POST する。2xx で delivered_slack=1。
+   * 各試行で attempts を加算し、SLACK_MAX_ATTEMPTS まで指数バックオフでリトライ。
+   * 全滅しても throw しない（人間の出番通知は console で既に届いている）。
    */
   private async deliverSlack(intentId: number, text: string): Promise<void> {
     const url = this.webhookUrl as string;
-    this.store.bumpAttempts(intentId);
-    try {
-      const res = await this.fetchFn(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (res.ok) {
-        this.store.markDelivered(intentId, "slack");
+    for (let attempt = 1; attempt <= SLACK_MAX_ATTEMPTS; attempt++) {
+      this.store.bumpAttempts(intentId);
+      try {
+        const res = await this.fetchFn(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        if (res.ok) {
+          this.store.markDelivered(intentId, "slack");
+          return;
+        }
+        // 非2xx は失敗扱い。次の試行へ（最終試行なら諦める）。
+      } catch {
+        // network エラーも失敗扱い。次の試行へ。
       }
-      // 非2xx は失敗扱い。undelivered のまま残す。
-    } catch {
-      // network エラーも失敗扱い。undelivered のまま残す。
+      if (attempt < SLACK_MAX_ATTEMPTS) {
+        await this.sleep(SLACK_BACKOFF_BASE_MS * 2 ** (attempt - 1));
+      }
     }
+    // 全滅: throw せず undelivered のまま残す（status CLI で可視化）。
   }
 
   /**
