@@ -55,4 +55,26 @@ describe("RealCommandRunner", () => {
     expect(lines).toEqual(["line1", "line2", "line3"]);
     expect(result.stdout).toBe("line1\nline2\nline3");
   });
+
+  // 仕様: timeoutMs 超過時はプロセスを kill して reject する（claude/gh のハング対策）
+  it("timeoutMs 超過時にプロセスを kill して reject する", async () => {
+    await expect(
+      runner.run(
+        "node",
+        ["-e", "setTimeout(() => {}, 10000)"],
+        { cwd: process.cwd(), timeoutMs: 100 },
+      ),
+    ).rejects.toThrow(/timed out after 100ms/);
+  });
+
+  // 仕様: timeoutMs を設定しても、その範囲内に終わるプロセスは通常どおり resolve する
+  it("timeoutMs 内に終わるプロセスは正常に resolve する", async () => {
+    const result = await runner.run(
+      "node",
+      ["-e", "process.stdout.write('quick')"],
+      { cwd: process.cwd(), timeoutMs: 5000 },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("quick");
+  });
 });

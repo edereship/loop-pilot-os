@@ -15,11 +15,30 @@ export class RealCommandRunner implements CommandRunner {
       let lineBuffer = "";
       let settled = false;
 
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
       const settle = (fn: () => void): void => {
         if (settled) return;
         settled = true;
+        if (timeoutHandle !== undefined) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = undefined;
+        }
         fn();
       };
+
+      if (opts.timeoutMs !== undefined) {
+        timeoutHandle = setTimeout(() => {
+          child.kill("SIGKILL");
+          settle(() =>
+            reject(
+              new Error(
+                `command "${cmd}" timed out after ${String(opts.timeoutMs)}ms`,
+              ),
+            ),
+          );
+        }, opts.timeoutMs);
+      }
 
       const emitLines = (): void => {
         if (!opts.onStdoutLine) return;
