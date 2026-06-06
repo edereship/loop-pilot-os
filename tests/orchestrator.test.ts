@@ -766,3 +766,188 @@ describe("Orchestrator 失敗系 — poll throw バックオフ（仕様 §5.5 /
     expect(h.monitor.pollCalls.length).toBeGreaterThanOrEqual(5); // 4 throws + 1 done（plan defect: was 6）
   });
 });
+
+describe("Orchestrator 失敗系 — merge readiness 分岐（仕様 §5.5 / §5.4 readiness / カーネル §7.6）", () => {
+  it("done → readiness ci_failed → stopped(ci_failed, detail=null)。mergePr は呼ばれない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.readiness.set(100, { ready: false, reason: "ci_failed" });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.stopDetail).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(false);
+  });
+
+  it("done → readiness conflict → stopped(merge_conflict)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.readiness.set(100, { ready: false, reason: "conflict" });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("merge_conflict");
+    expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(false);
+  });
+
+  it("done → readiness blocked → stopped(ci_failed, detail='merge blocked by branch protection...')", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.readiness.set(100, { ready: false, reason: "blocked" });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    // blocked は failureReason=ci_failed（カーネル §7.6）に写像
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.stopDetail).toContain("merge blocked by branch protection");
+    expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(false);
+  });
+
+  it("done → readiness ci_pending を 1 回 → 次 poll で done→ready→merge し、停止せず完走する", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 }); // taskCap=1: 完走後 HALT（IDLE ループ回避）
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    // poll: done → done → merged。readiness: 1回目 ci_pending、2回目 ready
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }, { kind: "merged" }];
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_pending" };
+      return { ready: true, headSha: "sha-100" };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // ci_pending では止まらず、2 回目の done で ready→merge→次 poll merged で完走
+    expect(s.state).toBe("merged");
+    expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-100"] });
+  });
+});
+
+describe("Orchestrator 失敗系 — mergePr 2 連続 throw fail-closed（カーネル §7.6）", () => {
+  it("ready のまま mergePr が 2 連続 throw → stopped(ci_failed, 'merge call failed under ready verdict: <error>')", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    // poll は done を返し続ける（要素 1 → 同じ verdict を維持）。readiness は常に ready（既定）。
+    h.monitor.verdicts = [{ kind: "done" }];
+    // mergePr を毎回 throw させる
+    let mergeCalls = 0;
+    h.git.mergePr = async (prNumber: number, headSha: string) => {
+      mergeCalls += 1;
+      h.git.calls.push({ method: "mergePr", args: [prNumber, headSha] });
+      throw new Error("gh: merge failed 422");
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    // 2 連続失敗で fail-closed（既定理由 ci_failed）
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.stopDetail).toBe("merge call failed under ready verdict: gh: merge failed 422");
+    // mergePr は ちょうど 2 回呼ばれて停止（1 回目は続行、2 回目で fail-closed）
+    expect(mergeCalls).toBe(2);
+  });
+
+  it("mergePr が 1 回 throw → 次 poll(done→ready) で成功 → 完走する（カウンタは成功でリセット）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 }); // taskCap=1: 完走後 HALT（IDLE ループ回避）
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    // poll: done → done → merged
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }, { kind: "merged" }];
+    let mergeCalls = 0;
+    h.git.mergePr = async (prNumber: number, headSha: string) => {
+      mergeCalls += 1;
+      h.git.calls.push({ method: "mergePr", args: [prNumber, headSha] });
+      if (mergeCalls === 1) throw new Error("transient 500");
+      // 2 回目は成功
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // 1 回失敗 → 2 回目成功 → 次 poll merged で完走（2 連続には達しない）
+    expect(s.state).toBe("merged");
+    expect(mergeCalls).toBe(2);
+  });
+
+  it("§6 HEAD 移動見送り: --match-head-commit 失敗で 1 回 throw → 次ポーリングで readiness 再評価 ready → mergePr 成功 → merged", async () => {
+    // 仕様 §6: HEAD 移動なら見送り（次ポーリング）。実装では --match-head-commit 失敗が mergePr の throw として現れ、
+    // 1 回目は次ポーリングで done→checkMergeReadiness を再評価する（mergeFailures=1、2 連続未満なので fail-closed しない）。
+    // 再評価で新しい headSha の ready が返り、その sha で mergePr が成功 → merged で回復する。
+    const config = makeConfig({ maxTasksPerRun: 1 }); // taskCap=1: 完走後 HALT（IDLE ループ回避）
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    // poll: done（1 回目 merge 試行）→ done（再評価して成功）→ merged（DONE へ）
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }, { kind: "merged" }];
+
+    // readiness は毎回 ready だが headSha が HEAD 移動で変わる: 1 回目 sha-stale → 2 回目 sha-fresh
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      return readinessCall === 1
+        ? { ready: true, headSha: "sha-stale" }
+        : { ready: true, headSha: "sha-fresh" };
+    };
+
+    // mergePr は --match-head-commit に相当: 渡された headSha が現在の HEAD（sha-fresh）と異なれば throw（HEAD 移動）。
+    const mergeShas: string[] = [];
+    h.git.mergePr = async (prNumber: number, headSha: string) => {
+      h.git.calls.push({ method: "mergePr", args: [prNumber, headSha] });
+      mergeShas.push(headSha);
+      if (headSha !== "sha-fresh") {
+        throw new Error("gh: head commit moved (--match-head-commit failed)");
+      }
+      // sha-fresh では成功
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // 1 回目 sha-stale で throw（見送り）→ 2 回目 sha-fresh で成功 → 次 poll merged で完走
+    expect(s.state).toBe("merged");
+    expect(s.failureReason).toBeNull();
+    // mergePr は 2 回呼ばれ、stale→fresh の順。2 連続失敗には達しないので fail-closed しない。
+    expect(mergeShas).toEqual(["sha-stale", "sha-fresh"]);
+    // 成功した sha で DONE 経路に入る
+    expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-fresh"] });
+  });
+});

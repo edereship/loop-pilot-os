@@ -256,6 +256,7 @@ export class Orchestrator {
     const pollIntervalMs = this.config.loop.monitorPollSeconds * 1000;
     let pollFailures = 0;
     let backoffMultiplier = 1;
+    let mergeFailures = 0; // ready verdict 下での mergePr 連続失敗（2 連続で fail-closed）
     while (true) {
       await this.sleep(pollIntervalMs * backoffMultiplier);
       let verdict: MonitorVerdict;
@@ -277,10 +278,24 @@ export class Orchestrator {
         case "merged":
           return CONTINUE; // DONE へ
         case "done": {
-          const ctrl = await this.tryMerge(session, prNumber);
-          if (ctrl === "merged") return CONTINUE;
-          if (ctrl === "halt") return HALT;
-          continue; // 続行（次ポーリング）
+          const outcome = await this.tryMerge(session, prNumber);
+          if (outcome.kind === "merged") return CONTINUE;
+          if (outcome.kind === "halt") return HALT;
+          if (outcome.kind === "merge_failed") {
+            // ready verdict のまま mergePr が throw。2 連続で fail-closed（カーネル §7.6）。
+            mergeFailures += 1;
+            if (mergeFailures >= 2) {
+              return await this.stopSession(
+                session,
+                "ci_failed",
+                `merge call failed under ready verdict: ${outcome.error}`,
+              );
+            }
+            continue; // 1 回目は次ポーリングで再評価
+          }
+          // outcome.kind === "continue"（readiness が ci_pending/unknown 等）
+          mergeFailures = 0; // ready 連続を断ち切る事象が起きたらリセット
+          continue;
         }
         case "stopped":
           return await this.stopSession(
@@ -313,35 +328,46 @@ export class Orchestrator {
     }
   }
 
-  /** done verdict 時のマージ試行。"merged" | "continue" | "halt" を返す */
-  private async tryMerge(session: TaskSessionRow, prNumber: number): Promise<"merged" | "continue" | "halt"> {
+  /**
+   * done verdict 時のマージ試行（カーネル §7.6）。
+   * - readiness が ready でなければ reason ごとに分類（ci_pending/unknown→continue、その他は stopSession→halt）。
+   * - ready なら mergePr。成功→merged。throw→merge_failed（連続回数の判定は monitorSession 側）。
+   */
+  private async tryMerge(
+    session: TaskSessionRow,
+    prNumber: number,
+  ): Promise<
+    | { kind: "merged" }
+    | { kind: "continue" }
+    | { kind: "halt" }
+    | { kind: "merge_failed"; error: string }
+  > {
     const readiness = await this.monitor.checkMergeReadiness(prNumber);
     if (!readiness.ready) {
       switch (readiness.reason) {
         case "ci_pending":
         case "unknown":
-          return "continue";
+          return { kind: "continue" };
         case "ci_failed":
           await this.stopSession(session, "ci_failed", null);
-          return "halt";
+          return { kind: "halt" };
         case "conflict":
           await this.stopSession(session, "merge_conflict", null);
-          return "halt";
+          return { kind: "halt" };
         case "blocked":
           await this.stopSession(
             session,
             "ci_failed",
             "merge blocked by branch protection: required reviews/rulesets (mergeStateStatus=BLOCKED with green checks)",
           );
-          return "halt";
+          return { kind: "halt" };
       }
     }
     try {
       await this.git.mergePr(prNumber, readiness.headSha);
-      return "merged";
-    } catch {
-      // 次ポーリングで再評価（mergePr 連続失敗の fail-closed は Task 13 で精密化）
-      return "continue";
+      return { kind: "merged" };
+    } catch (err) {
+      return { kind: "merge_failed", error: err instanceof Error ? err.message : String(err) };
     }
   }
 
