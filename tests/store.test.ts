@@ -328,3 +328,58 @@ describe("SqliteStore: notification intents", () => {
     ]);
   });
 });
+
+describe("SqliteStore: run lock", () => {
+  const allAlive = () => true;
+  const allDead = () => false;
+
+  // カーネル §4: 空ロックなら取得成功し、自 pid のロック行が立つ
+  it("acquireRunLock succeeds when no lock exists", () => {
+    const store = newStore();
+    const ok = store.acquireRunLock(1234, allDead, "2026-06-06T00:00:00.000Z");
+    expect(ok).toBe(true);
+    // 同 pid の再取得も冪等に成功する（自分のロックは奪える）
+    const again = store.acquireRunLock(1234, allAlive, "2026-06-06T00:00:01.000Z");
+    expect(again).toBe(true);
+  });
+
+  // 別プロセスが生存している間は奪取できない（単一インスタンス前提）
+  it("acquireRunLock fails when another live pid holds the lock", () => {
+    const store = newStore();
+    expect(store.acquireRunLock(1111, () => false, "2026-06-06T00:00:00.000Z")).toBe(true);
+    // 2222 から見て 1111 は生存 → 奪取不可
+    const isAlive = (pid: number): boolean => pid === 1111;
+    expect(store.acquireRunLock(2222, isAlive, "2026-06-06T00:00:01.000Z")).toBe(false);
+  });
+
+  // 保持者が死んでいれば奪取できる（死活奪取）
+  it("acquireRunLock steals the lock when the holding pid is dead", () => {
+    const store = newStore();
+    expect(store.acquireRunLock(1111, () => false, "2026-06-06T00:00:00.000Z")).toBe(true);
+    // 1111 は死亡、2222 が奪取
+    const isAlive = (pid: number): boolean => pid !== 1111;
+    expect(store.acquireRunLock(2222, isAlive, "2026-06-06T00:00:01.000Z")).toBe(true);
+    // 以後 1111 は（生きていても）旧ロック行を持たない → 3333 から見て保持者は 2222
+    const onlyActiveAlive = (pid: number): boolean => pid === 2222;
+    expect(store.acquireRunLock(3333, onlyActiveAlive, "2026-06-06T00:00:02.000Z")).toBe(false);
+  });
+
+  // 解放後は別プロセスが取得できる
+  it("releaseRunLock frees the lock for another pid", () => {
+    const store = newStore();
+    expect(store.acquireRunLock(1111, () => false, "2026-06-06T00:00:00.000Z")).toBe(true);
+    store.releaseRunLock(1111);
+    // 解放後は 2222 が（1111 が生存していても）取得できる
+    expect(store.acquireRunLock(2222, () => true, "2026-06-06T00:00:01.000Z")).toBe(true);
+  });
+
+  // 他 pid の releaseRunLock は自ロックを壊さない（自分のロックだけ解放）
+  it("releaseRunLock by a non-holder does not drop the current lock", () => {
+    const store = newStore();
+    expect(store.acquireRunLock(1111, () => false, "2026-06-06T00:00:00.000Z")).toBe(true);
+    store.releaseRunLock(9999); // 保持者でない pid の解放は no-op
+    // 1111 は依然保持者 → 2222（1111 生存）は取得不可
+    const isAlive = (pid: number): boolean => pid === 1111;
+    expect(store.acquireRunLock(2222, isAlive, "2026-06-06T00:00:02.000Z")).toBe(false);
+  });
+});

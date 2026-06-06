@@ -403,4 +403,38 @@ export class SqliteStore {
       .all() as Array<{ id: number; payload: string; attempts: number }>;
     return rows;
   }
+
+  // ---- run lock（単一インスタンス）----
+  acquireRunLock(
+    pid: number,
+    isPidAlive: (pid: number) => boolean,
+    now: string,
+  ): boolean {
+    const existing = this.db
+      .prepare(`SELECT pid FROM run_lock WHERE id = 1`)
+      .get() as { pid: number } | undefined;
+
+    if (existing !== undefined) {
+      // 自 pid のロックは冪等に奪える。別 pid は生存中なら奪わない。
+      if (existing.pid !== pid && isPidAlive(existing.pid)) {
+        return false;
+      }
+    }
+
+    // 空・自 pid・死んだ保持者 → 奪取（id=1 行を upsert）
+    this.db
+      .prepare(
+        `INSERT INTO run_lock (id, pid, acquired_at) VALUES (1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, acquired_at = excluded.acquired_at`,
+      )
+      .run(pid, now);
+    return true;
+  }
+
+  releaseRunLock(pid: number): void {
+    // 自分が保持しているロックだけ解放する（他 pid の解放は no-op）
+    this.db
+      .prepare(`DELETE FROM run_lock WHERE id = 1 AND pid = ?`)
+      .run(pid);
+  }
 }
