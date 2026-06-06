@@ -145,3 +145,74 @@ describe("GitPrManager.prepareWorktree", () => {
     expect(result.branch).toBe("looppilot/ty-123-refactor-the-authentication-mo");
   });
 });
+
+describe("GitPrManager.hasCommitsWithDiff", () => {
+  // カーネル §5.2: rev-list --count origin/<defaultBranch>..HEAD > 0
+  //                AND diff --quiet origin/<defaultBranch>..HEAD が非0（差分あり）
+  it("returns true when there are commits ahead and the diff is non-empty", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "rev-list"], { code: 0, stdout: "2\n", stderr: "" });
+    runner.on(["git", "-C", "/wt/x", "diff", "--quiet"], { code: 1, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    expect(await mgr.hasCommitsWithDiff("/wt/x")).toBe(true);
+
+    expect(runner.calls[0]).toEqual({
+      cmd: "git",
+      args: ["-C", "/wt/x", "rev-list", "--count", "origin/main..HEAD"],
+      opts: { cwd: "/wt/x" },
+    });
+    expect(runner.calls[1]).toEqual({
+      cmd: "git",
+      args: ["-C", "/wt/x", "diff", "--quiet", "origin/main..HEAD"],
+      opts: { cwd: "/wt/x" },
+    });
+  });
+
+  it("returns false when there are zero commits ahead (skips diff check)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "rev-list"], { code: 0, stdout: "0\n", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    expect(await mgr.hasCommitsWithDiff("/wt/x")).toBe(false);
+    // count==0 で短絡し diff は呼ばない
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("returns false when commits exist but diff --quiet reports no diff (code 0)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "rev-list"], { code: 0, stdout: "3\n", stderr: "" });
+    runner.on(["git", "-C", "/wt/x", "diff", "--quiet"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    expect(await mgr.hasCommitsWithDiff("/wt/x")).toBe(false);
+  });
+});
+
+describe("GitPrManager.hasUncommittedChanges", () => {
+  // カーネル §5.2: git status --porcelain 非空
+  it("returns true when status --porcelain output is non-empty", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "status"], {
+      code: 0,
+      stdout: " M src/a.ts\n",
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    expect(await mgr.hasUncommittedChanges("/wt/x")).toBe(true);
+    expect(runner.calls[0]).toEqual({
+      cmd: "git",
+      args: ["-C", "/wt/x", "status", "--porcelain"],
+      opts: { cwd: "/wt/x" },
+    });
+  });
+
+  it("returns false when status --porcelain output is empty (whitespace only)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "status"], { code: 0, stdout: "\n", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    expect(await mgr.hasUncommittedChanges("/wt/x")).toBe(false);
+  });
+});

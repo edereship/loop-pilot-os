@@ -81,12 +81,36 @@ export class GitPrManager implements GitPrManagerInterface {
     );
   }
 
-  async hasCommitsWithDiff(_worktreePath: string): Promise<boolean> {
-    throw new Error("not implemented");
+  async hasCommitsWithDiff(worktreePath: string): Promise<boolean> {
+    const { defaultBranch } = this.opts;
+    const range = `origin/${defaultBranch}..HEAD`;
+
+    const count = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "rev-list", "--count", range],
+      { cwd: worktreePath },
+    );
+    const ahead = Number.parseInt(count.stdout.trim(), 10);
+    if (!Number.isFinite(ahead) || ahead <= 0) {
+      return false;
+    }
+
+    const diff = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "diff", "--quiet", range],
+      { cwd: worktreePath },
+    );
+    // diff --quiet: 差分なし → code 0、差分あり → code 1（非0）
+    return diff.code !== 0;
   }
 
-  async hasUncommittedChanges(_worktreePath: string): Promise<boolean> {
-    throw new Error("not implemented");
+  async hasUncommittedChanges(worktreePath: string): Promise<boolean> {
+    const res = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "status", "--porcelain"],
+      { cwd: worktreePath },
+    );
+    return res.stdout.trim().length > 0;
   }
 
   async findOpenPrForBranch(_branch: string): Promise<number | null> {
