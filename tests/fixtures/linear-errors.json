@@ -1,0 +1,5 @@
+{
+  "errors": [
+    { "message": "Authentication required, not authenticated", "extensions": { "type": "authentication" } }
+  ]
+}

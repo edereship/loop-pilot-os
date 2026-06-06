@@ -1,0 +1,12 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        { "id": "i-b", "identifier": "TY-20", "title": "High b", "description": "", "priority": 2, "sortOrder": 7, "url": "https://linear.app/ty/issue/TY-20" },
+        { "id": "i-a", "identifier": "TY-21", "title": "High a", "description": "", "priority": 2, "sortOrder": 7, "url": "https://linear.app/ty/issue/TY-21" },
+        { "id": "i-none1", "identifier": "TY-22", "title": "None", "description": "", "priority": 0, "sortOrder": 1, "url": "https://linear.app/ty/issue/TY-22" },
+        { "id": "i-low1", "identifier": "TY-23", "title": "Low", "description": "", "priority": 4, "sortOrder": 999, "url": "https://linear.app/ty/issue/TY-23" }
+      ]
+    }
+  }
+}

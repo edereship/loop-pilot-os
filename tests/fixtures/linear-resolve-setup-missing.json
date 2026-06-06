@@ -1,0 +1,27 @@
+{
+  "data": {
+    "viewer": { "id": "user-1", "name": "LoopPilot Bot" },
+    "teams": {
+      "nodes": [
+        {
+          "id": "team-uuid-1",
+          "key": "TY",
+          "states": { "nodes": [
+            { "id": "state-todo", "name": "Todo" },
+            { "id": "state-wip", "name": "In Progress" },
+            { "id": "state-review", "name": "In Review" }
+          ] },
+          "labels": { "nodes": [] }
+        }
+      ]
+    },
+    "projects": {
+      "nodes": [
+        { "id": "project-uuid-2", "name": "Other Project" }
+      ]
+    },
+    "issueLabels": { "nodes": [
+      { "id": "label-bug", "name": "bug" }
+    ] }
+  }
+}
