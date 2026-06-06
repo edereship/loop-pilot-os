@@ -1,0 +1,10 @@
+node_modules/
+dist/
+
+# SQLite 状態ストア（実 DB はコミットしない。WAL 副生成物含む）
+*.db
+*.db-wal
+*.db-shm
+
+# 実設定はコミットしない（example のみコミット）
+looppilot-os.toml
