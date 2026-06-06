@@ -257,3 +257,69 @@ describe("GitPrManager.findOpenPrForBranch", () => {
     expect(await mgr.findOpenPrForBranch("looppilot/ty-123-x")).toBe(null);
   });
 });
+
+describe("GitPrManager.pushAndOpenPr", () => {
+  // カーネル §5.2 push: git -C <wt> push -u origin <branch>
+  // カーネル §5.3 create: gh pr create -R <o/n> --base <defaultBranch> --head <branch>
+  //                       --title "<identifier>: <title>" --body <本文>
+  // PR番号: stdout 末尾 URL の /pull/(\d+)
+  it("pushes then creates the PR with template-substituted body and parses the PR number", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "push"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["gh", "pr", "create"], {
+      code: 0,
+      stdout: "https://github.com/owner/name/pull/57\n",
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const branch = "looppilot/ty-123-x";
+    const n = await mgr.pushAndOpenPr(branch, "/wt/x", issue());
+    expect(n).toBe(57);
+
+    // push の argv（cwd=worktree）
+    expect(runner.calls[0]).toEqual({
+      cmd: "git",
+      args: ["-C", "/wt/x", "push", "-u", "origin", branch],
+      opts: { cwd: "/wt/x" },
+    });
+
+    // gh pr create の argv。--body は template 置換済み完成本文を直渡し
+    const expectedBody =
+      "Implements TY-123: Add the login flow!\n\n" +
+      "https://linear.app/team/issue/TY-123\n";
+    expect(runner.calls[1]).toEqual({
+      cmd: "gh",
+      args: [
+        "pr",
+        "create",
+        "-R",
+        "owner/name",
+        "--base",
+        "main",
+        "--head",
+        branch,
+        "--title",
+        "TY-123: Add the login flow!",
+        "--body",
+        expectedBody,
+      ],
+      opts: { cwd: "/repo" },
+    });
+  });
+
+  it("throws when the PR create stdout has no /pull/<n> URL", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "push"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["gh", "pr", "create"], {
+      code: 0,
+      stdout: "https://github.com/owner/name/tree/looppilot\n",
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(
+      mgr.pushAndOpenPr("looppilot/ty-123-x", "/wt/x", issue()),
+    ).rejects.toThrow(/PR number/);
+  });
+});

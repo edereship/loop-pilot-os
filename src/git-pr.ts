@@ -15,6 +15,14 @@ export interface GitPrManagerOptions {
   gateLabel: string;
 }
 
+/** prBodyTemplate の {identifier}/{title}/{issue_url} を置換（全出現を置換） */
+function renderPrBody(template: string, issue: EligibleIssue): string {
+  return template
+    .replaceAll("{identifier}", issue.identifier)
+    .replaceAll("{title}", issue.title)
+    .replaceAll("{issue_url}", issue.url);
+}
+
 /** title を小文字化し英数字以外を "-" に圧縮、先頭末尾 "-" 除去、30字に切詰め */
 function slugify(title: string): string {
   const base = title
@@ -128,11 +136,46 @@ export class GitPrManager implements GitPrManagerInterface {
   }
 
   async pushAndOpenPr(
-    _branch: string,
-    _worktreePath: string,
-    _issue: EligibleIssue,
+    branch: string,
+    worktreePath: string,
+    issue: EligibleIssue,
   ): Promise<number> {
-    throw new Error("not implemented");
+    const { repoPath, remote, defaultBranch } = this.opts;
+
+    await this.runner.run("git", ["-C", worktreePath, "push", "-u", "origin", branch], {
+      cwd: worktreePath,
+    });
+
+    const body = renderPrBody(this.opts.prBodyTemplate, issue);
+    const title = `${issue.identifier}: ${issue.title}`;
+    const res = await this.runner.run(
+      "gh",
+      [
+        "pr",
+        "create",
+        "-R",
+        remote,
+        "--base",
+        defaultBranch,
+        "--head",
+        branch,
+        "--title",
+        title,
+        "--body",
+        body,
+      ],
+      { cwd: repoPath },
+    );
+
+    const match = res.stdout.match(/\/pull\/(\d+)/);
+    if (match === null) {
+      throw new Error(`could not parse PR number from gh pr create output: ${res.stdout.trim()}`);
+    }
+    const prNumber = Number.parseInt(match[1], 10);
+    if (!Number.isFinite(prNumber)) {
+      throw new Error(`could not parse PR number from gh pr create output: ${res.stdout.trim()}`);
+    }
+    return prNumber;
   }
 
   async addLabel(_prNumber: number, _label: string): Promise<void> {
