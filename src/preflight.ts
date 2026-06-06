@@ -367,17 +367,53 @@ async function checkStateCommentAuthors(
   }
 }
 
-// ---- §9.7 Linear 解決（Step 16 で本体を追加） ----
-async function checkLinear(_deps: PreflightDeps, _errors: string[]): Promise<void> {
-  /* 本体は Step 16 で実装（先に Step 15 で赤テストを書く） */
+// ---- §9.7 Linear 解決 ----
+async function checkLinear(deps: PreflightDeps, errors: string[]): Promise<void> {
+  const { config, fetchFn } = deps;
+  // config.linear.states は camelCase。resolveLinearSetup の stateNames は TicketState キー。明示写像する。
+  const stateNames: Record<TicketState, string> = {
+    todo: config.linear.states.todo,
+    in_progress: config.linear.states.inProgress,
+    in_review: config.linear.states.inReview,
+    done: config.linear.states.done,
+  };
+  const req: LinearSetupRequest = {
+    teamKey: config.linear.team,
+    projectName: config.linear.project,
+    stateNames,
+    optInLabel: config.linear.optInLabel,
+  };
+  try {
+    // resolveLinearSetup: viewer 取得（APIキー検証）/ team・project・4状態・opt_in_label の解決。
+    // いずれか解決不能なら欠落を 1 回でまとめて throw する契約（task-source.ts）。
+    await resolveLinearSetup(config.linearApiKey, req, fetchFn);
+  } catch (e) {
+    errors.push(`Linear: セットアップ解決に失敗しました（${(e as Error).message}）`);
+  }
 }
 
-// ---- §9.8 claude 起動可（Step 18 で本体を追加） ----
+// ---- §9.8 claude 起動可 ----
 async function checkClaude(
-  _runner: CommandRunner, _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 18 で実装（先に Step 17 で赤テストを書く） */ }
+  runner: CommandRunner,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const ver = await runner.run("claude", ["--version"], opts);
+    if (ver.code !== 0) {
+      errors.push(`claude: 起動できません（claude にログインしているか確認してください: ${ver.stderr.trim()}）`);
+    }
+  } catch (e) {
+    errors.push(`claude: バージョン確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
-// ---- §9.10 Slack 到達可（Step 18 で本体を追加） ----
-async function checkSlack(_deps: PreflightDeps, _errors: string[]): Promise<void> {
-  /* 本体は Step 18 で実装（先に Step 17 で赤テストを書く） */
+// ---- §9.10 Slack 到達可 ----
+async function checkSlack(deps: PreflightDeps, errors: string[]): Promise<void> {
+  // 未設定なら probeReachability は即 resolve（notifier.ts / Task 6 契約）。設定済みで非2xx/network なら throw。
+  try {
+    await deps.notifier.probeReachability();
+  } catch (e) {
+    errors.push(`Slack: Webhook へ到達できません（${(e as Error).message}）`);
+  }
 }

@@ -272,4 +272,52 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: cfg, runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("monitor_never_engaged"))).toEqual([]);
   });
+
+  it("Linear 解決が失敗すると NG（仕様 §9.7）", async () => {
+    // team が見つからない応答 → resolveLinearSetup は throw する契約（task-source.ts）。
+    const failFetch: FetchFn = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: {
+          viewer: { id: "user-1", name: "Viewer" },
+          teams: { nodes: [] },
+          projects: { nodes: [] },
+          issueLabels: { nodes: [] },
+        },
+      }),
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: failFetch });
+    expect(errors.some((e) => e.includes("Linear"))).toBe(true);
+  });
+
+  it("Linear 解決が成功すれば Linear 由来エラーなし（仕様 §9.7）", async () => {
+    // passingFetch は viewer/team/project/states/label をすべて解決できる応答を返す。
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("Linear"))).toEqual([]);
+  });
+
+  it("claude が起動できないと NG（仕様 §9.8）", async () => {
+    const r = passingRunner();
+    r.on(["claude", "--version"], { code: 127, stdout: "", stderr: "command not found" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("claude"))).toBe(true);
+  });
+
+  it("Slack Webhook が非2xxなら NG（仕様 §9.10）", async () => {
+    const failingNotifier: Notifier = {
+      notify: async () => {},
+      probeReachability: async () => {
+        throw new Error("HTTP 500 from webhook");
+      },
+    };
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: failingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("Slack") && e.includes("HTTP 500"))).toBe(true);
+  });
+
+  it("Slack 未設定（probeReachability 即 resolve）なら Slack 由来エラーなし（仕様 §9.10）", async () => {
+    // passingNotifier.probeReachability は即 resolve（未設定相当）。
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("Slack"))).toEqual([]);
+  });
 });
