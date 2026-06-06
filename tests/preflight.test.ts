@@ -144,4 +144,52 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("push 権限がありません"))).toBe(true);
   });
+
+  it("ブランチ保護なし（404）は OK 判定（仕様 §9.4）", async () => {
+    // passingRunner はすでに protection=404, rulesets=[] を仕込んでおり合格する。
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("必須承認レビュー") || e.includes("restrictions"))).toEqual([]);
+  });
+
+  it("required_approving_review_count>0 のブランチ保護は NG（仕様 §9.4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({ required_pull_request_reviews: { required_approving_review_count: 1 }, restrictions: null }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("必須承認レビュー数") && e.includes("1"))).toBe(true);
+  });
+
+  it("restrictions に認証ユーザーが含まれていれば OK（仕様 §9.4・カーネル『含むときのみ OK』）", async () => {
+    const r = passingRunner();
+    // 認証ユーザーは the-bot（passingRunner の gh api user 応答）。restrictions.users に the-bot を含める。
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: { required_approving_review_count: 0 },
+        restrictions: { users: [{ login: "the-bot" }, { login: "someone-else" }], teams: [], apps: [] },
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    // restrictions があっても認証ユーザーが許可リストに居る → ブランチ由来エラーなし。
+    expect(errors.filter((e) => e.includes("restrictions") || e.includes("必須承認レビュー"))).toEqual([]);
+  });
+
+  it("restrictions に認証ユーザーが不在なら NG（仕様 §9.4・カーネル『不在のみ NG』）", async () => {
+    const r = passingRunner();
+    // 認証ユーザー the-bot が restrictions.users に居ない → NG。
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: { required_approving_review_count: 0 },
+        restrictions: { users: [{ login: "someone-else" }], teams: [], apps: [] },
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("restrictions") && e.includes("the-bot"))).toBe(true);
+  });
 });

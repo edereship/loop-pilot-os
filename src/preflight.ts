@@ -129,11 +129,83 @@ async function checkPushPermission(
   }
 }
 
-// ---- §9.4 ブランチ保護（Step 6 で本体を追加） ----
+// ---- §9.4 ブランチ保護 ----
 async function checkBranchProtection(
-  _runner: CommandRunner, _repoSlug: string, _branch: string,
-  _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 6 で実装（先に Step 5 で赤テストを書く） */ }
+  runner: CommandRunner,
+  repoSlug: string,
+  branch: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/branches/${branch}/protection`], opts);
+    if (isHttp404(r)) return; // 保護なし = OK
+    if (r.code !== 0) {
+      errors.push(`gh: ブランチ保護を取得できません（${r.stderr.trim()}）`);
+      return;
+    }
+    let parsed: {
+      required_pull_request_reviews?: { required_approving_review_count?: number };
+      restrictions?: {
+        users?: Array<{ login: string }>;
+        teams?: Array<{ slug: string }>;
+        apps?: Array<{ slug: string }>;
+      } | null;
+    };
+    try {
+      parsed = JSON.parse(r.stdout);
+    } catch {
+      errors.push("gh: ブランチ保護のJSONを解析できません");
+      return;
+    }
+    const reviewCount = parsed.required_pull_request_reviews?.required_approving_review_count ?? 0;
+    if (reviewCount > 0) {
+      errors.push(
+        `gh: ブランチ '${branch}' は必須承認レビュー数が ${reviewCount} です。` +
+          "ループに人間レビュアーが不在のためマージ不能になります（required_approving_review_count を 0 にしてください）",
+      );
+    }
+    // restrictions が設定されている場合、push/merge できる identity が allowlist に限定される。
+    // カーネル §9.4 の NG 条件は「restrictions に認証ユーザー不在」。
+    // 認証ユーザー（=push 権限保持者）が許可リストに含まれていれば restrictions があっても OK。
+    // 含まれていない場合のみ、その identity からはマージできないため NG。
+    if (parsed.restrictions != null) {
+      const login = await resolveAuthenticatedLogin(runner, opts);
+      if (login == null) {
+        errors.push(
+          `gh: ブランチ '${branch}' に push 制限（restrictions）がありますが、` +
+            "認証ユーザー名を解決できず許可リストとの照合ができません（gh api user --jq .login を確認してください）",
+        );
+      } else {
+        const allowedUsers = (parsed.restrictions.users ?? []).map((u) => u.login);
+        if (!allowedUsers.includes(login)) {
+          errors.push(
+            `gh: ブランチ '${branch}' の push 制限（restrictions）の許可リストに認証ユーザー '${login}' が含まれていません。` +
+              "この identity からはマージできません。restrictions.users に '" + login + "' を追加してください",
+          );
+        }
+      }
+    }
+  } catch (e) {
+    errors.push(`gh: ブランチ保護確認に失敗しました（${(e as Error).message}）`);
+  }
+}
+
+// 認証ユーザーのログイン名を解決する（restrictions の許可リスト照合に使う）。
+// 失敗時は null を返し、呼び出し側で照合不能として扱う。
+async function resolveAuthenticatedLogin(
+  runner: CommandRunner,
+  opts: { cwd: string },
+): Promise<string | null> {
+  try {
+    const r = await runner.run("gh", ["api", "user", "--jq", ".login"], opts);
+    if (r.code !== 0) return null;
+    const login = r.stdout.trim();
+    return login.length > 0 ? login : null;
+  } catch {
+    return null;
+  }
+}
 
 // ---- §9.4 rulesets（Step 8 で本体を追加） ----
 async function checkRulesets(
