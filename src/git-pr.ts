@@ -178,12 +178,32 @@ export class GitPrManager implements GitPrManagerInterface {
     return prNumber;
   }
 
-  async addLabel(_prNumber: number, _label: string): Promise<void> {
-    throw new Error("not implemented");
+  async addLabel(prNumber: number, label: string): Promise<void> {
+    const { repoPath, remote } = this.opts;
+    const res = await this.runner.run(
+      "gh",
+      ["pr", "edit", String(prNumber), "-R", remote, "--add-label", label],
+      { cwd: repoPath },
+    );
+    if (res.code !== 0) {
+      throw new Error(
+        `gh pr edit --add-label failed for PR #${prNumber}: ${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
   }
 
-  async mergePr(_prNumber: number, _headSha: string): Promise<void> {
-    throw new Error("not implemented");
+  async mergePr(prNumber: number, headSha: string): Promise<void> {
+    const { repoPath, remote } = this.opts;
+    const res = await this.runner.run(
+      "gh",
+      ["pr", "merge", String(prNumber), "-R", remote, "--squash", "--match-head-commit", headSha],
+      { cwd: repoPath },
+    );
+    if (res.code !== 0) {
+      throw new Error(
+        `gh pr merge failed for PR #${prNumber}: ${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
   }
 
   async discardWorktree(_branch: string, _worktreePath: string): Promise<void> {

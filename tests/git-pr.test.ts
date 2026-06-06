@@ -323,3 +323,53 @@ describe("GitPrManager.pushAndOpenPr", () => {
     ).rejects.toThrow(/PR number/);
   });
 });
+
+describe("GitPrManager.addLabel", () => {
+  // カーネル §5.3: gh pr edit <n> -R <o/n> --add-label <gate_label>
+  it("issues the exact gh pr edit argv with the gate label", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "edit"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.addLabel(57, "loop-pilot");
+
+    expect(runner.calls[0]).toEqual({
+      cmd: "gh",
+      args: ["pr", "edit", "57", "-R", "owner/name", "--add-label", "loop-pilot"],
+      opts: { cwd: "/repo" },
+    });
+  });
+
+  it("throws when gh pr edit exits non-zero", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "edit"], { code: 1, stdout: "", stderr: "label not found" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.addLabel(57, "loop-pilot")).rejects.toThrow(/label not found/);
+  });
+});
+
+describe("GitPrManager.mergePr", () => {
+  // カーネル §5.3: gh pr merge <n> -R <o/n> --squash --match-head-commit <headSha>
+  it("issues the exact gh pr merge argv with squash and match-head-commit", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "merge"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.mergePr(57, "deadbeef");
+
+    expect(runner.calls[0]).toEqual({
+      cmd: "gh",
+      args: ["pr", "merge", "57", "-R", "owner/name", "--squash", "--match-head-commit", "deadbeef"],
+      opts: { cwd: "/repo" },
+    });
+  });
+
+  it("throws when gh pr merge exits non-zero (caller maps to ci_failed/conflict)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "merge"], { code: 1, stdout: "", stderr: "not mergeable" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.mergePr(57, "deadbeef")).rejects.toThrow(/not mergeable/);
+  });
+});
