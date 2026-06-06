@@ -40,7 +40,8 @@ export class FakeCommandRunner implements CommandRunner {
     let best: Stub | undefined;
     for (const stub of this.stubs) {
       if (!matchesPrefix(full, stub.prefix)) continue;
-      if (best === undefined || stub.prefix.length > best.prefix.length) {
+      // 最長プレフィックス優先。同長の場合は後登録（= 上書き）が勝つ。
+      if (best === undefined || stub.prefix.length >= best.prefix.length) {
         best = stub;
       }
     }
