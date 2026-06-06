@@ -223,4 +223,53 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("ゲートラベル"))).toEqual([]);
   });
+
+  it("LOOPPILOT_AUTO_MERGE variable 404 は OK 判定（仕様 §9.6）", async () => {
+    // passingRunner は variable=404 を仕込んでおり合格する。
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("LOOPPILOT_AUTO_MERGE"))).toEqual([]);
+  });
+
+  it("LOOPPILOT_AUTO_MERGE が 'true'（大小無視）なら NG（仕様 §9.6）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/actions/variables/LOOPPILOT_AUTO_MERGE"], {
+      code: 0,
+      stdout: JSON.stringify({ name: "LOOPPILOT_AUTO_MERGE", value: "TRUE" }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("LOOPPILOT_AUTO_MERGE") && e.includes("唯一のマージャー"))).toBe(true);
+  });
+
+  it("STATE_COMMENT_AUTHORS variable 404 で config が github-actions[bot] を含めば OK（仕様 §9.9）", async () => {
+    // passingRunner は variable=404、config は ["github-actions[bot]"] → R ⊆ C 成立。
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("state_comment_authors") || e.includes("monitor_never_engaged"))).toEqual([]);
+  });
+
+  it("R ⊄ C（リポ writer を config が包含しない）なら NG（仕様 §9.9）", async () => {
+    const r = passingRunner();
+    // リポは bot-machine も writer に使うが、config は github-actions[bot] のみ → 欠落。
+    r.on(["gh", "api", "repos/owner/name/actions/variables/LOOPPILOT_STATE_COMMENT_AUTHORS"], {
+      code: 0,
+      stdout: JSON.stringify({ name: "LOOPPILOT_STATE_COMMENT_AUTHORS", value: "github-actions[bot], bot-machine" }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("bot-machine") && e.includes("monitor_never_engaged"))).toBe(true);
+  });
+
+  it("config が R を包含すれば余分な信頼著者があっても OK（R ⊆ C; 仕様 §9.9）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/actions/variables/LOOPPILOT_STATE_COMMENT_AUTHORS"], {
+      code: 0,
+      stdout: JSON.stringify({ value: "github-actions[bot]" }),
+      stderr: "",
+    });
+    const cfg = makeConfig({
+      looppilot: { gateLabel: "loop-pilot", stateCommentAuthors: ["github-actions[bot]", "extra-bot"] },
+    });
+    const errors = await runPreflight({ config: cfg, runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("monitor_never_engaged"))).toEqual([]);
+  });
 });

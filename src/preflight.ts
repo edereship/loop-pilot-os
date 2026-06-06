@@ -278,16 +278,94 @@ async function checkGateLabel(
   }
 }
 
-// ---- §9.6 LOOPPILOT_AUTO_MERGE（Step 12 で本体を追加） ----
+// ---- §9.6 LOOPPILOT_AUTO_MERGE ----
 async function checkAutoMerge(
-  _runner: CommandRunner, _repoSlug: string, _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 12 で実装（先に Step 11 で赤テストを書く） */ }
+  runner: CommandRunner,
+  repoSlug: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const r = await runner.run(
+      "gh",
+      ["api", `repos/${repoSlug}/actions/variables/LOOPPILOT_AUTO_MERGE`],
+      opts,
+    );
+    if (isHttp404(r)) return; // 未設定 = false = OK
+    if (r.code !== 0) {
+      errors.push(`gh: Actions 変数 LOOPPILOT_AUTO_MERGE を取得できません（${r.stderr.trim()}）`);
+      return;
+    }
+    let parsed: { value?: string };
+    try {
+      parsed = JSON.parse(r.stdout);
+    } catch {
+      errors.push("gh: LOOPPILOT_AUTO_MERGE のJSONを解析できません");
+      return;
+    }
+    const value = (parsed.value ?? "").trim().toLowerCase();
+    if (value === "true") {
+      errors.push(
+        "gh: Actions 変数 LOOPPILOT_AUTO_MERGE が 'true' です。" +
+          "LoopPilot OS が唯一のマージャーであるため false（または未設定）にしてください",
+      );
+    }
+  } catch (e) {
+    errors.push(`gh: LOOPPILOT_AUTO_MERGE 確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
-// ---- §9.9 state-comment 著者整合 R⊆C（Step 14 で本体を追加） ----
+// ---- §9.9 state-comment 著者整合 R⊆C ----
 async function checkStateCommentAuthors(
-  _runner: CommandRunner, _config: Config, _repoSlug: string,
-  _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 14 で実装（先に Step 13 で赤テストを書く） */ }
+  runner: CommandRunner,
+  config: Config,
+  repoSlug: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  const C = config.looppilot.stateCommentAuthors;
+  try {
+    const r = await runner.run(
+      "gh",
+      ["api", `repos/${repoSlug}/actions/variables/LOOPPILOT_STATE_COMMENT_AUTHORS`],
+      opts,
+    );
+
+    // R = リポが実際に書き手として使う著者集合（= LoopPilot が信頼コメントの著者に使う集合）
+    let R: string[];
+    if (isHttp404(r)) {
+      // 未設定 → リポ既定 writer は github-actions[bot]（state-manager.ts の DEFAULT_TRUSTED_STATE_AUTHOR）
+      R = ["github-actions[bot]"];
+    } else if (r.code !== 0) {
+      errors.push(`gh: Actions 変数 LOOPPILOT_STATE_COMMENT_AUTHORS を取得できません（${r.stderr.trim()}）`);
+      return;
+    } else {
+      let parsed: { value?: string };
+      try {
+        parsed = JSON.parse(r.stdout);
+      } catch {
+        errors.push("gh: LOOPPILOT_STATE_COMMENT_AUTHORS のJSONを解析できません");
+        return;
+      }
+      // LoopPilot と同一パース（カンマ区切り → trim → 空除去）。空なら既定にフォールバック。
+      const fromVar = parseAuthors(parsed.value ?? "");
+      R = fromVar.length > 0 ? fromVar : ["github-actions[bot]"];
+    }
+
+    // R ⊆ C を要求（リポの全 writer を config の信頼集合 C が包含）。
+    // 1つでも欠ければ Monitor が信頼コメントを発見できず monitor_never_engaged で全停止する。
+    const missing = R.filter((author) => !C.includes(author));
+    if (missing.length > 0) {
+      errors.push(
+        `設定不整合: config.looppilot.state_comment_authors が リポジトリの state-comment 著者 [${missing.join(", ")}] を含みません。` +
+          "Monitor が信頼コメントを発見できず monitor_never_engaged で全停止します。" +
+          `config.looppilot.state_comment_authors に [${R.join(", ")}] を含めてください`,
+      );
+    }
+  } catch (e) {
+    errors.push(`gh: state-comment 著者整合の確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
 // ---- §9.7 Linear 解決（Step 16 で本体を追加） ----
 async function checkLinear(_deps: PreflightDeps, _errors: string[]): Promise<void> {
