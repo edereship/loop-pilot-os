@@ -124,18 +124,56 @@ export class Orchestrator {
 
   /** in_review + PR の回復（カーネル §8）。poll の verdict で分岐する。 */
   private async recoverInReview(session: TaskSessionRow, prNumber: number): Promise<RunControl> {
-    const verdict: MonitorVerdict = await this.monitor.poll(prNumber);
+    let verdict: MonitorVerdict;
+    try {
+      verdict = await this.monitor.poll(prNumber);
+    } catch (err) {
+      // poll が回復時に throw → 採用して通常 MONITOR ループに委ねる（バックオフ/5連続停止は monitorSession が担う）。
+      this.log(`recovery: poll threw for PR #${prNumber}, resuming MONITOR: ${errMsg(err)}`);
+      return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+    }
     switch (verdict.kind) {
       case "merged":
         // DONE 後段（merged 永続化 → transition(done)）。二重計上なし（導出）。HALT しない。
         this.store.updateSession(session.id, { runId: this.runId });
         await this.recoverDone(session);
         return CONTINUE;
-      default:
-        // pr_closed / stopped / open 扱い（done・in_progress・corrupted・not_engaged）/ poll throw は
-        // それぞれ Step 5/6 で失敗テスト先行のうえ実装する。未実装の今は明示的に未対応で停止させる。
-        throw new Error(`recoverInReview: verdict "${verdict.kind}" not yet implemented`);
+      case "pr_closed":
+        this.store.updateSession(session.id, { runId: this.runId });
+        return await this.stopSession(session, "pr_closed", null);
+      case "stopped":
+        this.store.updateSession(session.id, { runId: this.runId });
+        return await this.stopSession(
+          session,
+          "looppilot_stopped",
+          verdict.stopReason ?? "looppilot stopped (no reason)",
+        );
+      // done / in_progress / corrupted / not_engaged = open 扱い → 採用して MONITOR 再開
+      case "done":
+      case "in_progress":
+      case "corrupted":
+      case "not_engaged":
+        return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
     }
+  }
+
+  /**
+   * 採用したセッションを MONITOR 再開し、merged まで進んだら DONE 後段を実行する。
+   * monitorStartedAt は上書きしない（ガード/timeout の経過を継続。引数は記録用で再設定はしない）。
+   */
+  private async adoptAndMonitor(
+    session: TaskSessionRow,
+    prNumber: number,
+    _monitorStartedAt: string | null,
+  ): Promise<RunControl> {
+    // runId 付替え（採用 → tasks_started に数えられる）。in_review 以外で来た場合も state は in_review にする。
+    this.store.updateSession(session.id, { runId: this.runId, state: "in_review" });
+    const fresh = this.store.getSession(session.id);
+    const ctrl = await this.monitorSession(fresh, prNumber);
+    if (ctrl.control === "halt") return HALT;
+    // merged 到達 → DONE 後段
+    await this.recoverDone(fresh);
+    return CONTINUE;
   }
 
   /** claimed/implementing/handing_off（および PR 番号欠落 in_review）の回復（カーネル §8）。 */

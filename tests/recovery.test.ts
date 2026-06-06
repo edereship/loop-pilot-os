@@ -129,6 +129,130 @@ function seedCrashedSession(
   return store.getSession(s.id);
 }
 
+describe("回復 — in_review + PR が停止系 verdict（仕様 §9 / カーネル §8）", () => {
+  it("poll が pr_closed → stopped(pr_closed) + Run=halted、ループに入らない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.source.queue = [issue("issue-Z", "TY-9")]; // 回復で HALT すれば SELECT には進まない
+    h.monitor.verdicts = [{ kind: "pr_closed" }];
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("pr_closed");
+    expect(s.runId).toBe(newRun.id);
+    // Run=halted・回復で停止したのでループに入らず getNextEligible は呼ばれない
+    expect(newRun.state).toBe("halted");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+    // 通知列: run_started → halted（停止 1 回）
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "pr_closed" });
+  });
+
+  it("poll が stopped(stopReason='codex gave up') → stopped(looppilot_stopped, detail=stopReason) + HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "codex gave up" }];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("codex gave up");
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+  });
+
+  it("poll が stopped(stopReason=null) → detail は既定文言へ", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: null }];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("looppilot stopped (no reason)");
+  });
+});
+
+describe("回復 — in_review + PR が open 扱い → 採用して MONITOR 再開（仕様 §9 / カーネル §8）", () => {
+  it("poll が in_progress → done → merged で完走し、monitorStartedAt は上書きされない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const originalStart = "2026-06-04T00:10:00.000Z";
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: originalStart,
+    });
+    // 回復 poll(in_progress) で採用 → monitorSession の poll で done → merged
+    h.monitor.verdicts = [{ kind: "in_progress" }, { kind: "done" }, { kind: "merged" }];
+    // 回復後ループに入るので 1 回の SELECT で停止させる
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    // 採用 → MONITOR 再開 → merged
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(newRun.id);
+    // 監視起点は上書きされない（ガード/timeout の経過継続。カーネル §8）
+    expect(s.monitorStartedAt).toBe(originalStart);
+    // DONE 後段 transition(done)
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+    // merge が呼ばれた（done→ready→merge）
+    expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-100"] });
+    // tasks_started=1（採用で新 Run に数えられる）
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+  });
+
+  it("poll が corrupted（open 扱いで採用）→ 続く poll が即 corrupted を維持 → MONITOR が即 stopped(monitor_never_engaged) で HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, notEngagedGuardMinutes: 999 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // 回復 poll(corrupted) で採用 → monitorSession の poll(corrupted) で即停止
+    h.monitor.verdicts = [{ kind: "corrupted" }, { kind: "corrupted" }];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("monitor_never_engaged");
+    expect(s.stopDetail).toBe("looppilot-state comment present but corrupted");
+    // 回復が HALT で終わったのでループに入らない
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+  });
+});
+
 describe("回復 — in_review + PR が merged（仕様 §9 / カーネル §8: DONE 後段・二重計上なし）", () => {
   it("再起動時 in_review+PR で monitor.poll が merged → merged 永続化 + transition(done)・新 Run の merged_count=1", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
