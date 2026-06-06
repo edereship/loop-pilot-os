@@ -144,6 +144,23 @@ describe("GitPrManager.prepareWorktree", () => {
     // "refactor-the-authentication-module-now" → 先頭30字 "refactor-the-authentication-mo"
     expect(result.branch).toBe("looppilot/ty-123-refactor-the-authentication-mo");
   });
+
+  // 本プロジェクトの実チケットは日本語タイトル。slug 規則（カーネル§5.2: 英数字以外をハイフン圧縮）に従うと
+  // 日本語のみのタイトルは識別子のみのブランチ名になる — この挙動を意図的なものとしてピン留めする。
+  it("produces an identifier-only branch for a Japanese-only title", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.prepareWorktree(
+      issue({ title: "ログインフローを追加する", identifier: "TY-123" }),
+    );
+    // 日本語は [^a-z0-9]+ にマッチするため slugify → ""。
+    // branch = "<branchPrefix>/<id小文字>-" (末尾ハイフンは slugify 後に id との連結部として残る)
+    expect(result.branch).toBe("looppilot/ty-123-");
+    expect(result.worktreePath.endsWith("ty-123-")).toBe(true);
+  });
 });
 
 describe("GitPrManager.hasCommitsWithDiff", () => {
@@ -321,6 +338,47 @@ describe("GitPrManager.pushAndOpenPr", () => {
     await expect(
       mgr.pushAndOpenPr("looppilot/ty-123-x", "/wt/x", issue()),
     ).rejects.toThrow(/PR number/);
+  });
+
+  it("throws with stderr when git push fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "push"], {
+      code: 1,
+      stdout: "",
+      stderr: "remote: permission denied\n",
+    });
+    runner.on(["gh", "pr", "create"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const branch = "looppilot/ty-123-x";
+    await expect(mgr.pushAndOpenPr(branch, "/wt/x", issue())).rejects.toThrow(
+      /git push failed.*permission denied/,
+    );
+    // gh pr create は呼ばれてはならない
+    const createCalls = runner.calls.filter(
+      (c) => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "create",
+    );
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("throws with stderr when gh pr create fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "push"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["gh", "pr", "create"], {
+      code: 1,
+      stdout: "",
+      stderr: "GraphQL: was submitted too quickly",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const branch = "looppilot/ty-123-x";
+    await expect(mgr.pushAndOpenPr(branch, "/wt/x", issue())).rejects.toThrow(
+      /gh pr create failed.*too quickly/,
+    );
+    // 誤解を招く "parse error" ではなく、意図したエラーが上がること
+    await expect(mgr.pushAndOpenPr(branch, "/wt/x", issue())).rejects.not.toThrow(
+      /could not parse PR number/,
+    );
   });
 });
 

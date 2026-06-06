@@ -142,9 +142,16 @@ export class GitPrManager implements GitPrManagerInterface {
   ): Promise<number> {
     const { repoPath, remote, defaultBranch } = this.opts;
 
-    await this.runner.run("git", ["-C", worktreePath, "push", "-u", "origin", branch], {
-      cwd: worktreePath,
-    });
+    const push = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "push", "-u", "origin", branch],
+      { cwd: worktreePath },
+    );
+    if (push.code !== 0) {
+      throw new Error(
+        `git push failed for ${branch}: ${push.stderr.trim() || `exit ${push.code}`}`,
+      );
+    }
 
     const body = renderPrBody(this.opts.prBodyTemplate, issue);
     const title = `${issue.identifier}: ${issue.title}`;
@@ -166,6 +173,12 @@ export class GitPrManager implements GitPrManagerInterface {
       ],
       { cwd: repoPath },
     );
+
+    if (res.code !== 0) {
+      throw new Error(
+        `gh pr create failed for ${branch}: ${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
 
     const match = res.stdout.match(/\/pull\/(\d+)/);
     if (match === null) {
