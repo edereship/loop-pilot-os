@@ -27,4 +27,32 @@ describe("RealCommandRunner", () => {
     expect(result.stdout).toBe("partial");
     expect(result.stderr).toBe("");
   });
+
+  // 仕様: stream-json 進捗用。完全な1行ごとに onStdoutLine を呼ぶ（複数行を順に供給）
+  it("onStdoutLine に完全な行を順に供給する（複数行・全文も stdout に蓄積）", async () => {
+    const lines: string[] = [];
+    const result = await runner.run(
+      "node",
+      ["-e", "process.stdout.write('a\\nb\\nc\\n')"],
+      { cwd: process.cwd(), onStdoutLine: (line) => lines.push(line) },
+    );
+    expect(lines).toEqual(["a", "b", "c"]);
+    expect(result.stdout).toBe("a\nb\nc\n");
+    expect(result.code).toBe(0);
+  });
+
+  // 仕様: チャンク境界が行の途中に来てもバッファリングして1行に再構成する。
+  // 末尾に改行が無い最終行は close 時に flush する。
+  it("チャンク跨ぎの行を再構成し、改行無しの末尾も最終行として供給する", async () => {
+    const lines: string[] = [];
+    // 1チャンク目 'line1\nli' → 'line1' を供給し 'li' をバッファ
+    // 2チャンク目（遅延）'ne2\nline3' → 'line2','line3' を供給（'line3' は close で flush）
+    const result = await runner.run(
+      "node",
+      ["-e", "process.stdout.write('line1\\nli'); setTimeout(() => process.stdout.write('ne2\\nline3'), 50)"],
+      { cwd: process.cwd(), onStdoutLine: (line) => lines.push(line) },
+    );
+    expect(lines).toEqual(["line1", "line2", "line3"]);
+    expect(result.stdout).toBe("line1\nline2\nline3");
+  });
 });

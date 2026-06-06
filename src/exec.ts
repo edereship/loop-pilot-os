@@ -12,6 +12,7 @@ export class RealCommandRunner implements CommandRunner {
 
       let stdout = "";
       let stderr = "";
+      let lineBuffer = "";
       let settled = false;
 
       const settle = (fn: () => void): void => {
@@ -20,8 +21,30 @@ export class RealCommandRunner implements CommandRunner {
         fn();
       };
 
+      const emitLines = (): void => {
+        if (!opts.onStdoutLine) return;
+        let newlineIndex = lineBuffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          opts.onStdoutLine(lineBuffer.slice(0, newlineIndex));
+          lineBuffer = lineBuffer.slice(newlineIndex + 1);
+          newlineIndex = lineBuffer.indexOf("\n");
+        }
+      };
+
+      const flushLines = (): void => {
+        if (opts.onStdoutLine && lineBuffer.length > 0) {
+          opts.onStdoutLine(lineBuffer);
+          lineBuffer = "";
+        }
+      };
+
       child.stdout.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
+        const text = chunk.toString();
+        stdout += text;
+        if (opts.onStdoutLine) {
+          lineBuffer += text;
+          emitLines();
+        }
       });
       child.stderr.on("data", (chunk: Buffer) => {
         stderr += chunk.toString();
@@ -32,6 +55,7 @@ export class RealCommandRunner implements CommandRunner {
       });
 
       child.on("close", (code: number | null) => {
+        flushLines();
         settle(() => resolve({ code: code ?? -1, stdout, stderr }));
       });
     });
