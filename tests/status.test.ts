@@ -66,4 +66,31 @@ describe("renderStatus", () => {
       store.close();
     }
   });
+
+  it("活性セッション（merged/stopped 以外）の state・identifier・branch・PR・経過を表示する", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(3, "2026-06-05T10:00:00.000Z");
+      const s = store.createSession({
+        runId: run.id, linearIssueId: "u9", linearIdentifier: "TY-9",
+        issueTitle: "Monitoring task", branch: "looppilot/ty-9-monitoring-task",
+        worktreePath: "/wt/9", now: "2026-06-05T10:02:00.000Z",
+      });
+      store.updateSession(s.id, {
+        state: "in_review", prNumber: 42,
+        monitorStartedAt: "2026-06-05T10:03:00.000Z",
+      });
+
+      const out = renderStatus(store);
+      expect(out).toContain("Active session");
+      expect(out).toContain("TY-9");
+      expect(out).toContain("state: in_review");
+      expect(out).toContain("branch: looppilot/ty-9-monitoring-task");
+      expect(out).toContain("PR #42");
+      // 経過は monitorStartedAt があれば since 起点で表示
+      expect(out).toContain("monitoring since 2026-06-05T10:03:00.000Z");
+    } finally {
+      store.close();
+    }
+  });
 });
