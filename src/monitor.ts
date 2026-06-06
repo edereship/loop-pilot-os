@@ -5,6 +5,25 @@ import type {
   MonitorVerdict,
 } from "./types.js";
 
+// ---- LoopPilot state-manager.ts と同一の定数 -----------------------------
+
+/** 信頼 state コメントの可視先頭テキスト（state-manager.ts: STATE_COMMENT_VISIBLE_TEXT） */
+const STATE_COMMENT_VISIBLE_TEXT = "LoopPilot state is stored in this comment.";
+/** 隠しコメント開始マーカー（state-manager.ts: STATE_COMMENT_OPEN = "<!-- " + "looppilot-state"） */
+const STATE_COMMENT_OPEN = "<!-- looppilot-state";
+/** state 抽出 regex（state-manager.ts deserializeState と同一の捕捉式） */
+const STATE_EXTRACT_RE = /<!-- looppilot-state\n([\s\S]*?)\n-->/;
+/** LoopPilot VALID_STATUSES（state-manager.ts L33） */
+const VALID_STATUSES = new Set([
+  "initialized",
+  "waiting_codex",
+  "fixing",
+  "done",
+  "stopped",
+]);
+/** checkMergeReadiness ② の「失敗でない」conclusion 集合（§5.3） */
+const GREEN_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+
 // ---- gh pr view --json の型 ---------------------------------------------
 
 interface PrViewJson {
@@ -15,6 +34,12 @@ interface PrViewJson {
   headRefOid: string;
   statusCheckRollup: Array<{ status: string; conclusion: string | null }>;
   closed: boolean;
+}
+
+/** gh api issue comments の1要素（必要フィールドのみ） */
+interface IssueComment {
+  user: { login: string };
+  body: string;
 }
 
 export interface GhLoopPilotMonitorOptions {
@@ -45,14 +70,62 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
     if (pr.mergedAt !== null || pr.state === "MERGED") {
       return { kind: "merged" };
     }
+    // §5.4 規則2: 未マージ ∧ CLOSED → pr_closed
+    if (pr.state === "CLOSED") {
+      return { kind: "pr_closed" };
+    }
 
-    // 残りの verdict 分岐は Step 7b の red→green で実装する（現時点は未実装）
-    throw new Error("poll: non-merged verdicts not implemented yet");
+    // §5.4 規則3-5: ここで初めてコメントを取得して信頼 state コメントを特定
+    const trusted = await this.findTrustedStateComment(prNumber);
+    if (trusted === null) {
+      return { kind: "not_engaged" };
+    }
+
+    const status = this.extractStatus(trusted.body);
+    if (status === null) {
+      return { kind: "corrupted" };
+    }
+    if (status.status === "stopped") {
+      return { kind: "stopped", stopReason: status.stopReason };
+    }
+    if (status.status === "done") {
+      return { kind: "done" };
+    }
+    // initialized | waiting_codex | fixing
+    return { kind: "in_progress" };
   }
 
-  async checkMergeReadiness(_prNumber: number): Promise<MergeReadiness> {
-    // ①-⑥ は Step 9b の red→green で実装する（現時点は未実装）
-    throw new Error("checkMergeReadiness not implemented yet");
+  async checkMergeReadiness(prNumber: number): Promise<MergeReadiness> {
+    const pr = await this.fetchPrView(prNumber);
+    const checks = pr.statusCheckRollup;
+
+    // ① コンフリクト
+    if (pr.mergeable === "CONFLICTING" || pr.mergeStateStatus === "DIRTY") {
+      return { ready: false, reason: "conflict" };
+    }
+    // ② 失敗チェックあり（completed かつ conclusion ∉ {SUCCESS,NEUTRAL,SKIPPED}）
+    const hasFailed = checks.some(
+      (c) =>
+        c.status === "COMPLETED" && !GREEN_CONCLUSIONS.has(c.conclusion ?? ""),
+    );
+    if (hasFailed) {
+      return { ready: false, reason: "ci_failed" };
+    }
+    // ③ 未完了チェックあり
+    const hasPending = checks.some((c) => c.status !== "COMPLETED");
+    if (hasPending) {
+      return { ready: false, reason: "ci_pending" };
+    }
+    // ④ 全グリーン（空配列含む）かつ BLOCKED
+    if (pr.mergeStateStatus === "BLOCKED") {
+      return { ready: false, reason: "blocked" };
+    }
+    // ⑤ MERGEABLE
+    if (pr.mergeable === "MERGEABLE") {
+      return { ready: true, headSha: pr.headRefOid };
+    }
+    // ⑥ それ以外
+    return { ready: false, reason: "unknown" };
   }
 
   // ---- 内部ヘルパ -------------------------------------------------------
@@ -72,5 +145,67 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
       { cwd: process.cwd() },
     );
     return JSON.parse(result.stdout) as PrViewJson;
+  }
+
+  /**
+   * §5.4 のコメント特定4規則を適用して信頼 state コメントを返す。
+   * 該当無し → null。複数該当 → 最後のもの（gh は作成昇順、配列末尾 = 最新）。
+   */
+  private async findTrustedStateComment(
+    prNumber: number,
+  ): Promise<IssueComment | null> {
+    const result = await this.runner.run(
+      "gh",
+      [
+        "api",
+        `repos/${this.owner}/${this.name}/issues/${prNumber}/comments`,
+        "--paginate",
+        "--slurp",
+      ],
+      { cwd: process.cwd() },
+    );
+    // --paginate --slurp は [[...page1...],[...page2...]] を返すので flat 化（§5.3）
+    const pages = JSON.parse(result.stdout) as IssueComment[][];
+    const comments: IssueComment[] = pages.flat();
+
+    let found: IssueComment | null = null;
+    for (const c of comments) {
+      // 規則1: 信頼著者
+      if (!this.trustedAuthors.includes(c.user.login)) continue;
+      // 規則2: 可視テキストで始まる
+      if (!c.body.startsWith(STATE_COMMENT_VISIBLE_TEXT)) continue;
+      // 規則3: 隠しマーカーを含む
+      if (!c.body.includes(STATE_COMMENT_OPEN)) continue;
+      // 規則4: 最後優先（上書きし続けて末尾を残す）
+      found = c;
+    }
+    return found;
+  }
+
+  /**
+   * 信頼コメント body から status / stopReason を抽出。
+   * regex 不一致 / JSON.parse 失敗 / 非オブジェクト / status 非文字列・不正値 → null（= corrupted の合図）。
+   */
+  private extractStatus(
+    body: string,
+  ): { status: string; stopReason: string | null } | null {
+    const match = body.match(STATE_EXTRACT_RE);
+    if (!match) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(match[1]);
+    } catch {
+      return null;
+    }
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const obj = parsed as Record<string, unknown>;
+    const status = obj.status;
+    if (typeof status !== "string" || !VALID_STATUSES.has(status)) {
+      return null;
+    }
+    // stopReason は文字列 or null（null はそのまま保持・変換しない、§5.4）
+    const rawReason = obj.stopReason;
+    const stopReason = typeof rawReason === "string" ? rawReason : null;
+    return { status, stopReason };
   }
 }
