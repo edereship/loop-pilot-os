@@ -1209,3 +1209,29 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
     expect(h.store.latestRun()!.haltReason).toContain("user_interrupt");
   });
 });
+
+// 二重起動: ロック拒否は戻り値で通知し、main が古い Run の状態から誤った exit code を導かないようにする
+describe("Orchestrator 二重起動 — run lock 拒否（Fix 1）", () => {
+  it("別の生存プロセスがロックを保持しているとき run() は 'lock_rejected' を返し、Run 行を作らず通知も送らない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+
+    // 別の「実在し生存している」pid がロックを保持中。orchestrator の run() は
+    // 実 isPidAlive（process.kill(pid, 0)）で死活判定するため、固定 pid（例: 99999）だと
+    // 実在しない環境でロックが奪取されて IDLE 無限ループになる。テストランナーの
+    // 親プロセス pid（process.ppid）は同一ユーザーで必ず生存しており、process.pid とも異なる。
+    const foreignPid = process.ppid;
+    h.store.acquireRunLock(foreignPid, () => true, "2026-06-05T00:00:00.000Z");
+
+    const outcome = await h.orch.run();
+
+    // 戻り値が "lock_rejected" であること
+    expect(outcome).toBe("lock_rejected");
+
+    // Run 行は一切作られていない
+    expect(h.store.latestRun()).toBeNull();
+
+    // 通知は一切送られていない
+    expect(h.notifier.events).toHaveLength(0);
+  });
+});

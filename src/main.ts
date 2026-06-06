@@ -15,7 +15,7 @@ import { GitPrManager } from "./git-pr.js";
 import { ClaudeAgentRunner } from "./agent-runner.js";
 import { GhLoopPilotMonitor } from "./monitor.js";
 import { buildPrompt } from "./context-bundle.js";
-import { Orchestrator } from "./orchestrator.js";
+import { Orchestrator, type RunOutcome } from "./orchestrator.js";
 import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
 
@@ -43,6 +43,10 @@ function parseCli(argv: string[]): { command: string; configPath: string } {
       config: { type: "string", default: "./looppilot-os.toml" },
     },
   });
+  if (positionals.length > 1) {
+    process.stderr.write("Usage: looppilot-os <run|status> [--config <path>]\n");
+    process.exit(1);
+  }
   const command = positionals[0] ?? "";
   return { command, configPath: values.config as string };
 }
@@ -159,10 +163,18 @@ async function runLoop(configPath: string): Promise<number> {
     };
     process.on("SIGINT", onSigint);
 
+    let outcome: RunOutcome;
     try {
-      await orchestrator.run();
+      outcome = await orchestrator.run();
     } finally {
       process.removeListener("SIGINT", onSigint);
+    }
+
+    if (outcome === "lock_rejected") {
+      process.stderr.write(
+        "Error: another looppilot-os run is already active (run lock held).\n",
+      );
+      return EXIT_PREFLIGHT;
     }
 
     // HALT 終端なら exit 2、それ以外（idle で綺麗に止まった等）は 0。

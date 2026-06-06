@@ -24,7 +24,7 @@ function activeDetail(s: TaskSessionRow): string[] {
 
 function recentRow(s: TaskSessionRow): string {
   const reason = s.failureReason ?? "-";
-  return `  ${s.linearIdentifier.padEnd(10)} ${s.state.padEnd(12)} ${reason.padEnd(20)} ${fmtCost(s.costUsd)}`;
+  return `  ${s.linearIdentifier.padEnd(10)} ${s.state.padEnd(12)} ${reason.padEnd(22)} ${fmtCost(s.costUsd)}`;
 }
 
 export function renderStatus(store: SqliteStore): string {
@@ -65,7 +65,7 @@ export function renderStatus(store: SqliteStore): string {
   if (recent.length === 0) {
     lines.push("  (none)");
   } else {
-    lines.push(`  ${"id".padEnd(10)} ${"state".padEnd(12)} ${"failure_reason".padEnd(20)} cost`);
+    lines.push(`  ${"id".padEnd(10)} ${"state".padEnd(12)} ${"failure_reason".padEnd(22)} cost`);
     for (const s of recent) {
       lines.push(recentRow(s));
     }

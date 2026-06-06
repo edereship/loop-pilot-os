@@ -14,6 +14,8 @@ import type {
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
+export type RunOutcome = "finished" | "lock_rejected";
+
 export interface OrchestratorDeps {
   config: Config;
   source: TaskSource;
@@ -71,12 +73,12 @@ export class Orchestrator {
     this.interrupted = true;
   }
 
-  async run(): Promise<void> {
+  async run(): Promise<RunOutcome> {
     const pid = process.pid;
     const acquired = this.store.acquireRunLock(pid, isPidAlive, this.clock());
     if (!acquired) {
       this.log("run lock held by another live process; aborting");
-      return;
+      return "lock_rejected";
     }
     try {
       const taskCap = this.config.safety.maxTasksPerRun;
@@ -93,6 +95,7 @@ export class Orchestrator {
     } finally {
       this.store.releaseRunLock(pid);
     }
+    return "finished";
   }
 
   /**
