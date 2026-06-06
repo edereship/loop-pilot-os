@@ -549,3 +549,220 @@ describe("Orchestrator 失敗系 — HANDOFF（仕様 §5.4 / カーネル §7.5
     expect(s.stopDetail).toContain("no PR created");
   });
 });
+
+describe("Orchestrator 失敗系 — MONITOR verdict 写像（仕様 §5.5 / §5.4 / カーネル §7.6）", () => {
+  it("stopped(stopReason='codex gave up') → stopped(looppilot_stopped, stop_detail=stopReason)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "codex gave up" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("codex gave up");
+  });
+
+  it("stopped(stopReason=null) → stopped(looppilot_stopped, stop_detail='looppilot stopped (no reason)')", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: null }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.failureReason).toBe("looppilot_stopped");
+    // null はそのまま保持せず既定文言へ（カーネル §7.6）
+    expect(s.stopDetail).toBe("looppilot stopped (no reason)");
+  });
+
+  it("pr_closed → stopped(pr_closed, detail=null)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "pr_closed" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("pr_closed");
+    expect(s.stopDetail).toBeNull();
+  });
+
+  it("corrupted → 即 stopped(monitor_never_engaged)。ガード経過を待たない（1 回目 poll で停止）", async () => {
+    // ガードを 999 分にしても即停止することで「ガードを待たない」ことを確かめる
+    const config = makeConfig({ maxTasksPerRun: 3, notEngagedGuardMinutes: 999 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "corrupted" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("monitor_never_engaged");
+    expect(s.stopDetail).toBe("looppilot-state comment present but corrupted");
+    // poll は 1 回だけ（即停止）
+    expect(h.monitor.pollCalls).toHaveLength(1);
+  });
+});
+
+describe("Orchestrator 失敗系 — not_engaged ガード / monitor_timeout（仕様 §5.5 / §11 / カーネル §7.6）", () => {
+  it("not_engaged かつ経過 > not_engaged_guard_minutes → stopped(monitor_never_engaged, detail=null)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, notEngagedGuardMinutes: 30 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // not_engaged を返し続ける（FakeMonitor は要素 1 のとき同じものを返す）
+    h.monitor.verdicts = [{ kind: "not_engaged" }];
+
+    // poll をフックして、poll の直前に monitorStartedAt を「現在 clock より 60 分前」へ上書きする。
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    h.monitor.poll = async (pr: number) => {
+      const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+      h.store.updateSession(s.id, { monitorStartedAt: "2026-06-04T23:00:00.000Z" });
+      return origPoll(pr);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("monitor_never_engaged");
+    expect(s.stopDetail).toBeNull();
+    // 1 回目の poll で経過超過 → 即停止
+    expect(h.monitor.pollCalls).toHaveLength(1);
+  });
+
+  it("not_engaged かつ経過 <= guard → 続行（停止しない）。経過が閾値内なら poll を繰り返す", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, notEngagedGuardMinutes: 30 }); // taskCap=1: 完走後 HALT（IDLE ループ回避）
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // 1 回目 not_engaged（ガード未経過で続行）→ 2 回目 done → merged で完走
+    // monitorStartedAt は上書きしない（clock の進みは数秒なので 30 分閾値を超えない）
+    h.monitor.verdicts = [{ kind: "not_engaged" }, { kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // ガード内 not_engaged では停止せず、最終的に merged
+    expect(s.state).toBe("merged");
+    // 少なくとも 2 回 poll した（not_engaged 続行 → done）
+    expect(h.monitor.pollCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("in_progress かつ monitor_timeout_minutes 設定・total 経過超過 → stopped(exception, 'monitor timeout')", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, monitorTimeoutMinutes: 120 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "in_progress" }];
+
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    h.monitor.poll = async (pr: number) => {
+      const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+      // monitorStartedAt を 3 時間前へ（> 120 分）
+      h.store.updateSession(s.id, { monitorStartedAt: "2026-06-04T21:00:00.000Z" });
+      return origPoll(pr);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toBe("monitor timeout");
+  });
+
+  it("in_progress かつ monitor_timeout 未設定（既定 undefined）→ timeout で止まらず続行する", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, monitorTimeoutMinutes: undefined }); // taskCap=1: 完走後 HALT（IDLE ループ回避）
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // in_progress（経過いくら長くても止まらない）→ done → merged
+    h.monitor.verdicts = [{ kind: "in_progress" }, { kind: "done" }, { kind: "merged" }];
+
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    h.monitor.poll = async (pr: number) => {
+      const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+      h.store.updateSession(s.id, { monitorStartedAt: "2026-06-01T00:00:00.000Z" }); // 何日も前
+      return origPoll(pr);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // timeout 未設定なので in_progress では止まらず、done→merged で完走
+    expect(s.state).toBe("merged");
+  });
+});
+
+describe("Orchestrator 失敗系 — poll throw バックオフ（仕様 §5.5 / カーネル §7.6）", () => {
+  it("poll が 5 連続で throw → stopped(exception, 'monitor poll failed 5x: ...')", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, monitorPollSeconds: 60 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // verdicts は使わず poll を常に throw させる
+    h.monitor.poll = async (pr: number) => {
+      h.monitor.pollCalls.push(pr);
+      throw new Error("gh api 502");
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("monitor poll failed 5x");
+    expect(s.stopDetail).toContain("gh api 502");
+    // poll は 5 回呼ばれた
+    expect(h.monitor.pollCalls).toHaveLength(5);
+    // バックオフ: 1回目 sleep=60000、以降 ×2..×8 クランプ。MONITOR の sleep だけ抜き出す。
+    // 各反復先頭で sleep(pollIntervalMs * backoffMultiplier)。
+    // multiplier 列: 1,2,4,8,8 → sleep 列: 60000,120000,240000,480000,480000
+    // （このテストは IDLE に入らない＝queue 1 件・taskCap 3 のため、MONITOR の sleep のみ）
+    const base = config.loop.monitorPollSeconds * 1000;
+    const monitorSleeps = h.sleepCalls.filter((ms) => ms % base === 0 && ms >= base);
+    expect(monitorSleeps.slice(0, 5)).toEqual([
+      base * 1,
+      base * 2,
+      base * 4,
+      base * 8,
+      base * 8, // ×8 でクランプ
+    ]);
+  });
+
+  it("poll が 4 回 throw 後に成功（done→merged）→ 停止せず完走し、バックオフは成功でリセットされる", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, monitorPollSeconds: 60 }); // taskCap=1: 完走後 HALT（IDLE ループ回避）
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+
+    let n = 0;
+    h.monitor.poll = async (pr: number) => {
+      h.monitor.pollCalls.push(pr);
+      n += 1;
+      if (n <= 4) throw new Error("transient 503");
+      if (n === 5) return { kind: "done" };
+      return { kind: "merged" };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // 4 連続失敗（<5）なので停止せず、5 回目 done → tryMerge(ready)→merge 成功 → 完走
+    // done verdict で tryMerge が即座に merged を返すため、merged verdict の poll は不要（計 5 回）
+    expect(s.state).toBe("merged");
+    expect(h.monitor.pollCalls.length).toBeGreaterThanOrEqual(5); // 4 throws + 1 done（plan defect: was 6）
+  });
+});
