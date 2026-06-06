@@ -78,6 +78,22 @@ describe("RealCommandRunner", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toBe("quick");
   });
+
+  // 仕様: マルチバイト UTF-8 文字がチャンク境界で分割されても正しく復号する
+  // （agentSummary 等の日本語テキストが化けないこと。StringDecoder による越境バッファリング）
+  it("チャンク境界で分割されたマルチバイト文字を正しく復号する", async () => {
+    const lines: string[] = [];
+    const result = await runner.run(
+      "node",
+      [
+        "-e",
+        "const b = Buffer.from('あ'); process.stdout.write(b.subarray(0, 2)); setTimeout(() => process.stdout.write(b.subarray(2)), 50)",
+      ],
+      { cwd: process.cwd(), onStdoutLine: (line) => lines.push(line) },
+    );
+    expect(result.stdout).toBe("あ");
+    expect(lines).toEqual(["あ"]);
+  });
 });
 
 describe("FakeCommandRunner", () => {

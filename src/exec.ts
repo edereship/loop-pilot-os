@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import type { CommandResult, CommandRunner, RunOptions } from "./types.js";
 
 export class RealCommandRunner implements CommandRunner {
@@ -14,6 +15,8 @@ export class RealCommandRunner implements CommandRunner {
       let stderr = "";
       let lineBuffer = "";
       let settled = false;
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
 
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
@@ -58,7 +61,7 @@ export class RealCommandRunner implements CommandRunner {
       };
 
       child.stdout.on("data", (chunk: Buffer) => {
-        const text = chunk.toString();
+        const text = stdoutDecoder.write(chunk);
         stdout += text;
         if (opts.onStdoutLine) {
           lineBuffer += text;
@@ -66,7 +69,7 @@ export class RealCommandRunner implements CommandRunner {
         }
       });
       child.stderr.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString();
+        stderr += stderrDecoder.write(chunk);
       });
 
       child.on("error", (err: Error) => {
@@ -74,6 +77,12 @@ export class RealCommandRunner implements CommandRunner {
       });
 
       child.on("close", (code: number | null) => {
+        const stdoutTail = stdoutDecoder.end();
+        if (stdoutTail.length > 0) {
+          stdout += stdoutTail;
+          if (opts.onStdoutLine) lineBuffer += stdoutTail;
+        }
+        stderr += stderrDecoder.end();
         flushLines();
         settle(() => resolve({ code: code ?? -1, stdout, stderr }));
       });
