@@ -103,6 +103,7 @@ export class Orchestrator {
    *    - claimed/implementing/handing_off: findOpenPrForBranch ヒット→採用、ミス→stopped(exception)+HALT。
    * いずれかの経路が HALT に至ったら { control: "halt" } を返し、run() はループを開始しない。
    * 採用セッションは runId を新 Run へ付替えるので countTasksStarted に数えられ、上限と比較される。
+   * 注: SIGINT(requestStop) は回復処理の完了後（loop 冒頭の安全点）まで効かない。回復は v1 では逐次・有限（monitor タイムアウト/HALT で抜ける）。
    */
   private async recoverPendingSessions(): Promise<RunControl> {
     // 1) 孤児チケット復帰（ベストエフォート）
