@@ -71,5 +71,14 @@ export function renderStatus(store: SqliteStore): string {
     }
   }
 
+  const undelivered = store.undeliveredIntents();
+  if (undelivered.length > 0) {
+    lines.push("");
+    lines.push(`WARNING: ${undelivered.length} undelivered notification(s):`);
+    for (const u of undelivered) {
+      lines.push(`  intent #${u.id} (attempts: ${u.attempts}) ${u.payload}`);
+    }
+  }
+
   return lines.join("\n");
 }

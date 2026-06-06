@@ -134,4 +134,32 @@ describe("renderStatus", () => {
       store.close();
     }
   });
+
+  it("未配信の通知 intent があれば警告を出し、無ければ警告を出さない", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(3, "2026-06-05T10:00:00.000Z");
+      void run;
+      const payload = JSON.stringify({
+        kind: "halted",
+        reason: "looppilot_stopped",
+        detail: "PR #42 stopped",
+      });
+      // Slack 設定済み (slackConfigured=true) → delivered_slack=0 のまま未配信
+      const intentId = store.recordIntent(payload, true, "2026-06-05T10:10:00.000Z");
+      void intentId;
+
+      const out = renderStatus(store);
+      expect(out).toContain("WARNING");
+      expect(out).toContain("undelivered notification");
+
+      // 配信済みにすると警告は消える
+      store.markDelivered(intentId, "console");
+      store.markDelivered(intentId, "slack");
+      const out2 = renderStatus(store);
+      expect(out2).not.toContain("undelivered notification");
+    } finally {
+      store.close();
+    }
+  });
 });
