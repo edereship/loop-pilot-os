@@ -206,7 +206,15 @@ export class GitPrManager implements GitPrManagerInterface {
     }
   }
 
-  async discardWorktree(_branch: string, _worktreePath: string): Promise<void> {
-    throw new Error("not implemented");
+  async discardWorktree(branch: string, worktreePath: string): Promise<void> {
+    const { repoPath } = this.opts;
+    await this.runner.run(
+      "git",
+      ["-C", repoPath, "worktree", "remove", "--force", worktreePath],
+      { cwd: repoPath },
+    );
+    await this.runner.run("git", ["-C", repoPath, "branch", "-D", branch], {
+      cwd: repoPath,
+    });
   }
 }

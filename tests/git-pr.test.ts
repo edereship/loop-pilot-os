@@ -373,3 +373,27 @@ describe("GitPrManager.mergePr", () => {
     await expect(mgr.mergePr(57, "deadbeef")).rejects.toThrow(/not mergeable/);
   });
 });
+
+describe("GitPrManager.discardWorktree", () => {
+  // カーネル §5.2: worktree remove --force <wt> → branch -D <branch>（この順）
+  it("removes the worktree first then deletes the branch, in that order", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "worktree", "remove"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "branch", "-D"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.discardWorktree("looppilot/ty-123-x", "/wt/ty-123-x");
+
+    expect(runner.calls[0]).toEqual({
+      cmd: "git",
+      args: ["-C", "/repo", "worktree", "remove", "--force", "/wt/ty-123-x"],
+      opts: { cwd: "/repo" },
+    });
+    expect(runner.calls[1]).toEqual({
+      cmd: "git",
+      args: ["-C", "/repo", "branch", "-D", "looppilot/ty-123-x"],
+      opts: { cwd: "/repo" },
+    });
+    expect(runner.calls).toHaveLength(2);
+  });
+});
