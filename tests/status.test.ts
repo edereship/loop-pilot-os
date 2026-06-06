@@ -53,4 +53,17 @@ describe("renderStatus", () => {
       store.close();
     }
   });
+
+  it("Run が halted のときは halt 理由を表示する", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(3, "2026-06-05T10:00:00.000Z");
+      store.setRunState(run.id, "halted", "task cap reached (3/3)");
+      const out = renderStatus(store);
+      expect(out).toContain("state: halted");
+      expect(out).toContain("halt reason: task cap reached (3/3)");
+    } finally {
+      store.close();
+    }
+  });
 });
