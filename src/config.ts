@@ -8,13 +8,13 @@ import { z } from "zod";
 const rawSchema = z.object({
   product: z.object({
     goal: z.string(),
-  }),
+  }).strict(),
   repo: z.object({
     path: z.string(),
     remote: z.string(),
     default_branch: z.string().default("main"),
     worktree_root: z.string().optional(),
-  }),
+  }).strict(),
   linear: z.object({
     team: z.string(),
     project: z.string(),
@@ -24,36 +24,36 @@ const rawSchema = z.object({
       in_progress: z.string(),
       in_review: z.string(),
       done: z.string(),
-    }),
-  }),
+    }).strict(),
+  }).strict(),
   agent: z.object({
     model: z.string(),
     allowed_tools: z.string(),
     extra_args: z.array(z.string()).default([]),
-  }),
+  }).strict(),
   handoff: z.object({
     branch_prefix: z.string(),
     pr_body_template: z.string(),
-  }),
+  }).strict(),
   looppilot: z.object({
     gate_label: z.string(),
     state_comment_authors: z.array(z.string()).min(1),
-  }),
+  }).strict(),
   safety: z.object({
     max_tasks_per_run: z.number().int().positive(),
     max_cost_usd_per_session: z.number().positive(),
     monitor_timeout_minutes: z.number().positive().optional(),
     not_engaged_guard_minutes: z.number().positive().default(30),
-  }),
+  }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
     idle_recheck_seconds: z.number().int().positive(),
-  }),
+  }).strict(),
   digest: z.object({
     recent_merged_count: z.number().int().positive(),
-  }),
-  notify: z.object({}).optional(),
-});
+  }).strict(),
+  notify: z.object({}).strict().optional(),
+}).strict();
 
 type RawConfig = z.infer<typeof rawSchema>;
 
@@ -170,7 +170,7 @@ export function loadConfig(
       "worktrees",
       path.basename(raw.repo.path),
     );
-  const stateDbPath = path.join(path.dirname(configPath), "looppilot-os.db");
+  const stateDbPath = path.join(path.dirname(path.resolve(configPath)), "looppilot-os.db");
 
   return {
     product: { goal: raw.product.goal },

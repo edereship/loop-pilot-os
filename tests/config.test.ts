@@ -135,4 +135,25 @@ describe("loadConfig", () => {
     expect(message).toContain("product.goal");
     expect(message).toContain("LINEAR_API_KEY");
   });
+
+  // TOML 構文エラーは "Failed to parse TOML" でラップして throw する。
+  it("throws wrapping TOML parse errors with 'Failed to parse TOML'", () => {
+    expect(() =>
+      loadConfig(fixture("config-syntax-error.toml"), fullEnv),
+    ).toThrow(/Failed to parse TOML/);
+  });
+
+  // 不明キー（operator typo）は集約エラーの message に含める。
+  it("throws on an unrecognized key in a sub-table", () => {
+    expect(() =>
+      loadConfig(fixture("config-unknown-key.toml"), fullEnv),
+    ).toThrow(/max_task_per_run/);
+  });
+
+  // LINEAR_API_KEY が空文字列の場合も欠落と同等に扱う。
+  it("throws when LINEAR_API_KEY is an empty string", () => {
+    expect(() =>
+      loadConfig(fixture("config-minimal.toml"), { LINEAR_API_KEY: "" }),
+    ).toThrow(/LINEAR_API_KEY/);
+  });
 });
