@@ -87,6 +87,7 @@ describe("LinearTaskSource.getNextEligible", () => {
       label: "ai-ok",
     });
     expect(calls[0].headers.Authorization).toBe("lin_api_test");
+    expect(calls[0].headers["Content-Type"]).toBe("application/json");
     expect(calls[0].url).toBe("https://api.linear.app/graphql");
   });
 
@@ -153,6 +154,16 @@ describe("LinearTaskSource.getNextEligible", () => {
     await expect(makeSource(fetchFn).getNextEligible([])).rejects.toThrow(
       /Linear HTTP 500/i,
     );
+  });
+
+  // 実API挙動: description が null のチケットは空文字に正規化される（EligibleIssue.description は非null）
+  it("normalizes a null description to an empty string", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-eligible-null-description.json") },
+    ]);
+    const issue = await makeSource(fetchFn).getNextEligible([]);
+    expect(issue?.id).toBe("i-nulldesc");
+    expect(issue?.description).toBe("");
   });
 });
 

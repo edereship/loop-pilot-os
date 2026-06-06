@@ -1,0 +1,9 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        { "id": "i-nulldesc", "identifier": "TY-9", "title": "Null description task", "description": null, "priority": 2, "sortOrder": 1, "url": "https://linear.app/ty/issue/TY-9" }
+      ]
+    }
+  }
+}
