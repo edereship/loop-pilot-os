@@ -1,0 +1,138 @@
+import { describe, it, expect } from "vitest";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import os from "node:os";
+import { loadConfig } from "../src/config.js";
+
+const fixturesDir = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "fixtures",
+);
+const fixture = (name: string): string => path.join(fixturesDir, name);
+
+const fullEnv: NodeJS.ProcessEnv = {
+  LINEAR_API_KEY: "lin_api_test_key",
+  SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/T/B/X",
+};
+
+describe("loadConfig", () => {
+  // 仕様 §8: product/repo/linear/agent/handoff/looppilot/safety/loop/digest を読み込み、
+  // snake_case TOML を camelCase Config に写像する（カーネル §3）。
+  it("loads a fully-specified config and maps snake_case TOML to camelCase Config", () => {
+    const config = loadConfig(fixture("config-valid.toml"), fullEnv);
+
+    expect(config.product.goal).toBe(
+      "Build the best widget. Constraint: no breaking API changes.",
+    );
+    expect(config.repo.path).toBe("/abs/path/to/target-repo");
+    expect(config.repo.remote).toBe("owner/name");
+    expect(config.repo.defaultBranch).toBe("main");
+    expect(config.repo.worktreeRoot).toBe("/custom/worktrees");
+
+    expect(config.linear.team).toBe("TY");
+    expect(config.linear.project).toBe("LoopPilot OS");
+    expect(config.linear.optInLabel).toBe("ai-ok");
+    expect(config.linear.states).toEqual({
+      todo: "Todo",
+      inProgress: "In Progress",
+      inReview: "In Review",
+      done: "Done",
+    });
+    expect(config.linearApiKey).toBe("lin_api_test_key");
+
+    expect(config.agent.model).toBe("opus");
+    expect(config.agent.allowedTools).toBe("Edit,Write,Read,Glob,Grep,Bash");
+    expect(config.agent.extraArgs).toEqual(["--verbose"]);
+
+    expect(config.handoff.branchPrefix).toBe("looppilot");
+    expect(config.handoff.prBodyTemplate).toContain("{identifier}");
+
+    expect(config.looppilot.gateLabel).toBe("loop-pilot");
+    expect(config.looppilot.stateCommentAuthors).toEqual([
+      "github-actions[bot]",
+    ]);
+
+    expect(config.safety.maxTasksPerRun).toBe(3);
+    expect(config.safety.maxCostUsdPerSession).toBe(10.0);
+    expect(config.safety.monitorTimeoutMinutes).toBe(120);
+    expect(config.safety.notEngagedGuardMinutes).toBe(30);
+
+    expect(config.loop.monitorPollSeconds).toBe(60);
+    expect(config.loop.idleRecheckSeconds).toBe(300);
+
+    expect(config.digest.recentMergedCount).toBe(5);
+
+    expect(config.slackWebhookUrl).toBe(
+      "https://hooks.slack.com/services/T/B/X",
+    );
+  });
+
+  // 仕様 §8: stateDbPath = config と同ディレクトリの looppilot-os.db（カーネル §3）。
+  it("resolves stateDbPath next to the config file", () => {
+    const config = loadConfig(fixture("config-valid.toml"), fullEnv);
+    expect(config.stateDbPath).toBe(path.join(fixturesDir, "looppilot-os.db"));
+  });
+
+  // カーネル §3: worktree_root 省略時 ~/.looppilot-os/worktrees/<repo basename>。
+  it("defaults worktreeRoot under the home directory using the repo basename", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.repo.worktreeRoot).toBe(
+      path.join(os.homedir(), ".looppilot-os", "worktrees", "myrepo"),
+    );
+  });
+
+  // カーネル §3: 任意キーの既定値解決（default_branch=main, extra_args=[],
+  // monitor_timeout_minutes=undefined, not_engaged_guard_minutes=30）。
+  it("applies defaults for omitted optional keys", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.repo.defaultBranch).toBe("main");
+    expect(config.agent.extraArgs).toEqual([]);
+    expect(config.safety.monitorTimeoutMinutes).toBeUndefined();
+    expect(config.safety.notEngagedGuardMinutes).toBe(30);
+  });
+
+  // カーネル §3: SLACK_WEBHOOK_URL 未設定なら undefined（コンソールのみ）。
+  it("leaves slackWebhookUrl undefined when env var is absent", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), {
+      LINEAR_API_KEY: "lin_api_test_key",
+    });
+    expect(config.slackWebhookUrl).toBeUndefined();
+    expect(config.linearApiKey).toBe("lin_api_test_key");
+  });
+
+  // カーネル §3: LINEAR_API_KEY 必須（env 欠落はエラー集約に含める）。
+  it("throws when LINEAR_API_KEY is missing from the environment", () => {
+    expect(() =>
+      loadConfig(fixture("config-valid.toml"), {
+        SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/T/B/X",
+      }),
+    ).toThrow(/LINEAR_API_KEY/);
+  });
+
+  // 仕様 §8: 必須キー欠落（[product].goal が無い）→ 該当パスを message に出す。
+  it("throws listing the missing required key", () => {
+    expect(() =>
+      loadConfig(fixture("config-missing-required.toml"), fullEnv),
+    ).toThrow(/product\.goal/);
+  });
+
+  // 型不正（max_tasks_per_run に文字列）→ 該当パスを message に出す。
+  it("throws on a type mismatch with the offending path", () => {
+    expect(() =>
+      loadConfig(fixture("config-wrong-type.toml"), fullEnv),
+    ).toThrow(/safety\.max_tasks_per_run/);
+  });
+
+  // カーネル §3: 検証エラーは全件集約して1つの Error message に（最初の1件で止めない）。
+  it("aggregates every validation error into a single message", () => {
+    let message = "";
+    try {
+      loadConfig(fixture("config-missing-required.toml"), {});
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    // [product].goal 欠落（zod 由来）と LINEAR_API_KEY 欠落（env 由来）の両方が同じ message に出る。
+    expect(message).toContain("product.goal");
+    expect(message).toContain("LINEAR_API_KEY");
+  });
+});
