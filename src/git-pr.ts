@@ -113,8 +113,18 @@ export class GitPrManager implements GitPrManagerInterface {
     return res.stdout.trim().length > 0;
   }
 
-  async findOpenPrForBranch(_branch: string): Promise<number | null> {
-    throw new Error("not implemented");
+  async findOpenPrForBranch(branch: string): Promise<number | null> {
+    const { repoPath, remote } = this.opts;
+    const res = await this.runner.run(
+      "gh",
+      ["pr", "list", "-R", remote, "--head", branch, "--state", "open", "--json", "number"],
+      { cwd: repoPath },
+    );
+    const rows = JSON.parse(res.stdout) as Array<{ number: number }>;
+    if (rows.length === 0) {
+      return null;
+    }
+    return rows[0].number;
   }
 
   async pushAndOpenPr(

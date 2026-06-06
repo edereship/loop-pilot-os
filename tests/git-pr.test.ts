@@ -216,3 +216,44 @@ describe("GitPrManager.hasUncommittedChanges", () => {
     expect(await mgr.hasUncommittedChanges("/wt/x")).toBe(false);
   });
 });
+
+describe("GitPrManager.findOpenPrForBranch", () => {
+  // カーネル §5.3: gh pr list -R <o/n> --head <branch> --state open --json number
+  it("issues the exact gh pr list argv and parses the first PR number from JSON", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: '[{"number":42}]',
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const n = await mgr.findOpenPrForBranch("looppilot/ty-123-x");
+    expect(n).toBe(42);
+
+    expect(runner.calls[0]).toEqual({
+      cmd: "gh",
+      args: [
+        "pr",
+        "list",
+        "-R",
+        "owner/name",
+        "--head",
+        "looppilot/ty-123-x",
+        "--state",
+        "open",
+        "--json",
+        "number",
+      ],
+      opts: { cwd: "/repo" },
+    });
+  });
+
+  it("returns null when the JSON array is empty (no open PR)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    expect(await mgr.findOpenPrForBranch("looppilot/ty-123-x")).toBe(null);
+  });
+});
