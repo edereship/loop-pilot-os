@@ -116,4 +116,32 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("feature-x") && e.includes("default_branch"))).toBe(true);
   });
+
+  it("作業ツリーがダーティなら NG（仕様 §9.2）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "status", "--porcelain"], { code: 0, stdout: " M src/a.ts\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("クリーンではありません"))).toBe(true);
+  });
+
+  it("remote 到達不可なら NG（仕様 §9.3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "ls-remote", "origin", "HEAD"], { code: 128, stdout: "", stderr: "fatal: could not read from remote" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("到達できません"))).toBe(true);
+  });
+
+  it("gh 認証されていなければ NG（仕様 §9.4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "auth", "status"], { code: 1, stdout: "", stderr: "You are not logged into any GitHub hosts" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("認証されていません"))).toBe(true);
+  });
+
+  it("push 権限が false なら NG（仕様 §9.4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name", "--jq", ".permissions.push"], { code: 0, stdout: "false\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push 権限がありません"))).toBe(true);
+  });
 });

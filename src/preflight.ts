@@ -77,22 +77,57 @@ async function checkGitClean(
   }
 }
 
-// ---- §9.3 remote 到達可（Step 4b で本体を追加） ----
+// ---- §9.3 remote 到達可 ----
 async function checkRemote(
-  _runner: CommandRunner, _repoPath: string,
-  _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 4b で実装（先に Step 4a で赤テストを書く） */ }
+  runner: CommandRunner,
+  repoPath: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const ls = await runner.run("git", ["-C", repoPath, "ls-remote", "origin", "HEAD"], opts);
+    if (ls.code !== 0) {
+      errors.push(`git: remote 'origin' に到達できません（${ls.stderr.trim()}）`);
+    }
+  } catch (e) {
+    errors.push(`git: remote 到達確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
-// ---- §9.4 gh 認証（Step 4b で本体を追加） ----
+// ---- §9.4 gh 認証 ----
 async function checkGhAuth(
-  _runner: CommandRunner, _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 4b で実装（先に Step 4a で赤テストを書く） */ }
+  runner: CommandRunner,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const auth = await runner.run("gh", ["auth", "status"], opts);
+    if (auth.code !== 0) {
+      errors.push(`gh: 認証されていません（gh auth login を実行してください: ${auth.stderr.trim()}）`);
+    }
+  } catch (e) {
+    errors.push(`gh: 認証確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
-// ---- §9.4 push 権限（Step 4b で本体を追加） ----
+// ---- §9.4 push 権限 ----
 async function checkPushPermission(
-  _runner: CommandRunner, _repoSlug: string,
-  _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 4b で実装（先に Step 4a で赤テストを書く） */ }
+  runner: CommandRunner,
+  repoSlug: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const push = await runner.run("gh", ["api", `repos/${repoSlug}`, "--jq", ".permissions.push"], opts);
+    if (push.code !== 0) {
+      errors.push(`gh: リポジトリ ${repoSlug} の権限を取得できません（${push.stderr.trim()}）`);
+    } else if (push.stdout.trim() !== "true") {
+      errors.push(`gh: リポジトリ ${repoSlug} への push 権限がありません`);
+    }
+  } catch (e) {
+    errors.push(`gh: push 権限確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
 // ---- §9.4 ブランチ保護（Step 6 で本体を追加） ----
 async function checkBranchProtection(
