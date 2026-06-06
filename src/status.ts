@@ -15,5 +15,12 @@ export function renderStatus(store: SqliteStore): string {
 
   lines.push("");
   lines.push(`Run #${run.id}`);
+  lines.push(`  state: ${run.state}`);
+  lines.push(`  started: ${run.startedAt}`);
+  lines.push(`  tasks: ${store.countTasksStarted(run.id)}/${run.taskCap} started`);
+  lines.push(`  merged: ${store.countMerged(run.id)}`);
+  if (run.state === "halted") {
+    lines.push(`  halt reason: ${run.haltReason ?? "(none)"}`);
+  }
   return lines.join("\n");
 }
