@@ -178,8 +178,24 @@ export class Orchestrator {
 
   /** claimed/implementing/handing_off（および PR 番号欠落 in_review）の回復（カーネル §8）。 */
   private async recoverByOpenPr(session: TaskSessionRow): Promise<RunControl> {
-    // ヒット（採用）は Step 8、ミス（stopped(exception)+HALT）は Step 9 で失敗テスト先行で実装する。
-    throw new Error(`recoverByOpenPr: not yet implemented (session ${session.id})`);
+    const prNumber = await this.git.findOpenPrForBranch(session.branch);
+    if (prNumber !== null) {
+      // 既存のオープン PR を採用。monitorStartedAt は既存値 ?? clock()。
+      const monitorStartedAt = session.monitorStartedAt ?? this.clock();
+      this.store.updateSession(session.id, {
+        runId: this.runId,
+        prNumber,
+        state: "in_review",
+        monitorStartedAt,
+      });
+      return await this.adoptAndMonitor(session, prNumber, monitorStartedAt);
+    }
+    // オープン PR なし → 手動掃除を促して HALT（タスク内自動再開は v1 スコープ外）。
+    this.store.updateSession(session.id, { runId: this.runId });
+    const detail =
+      `crash recovery: no open PR; manual cleanup: ` +
+      `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+    return await this.stopSession(session, "exception", detail);
   }
 
   /** 回復経路の DONE 後段。セッション行から最小 issue を再構成して done() を再利用する。 */

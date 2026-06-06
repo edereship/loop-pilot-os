@@ -253,6 +253,121 @@ describe("回復 — in_review + PR が open 扱い → 採用して MONITOR 再
   });
 });
 
+describe("回復 — claimed/implementing/handing_off で open PR ヒット → 採用（仕様 §9 / カーネル §8）", () => {
+  it("handing_off で findOpenPrForBranch が #555 を返す → state=in_review・PR永続化・monitorStartedAt は既存値 → MONITOR 完走", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const originalStart = "2026-06-04T00:12:00.000Z";
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "handing_off", monitorStartedAt: originalStart },
+      { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1", linearIssueId: "issue-A", linearIdentifier: "TY-1" },
+    );
+    // 既存オープン PR を発見
+    h.git.openPrForBranch.set("looppilot/ty-1-x", 555);
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.prNumber).toBe(555);
+    expect(s.runId).toBe(newRun.id);
+    // monitorStartedAt は既存値（??  clock の右辺は使われない）
+    expect(s.monitorStartedAt).toBe(originalStart);
+    // 採用で tasks_started に数えられる
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+    expect(h.git.calls).toContainEqual({ method: "mergePr", args: [555, "sha-555"] });
+  });
+
+  it("implementing で monitorStartedAt=null・open PR ヒット → monitorStartedAt が clock() で新規設定される", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing", monitorStartedAt: null },
+      { branch: "looppilot/ty-2-x", worktreePath: "/wt/ty-2", linearIssueId: "issue-B", linearIdentifier: "TY-2" },
+    );
+    h.git.openPrForBranch.set("looppilot/ty-2-x", 666);
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.prNumber).toBe(666);
+    // monitorStartedAt は null だったので clock() で設定（基準 2026-06-05... 始まり）
+    expect(typeof s.monitorStartedAt).toBe("string");
+    expect(s.monitorStartedAt).toMatch(/^2026-06-05T00:00:\d{2}\.\d{3}Z$/);
+  });
+});
+
+describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 / カーネル §8: 手動掃除）", () => {
+  it("claimed で findOpenPrForBranch が null → stopped(exception, stop_detail に branch/worktree/identifier) + HALT・ループに入らない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "claimed", monitorStartedAt: null },
+      { branch: "looppilot/ty-7-x", worktreePath: "/wt/ty-7", linearIssueId: "issue-G", linearIdentifier: "TY-7" },
+    );
+    // open PR なし（既定 null）
+    h.source.queue = [issue("issue-Z", "TY-9")];
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    // stop_detail に branch / worktree / identifier を明記（手動掃除を促す。カーネル §8）
+    expect(s.stopDetail).toContain("crash recovery: no open PR");
+    expect(s.stopDetail).toContain("looppilot/ty-7-x");
+    expect(s.stopDetail).toContain("/wt/ty-7");
+    expect(s.stopDetail).toContain("TY-7");
+    expect(s.runId).toBe(newRun.id);
+    // HALT したのでループに入らない
+    expect(newRun.state).toBe("halted");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+    // 通知列: run_started → halted（停止 1 回）
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "exception" });
+    // pushAndOpenPr / mergePr は呼ばれない（タスク内再開は v1 スコープ外）
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+    expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(false);
+  });
+
+  it("worktreePath=null でも stop_detail にプレースホルダを出して HALT する", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "claimed", worktreePath: null },
+      { branch: "looppilot/ty-8-x", linearIssueId: "issue-H", linearIdentifier: "TY-8" },
+    );
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("<no worktree>");
+    expect(s.stopDetail).toContain("looppilot/ty-8-x");
+    expect(s.stopDetail).toContain("TY-8");
+  });
+});
+
 describe("回復 — in_review + PR が merged（仕様 §9 / カーネル §8: DONE 後段・二重計上なし）", () => {
   it("再起動時 in_review+PR で monitor.poll が merged → merged 永続化 + transition(done)・新 Run の merged_count=1", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
