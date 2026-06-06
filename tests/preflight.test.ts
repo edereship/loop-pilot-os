@@ -320,4 +320,31 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("Slack"))).toEqual([]);
   });
+
+  it("全項目合格なら空配列を返す（仕様 §9）", async () => {
+    const errors = await runPreflight({
+      config: makeConfig(),
+      runner: passingRunner(),
+      notifier: passingNotifier,
+      fetchFn: passingFetch(),
+    });
+    expect(errors).toEqual([]);
+  });
+
+  it("複数違反を同時に報告する（途中 throw せず全件集約; 仕様 §9）", async () => {
+    const r = passingRunner();
+    // §9.2 ダーティ + §9.4 push 不可 + §9.6 auto-merge true を同時に仕込む
+    r.on(["git", "-C", "/abs/repo", "status", "--porcelain"], { code: 0, stdout: " M x\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name", "--jq", ".permissions.push"], { code: 0, stdout: "false\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/actions/variables/LOOPPILOT_AUTO_MERGE"], {
+      code: 0,
+      stdout: JSON.stringify({ value: "true" }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("クリーンではありません"))).toBe(true);
+    expect(errors.some((e) => e.includes("push 権限がありません"))).toBe(true);
+    expect(errors.some((e) => e.includes("LOOPPILOT_AUTO_MERGE"))).toBe(true);
+    expect(errors.length).toBeGreaterThanOrEqual(3);
+  });
 });
