@@ -39,6 +39,8 @@
 
 > 検証メモ（計画作成時、claude 2.1.165 実測）: stream-json は NDJSON で `{"type":"system","subtype":"init",...}` / `{"type":"assistant","message":{"content":[{"type":"thinking",...},{"type":"text","text":"..."}]}}` / 末尾 `{"type":"result","subtype":"success","is_error":false,"total_cost_usd":<number>,"result":"...","session_id":"..."}` を出力する。`system` には `init` 以外の subtype（`hook_started`/`thinking_tokens` 等）も混ざるため `subtype==="init"` で選別する。assistant content には `thinking` ブロックが先行し得るため `type==="text"` を探索する。
 
+> 修正 2026-06-06: 実CLIプローブにより --verbose 必須・subtype "error_max_budget_usd"・予算超過時 exit 1 を確認し、契約を実挙動へ修正（ユーザー承認済み）。
+
 ---
 
 ### Files:

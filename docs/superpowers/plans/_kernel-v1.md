@@ -352,11 +352,12 @@ class SqliteStore {
 
 ## 5. 外部コマンド契約（実検証済みの呼び出し形・パース規則）
 
-### 5.1 claude headless（agent-runner.ts）— v2.1.165 検証済み
+### 5.1 claude headless（agent-runner.ts）— v2.1.167 検証済み
 
 ```
 claude -p <prompt>
   --output-format stream-json
+  --verbose
   --max-budget-usd <safety.max_cost_usd_per_session>
   --permission-mode acceptEdits
   --allowedTools <agent.allowed_tools>
@@ -368,7 +369,9 @@ spawn の `cwd` = worktree。stdout は NDJSON 1行1イベント:
 - `{"type":"assistant",...}` → コンソール進捗（短縮表示）
 - 最終行 `{"type":"result","subtype":"success"|"error_max_budget"|...,"is_error":bool,"total_cost_usd":number,"result":"...","session_id":"..."}`
 
-マッピング: `subtype=="success"` → completed（summary=result、2000字に切詰め）。`subtype=="error_max_budget"` → cost_exceeded。その他/`is_error`/非0終了/result行欠落 → error。
+マッピング: `subtype=="success"` → completed（summary=result、2000字に切詰め）。`subtype が "error_max_budget" で始まる（実CLI v2.1.167 は "error_max_budget_usd"、exit code 1。予算判定は非0終了判定より先に評価する）` → cost_exceeded。その他/`is_error`/非0終了/result行欠落 → error。
+
+> 修正 2026-06-06: 実CLIプローブにより --verbose 必須・subtype "error_max_budget_usd"・予算超過時 exit 1 を確認し、契約を実挙動へ修正（ユーザー承認済み）。
 
 ### 5.2 git（git-pr.ts）
 

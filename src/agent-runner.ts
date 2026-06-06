@@ -69,6 +69,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       ctx.prompt,
       "--output-format",
       "stream-json",
+      "--verbose",
       "--max-budget-usd",
       ctx.maxCostUsd.toFixed(2),
       "--permission-mode",
@@ -132,11 +133,12 @@ export class ClaudeAgentRunner implements AgentRunner {
     if (resultLine === null) {
       return { kind: "error", costUsd, message: "no result line emitted" };
     }
+    // 予算超過判定は非0終了判定より先（実 CLI v2.1.167 は budget 超過時 exit 1 で終了する）
+    if (typeof resultLine.subtype === "string" && resultLine.subtype.startsWith("error_max_budget")) {
+      return { kind: "cost_exceeded", costUsd };
+    }
     if (code !== 0) {
       return { kind: "error", costUsd, message: `claude exited with code ${code}` };
-    }
-    if (resultLine.subtype === "error_max_budget") {
-      return { kind: "cost_exceeded", costUsd };
     }
     if (resultLine.subtype === "success" && resultLine.is_error !== true) {
       const summary = (resultLine.result ?? "").slice(0, SUMMARY_MAX);

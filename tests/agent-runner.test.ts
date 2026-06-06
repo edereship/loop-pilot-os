@@ -15,7 +15,7 @@ const ASSISTANT_TEXT_LINE =
 const RESULT_SUCCESS_LINE =
   '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":1.2345,"result":"Added function foo and a test.","session_id":"s1"}';
 const RESULT_BUDGET_LINE =
-  '{"type":"result","subtype":"error_max_budget","is_error":true,"total_cost_usd":10,"result":"budget exhausted","session_id":"s1"}';
+  '{"type":"result","subtype":"error_max_budget_usd","is_error":true,"total_cost_usd":0.0153253,"session_id":"s1"}';
 const RESULT_GENERIC_ERROR_LINE =
   '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.5,"result":"something went wrong","session_id":"s1"}';
 const RESULT_IS_ERROR_SUCCESS_SUBTYPE_LINE =
@@ -69,6 +69,7 @@ describe("ClaudeAgentRunner.runSession", () => {
       "implement the feature",
       "--output-format",
       "stream-json",
+      "--verbose",
       "--max-budget-usd",
       "10.00",
       "--permission-mode",
@@ -130,8 +131,18 @@ describe("ClaudeAgentRunner.runSession", () => {
     }
   });
 
-  it("subtype=error_max_budget → cost_exceeded{costUsd}", async () => {
-    const { runner } = runnerEmitting([INIT_LINE, RESULT_BUDGET_LINE]);
+  it("subtype=error_max_budget_usd (exit 1) → cost_exceeded{costUsd}（実 CLI v2.1.167 の予算超過は exit 1）", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_BUDGET_LINE], 1);
+    const logs: string[] = [];
+    const outcome = await makeRunner(runner, logs).runSession(ctx);
+    expect(outcome).toEqual({ kind: "cost_exceeded", costUsd: 0.0153253 });
+  });
+
+  // 後方互換: レガシーリテラル "error_max_budget"（exit 0）も cost_exceeded にマップする（startsWith 耐障害性）
+  it("subtype=error_max_budget (legacy, exit 0) も cost_exceeded にマップする", async () => {
+    const legacyBudgetLine =
+      '{"type":"result","subtype":"error_max_budget","is_error":true,"total_cost_usd":10,"result":"budget exhausted","session_id":"s1"}';
+    const { runner } = runnerEmitting([INIT_LINE, legacyBudgetLine], 0);
     const logs: string[] = [];
     const outcome = await makeRunner(runner, logs).runSession(ctx);
     expect(outcome).toEqual({ kind: "cost_exceeded", costUsd: 10 });
