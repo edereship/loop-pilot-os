@@ -951,3 +951,113 @@ describe("Orchestrator 失敗系 — mergePr 2 連続 throw fail-closed（カー
     expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-fresh"] });
   });
 });
+
+describe("Orchestrator 失敗系 — DONE transition 失敗でも継続（仕様 §5.6 / カーネル §7.7）", () => {
+  it("transition(done) が 3 回失敗しても HALT せず警告ログのみ・merged は永続化・次 SELECT へ進む", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    // transition(done) のみ常に throw（in_progress/in_review は通す）
+    const orig = h.source.transition.bind(h.source);
+    let doneAttempts = 0;
+    h.source.transition = async (issueId: string, state) => {
+      if (state === "done") {
+        doneAttempts += 1;
+        throw new Error("Linear timeout");
+      }
+      return orig(issueId, state);
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const s = h.store.sessionsForRun(run.id)[0];
+    // merged は永続化される（DONE は merged 先に永続化 → transition は best-effort）
+    expect(s.state).toBe("merged");
+    expect(s.endedAt).not.toBeNull();
+    expect(h.store.countMerged(run.id)).toBe(1);
+    // transition(done) は retry 3 回試みた
+    expect(doneAttempts).toBe(3);
+    // HALT していない：halted は taskCap 到達由来のみ（looppilot_stopped/exception ではない）
+    expect(run.state).toBe("halted"); // taskCap=1 到達で最終的に halted
+    expect(run.haltReason).toContain("task cap reached");
+    // 通知列に「失敗由来の halted」は無い（run_started → halted(task_cap) のみ）
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ reason: "task_cap" });
+    // 警告ログが出ている
+    expect(h.logs.some((l) => l.includes("warning") && l.includes("transition(done) failed"))).toBe(true);
+  });
+});
+
+describe("Orchestrator 失敗系 — STOPPED 共通処理の不変条件（仕様 §7 STOPPED⇒HALT 1:1 / カーネル §7 末尾）", () => {
+  it("stopSession を通る経路では『session=stopped+costUsd 保存』『Run=halted』『notify(halted) 1 回』が同時に成立する", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, maxCostUsdPerSession: 8 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    // cost_exceeded 経路（costUsd が判明している経路では併せて保存される）
+    h.agent.outcomes = [{ kind: "cost_exceeded", costUsd: 8.0 }];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const s = h.store.sessionsForRun(run.id)[0];
+    // セッション側
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("cost_exceeded");
+    expect(s.costUsd).toBe(8.0); // costUsd 併せて保存（カーネル §7 STOPPED 共通処理）
+    expect(s.endedAt).not.toBeNull();
+    // Run 側（TaskSession=stopped ⇒ Run=halted の 1:1）
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("cost_exceeded");
+    expect(run.haltReason).toContain("TY-1");
+    // notify(halted) はちょうど 1 回
+    const haltedEvents = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(haltedEvents).toHaveLength(1);
+    expect(haltedEvents[0]).toMatchObject({ kind: "halted", reason: "cost_exceeded" });
+    // 失敗後はループを脱出し、次の SELECT を試みない（getNextEligible は 1 回だけ）
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("MONITOR 中（in_review→merged 完走）にオーケは PR/ブランチへ書き込まない（マージのみ例外・仕様 §5.5/§4）", async () => {
+    // 仕様 §4/§5.5 の不変条件: MONITOR 中はオーケが PR/ブランチへ書き込まない（LoopPilot を唯一の書き手とし、mergePr のみ例外）。
+    // 正常完走（done→merged）を回し、monitorSession 突入後の Git/PR 呼び出しが mergePr 以外の書き込み系を含まないことを固定する。
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+
+    // 全 Git/PR 書き込み系メソッド（FakeGitPr.calls は { method, args } 形式）
+    const writeMethods = ["pushAndOpenPr", "addLabel", "prepareWorktree", "discardWorktree"];
+    // monitorSession 突入以降に書き込み系が一切呼ばれていないことを確認する。
+    // CLAIM/HANDOFF で prepareWorktree/pushAndOpenPr/addLabel は MONITOR 突入「前」に呼ばれ済みなので、
+    // 突入の境界＝最後の addLabel（HANDOFF 末尾の書き込み）以降のスライスを見る。
+    const lastHandoffWriteIdx = h.git.calls.map((c) => c.method).lastIndexOf("addLabel");
+    expect(lastHandoffWriteIdx).toBeGreaterThanOrEqual(0); // HANDOFF で addLabel は呼ばれている
+    const afterMonitor = h.git.calls.slice(lastHandoffWriteIdx + 1);
+    // MONITOR 中の書き込み系（pushAndOpenPr/addLabel/prepareWorktree/discardWorktree）は 0 件
+    expect(afterMonitor.filter((c) => writeMethods.includes(c.method))).toEqual([]);
+    // マージのみ例外として許される
+    expect(afterMonitor.map((c) => c.method)).toContain("mergePr");
+
+    // 念のため全期間でも: prepareWorktree/pushAndOpenPr/addLabel は各 1 回（CLAIM/HANDOFF のみ）、
+    // discardWorktree は 0 回（正常完走では破棄しない）、mergePr は 1 回。
+    const counts = (m: string): number => h.git.calls.filter((c) => c.method === m).length;
+    expect(counts("prepareWorktree")).toBe(1);
+    expect(counts("pushAndOpenPr")).toBe(1);
+    expect(counts("addLabel")).toBe(1);
+    expect(counts("discardWorktree")).toBe(0);
+    expect(counts("mergePr")).toBe(1);
+  });
+});
