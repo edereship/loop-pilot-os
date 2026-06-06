@@ -207,17 +207,76 @@ async function resolveAuthenticatedLogin(
   }
 }
 
-// ---- §9.4 rulesets（Step 8 で本体を追加） ----
+// ---- §9.4 rulesets ----
 async function checkRulesets(
-  _runner: CommandRunner, _repoSlug: string, _branch: string,
-  _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 8 で実装（先に Step 7 で赤テストを書く） */ }
+  runner: CommandRunner,
+  repoSlug: string,
+  branch: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/rules/branches/${branch}`], opts);
+    if (isHttp404(r)) return; // ルールセットなし = OK
+    if (r.code !== 0) {
+      errors.push(`gh: ブランチルールセットを取得できません（${r.stderr.trim()}）`);
+      return;
+    }
+    let rules: Array<{ type?: string; parameters?: { required_approving_review_count?: number } }>;
+    try {
+      rules = JSON.parse(r.stdout);
+    } catch {
+      errors.push("gh: ブランチルールセットのJSONを解析できません");
+      return;
+    }
+    if (!Array.isArray(rules)) return;
+    for (const rule of rules) {
+      if (rule.type === "pull_request") {
+        const count = rule.parameters?.required_approving_review_count ?? 0;
+        if (count > 0) {
+          errors.push(
+            `gh: ブランチ '${branch}' のルールセット pull_request ルールが必須承認レビュー数 ${count} を要求しています。` +
+              "ループに人間レビュアーが不在のためマージ不能になります",
+          );
+        }
+      }
+    }
+  } catch (e) {
+    errors.push(`gh: ブランチルールセット確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
-// ---- §9.5 gate_label（Step 10 で本体を追加） ----
+// ---- §9.5 gate_label ----
 async function checkGateLabel(
-  _runner: CommandRunner, _config: Config, _repoSlug: string,
-  _opts: { cwd: string }, _errors: string[],
-): Promise<void> { /* 本体は Step 10 で実装（先に Step 9 で赤テストを書く） */ }
+  runner: CommandRunner,
+  config: Config,
+  repoSlug: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    // gh label list は既定 limit 30 のため使わない。labels API を --paginate で全件取得し大小無視で照合（カーネル §5.3）。
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/labels`, "--paginate", "--jq", ".[].name"], opts);
+    if (r.code !== 0) {
+      errors.push(`gh: リポジトリ ${repoSlug} のラベル一覧を取得できません（${r.stderr.trim()}）`);
+      return;
+    }
+    const names = r.stdout
+      .split("\n")
+      .map((n) => n.trim())
+      .filter((n) => n.length > 0)
+      .map((n) => n.toLowerCase());
+    const gate = config.looppilot.gateLabel.toLowerCase();
+    if (!names.includes(gate)) {
+      errors.push(
+        `gh: ゲートラベル '${config.looppilot.gateLabel}' がリポジトリ ${repoSlug} に存在しません。` +
+          "LoopPilot を発火させるため、対象リポにこのラベルを作成してください",
+      );
+    }
+  } catch (e) {
+    errors.push(`gh: ゲートラベル確認に失敗しました（${(e as Error).message}）`);
+  }
+}
 
 // ---- §9.6 LOOPPILOT_AUTO_MERGE（Step 12 で本体を追加） ----
 async function checkAutoMerge(

@@ -192,4 +192,35 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("restrictions") && e.includes("the-bot"))).toBe(true);
   });
+
+  it("rulesets が空配列なら OK（仕様 §9.4）", async () => {
+    // passingRunner は rules/branches/main = [] を仕込んでおり合格する。
+    const errors = await runPreflight({ config: makeConfig(), runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("ルールセット"))).toEqual([]);
+  });
+
+  it("rulesets の pull_request ルールで required_approving_review_count>0 は NG（仕様 §9.4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "pull_request", parameters: { required_approving_review_count: 2 } }]),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("ルールセット") && e.includes("2"))).toBe(true);
+  });
+
+  it("gate_label がリポに無ければ NG（仕様 §9.5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/labels", "--paginate", "--jq", ".[].name"], { code: 0, stdout: "bug\nai-ok\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("ゲートラベル") && e.includes("loop-pilot"))).toBe(true);
+  });
+
+  it("gate_label は大小無視で照合する（仕様 §9.5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/labels", "--paginate", "--jq", ".[].name"], { code: 0, stdout: "Loop-Pilot\nai-ok\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("ゲートラベル"))).toEqual([]);
+  });
 });
