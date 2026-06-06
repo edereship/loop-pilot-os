@@ -347,4 +347,29 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("LOOPPILOT_AUTO_MERGE"))).toBe(true);
     expect(errors.length).toBeGreaterThanOrEqual(3);
   });
+
+  // フェイルオープン回帰ガード: 非404 の gh エラー（403/500）を「保護なし=OK」と誤読してはならない（最重要の安全特性）
+  it("ブランチ保護 API が 403 を返したら fail-open せず違反として報告する", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 1,
+      stdout: "",
+      stderr: "gh: Must have admin rights to Repository. (HTTP 403)",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("ブランチ保護を取得できません"))).toBe(true);
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("rulesets API が 500 を返したら fail-open せず違反として報告する", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 1,
+      stdout: "",
+      stderr: "gh: Internal Server Error (HTTP 500)",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("ブランチルールセットを取得できません"))).toBe(true);
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+  });
 });

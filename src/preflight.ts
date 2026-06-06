@@ -13,7 +13,7 @@ export interface PreflightDeps {
 // gh api は HTTP エラー時 code != 0 で終了し、stderr に "(HTTP 404)" 等を含む。
 // 404 を「存在しない」シグナルとして識別する（branch protection / actions variable で必須）。
 function isHttp404(r: CommandResult): boolean {
-  return r.code !== 0 && /\(HTTP 404\)/.test(r.stderr);
+  return r.code !== 0 && /\(HTTP 404\)\s*$/.test(r.stderr);
 }
 
 // LOOPPILOT_STATE_COMMENT_AUTHORS の値を LoopPilot と同一パースする
