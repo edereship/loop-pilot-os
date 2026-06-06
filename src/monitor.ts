@@ -32,7 +32,7 @@ interface PrViewJson {
   mergeable: string;
   mergeStateStatus: string;
   headRefOid: string;
-  statusCheckRollup: Array<{ status: string; conclusion: string | null }>;
+  statusCheckRollup?: Array<{ status: string; conclusion: string | null }> | null;
   closed: boolean;
 }
 
@@ -97,7 +97,7 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
 
   async checkMergeReadiness(prNumber: number): Promise<MergeReadiness> {
     const pr = await this.fetchPrView(prNumber);
-    const checks = pr.statusCheckRollup;
+    const checks = pr.statusCheckRollup ?? [];
 
     // ① コンフリクト
     if (pr.mergeable === "CONFLICTING" || pr.mergeStateStatus === "DIRTY") {

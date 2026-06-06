@@ -622,3 +622,65 @@ describe("GhLoopPilotMonitor — gh 呼び出し形の固定 (§5.3)", () => {
     ]);
   });
 });
+
+describe("GhLoopPilotMonitor — gh 失敗時は throw（オーケストレーターのバックオフ契約）", () => {
+  // 仕様(§7 step6): gh pr view 失敗（非0 exit・空 stdout）で poll は誤分類せず reject する
+  it("gh pr view が非0 exit・空 stdout を返したら poll は reject する", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view"], { code: 1, stdout: "", stderr: "gh: Not Found" });
+    const monitor = new GhLoopPilotMonitor(runner, {
+      remote: REMOTE,
+      trustedAuthors: TRUSTED,
+    });
+    await expect(monitor.poll(42)).rejects.toThrow();
+  });
+
+  // gh pr view が壊れた出力を返したら poll は reject する
+  it("gh pr view が壊れた出力（HTML）を返したら poll は reject する", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view"], { code: 0, stdout: "<html>rate limited</html>", stderr: "" });
+    const monitor = new GhLoopPilotMonitor(runner, {
+      remote: REMOTE,
+      trustedAuthors: TRUSTED,
+    });
+    await expect(monitor.poll(42)).rejects.toThrow();
+  });
+
+  // コメント取得失敗（非0 exit・空 stdout）でも poll は reject する
+  it("gh api コメント取得が非0 exit・空 stdout を返したら poll は reject する", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view"], { code: 0, stdout: prView(), stderr: "" });
+    runner.on(["gh", "api"], { code: 1, stdout: "", stderr: "" });
+    const monitor = new GhLoopPilotMonitor(runner, {
+      remote: REMOTE,
+      trustedAuthors: TRUSTED,
+    });
+    await expect(monitor.poll(42)).rejects.toThrow();
+  });
+
+  // 防御: 将来の gh が statusCheckRollup を null で返しても checkMergeReadiness は throw しない（poll バックオフ外のため fail-safe）
+  it("statusCheckRollup が null でも checkMergeReadiness は throw せず ready を返す", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view"], {
+      code: 0,
+      stdout: JSON.stringify({
+        state: "OPEN",
+        mergedAt: null,
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "deadbeefcafe",
+        statusCheckRollup: null,
+        closed: false,
+      }),
+      stderr: "",
+    });
+    const monitor = new GhLoopPilotMonitor(runner, {
+      remote: REMOTE,
+      trustedAuthors: TRUSTED,
+    });
+    expect(await monitor.checkMergeReadiness(42)).toEqual<MergeReadiness>({
+      ready: true,
+      headSha: "deadbeefcafe",
+    });
+  });
+});
