@@ -93,4 +93,45 @@ describe("renderStatus", () => {
       store.close();
     }
   });
+
+  it("直近 10 セッションを identifier/state/failure_reason/cost の表で出す（新しい順、最大 10 件）", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(20, "2026-06-05T09:00:00.000Z");
+      // 12 セッション作成。最古 (TY-100) は表から溢れる想定。
+      for (let i = 0; i < 12; i++) {
+        const n = 100 + i;
+        const s = store.createSession({
+          runId: run.id, linearIssueId: `u${n}`, linearIdentifier: `TY-${n}`,
+          issueTitle: `Task ${n}`, branch: `looppilot/ty-${n}`,
+          worktreePath: `/wt/${n}`,
+          now: `2026-06-05T09:${String(10 + i).padStart(2, "0")}:00.000Z`,
+        });
+        if (i === 11) {
+          // 最新: stopped(ci_failed) cost 付き
+          store.updateSession(s.id, {
+            state: "stopped", failureReason: "ci_failed", costUsd: 4.2,
+            endedAt: "2026-06-05T09:30:00.000Z",
+          });
+        } else {
+          store.updateSession(s.id, {
+            state: "merged", costUsd: 1.0,
+            endedAt: `2026-06-05T09:${String(15 + i).padStart(2, "0")}:00.000Z`,
+          });
+        }
+      }
+
+      const out = renderStatus(store);
+      expect(out).toContain("Recent sessions");
+      // 最新行: identifier / state / failure_reason / cost が全て出る
+      expect(out).toContain("TY-111");
+      expect(out).toContain("stopped");
+      expect(out).toContain("ci_failed");
+      expect(out).toContain("$4.20");
+      // 11 件目以前 = 表は 10 件のみなので最古 TY-100 は出ない
+      expect(out).not.toContain("TY-100");
+    } finally {
+      store.close();
+    }
+  });
 });

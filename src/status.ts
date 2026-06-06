@@ -12,7 +12,6 @@ function activeDetail(s: TaskSessionRow): string[] {
   out.push(`  branch: ${s.branch}`);
   out.push(`  PR: ${s.prNumber === null ? "(none)" : `#${s.prNumber}`}`);
   if (s.prNumber !== null) {
-    // 重複可読化: ヘッダ外でも "PR #<n>" を含める（grep 容易化）
     out.push(`  (tracking PR #${s.prNumber})`);
   }
   if (s.monitorStartedAt !== null) {
@@ -21,6 +20,11 @@ function activeDetail(s: TaskSessionRow): string[] {
     out.push(`  started: ${s.startedAt}`);
   }
   return out;
+}
+
+function recentRow(s: TaskSessionRow): string {
+  const reason = s.failureReason ?? "-";
+  return `  ${s.linearIdentifier.padEnd(10)} ${s.state.padEnd(12)} ${reason.padEnd(20)} ${fmtCost(s.costUsd)}`;
 }
 
 export function renderStatus(store: SqliteStore): string {
@@ -52,6 +56,18 @@ export function renderStatus(store: SqliteStore): string {
   } else {
     for (const s of active) {
       lines.push(...activeDetail(s));
+    }
+  }
+
+  lines.push("");
+  const recent = store.recentSessions(10);
+  lines.push("Recent sessions (latest 10)");
+  if (recent.length === 0) {
+    lines.push("  (none)");
+  } else {
+    lines.push(`  ${"id".padEnd(10)} ${"state".padEnd(12)} ${"failure_reason".padEnd(20)} cost`);
+    for (const s of recent) {
+      lines.push(recentRow(s));
     }
   }
 
