@@ -952,6 +952,87 @@ describe("Orchestrator 失敗系 — mergePr 2 連続 throw fail-closed（カー
   });
 });
 
+describe("Orchestrator 失敗系 — mergePr throw ストリーク断絶（カーネル §7.6）", () => {
+  it("mergePr throw → in_progress を挟んで再度 throw ではフェイルクローズしない（ready ストリーク断絶）", async () => {
+    // カーネル §7: 「ready のまま 2連続 throw」—  in_progress が間に入ったら 2連続にカウントしない。
+    // 期待: done(throw), in_progress, done(throw), done(success) → merged（stopped にならない）
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    // poll: done → in_progress → done → done → merged
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "in_progress" },
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+    // mergePr: 1回目 throw, 2回目 throw, 3回目 成功
+    let mergeCalls = 0;
+    h.git.mergePr = async (prNumber: number, headSha: string) => {
+      mergeCalls += 1;
+      h.git.calls.push({ method: "mergePr", args: [prNumber, headSha] });
+      if (mergeCalls <= 2) throw new Error("gh: transient 422");
+      // 3回目は成功
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // in_progress を挟んでいるのでストリーク断絶 → fail-closed せず最終的に merged
+    expect(s.state).toBe("merged");
+    expect(s.failureReason).toBeNull();
+    expect(mergeCalls).toBe(3);
+  });
+
+  it("poll throw を挟んだ mergePr throw もストリークを断絶する", async () => {
+    // カーネル §7: 「ready のまま 2連続 throw」— poll throw が間に入ったら 2連続にカウントしない。
+    // 期待: done(throw), poll-throw, done(throw), done(success) → merged（stopped にならない）
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+
+    // poll: done → throw → done → done → merged（throw は2回目のpollだけ）
+    let pollCalls = 0;
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+    h.monitor.poll = async (pr: number) => {
+      pollCalls += 1;
+      h.monitor.pollCalls.push(pr);
+      if (pollCalls === 2) throw new Error("gh api 503 transient");
+      return origPoll(pr);
+    };
+
+    // mergePr: 1回目 throw, 2回目 throw, 3回目 成功
+    let mergeCalls = 0;
+    h.git.mergePr = async (prNumber: number, headSha: string) => {
+      mergeCalls += 1;
+      h.git.calls.push({ method: "mergePr", args: [prNumber, headSha] });
+      if (mergeCalls <= 2) throw new Error("gh: transient 422");
+      // 3回目は成功
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // poll throw を挟んでいるのでストリーク断絶 → fail-closed せず最終的に merged
+    expect(s.state).toBe("merged");
+    expect(s.failureReason).toBeNull();
+    expect(mergeCalls).toBe(3);
+  });
+});
+
 describe("Orchestrator 失敗系 — DONE transition 失敗でも継続（仕様 §5.6 / カーネル §7.7）", () => {
   it("transition(done) が 3 回失敗しても HALT せず警告ログのみ・merged は永続化・次 SELECT へ進む", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });

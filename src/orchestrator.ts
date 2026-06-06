@@ -276,7 +276,9 @@ export class Orchestrator {
         verdict = await this.monitor.poll(prNumber);
       } catch (err) {
         // poll throw → バックオフ（×2..×8）、5連続で stopped(exception)
+        // カーネル§7: 「ready のまま 2連続 throw」— done+ready 以外の評価を挟んだらストリークは断絶する
         pollFailures += 1;
+        mergeFailures = 0;
         if (pollFailures >= 5) {
           return await this.stopSession(session, "exception", `monitor poll failed 5x: ${errMsg(err)}`);
         }
@@ -285,6 +287,8 @@ export class Orchestrator {
       }
       pollFailures = 0;
       backoffMultiplier = 1;
+      // カーネル§7: 「ready のまま 2連続 throw」— done+ready 以外の評価を挟んだらストリークは断絶する
+      if (verdict.kind !== "done") mergeFailures = 0;
 
       switch (verdict.kind) {
         case "merged":
