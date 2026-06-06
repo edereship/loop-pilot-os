@@ -368,6 +368,205 @@ describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 /
   });
 });
 
+describe("回復 — 孤児チケット（In Progress だがセッション行なし → Todo 復帰・ベストエフォート）（仕様 §9 / カーネル §8）", () => {
+  it("findOrphanedInProgress が 2 件返す → 各々 transition(todo) + 警告ログ。HALT しない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // 活性セッションは無し（孤児だけ）→ 回復は孤児復帰のみ。
+    h.source.orphans = [issue("issue-O1", "TY-11"), issue("issue-O2", "TY-12")];
+    // 回復後ループは 1 回の SELECT で停止させる
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // 孤児 2 件が Todo へ戻された
+    expect(h.source.transitions).toEqual([
+      { issueId: "issue-O1", state: "todo" },
+      { issueId: "issue-O2", state: "todo" },
+    ]);
+    // 警告ログが各孤児に出ている
+    expect(h.logs.some((l) => l.includes("warning") && l.includes("TY-11"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("warning") && l.includes("TY-12"))).toBe(true);
+    // 孤児復帰は HALT しない → ループに入った（getNextEligible が呼ばれている）
+    // 注: requestStop() → haltForInterrupt() により run.state は halted になるが、
+    // これは recovery の HALT ではなく user_interrupt による正常終了である。
+    // recovery が HALT していないことは eligibleCalls >= 1（ループに入った）で確認する。
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // 通知列には run_started が含まれる（recovery-HALT なら run_started のみ + halted(from recovery)）
+    expect(h.notifier.events.some((e) => e.kind === "run_started")).toBe(true);
+  });
+
+  it("transition(todo) が throw してもベストエフォート（HALT せず警告ログ）で次の孤児へ進む", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.orphans = [issue("issue-O1", "TY-11"), issue("issue-O2", "TY-12")];
+    // 最初の transition(todo) で 1 回だけ throw（FakeTaskSource.failNext は次の1回だけ throw）
+    h.source.failNext("transition", new Error("Linear 5xx"));
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // 1 件目の transition は throw（記録されない）、2 件目は成功して記録される
+    expect(h.source.transitions).toEqual([{ issueId: "issue-O2", state: "todo" }]);
+    // ベストエフォートなので recovery は HALT していない → ループに入った
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("findOrphanedInProgress 自体が throw しても回復は HALT せず警告のみで継続する", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.failNext("findOrphanedInProgress", new Error("Linear query failed"));
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    expect(h.logs.some((l) => l.includes("warning") && l.includes("findOrphanedInProgress failed"))).toBe(true);
+    // findOrphanedInProgress の throw は recovery HALT しない → ループに入った
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+});
+
+describe("回復 — 採用セッションが tasks_started に数えられ上限と比較される（仕様 §11 / カーネル §8）", () => {
+  it("maxTasksPerRun=1 で回復が 1 件採用→完走すると、ループ先頭で task cap 到達 → SELECT せず HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // 残キューに 1 件あるが、採用 1 件で上限到達のため着手されない
+    h.source.queue = [issue("issue-Q", "TY-99")];
+    // 回復 poll が open → 採用して MONITOR、done→merged で完走
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    // 採用セッションは新 Run の tasks_started=1
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+    expect(h.store.countMerged(newRun.id)).toBe(1);
+    // 上限到達でループ先頭 HALT（SELECT に進まない → getNextEligible は呼ばれない）
+    expect(newRun.state).toBe("halted");
+    expect(newRun.haltReason).toContain("task cap reached");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+    // 残キューの TY-99 は未着手
+    expect(h.source.queue.map((i) => i.identifier)).toEqual(["TY-99"]);
+    // 通知列: run_started → halted(task_cap)
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "task_cap" });
+  });
+
+  it("回復で HALT したら（in_review が stopped verdict）ループに一切入らない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.source.queue = [issue("issue-Q", "TY-99")];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "gave up" }];
+
+    await h.orch.run();
+
+    // 回復で HALT → ループ(loop)に入らず SELECT は 0 回
+    expect(h.source.eligibleCalls).toHaveLength(0);
+    expect(h.agent.contexts).toHaveLength(0); // 実装フェーズにも入らない
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+});
+
+describe("回復 — updateSession({runId}) による再ペアレント確認（Task 5 carry-over）", () => {
+  it("再ペアレントで countTasksStarted が旧 Run から新 Run へ移行し monitorStartedAt は保持される", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const originalStart = "2026-06-04T00:15:00.000Z";
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 200,
+      monitorStartedAt: originalStart,
+    });
+    // 旧 Run の countTasksStarted を確認（セッション 1 件が旧 Run に属している）
+    const oldRunId = crashed.runId;
+    expect(h.store.countTasksStarted(oldRunId)).toBe(1);
+
+    // 回復: poll=merged → runId を新 Run へ付替え
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const adopted = h.store.getSession(crashed.id);
+
+    // 旧 Run の countTasksStarted は 0 に減少（セッションが新 Run へ移動）
+    expect(h.store.countTasksStarted(oldRunId)).toBe(0);
+    // 新 Run の countTasksStarted は 1 に増加
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+    // monitorStartedAt は再ペアレント後も保持されている（上書きされない）
+    expect(adopted.monitorStartedAt).toBe(originalStart);
+  });
+});
+
+describe("回復 — 複数 active セッションは id ASC・最初の HALT で打ち切り（仕様 §9 / カーネル §8）", () => {
+  it("2 件 active（1 件目 in_review→merged、2 件目 claimed→open PR ミス）→ 1 件目採用後 2 件目で HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 5 });
+    const h = makeHarness(config);
+    // 1 件目: in_review + PR #100（merged で完走）
+    const s1 = seedCrashedSession(
+      h.store,
+      { state: "in_review", prNumber: 100, monitorStartedAt: "2026-06-04T00:10:00.000Z" },
+      { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1", linearIssueId: "issue-A", linearIdentifier: "TY-1" },
+    );
+    // 2 件目: claimed・open PR ミス → HALT（同じ store・別セッション）
+    const s2RunSeed = h.store.createSession({
+      runId: h.store.latestRun()!.id, // s1 の旧 Run と同じ旧 Run
+      linearIssueId: "issue-B",
+      linearIdentifier: "TY-2",
+      issueTitle: "second crashed",
+      branch: "looppilot/ty-2-x",
+      worktreePath: "/wt/ty-2",
+      now: "2026-06-04T00:00:02.000Z",
+    });
+    h.store.updateSession(s2RunSeed.id, { state: "claimed" });
+    // 1 件目だけ open verdict→merged で完走。2 件目は open PR 無し（既定 null）で HALT。
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const r1 = h.store.getSession(s1.id);
+    const r2 = h.store.getSession(s2RunSeed.id);
+    // 1 件目は merged（採用・DONE 後段）
+    expect(r1.state).toBe("merged");
+    expect(r1.runId).toBe(newRun.id);
+    // 2 件目は stopped(exception)（open PR ミス）→ HALT
+    expect(r2.state).toBe("stopped");
+    expect(r2.failureReason).toBe("exception");
+    expect(r2.runId).toBe(newRun.id);
+    // 回復で HALT → ループに入らない
+    expect(newRun.state).toBe("halted");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+  });
+});
+
 describe("回復 — in_review + PR が merged（仕様 §9 / カーネル §8: DONE 後段・二重計上なし）", () => {
   it("再起動時 in_review+PR で monitor.poll が merged → merged 永続化 + transition(done)・新 Run の merged_count=1", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });

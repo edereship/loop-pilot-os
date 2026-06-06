@@ -107,7 +107,18 @@ export class Orchestrator {
    * 注: 本 Step では in_review merged 分岐のみ実装。他分岐は後続 Step で失敗テスト先行で増やす。
    */
   private async recoverPendingSessions(): Promise<RunControl> {
-    // 1) 孤児チケット復帰: Step 11 で失敗テスト先行のうえ実装する。現状は何もしない。
+    // 1) 孤児チケット復帰（ベストエフォート）
+    try {
+      const orphans = await this.source.findOrphanedInProgress(this.store.knownIssueIds());
+      for (const orphan of orphans) {
+        await bestEffort(() => this.source.transition(orphan.id, "todo"));
+        this.log(
+          `warning: recovered orphaned In Progress ticket ${orphan.identifier} -> Todo (no session row)`,
+        );
+      }
+    } catch (err) {
+      this.log(`warning: findOrphanedInProgress failed during recovery: ${errMsg(err)}`);
+    }
 
     // 2) 活性セッションの照合・採用/停止
     for (const session of this.store.activeSessions()) {
