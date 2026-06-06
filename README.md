@@ -182,7 +182,7 @@ looppilot-os status --config ./looppilot-os.toml
 | `merge_conflict` | MONITOR で PR がデフォルトブランチと衝突（`CONFLICTING` / `DIRTY`） | PR を rebase/解決する |
 | `pr_closed` | PR がマージされずにクローズされた | 意図的なら無視、再開したいなら新チケットへ |
 | `claim_failed` | CLAIM 失敗（worktree 作成 or Linear 遷移）。可能なら worktree 破棄・チケットを Todo へ復帰 | リポのクリーン状態・ブランチ衝突・Linear 権限を確認 |
-| `handoff_failed` | HANDOFF 失敗（push / PR 作成 / ラベル / In Review 遷移）。`stop_detail` に作成済み PR 番号を明記 | 明記された PR を手当てし、必要なら手動でラベル/遷移 |
+| `handoff_failed` | HANDOFF 失敗（push / PR 作成 / ラベル / In Review 遷移）。`stop_detail` に PR 作成済みなら番号を、未作成なら `no PR created` を明記 | PR があれば手当てし（必要なら手動でラベル/遷移）、無ければブランチを確認して再実行か破棄 |
 
 `stop_detail` 列に追加文脈（LoopPilot の stopReason、例外メッセージ、ブロック理由、回復時の手動掃除対象など）が入ります。
 
