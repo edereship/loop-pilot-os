@@ -50,6 +50,7 @@ export class Orchestrator {
   private readonly log: (line: string) => void;
 
   private runId = 0;
+  private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
 
   constructor(deps: OrchestratorDeps) {
     this.config = deps.config;
@@ -63,6 +64,11 @@ export class Orchestrator {
     this.clock = deps.clock;
     this.sleep = deps.sleep;
     this.log = deps.log;
+  }
+
+  /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
+  requestStop(): void {
+    this.interrupted = true;
   }
 
   async run(): Promise<void> {
@@ -99,6 +105,12 @@ export class Orchestrator {
   private async loop(): Promise<void> {
     let idleNotified = false;
     while (true) {
+      // 0) 停止要求の安全点（各反復先頭。現フェーズ群完了後にここへ戻る）
+      if (this.interrupted) {
+        this.haltForInterrupt();
+        return;
+      }
+
       // 1) タスク上限チェック（仕様 §11 / §5 SELECT 末尾）
       const started = this.store.countTasksStarted(this.runId);
       if (started >= this.config.safety.maxTasksPerRun) {
@@ -403,6 +415,14 @@ export class Orchestrator {
     this.store.setRunState(this.runId, "halted", haltDetail);
     this.log(haltDetail);
     return HALT;
+  }
+
+  /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。 */
+  private haltForInterrupt(): void {
+    const detail = "user_interrupt: stop requested; halting at safe point";
+    this.store.setRunState(this.runId, "halted", detail);
+    void this.notifier.notify({ kind: "halted", reason: "user_interrupt", detail });
+    this.log(detail);
   }
 
   private elapsedMinutesSinceMonitorStart(sessionId: number): number {
