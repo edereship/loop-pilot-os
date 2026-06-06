@@ -11,13 +11,11 @@
             { "id": "state-wip", "name": "In Progress" },
             { "id": "state-review", "name": "In Review" }
           ] },
-          "labels": { "nodes": [] }
+          "labels": { "nodes": [] },
+          "projects": { "nodes": [
+            { "id": "project-uuid-2", "name": "Other Project" }
+          ] }
         }
-      ]
-    },
-    "projects": {
-      "nodes": [
-        { "id": "project-uuid-2", "name": "Other Project" }
       ]
     },
     "issueLabels": { "nodes": [

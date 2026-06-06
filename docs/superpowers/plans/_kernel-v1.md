@@ -430,7 +430,7 @@ query Eligible($projectId: ID, $todoStateId: ID!, $label: String!) {
 - 順序: priority を意味順位へ写像（1→0, 2→1, 3→2, 4→3, 0→4）昇順 → sortOrder 昇順 → id 昇順。excludeIds を除外して先頭。
 - 遷移: `mutation IssueUpdate($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`
 - 孤児検出: state=in_progress の issues を同フィルタ（label付き）で取得し knownIssueIds に無いもの。
-- プリフライト解決: team key → team、project 名 → projectId、`team.states` から4状態の stateId、`team.labels`+workspace labels から opt_in_label の存在。
+- プリフライト解決: team key → team、`team.projects` から project 名 → projectId（ワークスペース横断の名前解決は同名 project が他チームにある場合に誤解決するため team スコープで解決。2026-06-06 是正）、`team.states` から4状態の stateId、`team.labels`+workspace labels から opt_in_label の存在。
 
 ## 6. tests/fakes.ts — フェイク契約（シグネチャ固定）
 

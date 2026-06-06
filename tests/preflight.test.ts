@@ -89,10 +89,10 @@ function passingFetch(): FetchFn {
               ],
             },
             labels: { nodes: [{ id: "lb-1", name: "ai-ok" }] },
+            projects: { nodes: [{ id: "proj-1", name: "LoopPilot OS" }] },
           },
         ],
       },
-      projects: { nodes: [{ id: "proj-1", name: "LoopPilot OS" }] },
       issueLabels: { nodes: [] },
     },
   };
@@ -282,7 +282,6 @@ describe("runPreflight", () => {
         data: {
           viewer: { id: "user-1", name: "Viewer" },
           teams: { nodes: [] },
-          projects: { nodes: [] },
           issueLabels: { nodes: [] },
         },
       }),

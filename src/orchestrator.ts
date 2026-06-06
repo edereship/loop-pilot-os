@@ -8,6 +8,7 @@ import type {
   TaskSessionRow,
   FailureReason,
   AgentOutcome,
+  MergeReadiness,
   MonitorVerdict,
   PromptArgs,
 } from "./types.js";
@@ -383,6 +384,7 @@ export class Orchestrator {
     let pollFailures = 0;
     let backoffMultiplier = 1;
     let mergeFailures = 0; // ready verdict 下での mergePr 連続失敗（2 連続で fail-closed）
+    let readinessFailures = 0; // checkMergeReadiness の連続 throw（poll throw と同じ一時障害扱い）
     while (true) {
       await this.sleep(pollIntervalMs * backoffMultiplier);
       let verdict: MonitorVerdict;
@@ -411,6 +413,23 @@ export class Orchestrator {
           const outcome = await this.tryMerge(session, prNumber);
           if (outcome.kind === "merged") return CONTINUE;
           if (outcome.kind === "halt") return HALT;
+          if (outcome.kind === "readiness_failed") {
+            // checkMergeReadiness が throw → poll throw と同じ一時障害扱い（仕様 §5.5）。
+            // バックオフ再試行、5 連続で stopped(exception)。カウンタは readiness 評価成功でリセット。
+            readinessFailures += 1;
+            mergeFailures = 0; // done+ready 以外の評価 → ready ストリーク断絶
+            if (readinessFailures >= 5) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `merge readiness check failed 5x: ${outcome.error}`,
+              );
+            }
+            // 直前の poll 成功で backoffMultiplier は 1 に戻っているため、連続失敗数から導出（×2..×8）。
+            backoffMultiplier = Math.min(2 ** readinessFailures, 8);
+            continue;
+          }
+          readinessFailures = 0; // readiness 評価成功（merge_failed/continue いずれも評価自体は成功）
           if (outcome.kind === "merge_failed") {
             // ready verdict のまま mergePr が throw。2 連続で fail-closed（カーネル §7.6）。
             mergeFailures += 1;
@@ -460,6 +479,7 @@ export class Orchestrator {
 
   /**
    * done verdict 時のマージ試行（カーネル §7.6）。
+   * - checkMergeReadiness が throw → readiness_failed（一時障害。バックオフ/5連続停止は monitorSession 側）。
    * - readiness が ready でなければ reason ごとに分類（ci_pending/unknown→continue、その他は stopSession→halt）。
    * - ready なら mergePr。成功→merged。throw→merge_failed（連続回数の判定は monitorSession 側）。
    */
@@ -471,8 +491,14 @@ export class Orchestrator {
     | { kind: "continue" }
     | { kind: "halt" }
     | { kind: "merge_failed"; error: string }
+    | { kind: "readiness_failed"; error: string }
   > {
-    const readiness = await this.monitor.checkMergeReadiness(prNumber);
+    let readiness: MergeReadiness;
+    try {
+      readiness = await this.monitor.checkMergeReadiness(prNumber);
+    } catch (err) {
+      return { kind: "readiness_failed", error: errMsg(err) };
+    }
     if (!readiness.ready) {
       switch (readiness.reason) {
         case "ci_pending":

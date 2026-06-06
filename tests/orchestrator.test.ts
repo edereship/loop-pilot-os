@@ -767,6 +767,64 @@ describe("Orchestrator 失敗系 — poll throw バックオフ（仕様 §5.5 /
   });
 });
 
+describe("Orchestrator 失敗系 — checkMergeReadiness throw バックオフ（仕様 §5.5 一時エラー / カーネル §7.6）", () => {
+  // gh pr view の一時障害でループ全体が Fatal 落ちしてはならない。
+  // poll throw と同じ一時障害扱い: バックオフ再試行、5 連続で stopped(exception)。
+  it("checkMergeReadiness が 5 連続で throw → stopped(exception, 'merge readiness check failed 5x: ...')・mergePr は呼ばれない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, monitorPollSeconds: 60 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }]; // 常に done → 毎回 readiness 評価へ
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      throw new Error("gh pr view 502");
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("merge readiness check failed 5x");
+    expect(s.stopDetail).toContain("gh pr view 502");
+    expect(h.monitor.readinessCalls).toHaveLength(5);
+    expect(h.git.calls.filter((c) => c.method === "mergePr")).toHaveLength(0);
+    // バックオフ: 反復先頭の sleep が ×1,×2,×4,×8,×8 とエスカレートする
+    const base = config.loop.monitorPollSeconds * 1000;
+    const monitorSleeps = h.sleepCalls.filter((ms) => ms % base === 0 && ms >= base);
+    expect(monitorSleeps.slice(0, 5)).toEqual([
+      base * 1,
+      base * 2,
+      base * 4,
+      base * 8,
+      base * 8, // ×8 でクランプ
+    ]);
+  });
+
+  it("checkMergeReadiness が 2 回 throw 後に成功（ready）→ merged で完走（カウンタは成功でリセット）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, monitorPollSeconds: 60 }); // 完走後 HALT（IDLE 回避）
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    let n = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      n += 1;
+      if (n <= 2) throw new Error("transient 503");
+      return { ready: true, headSha: "sha-101" };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.monitor.readinessCalls).toHaveLength(3);
+    expect(h.git.calls.filter((c) => c.method === "mergePr")).toHaveLength(1);
+  });
+});
+
 describe("Orchestrator 失敗系 — merge readiness 分岐（仕様 §5.5 / §5.4 readiness / カーネル §7.6）", () => {
   it("done → readiness ci_failed → stopped(ci_failed, detail=null)。mergePr は呼ばれない", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });

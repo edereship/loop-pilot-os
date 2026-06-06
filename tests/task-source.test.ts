@@ -270,6 +270,32 @@ describe("resolveLinearSetup", () => {
     expect(calls[0].headers.Authorization).toBe("lin_api_test");
   });
 
+  // 同名 project が他チームにも存在する場合、指定 team 配下の project に解決する
+  // （仕様 §5.1「指定Team/PJ」。ワークスペース横断の名前解決は誤った project に解決し得る）。
+  // fixture はワークスペース横断リスト（他チームの project が先頭）も含み、
+  // team.projects が優先されることを固定する。
+  it("resolves the project from the requested team when another team has a same-named project", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-resolve-setup-duplicate-project.json") },
+    ]);
+    const resolved = await resolveLinearSetup(
+      "lin_api_test",
+      {
+        teamKey: "TY",
+        projectName: "LoopPilot OS",
+        stateNames: {
+          todo: "Todo",
+          in_progress: "In Progress",
+          in_review: "In Review",
+          done: "Done",
+        },
+        optInLabel: "ai-ok",
+      },
+      fetchFn,
+    );
+    expect(resolved.projectId).toBe("project-uuid-ty");
+  });
+
   // opt-in ラベルが team スコープに無くワークスペースラベルとしてのみ存在する場合でも
   // 解決できる（カーネル §5.5: `team.labels`+workspace labels の和集合）。
   it("resolves the opt-in label from workspace-level labels when absent on the team", async () => {

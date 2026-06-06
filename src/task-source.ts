@@ -21,12 +21,13 @@ const ELIGIBLE_QUERY = `query Eligible($projectId: ID, $todoStateId: ID!, $label
 const TRANSITION_MUTATION = `mutation IssueUpdate($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`;
 
 // カーネル §5.5 プリフライト解決: viewer 検証 + team/project/states/labels。
+// project は team.projects から解決する（ワークスペース横断の名前解決は、同名 project が
+// 他チームにある場合に誤った projectId へ解決し得るため。仕様 §5.1「指定Team/PJ」）。
 // ラベルは team.labels + ワークスペース全体の issueLabels の和集合で解決する
 // （opt_in_label がワークスペースラベルとして定義されているケースに対応）。
 const SETUP_QUERY = `query Setup {
   viewer { id name }
-  teams { nodes { id key states { nodes { id name } } labels { nodes { id name } } } }
-  projects { nodes { id name } }
+  teams { nodes { id key states { nodes { id name } } labels { nodes { id name } } projects { nodes { id name } } } }
   issueLabels { nodes { id name } }
 }`;
 
@@ -194,9 +195,9 @@ interface SetupData {
       key: string;
       states: { nodes: Array<{ id: string; name: string }> };
       labels: { nodes: Array<{ id: string; name: string }> };
+      projects: { nodes: Array<{ id: string; name: string }> };
     }>;
   };
-  projects: { nodes: Array<{ id: string; name: string }> };
   // ワークスペース全体のラベル（team スコープに無いラベルの解決に使う）。
   issueLabels: { nodes: Array<{ id: string; name: string }> };
 }
@@ -241,7 +242,8 @@ export async function resolveLinearSetup(
 
   const missing: string[] = [];
 
-  const project = data.projects.nodes.find(
+  // project は指定 team 配下から解決（他チームの同名 project に誤解決しない）。
+  const project = team.projects.nodes.find(
     (p) => p.name === req.projectName,
   );
   if (!project) {

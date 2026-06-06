@@ -12,13 +12,11 @@
             { "id": "state-review", "name": "In Review" },
             { "id": "state-done", "name": "Done" }
           ] },
-          "labels": { "nodes": [] }
+          "labels": { "nodes": [] },
+          "projects": { "nodes": [
+            { "id": "project-uuid-1", "name": "LoopPilot OS" }
+          ] }
         }
-      ]
-    },
-    "projects": {
-      "nodes": [
-        { "id": "project-uuid-1", "name": "LoopPilot OS" }
       ]
     },
     "issueLabels": { "nodes": [
