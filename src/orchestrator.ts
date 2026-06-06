@@ -86,20 +86,67 @@ export class Orchestrator {
         kind: "run_started",
         detail: `run ${run.id} started (taskCap=${taskCap})`,
       });
-      await this.recoverPendingSessions();
-      await this.loop();
+      const recovery = await this.recoverPendingSessions();
+      if (recovery.control === "continue") {
+        await this.loop();
+      }
     } finally {
       this.store.releaseRunLock(pid);
     }
   }
 
   /**
-   * 起動時回復（仕様 §9）。
-   * 本タスク（Task 12）では活性セッション無しを前提に素通しする空実装。
-   * 中身（in_review 再開 / crash 回復 / 孤児チケット復帰）は Task 14 で実装する。
+   * 起動時回復（仕様 §9 / カーネル §8）。
+   * 1) 孤児チケット（In Progress だがセッション行なし）を Todo へベストエフォート復帰。
+   * 2) activeSessions()（merged/stopped 以外・全 run 横断）を走査し state ごとに分岐:
+   *    - in_review+PR: monitor.poll の verdict で merged→DONE後段 / pr_closed・stopped→停止 / その他→採用しMONITOR再開。
+   *    - claimed/implementing/handing_off: findOpenPrForBranch ヒット→採用、ミス→stopped(exception)+HALT。
+   * いずれかの経路が HALT に至ったら { control: "halt" } を返し、run() はループを開始しない。
+   * 採用セッションは runId を新 Run へ付替えるので countTasksStarted に数えられ、上限と比較される。
+   *
+   * 注: 本 Step では in_review merged 分岐のみ実装。他分岐は後続 Step で失敗テスト先行で増やす。
    */
-  private async recoverPendingSessions(): Promise<void> {
-    // Task 14 で実装。現状は no-op（活性セッション無し前提）。
+  private async recoverPendingSessions(): Promise<RunControl> {
+    // 1) 孤児チケット復帰: Step 11 で失敗テスト先行のうえ実装する。現状は何もしない。
+
+    // 2) 活性セッションの照合・採用/停止
+    for (const session of this.store.activeSessions()) {
+      let ctrl: RunControl;
+      if (session.state === "in_review" && session.prNumber !== null) {
+        ctrl = await this.recoverInReview(session, session.prNumber);
+      } else {
+        ctrl = await this.recoverByOpenPr(session);
+      }
+      if (ctrl.control === "halt") return HALT;
+    }
+    return CONTINUE;
+  }
+
+  /** in_review + PR の回復（カーネル §8）。poll の verdict で分岐する。 */
+  private async recoverInReview(session: TaskSessionRow, prNumber: number): Promise<RunControl> {
+    const verdict: MonitorVerdict = await this.monitor.poll(prNumber);
+    switch (verdict.kind) {
+      case "merged":
+        // DONE 後段（merged 永続化 → transition(done)）。二重計上なし（導出）。HALT しない。
+        this.store.updateSession(session.id, { runId: this.runId });
+        await this.recoverDone(session);
+        return CONTINUE;
+      default:
+        // pr_closed / stopped / open 扱い（done・in_progress・corrupted・not_engaged）/ poll throw は
+        // それぞれ Step 5/6 で失敗テスト先行のうえ実装する。未実装の今は明示的に未対応で停止させる。
+        throw new Error(`recoverInReview: verdict "${verdict.kind}" not yet implemented`);
+    }
+  }
+
+  /** claimed/implementing/handing_off（および PR 番号欠落 in_review）の回復（カーネル §8）。 */
+  private async recoverByOpenPr(session: TaskSessionRow): Promise<RunControl> {
+    // ヒット（採用）は Step 8、ミス（stopped(exception)+HALT）は Step 9 で失敗テスト先行で実装する。
+    throw new Error(`recoverByOpenPr: not yet implemented (session ${session.id})`);
+  }
+
+  /** 回復経路の DONE 後段。セッション行から最小 issue を再構成して done() を再利用する。 */
+  private async recoverDone(session: TaskSessionRow): Promise<void> {
+    await this.done(session, reconstructIssue(session));
   }
 
   private async loop(): Promise<void> {
@@ -475,4 +522,21 @@ async function retry(times: number, fn: () => Promise<void>): Promise<void> {
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+/**
+ * 回復経路で done()/buildPrompt に渡す最小 EligibleIssue をセッション行から再構成する。
+ * done() は issue.id（transition）と issue.identifier（ログ）しか使わないため、
+ * title 等は記録済みの値で埋め、未保持フィールドは安全な既定で埋める。
+ */
+function reconstructIssue(session: TaskSessionRow): EligibleIssue {
+  return {
+    id: session.linearIssueId,
+    identifier: session.linearIdentifier,
+    title: session.issueTitle,
+    description: "",
+    priority: 0,
+    sortOrder: 0,
+    url: "",
+  };
 }
