@@ -101,11 +101,22 @@ export class ConsoleSlackNotifier implements Notifier {
 
   /**
    * プリフライト専用（カーネル §9 step10）。
-   * ※ 未実装スタブ。到達性検証ロジック（未設定→即 resolve・fetch 不呼出／設定時は
-   *   最小 POST し非2xx・network エラーで throw）は Step 12 のテスト追加時に実装する。
-   *   現状は何もせず即 resolve するため、Step 12 の probe テストは genuine に red になる。
+   * Webhook 未設定なら即 resolve（fetch 不呼出）。設定時は最小 POST し、非2xx・network エラーで throw。
+   * notify() と違い、ここでは到達性検証のため失敗を呼び出し元へ伝播する。
    */
   async probeReachability(): Promise<void> {
-    return;
+    if (this.webhookUrl === null) {
+      return;
+    }
+    const res = await this.fetchFn(this.webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "LoopPilot OS preflight reachability probe" }),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Slack webhook unreachable: POST returned HTTP ${res.status}`,
+      );
+    }
   }
 }

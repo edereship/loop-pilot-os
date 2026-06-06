@@ -178,4 +178,68 @@ describe("ConsoleSlackNotifier", () => {
     // 配信完了 → 未配信なし
     expect(store.undeliveredIntents().length).toBe(0);
   });
+
+  // probe: webhook 未設定なら即 resolve、fetch を呼ばない。
+  it("probeReachability resolves immediately without calling fetch when webhook is unset", async () => {
+    const { fn, calls } = makeFetch([]);
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      null,
+      log,
+      fn,
+      instantSleep(),
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await expect(notifier.probeReachability()).resolves.toBeUndefined();
+    expect(calls.length).toBe(0);
+  });
+
+  // probe: 2xx なら resolve。POST を1回だけ行う。
+  it("probeReachability resolves on 2xx", async () => {
+    const { fn, calls } = makeFetch([{ ok: true, status: 200 }]);
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      "https://hooks.slack.test/abc",
+      log,
+      fn,
+      instantSleep(),
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await expect(notifier.probeReachability()).resolves.toBeUndefined();
+    expect(calls.length).toBe(1);
+    expect(calls[0].init?.method).toBe("POST");
+  });
+
+  // probe: 非2xx なら throw（リトライしない・1回で判定）。
+  it("probeReachability throws on non-2xx and does not retry", async () => {
+    const { fn, calls } = makeFetch([{ ok: false, status: 404 }]);
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      "https://hooks.slack.test/abc",
+      log,
+      fn,
+      instantSleep(),
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await expect(notifier.probeReachability()).rejects.toThrow(/404/);
+    expect(calls.length).toBe(1);
+  });
+
+  // probe: network エラーは throw を伝播する。
+  it("probeReachability propagates network errors", async () => {
+    const { fn } = makeFetch(["throw"]);
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      "https://hooks.slack.test/abc",
+      log,
+      fn,
+      instantSleep(),
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await expect(notifier.probeReachability()).rejects.toThrow(/network down/);
+  });
 });
