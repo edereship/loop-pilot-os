@@ -364,7 +364,7 @@ claude -p <prompt>
   --model <agent.model>
   (+ agent.extra_args)
 ```
-spawn の `cwd` = worktree。stdout は NDJSON 1行1イベント:
+spawn の `cwd` = worktree。`env` は親環境から機密キー（`LINEAR_API_KEY` / `SLACK_WEBHOOK_URL`）を除いて渡す（2026-06-07 追加。IPI でチケット由来プロンプトに操作された agent が Bash 等でシークレットを外部送信するのを防ぐ防御の多層化。両キーは親プロセスのみで必要で agent には不要）。stdout は NDJSON 1行1イベント:
 - `{"type":"system","subtype":"init",...}` → セッション開始ログ
 - `{"type":"assistant",...}` → コンソール進捗（短縮表示）
 - 最終行 `{"type":"result","subtype":"success"|"error_max_budget"|...,"is_error":bool,"total_cost_usd":number,"result":"...","session_id":"..."}`

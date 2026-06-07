@@ -84,6 +84,31 @@ describe("ClaudeAgentRunner.runSession", () => {
     expect(call.opts.timeoutMs).toBeUndefined();
   });
 
+  it("claude 子プロセスに LINEAR_API_KEY / SLACK_WEBHOOK_URL を渡さない（IPI 漏えい防止・防御の多層化）", async () => {
+    const prevLinear = process.env.LINEAR_API_KEY;
+    const prevSlack = process.env.SLACK_WEBHOOK_URL;
+    process.env.LINEAR_API_KEY = "lin_secret_should_not_leak";
+    process.env.SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/secret";
+    try {
+      const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+      const logs: string[] = [];
+      await makeRunner(runner, logs).runSession(ctx);
+
+      const call = runner.calls[0]!;
+      // 子プロセスへ明示 env を渡し、機密2変数は含めない
+      expect(call.opts.env).toBeDefined();
+      expect(call.opts.env!.LINEAR_API_KEY).toBeUndefined();
+      expect(call.opts.env!.SLACK_WEBHOOK_URL).toBeUndefined();
+      // 通常の環境（PATH 等）は引き継ぐ（空 env で claude を壊さない）
+      expect(call.opts.env!.PATH).toBe(process.env.PATH);
+    } finally {
+      if (prevLinear === undefined) delete process.env.LINEAR_API_KEY;
+      else process.env.LINEAR_API_KEY = prevLinear;
+      if (prevSlack === undefined) delete process.env.SLACK_WEBHOOK_URL;
+      else process.env.SLACK_WEBHOOK_URL = prevSlack;
+    }
+  });
+
   it("カーネル§5.1: max-budget-usd は ctx.maxCostUsd を toFixed(2) で渡す", async () => {
     const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
     const logs: string[] = [];

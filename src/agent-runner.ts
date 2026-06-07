@@ -1,3 +1,4 @@
+import process from "node:process";
 import type {
   AgentOutcome,
   AgentRunner,
@@ -8,6 +9,22 @@ import type {
 
 const SUMMARY_MAX = 2000;
 const PROGRESS_TEXT_MAX = 80;
+
+// claude 子プロセスへ渡さない機密環境変数（IPI でチケット由来プロンプトに操作された
+// agent が Bash 等で読み出し外部送信するのを防ぐ防御の多層化）。これらは親プロセス
+// （task-source の fetch / notifier の Slack）でのみ必要で、agent には不要。
+const SENSITIVE_ENV_KEYS = ["LINEAR_API_KEY", "SLACK_WEBHOOK_URL"];
+
+/** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。 */
+function agentChildEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (SENSITIVE_ENV_KEYS.includes(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
 
 interface AgentRunnerOptions {
   model: string;
@@ -118,7 +135,12 @@ export class ClaudeAgentRunner implements AgentRunner {
     };
 
     // 仕様§11: timeoutMs は設定しない（コスト上限へ一本化）。
-    const opts: RunOptions = { cwd: ctx.worktreePath, onStdoutLine };
+    // env: 機密キーを除いた親環境を明示的に渡す（claude へのシークレット継承を断つ）。
+    const opts: RunOptions = {
+      cwd: ctx.worktreePath,
+      env: agentChildEnv(),
+      onStdoutLine,
+    };
     const cmdResult = await this.runner.run("claude", args, opts);
 
     return this.toOutcome(resultLine, cmdResult.code);
