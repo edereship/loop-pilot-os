@@ -9,11 +9,24 @@ import type {
 
 const SUMMARY_MAX = 2000;
 const PROGRESS_TEXT_MAX = 80;
+const STDERR_TAIL_MAX = 1000;
 
 // claude 子プロセスへ渡さない機密環境変数（IPI でチケット由来プロンプトに操作された
-// agent が Bash 等で読み出し外部送信するのを防ぐ防御の多層化）。これらは親プロセス
-// （task-source の fetch / notifier の Slack）でのみ必要で、agent には不要。
-const SENSITIVE_ENV_KEYS = ["LINEAR_API_KEY", "SLACK_WEBHOOK_URL"];
+// agent が Bash 等で読み出し外部送信・権限昇格するのを防ぐ防御の多層化）。
+// - LINEAR_API_KEY / SLACK_WEBHOOK_URL: 親プロセス（task-source fetch / Slack）専用、agent に不要。
+// - GH/GITHUB トークン: env 認証の gh/git 資格情報。agent に渡すと `gh pr merge` /
+//   `git push origin HEAD:main` で Codex レビュー+ブランチ保護を迂回し誤マージし得る。
+// 注（残存リスク）: gh が `gh auth login`（~/.config/gh/hosts.yml）で認証済みかつ agent に
+//   Bash を許可している場合、env 除外だけでは ambient 認証経由の濫用は防げない。運用側で
+//   agent.allowed_tools を最小化（Bash/ネットワークを絞る）こと。
+const SENSITIVE_ENV_KEYS = [
+  "LINEAR_API_KEY",
+  "SLACK_WEBHOOK_URL",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
+];
 
 /** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。 */
 function agentChildEnv(): Record<string, string> {
@@ -143,24 +156,31 @@ export class ClaudeAgentRunner implements AgentRunner {
     };
     const cmdResult = await this.runner.run("claude", args, opts);
 
-    return this.toOutcome(resultLine, cmdResult.code);
+    return this.toOutcome(resultLine, cmdResult.code, cmdResult.stderr);
   }
 
-  private toOutcome(resultLine: ResultLine | null, code: number): AgentOutcome {
+  private toOutcome(
+    resultLine: ResultLine | null,
+    code: number,
+    stderr: string,
+  ): AgentOutcome {
     const costUsd =
       resultLine && typeof resultLine.total_cost_usd === "number"
         ? resultLine.total_cost_usd
         : 0;
+    // 失敗時の診断のため stderr 末尾を付す（無人運用での人間トリアージを可能にする）。
+    const tail = stderr.trim().slice(-STDERR_TAIL_MAX);
+    const withStderr = (msg: string): string => (tail ? `${msg}: ${tail}` : msg);
 
     if (resultLine === null) {
-      return { kind: "error", costUsd, message: "no result line emitted" };
+      return { kind: "error", costUsd, message: withStderr("no result line emitted") };
     }
     // 予算超過判定は非0終了判定より先（実 CLI v2.1.167 は budget 超過時 exit 1 で終了する）
     if (typeof resultLine.subtype === "string" && resultLine.subtype.startsWith("error_max_budget")) {
       return { kind: "cost_exceeded", costUsd };
     }
     if (code !== 0) {
-      return { kind: "error", costUsd, message: `claude exited with code ${code}` };
+      return { kind: "error", costUsd, message: withStderr(`claude exited with code ${code}`) };
     }
     if (resultLine.subtype === "success" && resultLine.is_error !== true) {
       const summary = (resultLine.result ?? "").slice(0, SUMMARY_MAX);

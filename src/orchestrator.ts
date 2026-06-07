@@ -192,7 +192,18 @@ export class Orchestrator {
 
   /** claimed/implementing/handing_off（および PR 番号欠落 in_review）の回復（カーネル §8）。 */
   private async recoverByOpenPr(session: TaskSessionRow): Promise<RunControl> {
-    const prNumber = await this.git.findOpenPrForBranch(session.branch);
+    let prNumber: number | null;
+    try {
+      prNumber = await this.git.findOpenPrForBranch(session.branch);
+    } catch (err) {
+      // gh 一時障害等で PR 状態が判定不能 → Fatal 落ち（無通知）にせず HALT+通知で人間に上げる。
+      this.store.updateSession(session.id, { runId: this.runId });
+      return await this.stopSession(
+        session,
+        "exception",
+        `crash recovery: findOpenPrForBranch failed for ${session.branch}: ${errMsg(err)}`,
+      );
+    }
     if (prNumber !== null) {
       // 既存のオープン PR を採用。monitorStartedAt は既存値 ?? clock()。
       const monitorStartedAt = session.monitorStartedAt ?? this.clock();
@@ -222,7 +233,7 @@ export class Orchestrator {
     while (true) {
       // 0) 停止要求の安全点（各反復先頭。現フェーズ群完了後にここへ戻る）
       if (this.interrupted) {
-        this.haltForInterrupt();
+        await this.haltForInterrupt();
         return;
       }
 
@@ -573,10 +584,12 @@ export class Orchestrator {
   }
 
   /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。 */
-  private haltForInterrupt(): void {
+  private async haltForInterrupt(): Promise<void> {
     const detail = "user_interrupt: stop requested; halting at safe point";
     this.store.setRunState(this.runId, "halted", detail);
-    void this.notifier.notify({ kind: "halted", reason: "user_interrupt", detail });
+    // 他の全 stopSession 経路と同様に await（通知を main の store.close() 前に確実に配信し、
+    // 閉じた DB へ触れる未捕捉 Promise 拒否を避ける）。notify はコントラクト上 throw しない。
+    await this.notifier.notify({ kind: "halted", reason: "user_interrupt", detail });
     this.log(detail);
   }
 

@@ -128,6 +128,13 @@ export class GitPrManager implements GitPrManagerInterface {
       ["pr", "list", "-R", remote, "--head", branch, "--state", "open", "--json", "number"],
       { cwd: repoPath },
     );
+    // 非0終了は throw（他の gh ラッパと一貫）。stdout が空/HTML/部分でも
+    // JSON.parse の偶発例外に頼らず明示的に失敗を上げる。
+    if (res.code !== 0) {
+      throw new Error(
+        `gh pr list failed for ${branch}: ${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
     const rows = JSON.parse(res.stdout) as Array<{ number: number }>;
     if (rows.length === 0) {
       return null;

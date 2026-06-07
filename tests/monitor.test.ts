@@ -304,6 +304,22 @@ describe("GhLoopPilotMonitor.poll — verdict 決定順 (§5.4)", () => {
     expect(await monitor.poll(17)).toEqual<MonitorVerdict>({ kind: "done" });
   });
 
+  it("user===null のコメント（ghost/削除アカウント）でクラッシュせず、有効な信頼コメントを採用する", async () => {
+    // GitHub は削除/ghost アカウントのコメントを user:null で返す。著者フィルタ前に
+    // c.user.login を触ると TypeError でセッションが exception HALT に固着する。
+    const slurp = JSON.stringify([
+      [
+        { user: null, body: "third-party comment from a deleted account" },
+        {
+          user: { login: "github-actions[bot]" },
+          body: stateCommentBody({ status: "done", stopReason: null }),
+        },
+      ],
+    ]);
+    const { monitor } = makeMonitor({ view: prView(), comments: slurp });
+    expect(await monitor.poll(31)).toEqual<MonitorVerdict>({ kind: "done" });
+  });
+
   it("信頼著者コメントは在るが JSON 破損 → corrupted（§5.4 規則4: パース不能）", async () => {
     // 可視テキスト + マーカー + 前後改行は満たすが、内側 JSON が壊れている
     const broken =
@@ -629,6 +645,36 @@ describe("GhLoopPilotMonitor.checkMergeReadiness — 決定順 ①-⑥ (§5.3)",
       ready: true,
       headSha: "mixsha",
     });
+  });
+});
+
+describe("GhLoopPilotMonitor — gh 終了コード検査（失敗を JSON.parse 偶発に頼らない）", () => {
+  // gh が非0終了かつ stdout に何らかの JSON を載せた場合でも、失敗を成功として
+  // 採用してはならない（poll の backoff/5連続停止の安全弁を迂回させない）。
+  it("poll: gh pr view が非0終了なら（stdout に JSON があっても）throw する", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view"], {
+      code: 1,
+      stdout: '{"state":"OPEN","mergedAt":null,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"x","statusCheckRollup":[],"closed":false}',
+      stderr: "gh: API rate limit exceeded",
+    });
+    const monitor = new GhLoopPilotMonitor(runner, { remote: REMOTE, trustedAuthors: TRUSTED });
+    await expect(monitor.poll(40)).rejects.toThrow(/gh pr view/);
+  });
+
+  it("checkMergeReadiness: gh pr view が非0終了なら throw する", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view"], { code: 1, stdout: "{}", stderr: "boom" });
+    const monitor = new GhLoopPilotMonitor(runner, { remote: REMOTE, trustedAuthors: TRUSTED });
+    await expect(monitor.checkMergeReadiness(41)).rejects.toThrow(/gh pr view/);
+  });
+
+  it("poll: コメント取得(gh api)が非0終了なら throw する（not_engaged 誤判定しない）", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view"], { code: 0, stdout: prView(), stderr: "" });
+    runner.on(["gh", "api"], { code: 1, stdout: "[]", stderr: "gh: Not Found" });
+    const monitor = new GhLoopPilotMonitor(runner, { remote: REMOTE, trustedAuthors: TRUSTED });
+    await expect(monitor.poll(42)).rejects.toThrow(/gh api/);
   });
 });
 

@@ -65,9 +65,9 @@ function classifyCheck(c: RollupCheck): "green" | "failed" | "pending" {
   return "failed";
 }
 
-/** gh api issue comments の1要素（必要フィールドのみ） */
+/** gh api issue comments の1要素（必要フィールドのみ）。user は削除/ghost で null になり得る。 */
 interface IssueComment {
-  user: { login: string };
+  user: { login: string } | null;
   body: string;
 }
 
@@ -169,6 +169,13 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
       ],
       { cwd: process.cwd() },
     );
+    // 非0終了は失敗として throw（poll の backoff/5連続停止に委ねる）。
+    // stdout に部分 JSON が載っていても「成功」と誤採用しない。
+    if (result.code !== 0) {
+      throw new Error(
+        `gh pr view failed for PR #${prNumber}: ${result.stderr.trim() || `exit ${result.code}`}`,
+      );
+    }
     return JSON.parse(result.stdout) as PrViewJson;
   }
 
@@ -189,14 +196,19 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
       ],
       { cwd: process.cwd() },
     );
+    if (result.code !== 0) {
+      throw new Error(
+        `gh api comments failed for PR #${prNumber}: ${result.stderr.trim() || `exit ${result.code}`}`,
+      );
+    }
     // --paginate --slurp は [[...page1...],[...page2...]] を返すので flat 化（§5.3）
     const pages = JSON.parse(result.stdout) as IssueComment[][];
     const comments: IssueComment[] = pages.flat();
 
     let found: IssueComment | null = null;
     for (const c of comments) {
-      // 規則1: 信頼著者
-      if (!this.trustedAuthors.includes(c.user.login)) continue;
+      // 規則1: 信頼著者（user は削除/ghost で null になり得る → スキップ）
+      if (!c.user || !this.trustedAuthors.includes(c.user.login)) continue;
       // 規則2: 可視テキストで始まる
       if (!c.body.startsWith(STATE_COMMENT_VISIBLE_TEXT)) continue;
       // 規則3: 隠しマーカーを含む

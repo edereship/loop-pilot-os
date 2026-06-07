@@ -84,28 +84,51 @@ describe("ClaudeAgentRunner.runSession", () => {
     expect(call.opts.timeoutMs).toBeUndefined();
   });
 
-  it("claude 子プロセスに LINEAR_API_KEY / SLACK_WEBHOOK_URL を渡さない（IPI 漏えい防止・防御の多層化）", async () => {
-    const prevLinear = process.env.LINEAR_API_KEY;
-    const prevSlack = process.env.SLACK_WEBHOOK_URL;
-    process.env.LINEAR_API_KEY = "lin_secret_should_not_leak";
-    process.env.SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/secret";
+  it("claude 子プロセスに機密 env（Linear/Slack/GitHub トークン）を渡さない（IPI 漏えい・権限昇格防止）", async () => {
+    const SECRETS = {
+      LINEAR_API_KEY: "lin_secret_should_not_leak",
+      SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/secret",
+      GH_TOKEN: "gho_should_not_leak",
+      GITHUB_TOKEN: "ghs_should_not_leak",
+      GH_ENTERPRISE_TOKEN: "ghe_should_not_leak",
+      GITHUB_ENTERPRISE_TOKEN: "ghe2_should_not_leak",
+    };
+    const prev: Record<string, string | undefined> = {};
+    for (const k of Object.keys(SECRETS)) prev[k] = process.env[k];
+    Object.assign(process.env, SECRETS);
     try {
       const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
       const logs: string[] = [];
       await makeRunner(runner, logs).runSession(ctx);
 
       const call = runner.calls[0]!;
-      // 子プロセスへ明示 env を渡し、機密2変数は含めない
+      // 子プロセスへ明示 env を渡し、機密キーは一切含めない
       expect(call.opts.env).toBeDefined();
-      expect(call.opts.env!.LINEAR_API_KEY).toBeUndefined();
-      expect(call.opts.env!.SLACK_WEBHOOK_URL).toBeUndefined();
+      for (const k of Object.keys(SECRETS)) {
+        expect(call.opts.env![k]).toBeUndefined();
+      }
       // 通常の環境（PATH 等）は引き継ぐ（空 env で claude を壊さない）
       expect(call.opts.env!.PATH).toBe(process.env.PATH);
     } finally {
-      if (prevLinear === undefined) delete process.env.LINEAR_API_KEY;
-      else process.env.LINEAR_API_KEY = prevLinear;
-      if (prevSlack === undefined) delete process.env.SLACK_WEBHOOK_URL;
-      else process.env.SLACK_WEBHOOK_URL = prevSlack;
+      for (const k of Object.keys(SECRETS)) {
+        if (prev[k] === undefined) delete process.env[k];
+        else process.env[k] = prev[k];
+      }
+    }
+  });
+
+  it("claude 失敗（非0終了・result 行欠落）時に stderr を error message に含める（トリアージ可能化）", async () => {
+    // result 行を出さず exit 1・stderr にエラー。診断情報を捨てない。
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      opts.onStdoutLine?.(INIT_LINE);
+      return { code: 1, stdout: "", stderr: "Error: credentials expired; run /login" };
+    });
+    const logs: string[] = [];
+    const outcome = await makeRunner(runner, logs).runSession(ctx);
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain("credentials expired");
     }
   });
 

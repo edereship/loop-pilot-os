@@ -410,6 +410,33 @@ describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 /
     expect(s.stopDetail).toContain("looppilot/ty-8-x");
     expect(s.stopDetail).toContain("TY-8");
   });
+
+  // findOpenPrForBranch が throw（gh 一時障害）→ Fatal 落ち・無通知ではなく
+  // stopped(exception)+HALT+通知で人間に上げる（回復経路でも「失敗は HALT で surface」）。
+  it("handing_off で findOpenPrForBranch が throw → run() は throw せず stopped(exception)+HALT+通知", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "handing_off", monitorStartedAt: null },
+      { branch: "looppilot/ty-11-x", worktreePath: "/wt/ty-11", linearIssueId: "issue-K", linearIdentifier: "TY-11" },
+    );
+    h.git.failNext("findOpenPrForBranch", new Error("gh pr list failed: API rate limit"));
+
+    // run() は Fatal 経路へ伝播せず正常終了する
+    await expect(h.orch.run()).resolves.toBe("finished");
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("API rate limit");
+    expect(newRun.state).toBe("halted");
+    // ループに入らない・通知される
+    expect(h.source.eligibleCalls).toHaveLength(0);
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "exception" });
+  });
 });
 
 describe("回復 — 孤児チケット（In Progress だがセッション行なし → Todo 復帰・ベストエフォート）（仕様 §9 / カーネル §8）", () => {

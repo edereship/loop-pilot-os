@@ -1291,6 +1291,40 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
     expect(h.store.latestRun()!.state).toBe("halted");
     expect(h.store.latestRun()!.haltReason).toContain("user_interrupt");
   });
+
+  it("user_interrupt の halt 通知は await される（run() は通知完了まで resolve しない）", async () => {
+    // 通知を fire-and-forget にすると、main の store.close() 後に通知の非同期が走り
+    // 閉じた DB を触る未捕捉拒否や通知欠落を招く。run() は halt 通知の完了を待つこと。
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // 起動直後の安全点（loop 冒頭）で停止 → haltForInterrupt 経路
+    h.orch.requestStop();
+
+    // user_interrupt 通知だけゲートして、await されているかを観測する
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const orig = h.notifier.notify.bind(h.notifier);
+    h.notifier.notify = async (e) => {
+      await orig(e);
+      if (e.kind === "halted" && e.reason === "user_interrupt") await gate;
+    };
+
+    let resolved = false;
+    const p = h.orch.run().then((v) => {
+      resolved = true;
+      return v;
+    });
+    // ゲート解放前: await されていれば run() は未完了
+    await new Promise((r) => setTimeout(r, 10));
+    expect(resolved).toBe(false);
+
+    release();
+    await p;
+    expect(resolved).toBe(true);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
 });
 
 // 二重起動: ロック拒否は戻り値で通知し、main が古い Run の状態から誤った exit code を導かないようにする

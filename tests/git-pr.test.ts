@@ -273,6 +273,22 @@ describe("GitPrManager.findOpenPrForBranch", () => {
     const mgr = new GitPrManager(runner, OPTS);
     expect(await mgr.findOpenPrForBranch("looppilot/ty-123-x")).toBe(null);
   });
+
+  // 他の gh ラッパ（pushAndOpenPr/addLabel/mergePr）と一貫させ、非0終了は throw。
+  // gh の一時障害（auth 失効/レート制限）で stdout が空/HTML/部分でも JSON.parse の
+  // 偶発 SyntaxError に頼らず、明示エラーで失敗を上げる。
+  it("throws on non-zero gh exit instead of JSON.parse of garbage", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 1,
+      stdout: "",
+      stderr: "gh: API rate limit exceeded",
+    });
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.findOpenPrForBranch("looppilot/ty-123-x")).rejects.toThrow(
+      /gh pr list/,
+    );
+  });
 });
 
 describe("GitPrManager.pushAndOpenPr", () => {
