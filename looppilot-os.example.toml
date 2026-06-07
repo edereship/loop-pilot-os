@@ -42,6 +42,7 @@ max_tasks_per_run = 3
 max_cost_usd_per_session = 10.0
 # monitor_timeout_minutes = 120  # 任意。既定オフ（コメントアウト）
 not_engaged_guard_minutes = 30   # 常時オン
+session_hard_timeout_minutes = 120  # 任意。既定120。hung（無進捗・無支出）claude を切る hard backstop
 
 [loop]
 monitor_poll_seconds = 60

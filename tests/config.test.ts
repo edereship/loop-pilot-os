@@ -56,6 +56,7 @@ describe("loadConfig", () => {
     expect(config.safety.maxCostUsdPerSession).toBe(10.0);
     expect(config.safety.monitorTimeoutMinutes).toBe(120);
     expect(config.safety.notEngagedGuardMinutes).toBe(30);
+    expect(config.safety.sessionHardTimeoutMinutes).toBe(120); // 既定（hung claude 用 hard backstop）
 
     expect(config.loop.monitorPollSeconds).toBe(60);
     expect(config.loop.idleRecheckSeconds).toBe(300);
@@ -89,6 +90,7 @@ describe("loadConfig", () => {
     expect(config.agent.extraArgs).toEqual([]);
     expect(config.safety.monitorTimeoutMinutes).toBeUndefined();
     expect(config.safety.notEngagedGuardMinutes).toBe(30);
+    expect(config.safety.sessionHardTimeoutMinutes).toBe(120); // 省略時の既定
   });
 
   // カーネル §3: SLACK_WEBHOOK_URL 未設定なら undefined（コンソールのみ）。

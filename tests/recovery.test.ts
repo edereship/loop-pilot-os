@@ -33,6 +33,7 @@ function makeConfig(over: Partial<{
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes,
+      sessionHardTimeoutMinutes: 120,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,

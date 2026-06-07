@@ -33,6 +33,7 @@ function makeConfig(over: Partial<{
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes,
+      sessionHardTimeoutMinutes: 120,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -1290,6 +1291,40 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
     expect(s.failureReason).toBeNull();
     expect(h.store.latestRun()!.state).toBe("halted");
     expect(h.store.latestRun()!.haltReason).toContain("user_interrupt");
+  });
+
+  it("MONITOR 中（支配的フェーズ）の停止要求は poll 境界の安全点でクリーン HALT し、セッションは in_review のまま", async () => {
+    // MONITOR は最長フェーズ。poll 境界（無書込みの安全点）で interrupted を検査し、
+    // 現 PR の解決を待たずにクリーン停止できること（カーネル §7 安全点の精緻化）。
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // poll は常に in_progress（merge/stop へ進まない＝支配的 MONITOR を模す）。1 回目で停止要求。
+    let polls = 0;
+    h.monitor.poll = async (pr: number) => {
+      h.monitor.pollCalls.push(pr);
+      polls += 1;
+      if (polls === 1) h.orch.requestStop();
+      return { kind: "in_progress" };
+    };
+
+    await expect(h.orch.run()).resolves.toBe("finished");
+
+    const run = h.store.latestRun()!;
+    const s = h.store.sessionsForRun(run.id)[0];
+    // クリーン停止: セッションは stopped にせず in_review のまま（再起動で回復可能）
+    expect(s.state).toBe("in_review");
+    expect(s.failureReason).toBeNull();
+    // Run=halted(user_interrupt)・通知される
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events.at(-1)).toMatchObject({ kind: "halted", reason: "user_interrupt" });
+    // 無限に poll し続けず、安全点で止まる（数回以内）
+    expect(h.monitor.pollCalls.length).toBeLessThanOrEqual(2);
   });
 
   it("user_interrupt の halt 通知は await される（run() は通知完了まで resolve しない）", async () => {

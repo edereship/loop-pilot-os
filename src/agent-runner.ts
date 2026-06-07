@@ -147,12 +147,15 @@ export class ClaudeAgentRunner implements AgentRunner {
       }
     };
 
-    // 仕様§11: timeoutMs は設定しない（コスト上限へ一本化）。
+    // 仕様§11: 基本はコスト一本化。ただし hung（無進捗・無支出）claude を切る hard backstop
+    // として hardTimeoutMs があれば timeoutMs に渡す（超過時 exec が kill→reject→implement で
+    // stopped(exception)+通知に写像される）。
     // env: 機密キーを除いた親環境を明示的に渡す（claude へのシークレット継承を断つ）。
     const opts: RunOptions = {
       cwd: ctx.worktreePath,
       env: agentChildEnv(),
       onStdoutLine,
+      ...(ctx.hardTimeoutMs !== undefined ? { timeoutMs: ctx.hardTimeoutMs } : {}),
     };
     const cmdResult = await this.runner.run("claude", args, opts);
 

@@ -252,6 +252,7 @@ max_tasks_per_run = 3
 max_cost_usd_per_session = 10.0
 # monitor_timeout_minutes = 120  # 任意。既定オフ（コメントアウト）
 not_engaged_guard_minutes = 30   # 常時オン
+session_hard_timeout_minutes = 120  # 任意。既定120。hung（無進捗・無支出）claude を切る hard backstop（2026-06-07 追加。仕様§11 コスト一本化は維持）
 
 [loop]
 monitor_poll_seconds = 60
@@ -372,6 +373,7 @@ spawn の `cwd` = worktree。`env` は親環境から機密キー（`LINEAR_API_
 マッピング: `subtype=="success"` → completed（summary=result、2000字に切詰め）。`subtype が "error_max_budget" で始まる（実CLI v2.1.167 は "error_max_budget_usd"、exit code 1。予算判定は非0終了判定より先に評価する）` → cost_exceeded。その他/`is_error`/非0終了/result行欠落 → error。
 
 > 修正 2026-06-06: 実CLIプローブにより --verbose 必須・subtype "error_max_budget_usd"・予算超過時 exit 1 を確認し、契約を実挙動へ修正（ユーザー承認済み）。
+> 追加 2026-06-07: 基本はコスト一本化（仕様§11）だが、hung（無進捗・無支出）claude が無人ループを永久に固めるため、`safety.session_hard_timeout_minutes`（既定120）を hard backstop として `timeoutMs` に渡す。超過時 exec が kill→reject→implement で stopped(exception)+通知へ写像（ユーザー承認済み）。
 
 ### 5.2 git（git-pr.ts）
 
@@ -472,7 +474,8 @@ export function instantSleep(): (ms: number) => Promise<void>; // 即 resolve・
      - poll() throw → バックオフ（poll間隔×2..×8）、5連続失敗 → stopped(exception)
   7. DONE: updateSession(merged, endedAt) → `transition(done)`（**best-effort** リトライ3回・既Done許容）。3回失敗してもコンソール警告のみで Run=running を維持し SELECT(1) へ進む（merged は永続化済みで二重マージは起きない。HALT しない — 仕様§5.6 に失敗遷移は無く、§7 の「stopped⇒halted 1:1」を保つ）。成功時はログに merged_count → 1 へ
 - STOPPED の共通処理: updateSession(stopped, failureReason, stopDetail, endedAt［costUsd が判明している経路では併せて保存］) → notify(halted) → Run=halted → ループ終了。
-- SIGINT: ハンドラで「次の安全点で停止」フラグ → 現フェーズ完了後 Run=halted(reason="user_interrupt") → ロック解放 → exit。
+- 停止シグナル（SIGINT / SIGTERM / SIGHUP）: ハンドラで「次の安全点で停止」フラグ（requestStop）→ 安全点で Run=halted(reason="user_interrupt") → ロック解放 → exit。2回目の停止シグナルは強制終了（exit 130）。（2026-06-07 拡張: 常駐運用で一般的な SIGTERM/SIGHUP も捕捉。未捕捉だと Node 既定の即時終了で finally の releaseRunLock/close が走らず run_lock 行・Run=running・未チェックポイント WAL が残留する。）
+  - 安全点: 各ループ反復先頭に加え、**MONITOR の poll 境界**（2026-06-07 拡張）。MONITOR は最長フェーズのため、入場直後の1回目 poll（即マージ可能タスクへの猶予）を除き各 poll 境界で停止フラグを検査し、無書込みの安全点でクリーン HALT する（セッションは in_review のまま＝再起動で回復可能）。これにより数時間に及ぶ MONITOR 待機中も Ctrl-C 等で停止できる。
 
 ## 8. 回復処理（起動時、仕様 §9）
 

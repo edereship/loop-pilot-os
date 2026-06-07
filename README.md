@@ -98,6 +98,7 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `safety.max_cost_usd_per_session` | 1 セッションのコスト上限（`claude --max-budget-usd`） |
 | `safety.monitor_timeout_minutes` | 全体監視のタイムアウト（任意・既定オフ／コメントアウト） |
 | `safety.not_engaged_guard_minutes` | LoopPilot 未起動ガード（常時オン） |
+| `safety.session_hard_timeout_minutes` | hung（無進捗・無支出）claude を切る hard backstop（任意・既定120分。コスト一本化を維持しつつ無人ループの永久ハングを防ぐ） |
 | `loop.monitor_poll_seconds` | MONITOR のポーリング間隔 |
 | `loop.idle_recheck_seconds` | IDLE 時のキュー再確認間隔 |
 | `digest.recent_merged_count` | プロンプトに含める直近マージ済みセッション要約の件数 |
@@ -141,7 +142,7 @@ looppilot-os status --config ./looppilot-os.toml
 
 - `--config <path>` 省略時の既定は `./looppilot-os.toml`。
 - **単一インスタンス前提**: `run` はランロック（PID）を取得します。既に生きたインスタンスがある場合は二重起動しません。
-- 停止は `Ctrl-C`（SIGINT）。**次の安全点で**現フェーズを完了してから Run を `halted`（理由 `user_interrupt`）にしてロックを解放し終了します（フェーズ途中で中断しません）。
+- 停止は `Ctrl-C`（SIGINT）。常駐運用向けに **SIGTERM / SIGHUP**（systemd・コンテナ停止・端末切断）も同様に捕捉します。**次の安全点で** Run を `halted`（理由 `user_interrupt`）にしてロックを解放し終了します。安全点は各タスク境界に加え **MONITOR の poll 境界**（数時間に及ぶ監視待機中でも停止可能。セッションは `in_review` のまま残り再起動で回復）。**2 回目**の停止シグナルは即時強制終了（exit 130）。
 
 ## `run` の使い方
 

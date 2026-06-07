@@ -80,8 +80,15 @@ describe("ClaudeAgentRunner.runSession", () => {
       "opus",
     ]);
     expect(call.opts.cwd).toBe("/wt");
-    // 仕様§11: コスト一本化のため timeoutMs は設定しない
+    // 仕様§11: コスト一本化が基本。hardTimeoutMs 未指定なら timeoutMs は設定しない
     expect(call.opts.timeoutMs).toBeUndefined();
+  });
+
+  it("hardTimeoutMs 指定時は opts.timeoutMs に渡す（hung claude の hard backstop・仕様§11 維持の最終手段）", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+    const logs: string[] = [];
+    await makeRunner(runner, logs).runSession({ ...ctx, hardTimeoutMs: 7_200_000 });
+    expect(runner.calls[0]!.opts.timeoutMs).toBe(7_200_000);
   });
 
   it("claude 子プロセスに機密 env（Linear/Slack/GitHub トークン）を渡さない（IPI 漏えい・権限昇格防止）", async () => {

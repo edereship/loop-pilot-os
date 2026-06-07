@@ -151,24 +151,41 @@ async function runLoop(configPath: string): Promise<number> {
       log: logLine,
     });
 
-    // SIGINT → orchestrator.requestStop()（次の安全点でクリーン halt）。
+    // 停止シグナル → orchestrator.requestStop()（次の安全点でクリーン halt）。
+    // SIGINT に加え、常駐運用で一般的な SIGTERM（systemd/コンテナ停止）・SIGHUP（端末切断）も
+    // 捕捉する（未捕捉だと Node 既定の即時終了で finally の releaseRunLock/close が走らず、
+    // run_lock 行・Run=running・未チェックポイント WAL が残留する）。
+    // 2 回目の停止シグナルは強制終了（安全点まで待てない運用者向けのエスケープハッチ）。
     // run_started 通知は orchestrator.run() が内部で送る（カーネル §7）。
-    let interrupted = false;
-    const onSigint = (): void => {
-      if (interrupted) return;
-      interrupted = true;
+    const STOP_SIGNALS: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+    let stopRequested = false;
+    const onStopSignal = (signal: NodeJS.Signals): void => {
+      if (stopRequested) {
+        process.stderr.write(`\n${signal} again: forcing exit.\n`);
+        process.exit(130);
+      }
+      stopRequested = true;
       process.stderr.write(
-        "\nSIGINT received: stopping at next safe point...\n",
+        `\n${signal} received: stopping at next safe point (repeat to force exit)...\n`,
       );
       orchestrator.requestStop();
     };
-    process.on("SIGINT", onSigint);
+    const handlers = new Map<NodeJS.Signals, () => void>();
+    for (const signal of STOP_SIGNALS) {
+      const handler = (): void => {
+        onStopSignal(signal);
+      };
+      handlers.set(signal, handler);
+      process.on(signal, handler);
+    }
 
     let outcome: RunOutcome;
     try {
       outcome = await orchestrator.run();
     } finally {
-      process.removeListener("SIGINT", onSigint);
+      for (const [signal, handler] of handlers) {
+        process.removeListener(signal, handler);
+      }
     }
 
     if (outcome === "lock_rejected") {

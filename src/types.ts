@@ -67,6 +67,8 @@ export interface SessionContext {
   worktreePath: string;
   prompt: string;
   maxCostUsd: number;
+  /** hung（無進捗・無支出）claude を切る hard backstop（ms）。未指定なら timeout なし。 */
+  hardTimeoutMs?: number;
 }
 export type AgentOutcome =
   | { kind: "completed"; costUsd: number; summary: string }

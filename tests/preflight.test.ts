@@ -29,6 +29,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       maxCostUsdPerSession: 10,
       monitorTimeoutMinutes: undefined,
       notEngagedGuardMinutes: 30,
+      sessionHardTimeoutMinutes: 120,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
     digest: { recentMergedCount: 5 },

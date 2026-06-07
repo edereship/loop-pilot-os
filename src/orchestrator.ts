@@ -346,6 +346,7 @@ export class Orchestrator {
         worktreePath,
         prompt,
         maxCostUsd: this.config.safety.maxCostUsdPerSession,
+        hardTimeoutMs: this.config.safety.sessionHardTimeoutMinutes * 60_000,
       });
     } catch (err) {
       return await this.stopSession(session, "exception", errMsg(err));
@@ -407,7 +408,18 @@ export class Orchestrator {
     let backoffMultiplier = 1;
     let mergeFailures = 0; // ready verdict 下での mergePr 連続失敗（2 連続で fail-closed）
     let readinessFailures = 0; // checkMergeReadiness の連続 throw（poll throw と同じ一時障害扱い）
+    // 停止要求の安全点（カーネル §7）。MONITOR は最長フェーズのため poll 境界でも検査する。
+    // 入場直後の 1 回目だけは見送り、即マージ可能なタスク（done→merged）には1ポーリングの
+    // 猶予を与える（「現フェーズ群を完了してから停止」の従来契約を維持）。以降の poll 境界は
+    // 無書込みの安全点なので、現 PR の解決を待たずクリーン HALT する（セッションは in_review の
+    // まま＝再起動で回復可能）。
+    let firstPoll = true;
     while (true) {
+      if (!firstPoll && this.interrupted) {
+        await this.haltForInterrupt();
+        return HALT;
+      }
+      firstPoll = false;
       await this.sleep(pollIntervalMs * backoffMultiplier);
       let verdict: MonitorVerdict;
       try {

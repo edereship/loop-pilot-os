@@ -44,6 +44,9 @@ const rawSchema = z.object({
     max_cost_usd_per_session: z.number().positive(),
     monitor_timeout_minutes: z.number().positive().optional(),
     not_engaged_guard_minutes: z.number().positive().default(30),
+    // 停止した（コストを消費しない）claude が無人ループを永久に固めるのを防ぐ hard backstop。
+    // コスト一本化（仕様§11）は維持し、これは進捗・支出ゼロのハングを切る最終手段。
+    session_hard_timeout_minutes: z.number().positive().default(120),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -95,6 +98,7 @@ export interface Config {
     maxCostUsdPerSession: number;
     monitorTimeoutMinutes: number | undefined;
     notEngagedGuardMinutes: number;
+    sessionHardTimeoutMinutes: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -209,6 +213,7 @@ export function loadConfig(
       maxCostUsdPerSession: raw.safety.max_cost_usd_per_session,
       monitorTimeoutMinutes: raw.safety.monitor_timeout_minutes,
       notEngagedGuardMinutes: raw.safety.not_engaged_guard_minutes,
+      sessionHardTimeoutMinutes: raw.safety.session_hard_timeout_minutes,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
