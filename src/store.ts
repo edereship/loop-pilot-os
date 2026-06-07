@@ -135,6 +135,9 @@ export class SqliteStore {
     } catch {
       // ignore: WAL is a best-effort optimization
     }
+    // 別プロセスとの書込み競合時に即 SQLITE_BUSY で失敗せず待つ
+    // （acquireRunLock の BEGIN IMMEDIATE をプロセス間で直列化するため）。
+    this.db.pragma("busy_timeout = 5000");
     this.db.pragma("user_version = 1");
     this.db.exec(SCHEMA);
   }
@@ -410,25 +413,32 @@ export class SqliteStore {
     isPidAlive: (pid: number) => boolean,
     now: string,
   ): boolean {
-    const existing = this.db
-      .prepare(`SELECT pid FROM run_lock WHERE id = 1`)
-      .get() as { pid: number } | undefined;
+    // read(SELECT)→liveness 判定→write(UPSERT) を BEGIN IMMEDIATE で原子化する。
+    // 非トランザクションだと 2 プロセスが共に空を読んで共にロック取得し（TOCTOU）、
+    // 単一インスタンス前提（仕様 §3/§5.1）が破れる。IMMEDIATE は開始時に write ロックを
+    // 取り、後発プロセスを busy_timeout まで待たせて直列化する。
+    const acquire = this.db.transaction((): boolean => {
+      const existing = this.db
+        .prepare(`SELECT pid FROM run_lock WHERE id = 1`)
+        .get() as { pid: number } | undefined;
 
-    if (existing !== undefined) {
-      // 自 pid のロックは冪等に奪える。別 pid は生存中なら奪わない。
-      if (existing.pid !== pid && isPidAlive(existing.pid)) {
-        return false;
+      if (existing !== undefined) {
+        // 自 pid のロックは冪等に奪える。別 pid は生存中なら奪わない。
+        if (existing.pid !== pid && isPidAlive(existing.pid)) {
+          return false;
+        }
       }
-    }
 
-    // 空・自 pid・死んだ保持者 → 奪取（id=1 行を upsert）
-    this.db
-      .prepare(
-        `INSERT INTO run_lock (id, pid, acquired_at) VALUES (1, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, acquired_at = excluded.acquired_at`,
-      )
-      .run(pid, now);
-    return true;
+      // 空・自 pid・死んだ保持者 → 奪取（id=1 行を upsert）
+      this.db
+        .prepare(
+          `INSERT INTO run_lock (id, pid, acquired_at) VALUES (1, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, acquired_at = excluded.acquired_at`,
+        )
+        .run(pid, now);
+      return true;
+    });
+    return acquire.immediate();
   }
 
   releaseRunLock(pid: number): void {

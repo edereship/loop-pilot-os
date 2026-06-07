@@ -237,7 +237,18 @@ export class Orchestrator {
       }
 
       // 2) SELECT（仕様 §5.1）
-      const issue = await this.source.getNextEligible(this.store.activeIssueIds());
+      // getNextEligible の失敗（Linear 一時障害等）は CLAIM① と同様にセッション無しで
+      // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
+      let issue: EligibleIssue | null;
+      try {
+        issue = await this.source.getNextEligible(this.store.activeIssueIds());
+      } catch (err) {
+        const detail = `select_failed: getNextEligible: ${errMsg(err)}`;
+        await this.notifier.notify({ kind: "halted", reason: "exception", detail });
+        this.store.setRunState(this.runId, "halted", detail);
+        this.log(detail);
+        return;
+      }
       if (issue === null) {
         // IDLE（キュー空 → 通知は初回のみ → 定期再確認）
         if (!idleNotified) {

@@ -37,7 +37,10 @@ function prView(
     mergeable: string;
     mergeStateStatus: string;
     headRefOid: string;
-    statusCheckRollup: Array<{ status: string; conclusion: string | null }>;
+    statusCheckRollup: Array<
+      | { status: string; conclusion: string | null }
+      | { state: string }
+    >;
     closed: boolean;
   }> = {},
 ): string {
@@ -559,6 +562,72 @@ describe("GhLoopPilotMonitor.checkMergeReadiness — 決定順 ①-⑥ (§5.3)",
     expect(await monitor.checkMergeReadiness(9)).toEqual<MergeReadiness>({
       ready: false,
       reason: "unknown",
+    });
+  });
+
+  // legacy commit status（StatusContext）は status/conclusion を持たず state を持つ。
+  // gh pr view --json statusCheckRollup は CheckRun と StatusContext を混在で返すため、
+  // state を解釈しないと「失敗を見逃し」「成功すら永久 pending 扱いでマージ不能」になる。
+  it("StatusContext state=='FAILURE' → ci_failed（status/conclusion が無くても失敗を検出）", async () => {
+    const { monitor } = makeMonitor({
+      view: prView({
+        statusCheckRollup: [
+          { status: "COMPLETED", conclusion: "SUCCESS" },
+          { state: "FAILURE" },
+        ],
+      }),
+    });
+    expect(await monitor.checkMergeReadiness(10)).toEqual<MergeReadiness>({
+      ready: false,
+      reason: "ci_failed",
+    });
+  });
+
+  it("StatusContext state=='SUCCESS' のみ（全グリーン・MERGEABLE）→ ready（pending 誤判定しない）", async () => {
+    const { monitor } = makeMonitor({
+      view: prView({
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "ctxsha",
+        statusCheckRollup: [{ state: "SUCCESS" }],
+      }),
+    });
+    expect(await monitor.checkMergeReadiness(11)).toEqual<MergeReadiness>({
+      ready: true,
+      headSha: "ctxsha",
+    });
+  });
+
+  it("StatusContext state=='PENDING' → ci_pending", async () => {
+    const { monitor } = makeMonitor({
+      view: prView({
+        statusCheckRollup: [
+          { status: "COMPLETED", conclusion: "SUCCESS" },
+          { state: "PENDING" },
+        ],
+      }),
+    });
+    expect(await monitor.checkMergeReadiness(12)).toEqual<MergeReadiness>({
+      ready: false,
+      reason: "ci_pending",
+    });
+  });
+
+  it("CheckRun と StatusContext 混在で双方グリーン → ready", async () => {
+    const { monitor } = makeMonitor({
+      view: prView({
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "mixsha",
+        statusCheckRollup: [
+          { status: "COMPLETED", conclusion: "SUCCESS" },
+          { state: "SUCCESS" },
+        ],
+      }),
+    });
+    expect(await monitor.checkMergeReadiness(13)).toEqual<MergeReadiness>({
+      ready: true,
+      headSha: "mixsha",
     });
   });
 });

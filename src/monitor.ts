@@ -26,14 +26,43 @@ const GREEN_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 
 // ---- gh pr view --json の型 ---------------------------------------------
 
+/**
+ * statusCheckRollup の要素は2系統が混在する（gh pr view --json statusCheckRollup）:
+ * - CheckRun: status(QUEUED/IN_PROGRESS/COMPLETED) + conclusion(SUCCESS/FAILURE/...)
+ * - StatusContext（legacy commit status）: status/conclusion を持たず state(SUCCESS/PENDING/FAILURE/ERROR/EXPECTED)
+ */
+interface RollupCheck {
+  status?: string;
+  conclusion?: string | null;
+  state?: string;
+}
+
 interface PrViewJson {
   state: string;
   mergedAt: string | null;
   mergeable: string;
   mergeStateStatus: string;
   headRefOid: string;
-  statusCheckRollup?: Array<{ status: string; conclusion: string | null }> | null;
+  statusCheckRollup?: Array<RollupCheck> | null;
   closed: boolean;
+}
+
+/** 1 チェックを green/failed/pending に分類（CheckRun と StatusContext の両形に対応）。 */
+function classifyCheck(c: RollupCheck): "green" | "failed" | "pending" {
+  // CheckRun（status フィールドを持つ）
+  if (typeof c.status === "string") {
+    if (c.status !== "COMPLETED") return "pending";
+    return GREEN_CONCLUSIONS.has(c.conclusion ?? "") ? "green" : "failed";
+  }
+  // StatusContext（state フィールドを持つ）
+  if (typeof c.state === "string") {
+    const s = c.state.toUpperCase();
+    if (s === "SUCCESS") return "green";
+    if (s === "PENDING" || s === "EXPECTED") return "pending";
+    return "failed"; // FAILURE / ERROR / その他
+  }
+  // 未知の形は fail-closed（マージせず ci_failed→HALT で人間に上げる。無限 pending を避ける）
+  return "failed";
 }
 
 /** gh api issue comments の1要素（必要フィールドのみ） */
@@ -103,17 +132,13 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
     if (pr.mergeable === "CONFLICTING" || pr.mergeStateStatus === "DIRTY") {
       return { ready: false, reason: "conflict" };
     }
-    // ② 失敗チェックあり（completed かつ conclusion ∉ {SUCCESS,NEUTRAL,SKIPPED}）
-    const hasFailed = checks.some(
-      (c) =>
-        c.status === "COMPLETED" && !GREEN_CONCLUSIONS.has(c.conclusion ?? ""),
-    );
-    if (hasFailed) {
+    const classes = checks.map(classifyCheck);
+    // ② 失敗チェックあり（CheckRun: completed かつ conclusion ∉ {SUCCESS,NEUTRAL,SKIPPED} / StatusContext: FAILURE,ERROR）
+    if (classes.includes("failed")) {
       return { ready: false, reason: "ci_failed" };
     }
     // ③ 未完了チェックあり
-    const hasPending = checks.some((c) => c.status !== "COMPLETED");
-    if (hasPending) {
+    if (classes.includes("pending")) {
       return { ready: false, reason: "ci_pending" };
     }
     // ④ 全グリーン（空配列含む）かつ BLOCKED
