@@ -89,7 +89,7 @@ describe("loadConfig", () => {
     const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
     expect(config.repo.defaultBranch).toBe("main");
     expect(config.agent.extraArgs).toEqual([]);
-    expect(config.agent.effort).toBe("auto");
+    expect(config.agent.effort).toBe("max");
     expect(config.safety.monitorTimeoutMinutes).toBeUndefined();
     expect(config.safety.notEngagedGuardMinutes).toBe(30);
     expect(config.safety.sessionHardTimeoutMinutes).toBe(120); // 省略時の既定
@@ -172,6 +172,20 @@ describe("loadConfig", () => {
   it("throws when Sonnet 4.5 is paired with a non-auto effort value", () => {
     expect(() =>
       loadConfig(fixture("config-effort-sonnet45-unsupported.toml"), fullEnv),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 2: "sonnet" ベアエイリアスは最新 Sonnet（4.6）に解決されるため effort 対応とみなす。
+  it("accepts the 'sonnet' bare alias with a non-auto effort value", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-sonnet-alias.toml"), fullEnv),
+    ).not.toThrow();
+  });
+
+  // Finding 3: effort 対応モデルでも xhigh 非対応モデル（Sonnet 4.6 等）では xhigh を拒否する。
+  it("throws when xhigh effort is paired with a model that does not support xhigh", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-xhigh-unsupported.toml"), fullEnv),
     ).toThrow(/agent\.effort/);
   });
 });

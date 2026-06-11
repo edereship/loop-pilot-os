@@ -30,7 +30,7 @@ const rawSchema = z.object({
     model: z.string(),
     allowed_tools: z.string(),
     extra_args: z.array(z.string()).default([]),
-    effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).default("auto"),
+    effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).default("max"),
   }).strict(),
   handoff: z.object({
     branch_prefix: z.string(),
@@ -119,11 +119,28 @@ export interface Config {
 // Sonnet 4.5 は非対応のため "sonnet" 全体ではなくバージョン付きサブストリングで照合する。
 // 未知・将来モデルは非サポートとして安全側に倒す（denylist では漏れが生じる）。
 const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus", "sonnet-4-6", "sonnet-4.6"];
+// "sonnet" ベアエイリアスはサブストリングで照合すると Sonnet 4.5 まで誤ってヒットするため
+// 完全一致で扱う（CLI は "sonnet" を最新 Sonnet = 4.6 に解決し、4.6 は effort 対応）。
+const EFFORT_SUPPORTED_MODEL_EXACT = new Set(["sonnet"]);
 
 /** モデルが effort フラグをサポートしているか（allowlist に合致する場合のみ対応とみなす）。 */
 export function modelSupportsEffort(model: string): boolean {
   const lower = model.toLowerCase();
-  return EFFORT_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
+  return EFFORT_SUPPORTED_MODEL_EXACT.has(lower) ||
+    EFFORT_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
+}
+
+// xhigh をサポートするのは Fable 5 と Opus 4.7+（README §model×effort 対応表）。
+// Opus 4.6 や Sonnet 4.6 は xhigh 非対応（low/medium/high/max のみ）。
+const XHIGH_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8"];
+// "fable"/"opus" ベアエイリアスは最新世代（xhigh 対応）に解決されるため完全一致で許可する。
+const XHIGH_SUPPORTED_MODEL_EXACT = new Set(["fable", "opus"]);
+
+/** モデルが xhigh effort をサポートしているか（Fable 5 / Opus 4.7+ のみ）。 */
+function modelSupportsXhigh(model: string): boolean {
+  const lower = model.toLowerCase();
+  return XHIGH_SUPPORTED_MODEL_EXACT.has(lower) ||
+    XHIGH_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
 }
 
 function formatIssuePath(issuePath: PropertyKey[]): string {
@@ -178,6 +195,12 @@ export function loadConfig(
       errors.push(
         `agent.effort: model "${model}" does not support effort levels; ` +
           `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
+      );
+    }
+    if (effort === "xhigh" && modelSupportsEffort(model) && !modelSupportsXhigh(model)) {
+      errors.push(
+        `agent.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
+          `model "${model}" supports low/medium/high/max only`,
       );
     }
   }
