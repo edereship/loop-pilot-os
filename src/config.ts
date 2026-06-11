@@ -30,7 +30,7 @@ const rawSchema = z.object({
     model: z.string(),
     allowed_tools: z.string(),
     extra_args: z.array(z.string()).default([]),
-    effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).default("max"),
+    effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
   }).strict(),
   handoff: z.object({
     branch_prefix: z.string(),
@@ -115,11 +115,18 @@ export interface Config {
 }
 
 // モデル名に含まれるサブストリング（小文字）が一致した場合のみ effort 対応とみなす allowlist。
-// Claude Code docs が effort 対応を明記しているのは Fable 5, Opus 4.x, Sonnet 4.6 のみ。
+// Claude Code docs が effort 対応を明記しているのは Fable 5, Opus 4.6/4.7/4.8, Sonnet 4.6 のみ。
 // Sonnet 4.5 は非対応のため "sonnet" 全体ではなくバージョン付きサブストリングで照合する。
-// claude-3-opus-20240229 等のレガシー Opus は非対応のため "opus-4" でバージョン限定する。
+// claude-3-opus-20240229 等のレガシー Opus および claude-opus-4-20250514 等の 4.x patch ID は
+// 非対応のため "opus-4-6/4-7/4-8" の完全バージョン番号でのみ照合する（"opus-4" では漏れる）。
 // 未知・将来モデルは非サポートとして安全側に倒す（denylist では漏れが生じる）。
-const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4", "sonnet-4-6", "sonnet-4.6"];
+const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = [
+  "fable",
+  "opus-4-6", "opus-4.6",
+  "opus-4-7", "opus-4.7",
+  "opus-4-8", "opus-4.8",
+  "sonnet-4-6", "sonnet-4.6",
+];
 // ベアエイリアスはサブストリングで照合すると誤ヒットするため完全一致で扱う。
 // "sonnet" → 最新 Sonnet（4.6）, "opus" → 最新 Opus（4.x）, "best" → Fable 5 / 最新 Opus
 // "opusplan" → Opus の plan モード（effort 対応）
@@ -204,16 +211,23 @@ export function loadConfig(
   // モデルと effort の組み合わせ検証（schema parse 成功後に実施）。
   // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 がセットされている場合はカスタムモデル/ゲートウェイ
   // デプロイ向けのエスケープハッチとして allowlist チェックをスキップする。
+  const effortAlwaysEnabled = env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
+  // effort の有効値（モデル対応を考慮したデフォルト解決済み）。
+  // result.success の場合のみ上書きされるが、エラー時はこの値を使わないため初期値は不問。
+  let effectiveEffort = "max";
   if (result.success) {
-    const { model, effort, extra_args } = result.data.agent;
-    const effortAlwaysEnabled = env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
-    if (!effortAlwaysEnabled && effort !== "auto" && !modelSupportsEffort(model)) {
+    const { model, effort: rawEffort, extra_args } = result.data.agent;
+    // effort 未指定時: effort 対応モデルは "max"、非対応モデルは "auto" をデフォルトにする。
+    // これにより、effort キーを追加しなかった既存設定が非対応モデルを使っている場合でも
+    // デフォルト "max" が注入されて設定エラーになる問題を回避する。
+    effectiveEffort = rawEffort ?? ((effortAlwaysEnabled || modelSupportsEffort(model)) ? "max" : "auto");
+    if (!effortAlwaysEnabled && effectiveEffort !== "auto" && !modelSupportsEffort(model)) {
       errors.push(
         `agent.effort: model "${model}" does not support effort levels; ` +
           `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
       );
     }
-    if (!effortAlwaysEnabled && effort === "xhigh" && modelSupportsEffort(model) && !modelSupportsXhigh(model)) {
+    if (!effortAlwaysEnabled && effectiveEffort === "xhigh" && modelSupportsEffort(model) && !modelSupportsXhigh(model)) {
       errors.push(
         `agent.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
           `model "${model}" supports low/medium/high/max only`,
@@ -273,7 +287,7 @@ export function loadConfig(
       model: raw.agent.model,
       allowedTools: raw.agent.allowed_tools,
       extraArgs: raw.agent.extra_args,
-      effort: raw.agent.effort,
+      effort: effectiveEffort,
     },
     handoff: {
       branchPrefix: raw.handoff.branch_prefix,
