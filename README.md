@@ -87,7 +87,8 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `linear.project` | Project 名（プリフライトで ID 解決・検証） |
 | `linear.opt_in_label` | AI 着手を許可するオプトインラベル名 |
 | `linear.states.{todo,in_progress,in_review,done}` | 状態名 → プリフライトで stateId に解決 |
-| `agent.model` | `claude --model` に渡すモデル（例 `opus`） |
+| `agent.model` | `claude --model` に渡すモデル（出荷既定 `claude-opus-4-6[1m]`） |
+| `agent.effort` | `claude --effort` に渡す思考レベル（`low\|medium\|high\|xhigh\|max`・既定 `max`） |
 | `agent.allowed_tools` | `claude --allowedTools`（例 `Edit,Write,Read,Glob,Grep,Bash`） |
 | `agent.extra_args` | 任意の追加 claude フラグ（既定なし） |
 | `handoff.branch_prefix` | ブランチ接頭辞（例 `looppilot`） |
@@ -102,6 +103,18 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `loop.monitor_poll_seconds` | MONITOR のポーリング間隔 |
 | `loop.idle_recheck_seconds` | IDLE 時のキュー再確認間隔 |
 | `digest.recent_merged_count` | プロンプトに含める直近マージ済みセッション要約の件数 |
+
+#### model × effort 対応表
+
+| model | 使える effort |
+| -- | -- |
+| Opus 4.8 / 4.7 | low / medium / high / xhigh / max |
+| **Opus 4.6**（出荷既定 `claude-opus-4-6[1m]`） | low / medium / high / **max**（xhigh 非対応） |
+| Sonnet 4.6 | low / medium / high / max（xhigh 非対応） |
+| Haiku 4.5 / Sonnet 4.5 | **effort 非対応**（どの値もエラー） |
+
+* `xhigh` は Opus 4.7+/Fable 5 専用。`max` は Opus 4.6 以降・Sonnet 4.6 で可。
+* 不正な model×effort 組合せは起動前の設定検証（`loadConfig`）で fatal エラーとして報告される（セッションは開始しない）。
 
 状態 DB（`looppilot-os.db`）は `looppilot-os.toml` と同じディレクトリに作られます。
 

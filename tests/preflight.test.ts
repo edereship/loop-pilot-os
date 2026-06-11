@@ -21,7 +21,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       optInLabel: "ai-ok",
       states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" },
     },
-    agent: { model: "opus", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [] },
+    agent: { model: "opus", effort: "max", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [] },
     handoff: { branchPrefix: "looppilot", prBodyTemplate: "Implements {identifier}" },
     looppilot: { gateLabel: "loop-pilot", stateCommentAuthors: ["github-actions[bot]"] },
     safety: {

@@ -28,19 +28,36 @@ const SENSITIVE_ENV_KEYS = [
   "GITHUB_ENTERPRISE_TOKEN",
 ];
 
-/** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。 */
-function agentChildEnv(): Record<string, string> {
+/** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。
+ * effortEnvOverride が指定されたとき、親プロセスの CLAUDE_CODE_EFFORT_LEVEL を除いて
+ * effortEnvOverride の値を設定する。Claude Code は settings.json の env セクション経由でも
+ * CLAUDE_CODE_EFFORT_LEVEL を注入し得るが、子プロセス起動時点で明示的に設定することで
+ * settings 由来の値より env が優先され TOML の agent.effort が無視されるのを防ぐ。
+ * "auto" を渡すと Claude がモデルデフォルトにリセットする（configured level を上書き）。
+ * undefined のときは CLAUDE_CODE_EFFORT_LEVEL を除去せず親プロセス env をそのまま引き継ぐ。*/
+function agentChildEnv(effortEnvOverride: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
     if (SENSITIVE_ENV_KEYS.includes(key)) continue;
+    if (effortEnvOverride !== undefined && key === "CLAUDE_CODE_EFFORT_LEVEL") continue;
     out[key] = value;
+  }
+  if (effortEnvOverride !== undefined) {
+    out["CLAUDE_CODE_EFFORT_LEVEL"] = effortEnvOverride;
   }
   return out;
 }
 
 interface AgentRunnerOptions {
   model: string;
+  /** undefined → omit --effort flag */
+  effort: string | undefined;
+  /** Value to inject as CLAUDE_CODE_EFFORT_LEVEL in the child env, overriding both the parent env
+   *  and any value Claude Code's settings.json would inject via its env section.
+   *  Pass "auto" to reset to the model default, overriding any configured effort level.
+   *  Omit (undefined) to leave CLAUDE_CODE_EFFORT_LEVEL unmodified (inherit from parent env). */
+  effortEnvOverride?: string;
   allowedTools: string;
   extraArgs: string[];
   log: (line: string) => void;
@@ -94,6 +111,7 @@ export class ClaudeAgentRunner implements AgentRunner {
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
+    // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
     const args: string[] = [
       "-p",
       ctx.prompt,
@@ -108,6 +126,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       this.opts.allowedTools,
       "--model",
       this.opts.model,
+      ...(this.opts.effort !== undefined ? ["--effort", this.opts.effort] : []),
       ...this.opts.extraArgs,
     ];
 
@@ -153,7 +172,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     // env: 機密キーを除いた親環境を明示的に渡す（claude へのシークレット継承を断つ）。
     const opts: RunOptions = {
       cwd: ctx.worktreePath,
-      env: agentChildEnv(),
+      env: agentChildEnv(this.opts.effortEnvOverride),
       onStdoutLine,
       ...(ctx.hardTimeoutMs !== undefined ? { timeoutMs: ctx.hardTimeoutMs } : {}),
     };

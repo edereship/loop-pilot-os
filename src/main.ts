@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import process from "node:process";
 
 import type { TicketState } from "./types.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar } from "./config.js";
 import { SqliteStore } from "./store.js";
 import { RealCommandRunner } from "./exec.js";
 import { ConsoleSlackNotifier } from "./notifier.js";
@@ -117,8 +117,22 @@ async function runLoop(configPath: string): Promise<number> {
       optInLabel: config.linear.optInLabel,
       fetchFn: globalThis.fetch,
     });
+    // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 はカスタムモデル/ゲートウェイ向けのエスケープハッチ。
+    // *_SUPPORTED_CAPABILITIES env var も同様のオーバーライドとして扱う（loadConfig と一致）。
+    // これらが未設定の場合は通常の allowlist 照合で effort 対応の有無を判定する。
+    const effortAlwaysEnabled = process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
+    const effortSupported = effortAlwaysEnabled ||
+      modelHasEffortCapabilityEnvVar(config.agent.model, process.env) ||
+      modelSupportsEffort(config.agent.model);
+    const effort = config.agent.effort;
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,
+      // omit --effort flag for "auto" or models that do not support effort
+      effort: effortSupported && effort !== "auto" ? effort : undefined,
+      // override CLAUDE_CODE_EFFORT_LEVEL for supported models (so inherited env cannot
+      // silently override the TOML value) and also for effort="auto" on any model (so an
+      // inherited CLAUDE_CODE_EFFORT_LEVEL=max in the shell cannot leak into the child)
+      effortEnvOverride: effortSupported || effort === "auto" ? effort : undefined,
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,
