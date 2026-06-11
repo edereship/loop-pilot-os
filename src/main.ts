@@ -81,6 +81,7 @@ async function runLoop(configPath: string): Promise<number> {
       runner,
       notifier,
       fetchFn: globalThis.fetch,
+      getuid: process.getuid?.bind(process),
     });
     if (preflightErrors.length > 0) {
       process.stderr.write("Preflight failed:\n");
@@ -133,6 +134,7 @@ async function runLoop(configPath: string): Promise<number> {
       // silently override the TOML value) and also for effort="auto" on any model (so an
       // inherited CLAUDE_CODE_EFFORT_LEVEL=max in the shell cannot leak into the child)
       effortEnvOverride: effortSupported || effort === "auto" ? effort : undefined,
+      permissionMode: config.agent.permissionMode,
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,

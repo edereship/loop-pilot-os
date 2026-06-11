@@ -8,6 +8,8 @@ export interface PreflightDeps {
   runner: CommandRunner;
   notifier: Notifier;
   fetchFn: FetchFn;
+  /** process.getuid の注入口。未提供（Windows/非 POSIX）時は root チェックをスキップする。 */
+  getuid?: () => number;
 }
 
 // gh api は HTTP エラー時 code != 0 で終了し、stderr に "(HTTP 404)" 等を含む。
@@ -46,6 +48,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<string[]> {
   await checkLinear(deps, errors);                                     // §9.7（Step 15 で追加）
   await checkClaude(runner, opts, errors);                             // §9.8（Step 17 で追加）
   await checkSlack(deps, errors);                                      // §9.10（Step 17 で追加）
+  checkNonRoot(deps, errors);                                          // ES-385: bypassPermissions + root 拒否
 
   return errors;
 }
@@ -405,6 +408,19 @@ async function checkClaude(
     }
   } catch (e) {
     errors.push(`claude: バージョン確認に失敗しました（${(e as Error).message}）`);
+  }
+}
+
+// ---- ES-385: bypassPermissions 時の非 root チェック ----
+function checkNonRoot(deps: PreflightDeps, errors: string[]): void {
+  if (deps.config.agent.permissionMode !== "bypassPermissions") return;
+  const uid = deps.getuid?.();
+  if (uid === undefined) return;
+  if (uid === 0) {
+    errors.push(
+      "security: bypassPermissions モードでの root 実行は禁止されています。" +
+        "非 root ユーザーでコンテナ/VM を実行してください",
+    );
   }
 }
 
