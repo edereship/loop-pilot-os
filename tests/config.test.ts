@@ -167,4 +167,11 @@ describe("loadConfig", () => {
       loadConfig(fixture("config-effort-unsupported.toml"), fullEnv),
     ).toThrow(/agent\.effort/);
   });
+
+  // Finding 2: Sonnet 4.5 は effort 非対応（4.6 以降のみ対応）。
+  it("throws when Sonnet 4.5 is paired with a non-auto effort value", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-sonnet45-unsupported.toml"), fullEnv),
+    ).toThrow(/agent\.effort/);
+  });
 });

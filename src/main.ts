@@ -123,6 +123,9 @@ async function runLoop(configPath: string): Promise<number> {
       model: config.agent.model,
       // omit --effort flag for "auto" or models that do not support effort
       effort: effortSupported && effort !== "auto" ? effort : undefined,
+      // for supported models, always override CLAUDE_CODE_EFFORT_LEVEL in the child env
+      // so an inherited env var cannot silently override the TOML-configured effort level
+      effortEnvOverride: effortSupported ? effort : undefined,
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,
