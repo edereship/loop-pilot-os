@@ -43,6 +43,7 @@ describe("loadConfig", () => {
     expect(config.agent.model).toBe("opus");
     expect(config.agent.allowedTools).toBe("Edit,Write,Read,Glob,Grep,Bash");
     expect(config.agent.extraArgs).toEqual(["--verbose"]);
+    expect(config.agent.effort).toBe("high");
 
     expect(config.handoff.branchPrefix).toBe("looppilot");
     expect(config.handoff.prBodyTemplate).toContain("{identifier}");
@@ -88,6 +89,7 @@ describe("loadConfig", () => {
     const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
     expect(config.repo.defaultBranch).toBe("main");
     expect(config.agent.extraArgs).toEqual([]);
+    expect(config.agent.effort).toBe("max");
     expect(config.safety.monitorTimeoutMinutes).toBeUndefined();
     expect(config.safety.notEngagedGuardMinutes).toBe(30);
     expect(config.safety.sessionHardTimeoutMinutes).toBe(120); // 省略時の既定

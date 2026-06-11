@@ -21,6 +21,7 @@ done = "Done"
 model = "opus"
 allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"
 extra_args = ["--verbose"]
+effort = "high"
 
 [handoff]
 branch_prefix = "looppilot"

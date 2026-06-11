@@ -30,6 +30,7 @@ const rawSchema = z.object({
     model: z.string(),
     allowed_tools: z.string(),
     extra_args: z.array(z.string()).default([]),
+    effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("max"),
   }).strict(),
   handoff: z.object({
     branch_prefix: z.string(),
@@ -84,6 +85,7 @@ export interface Config {
     model: string;
     allowedTools: string;
     extraArgs: string[];
+    effort: string;
   };
   handoff: {
     branchPrefix: string;
@@ -199,6 +201,7 @@ export function loadConfig(
       model: raw.agent.model,
       allowedTools: raw.agent.allowed_tools,
       extraArgs: raw.agent.extra_args,
+      effort: raw.agent.effort,
     },
     handoff: {
       branchPrefix: raw.handoff.branch_prefix,
