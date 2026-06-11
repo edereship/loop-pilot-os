@@ -31,6 +31,9 @@ const rawSchema = z.object({
     allowed_tools: z.string(),
     extra_args: z.array(z.string()).default([]),
     effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+    permission_mode: z.enum([
+      "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions",
+    ]).default("acceptEdits"),
   }).strict(),
   handoff: z.object({
     branch_prefix: z.string(),
@@ -88,6 +91,7 @@ export interface Config {
     allowedTools: string;
     extraArgs: string[];
     effort: string;
+    permissionMode: string;
   };
   handoff: {
     branchPrefix: string;
@@ -553,6 +557,7 @@ export function loadConfig(
       allowedTools: raw.agent.allowed_tools,
       extraArgs: raw.agent.extra_args,
       effort: effectiveEffort,
+      permissionMode: raw.agent.permission_mode,
     },
     handoff: {
       branchPrefix: raw.handoff.branch_prefix,

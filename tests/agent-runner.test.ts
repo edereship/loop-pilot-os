@@ -40,11 +40,12 @@ function runnerEmitting(
   return { runner, emittedCwd: () => seenCwd };
 }
 
-function makeRunner(runner: FakeCommandRunner, logs: string[]): ClaudeAgentRunner {
+function makeRunner(runner: FakeCommandRunner, logs: string[], overrides?: Partial<{ permissionMode: string }>): ClaudeAgentRunner {
   return new ClaudeAgentRunner(runner, {
     model: "opus",
     effort: "max",
     effortEnvOverride: "max",
+    permissionMode: overrides?.permissionMode ?? "acceptEdits",
     allowedTools: "Edit,Write,Read,Glob,Grep,Bash",
     extraArgs: [],
     log: (line: string) => logs.push(line),
@@ -158,6 +159,7 @@ describe("ClaudeAgentRunner.runSession", () => {
     const agent = new ClaudeAgentRunner(runner, {
       model: "haiku",
       effort: undefined,
+      permissionMode: "acceptEdits",
       allowedTools: "Edit",
       extraArgs: [],
       log: () => {},
@@ -188,6 +190,7 @@ describe("ClaudeAgentRunner.runSession", () => {
       const agent = new ClaudeAgentRunner(runner, {
         model: "haiku",
         effort: undefined,
+        permissionMode: "acceptEdits",
         allowedTools: "Edit",
         extraArgs: [],
         log: () => {},
@@ -209,6 +212,7 @@ describe("ClaudeAgentRunner.runSession", () => {
         model: "opus",
         effort: undefined,
         effortEnvOverride: "auto",
+        permissionMode: "acceptEdits",
         allowedTools: "Edit",
         extraArgs: [],
         log: () => {},
@@ -222,11 +226,22 @@ describe("ClaudeAgentRunner.runSession", () => {
     }
   });
 
+  it("ES-385: permissionMode を --permission-mode 引数に反映する（bypassPermissions）", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+    const logs: string[] = [];
+    await makeRunner(runner, logs, { permissionMode: "bypassPermissions" }).runSession(ctx);
+    const args = runner.calls[0]!.args;
+    const i = args.indexOf("--permission-mode");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe("bypassPermissions");
+  });
+
   it("extra_args をモデル指定の後ろへ連結する", async () => {
     const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
     const agent = new ClaudeAgentRunner(runner, {
       model: "opus",
       effort: "max",
+      permissionMode: "acceptEdits",
       allowedTools: "Edit",
       extraArgs: ["--add-dir", "/extra"],
       log: () => {},

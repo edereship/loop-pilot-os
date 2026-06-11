@@ -90,6 +90,7 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `agent.model` | `claude --model` に渡すモデル（出荷既定 `claude-opus-4-6[1m]`） |
 | `agent.effort` | `claude --effort` に渡す思考レベル（`low\|medium\|high\|xhigh\|max`・既定 `max`） |
 | `agent.allowed_tools` | `claude --allowedTools`（例 `Edit,Write,Read,Glob,Grep,Bash`） |
+| `agent.permission_mode` | `claude --permission-mode` に渡す権限モード（既定 `acceptEdits`）。隔離コンテナでは `bypassPermissions` を選択（下記セキュリティモデル参照） |
 | `agent.extra_args` | 任意の追加 claude フラグ（既定なし） |
 | `handoff.branch_prefix` | ブランチ接頭辞（例 `looppilot`） |
 | `handoff.pr_body_template` | PR 本文テンプレ。`{identifier}` `{title}` `{issue_url}` を置換 |
@@ -302,6 +303,37 @@ npm run typecheck    # src の型チェックのみ
 ```
 
 CI（`.github/workflows/ci.yml`）は push(main)/PR で `npm ci && npm run check` を回します。
+
+## セキュリティモデル（`bypassPermissions` 使用時）
+
+`agent.permission_mode = "bypassPermissions"` は Claude Code の全権限チェックを迂回し、agent がツール呼出でブロックされなくなります。**使い捨て隔離コンテナ/VM でのみ使用してください。** 以下の補償条件がすべて必要です。
+
+### 1. 資格情報分離（不変条件: agent は push/merge できない）
+
+- **env スクラブ**: agent 子プロセスには `GH_TOKEN` / `GITHUB_TOKEN` / `LINEAR_API_KEY` / `SLACK_WEBHOOK_URL` 等の機密 env を渡しません（`agent-runner.ts` で除去済み）。
+- **ambient 認証の隔離**: `gh auth login`（`~/.config/gh/hosts.yml`）が agent から読める場合、env 除外だけでは Bash 経由の `gh pr merge` / `git push` を防げません。以下のいずれかで対処してください:
+  - agent を別ユーザー/別 HOME で実行（`useradd agent-user && su - agent-user`）
+  - コンテナに `gh` をインストールしない（agent の作業に gh CLI は不要 — push/PR はオーケ側 `GitPrManager` が行う）
+  - `GH_CONFIG_DIR` を空ディレクトリに向ける
+
+### 2. Egress 制限
+
+コンテナ/サンドボックスで以下のみ許可し、資格情報の外部 exfiltrate を遮断してください:
+
+- LLM エンドポイント（`api.anthropic.com` 等）
+- パッケージレジストリ（`registry.npmjs.org` 等 — 必要な場合）
+- GitHub API（オーケストレーター用 — agent からは不要）
+
+**実装方法**: コンテナ FW（iptables/nftables）が確実です。Claude Code の `network_allowlist`（sandbox 設定）は Claude 自身のネットワークのみを制限し、Bash からの `curl` は制限外です。
+
+### 3. 非 root 実行
+
+`bypassPermissions` モードでは root（UID 0）での実行をプリフライトで拒否します。コンテナを非 root ユーザーで起動してください。
+
+```dockerfile
+RUN useradd -m agent
+USER agent
+```
 
 ## 設計ドキュメント
 

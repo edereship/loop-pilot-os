@@ -534,6 +534,25 @@ describe("loadConfig", () => {
     expect(config.agent.effort).toBe("auto");
   });
 
+  // ES-385: agent.permission_mode — 省略時は既定 "acceptEdits"
+  it("defaults agent.permissionMode to 'acceptEdits' when permission_mode is omitted", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.agent.permissionMode).toBe("acceptEdits");
+  });
+
+  // ES-385: agent.permission_mode = "bypassPermissions" を明示的に設定
+  it("reads agent.permissionMode when explicitly set to 'bypassPermissions'", () => {
+    const config = loadConfig(fixture("config-permission-bypass.toml"), fullEnv);
+    expect(config.agent.permissionMode).toBe("bypassPermissions");
+  });
+
+  // ES-385: 不正な permission_mode はエラー
+  it("throws on an invalid permission_mode value", () => {
+    expect(() =>
+      loadConfig(fixture("config-permission-invalid.toml"), fullEnv),
+    ).toThrow(/agent\.permission_mode/);
+  });
+
   // notify.progress: 既定 false（未設定 or empty [notify]）
   it("defaults notify.progress to false when [notify] section is empty", () => {
     const config = loadConfig(fixture("config-valid.toml"), fullEnv);

@@ -58,6 +58,9 @@ interface AgentRunnerOptions {
    *  Pass "auto" to reset to the model default, overriding any configured effort level.
    *  Omit (undefined) to leave CLAUDE_CODE_EFFORT_LEVEL unmodified (inherit from parent env). */
   effortEnvOverride?: string;
+  /** Claude Code の --permission-mode に渡す権限モード。
+   *  隔離コンテナでは "bypassPermissions" を選択する。既定は "acceptEdits"。 */
+  permissionMode: string;
   allowedTools: string;
   extraArgs: string[];
   log: (line: string) => void;
@@ -121,7 +124,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       "--max-budget-usd",
       ctx.maxCostUsd.toFixed(2),
       "--permission-mode",
-      "acceptEdits",
+      this.opts.permissionMode,
       "--allowedTools",
       this.opts.allowedTools,
       "--model",
