@@ -223,6 +223,13 @@ describe("loadConfig", () => {
     ).toThrow(/agent\.extra_args/);
   });
 
+  // Finding 3 (equals syntax): extra_args に --effort=low のようなイコール構文も拒否する。
+  it("throws when extra_args contains --effort=<level> (equals syntax conflicts with agent.effort env override)", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-extra-args-conflict-equals.toml"), fullEnv),
+    ).toThrow(/agent\.extra_args/);
+  });
+
   // Finding 4: ANTHROPIC_CUSTOM_MODEL_OPTION + _SUPPORTED_CAPABILITIES でカスタムモデルの
   // allowlist チェックをスキップする（Claude Code 公式 capability オーバーライド機構）。
   it("skips allowlist check when ANTHROPIC_CUSTOM_MODEL_OPTION matches and capabilities include effort", () => {
@@ -469,6 +476,60 @@ describe("loadConfig", () => {
     const config = loadConfig(fixture("config-effort-opusplan-no-effort.toml"), {
       ...fullEnv,
       CLAUDE_CODE_USE_BEDROCK: "1",
+    });
+    expect(config.agent.effort).toBe("auto");
+  });
+
+  // Finding 2 (opusplan phase-model): Bedrock/Vertex/Foundry で ANTHROPIC_DEFAULT_OPUS_MODEL と
+  // ANTHROPIC_DEFAULT_SONNET_MODEL の両方が "effort" を宣言している場合、opusplan の non-auto effort を許可する。
+  it("does not throw for 'opusplan' + explicit effort on third-party when both phase-model pins declare effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opusplan.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "bedrock-opus-model",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: "effort,max_effort",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "bedrock-sonnet-model",
+        ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: "effort,max_effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 2 (opusplan phase-model): 片方の phase-model しか effort を宣言していない場合は拒否する。
+  it("throws for 'opusplan' + explicit effort on third-party when only one phase-model pin declares effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opusplan.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "bedrock-opus-model",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: "effort,max_effort",
+        // SONNET is missing
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 2 (opusplan phase-model): effort 未指定のとき、両 phase-model が max_effort を宣言していれば "max" をデフォルトにする。
+  it("defaults effort to 'max' for 'opusplan' on third-party when both phase-model pins declare max_effort", () => {
+    const config = loadConfig(fixture("config-effort-opusplan-no-effort.toml"), {
+      ...fullEnv,
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "bedrock-opus-model",
+      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: "effort,max_effort",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "bedrock-sonnet-model",
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: "effort,max_effort",
+    });
+    expect(config.agent.effort).toBe("max");
+  });
+
+  // Finding 2 (opusplan phase-model): 両 phase-model が "effort" のみ宣言（max_effort なし）のとき effort 未指定なら "auto"。
+  it("defaults effort to 'auto' for 'opusplan' on third-party when phase-model pins declare only 'effort' (no max_effort)", () => {
+    const config = loadConfig(fixture("config-effort-opusplan-no-effort.toml"), {
+      ...fullEnv,
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "bedrock-opus-model",
+      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: "effort",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "bedrock-sonnet-model",
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: "effort",
     });
     expect(config.agent.effort).toBe("auto");
   });

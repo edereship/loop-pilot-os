@@ -211,6 +211,15 @@ export function modelHasEffortCapabilityEnvVar(model: string, env: NodeJS.Proces
     }
   }
 
+  // 4. For "opusplan": both the Opus and Sonnet phase-model pins must declare the capability,
+  //    since opusplan runs plan phase on Opus and execution phase on Sonnet.
+  if (normalizedModel === "opusplan") {
+    if (hasEffort(env["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"]) &&
+        hasEffort(env["ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES"])) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -245,6 +254,14 @@ export function modelHasMaxEffortCapabilityEnvVar(model: string, env: NodeJS.Pro
     }
   }
 
+  // 4. For "opusplan": both the Opus and Sonnet phase-model pins must declare max_effort.
+  if (normalizedModel === "opusplan") {
+    if (hasMaxEffort(env["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"]) &&
+        hasMaxEffort(env["ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES"])) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -275,6 +292,14 @@ export function modelHasXhighEffortCapabilityEnvVar(model: string, env: NodeJS.P
           hasXhighEffort(env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`])) {
         return true;
       }
+    }
+  }
+
+  // 4. For "opusplan": both the Opus and Sonnet phase-model pins must declare xhigh_effort.
+  if (normalizedModel === "opusplan") {
+    if (hasXhighEffort(env["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"]) &&
+        hasXhighEffort(env["ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES"])) {
+      return true;
     }
   }
 
@@ -471,7 +496,7 @@ export function loadConfig(
     // CLAUDE_CODE_EFFORT_LEVEL env override（effortEnvOverride 経由で子プロセスに注入）は
     // --effort フラグより優先されるため、extra_args に --effort を含めると agent.effort の
     // 設定が無視されてしまう。effort の調整は agent.effort キーで一元管理すること。
-    if (extra_args.includes("--effort")) {
+    if (extra_args.some((arg) => arg === "--effort" || arg.startsWith("--effort="))) {
       errors.push(
         `agent.extra_args: "--effort" must not be set via extra_args; ` +
           `use agent.effort instead (the CLAUDE_CODE_EFFORT_LEVEL env override injected at launch ` +
