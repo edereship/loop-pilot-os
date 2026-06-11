@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import process from "node:process";
 
 import type { TicketState } from "./types.js";
-import { loadConfig, modelSupportsEffort } from "./config.js";
+import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar } from "./config.js";
 import { SqliteStore } from "./store.js";
 import { RealCommandRunner } from "./exec.js";
 import { ConsoleSlackNotifier } from "./notifier.js";
@@ -118,10 +118,12 @@ async function runLoop(configPath: string): Promise<number> {
       fetchFn: globalThis.fetch,
     });
     // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 はカスタムモデル/ゲートウェイ向けのエスケープハッチ。
-    // loadConfig がこの env を尊重して allowlist チェックをスキップするのと同様に、ここでも
-    // effort フラグ・環境変数の注入を有効にする（env が未設定の場合は通常の allowlist 照合）。
+    // *_SUPPORTED_CAPABILITIES env var も同様のオーバーライドとして扱う（loadConfig と一致）。
+    // これらが未設定の場合は通常の allowlist 照合で effort 対応の有無を判定する。
     const effortAlwaysEnabled = process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
-    const effortSupported = effortAlwaysEnabled || modelSupportsEffort(config.agent.model);
+    const effortSupported = effortAlwaysEnabled ||
+      modelHasEffortCapabilityEnvVar(config.agent.model, process.env) ||
+      modelSupportsEffort(config.agent.model);
     const effort = config.agent.effort;
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,

@@ -135,6 +135,10 @@ const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = [
 // 解決される場合がある（4.5 は effort 非対応）。そのようなデプロイでは effort = "auto" を
 // 明示するか、バージョン付きモデル名（例: claude-sonnet-4-6）を使用すること。
 const EFFORT_SUPPORTED_MODEL_EXACT = new Set(["sonnet", "opus", "best", "opusplan"]);
+// effort キーが未設定のときにデフォルト "max" を採用する（安全な）ベアエイリアスのセット。
+// "sonnet" はサードパーティプロバイダで Sonnet 4.5 に解決される可能性があるため除外する。
+// 未指定の既存設定を壊さないよう、"sonnet" は明示的に effort を指定した場合のみ許可する。
+const EFFORT_SAFE_DEFAULT_MODEL_EXACT = new Set(["opus", "best", "opusplan"]);
 
 // "[1m]" サフィックスはコンテキストウィンドウ指定であり effort 対応可否に影響しない。
 // 照合前に除去することで "opus[1m]" → "opus" のような 1M バリアントを透過的に扱う。
@@ -147,6 +151,31 @@ export function modelSupportsEffort(model: string): boolean {
   const lower = normalizeModelForCapabilityCheck(model);
   return EFFORT_SUPPORTED_MODEL_EXACT.has(lower) ||
     EFFORT_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
+}
+
+/**
+ * effort キー未指定時に "max" をデフォルトとして安全に採用できるモデルか。
+ * "sonnet" ベアエイリアスは除外する（Bedrock/Vertex/Foundry では Sonnet 4.5 に解決され得るため）。
+ * バージョン付き ID（"claude-sonnet-4-6" 等）は EFFORT_SUPPORTED_MODEL_SUBSTRINGS で対象になる。
+ */
+function modelDefaultsToMaxEffort(model: string): boolean {
+  const lower = normalizeModelForCapabilityCheck(model);
+  return EFFORT_SAFE_DEFAULT_MODEL_EXACT.has(lower) ||
+    EFFORT_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
+}
+
+/**
+ * モデル名から導出した *_SUPPORTED_CAPABILITIES 環境変数に "effort" が含まれるか確認する。
+ * これは Claude Code が定義する、プロバイダ固有モデル ID（Bedrock / Vertex / Foundry 等）に
+ * effort 対応を宣言するための公式メカニズム。
+ * 例: model "anthropic.claude-sonnet-4-6-20250514-v1:0" →
+ *     env var "ANTHROPIC_CLAUDE_SONNET_4_6_20250514_V1_0_SUPPORTED_CAPABILITIES=effort"
+ */
+export function modelHasEffortCapabilityEnvVar(model: string, env: NodeJS.ProcessEnv): boolean {
+  const prefix = model.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const capVar = env[`${prefix}_SUPPORTED_CAPABILITIES`];
+  if (!capVar) return false;
+  return capVar.split(",").map((s) => s.trim()).includes("effort");
 }
 
 // xhigh をサポートするのは Fable 5 と Opus 4.7+（README §model×effort 対応表）。
@@ -211,23 +240,29 @@ export function loadConfig(
   // モデルと effort の組み合わせ検証（schema parse 成功後に実施）。
   // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 がセットされている場合はカスタムモデル/ゲートウェイ
   // デプロイ向けのエスケープハッチとして allowlist チェックをスキップする。
+  // プロバイダ固有モデル ID に対する *_SUPPORTED_CAPABILITIES env var も同様にスキップを
+  // トリガーする（Claude Code 公式の capability オーバーライド機構）。
   const effortAlwaysEnabled = env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
   // effort の有効値（モデル対応を考慮したデフォルト解決済み）。
   // result.success の場合のみ上書きされるが、エラー時はこの値を使わないため初期値は不問。
   let effectiveEffort = "max";
   if (result.success) {
     const { model, effort: rawEffort, extra_args } = result.data.agent;
-    // effort 未指定時: effort 対応モデルは "max"、非対応モデルは "auto" をデフォルトにする。
-    // これにより、effort キーを追加しなかった既存設定が非対応モデルを使っている場合でも
-    // デフォルト "max" が注入されて設定エラーになる問題を回避する。
-    effectiveEffort = rawEffort ?? ((effortAlwaysEnabled || modelSupportsEffort(model)) ? "max" : "auto");
-    if (!effortAlwaysEnabled && effectiveEffort !== "auto" && !modelSupportsEffort(model)) {
+    // capability env var または CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 がある場合は
+    // allowlist チェックを全スキップする。
+    const skipEffortChecks = effortAlwaysEnabled || modelHasEffortCapabilityEnvVar(model, env);
+    // effort 未指定時のデフォルト:
+    // - skipEffortChecks が true: "max"（ユーザーが明示的に対応を宣言）
+    // - modelDefaultsToMaxEffort が true: "max"（バージョン確定済み・全プロバイダ対応）
+    // - それ以外: "auto"（"sonnet" 等の曖昧なエイリアス、Bedrock/Vertex での安全側）
+    effectiveEffort = rawEffort ?? ((skipEffortChecks || modelDefaultsToMaxEffort(model)) ? "max" : "auto");
+    if (!skipEffortChecks && effectiveEffort !== "auto" && !modelSupportsEffort(model)) {
       errors.push(
         `agent.effort: model "${model}" does not support effort levels; ` +
           `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
       );
     }
-    if (!effortAlwaysEnabled && effectiveEffort === "xhigh" && modelSupportsEffort(model) && !modelSupportsXhigh(model)) {
+    if (!skipEffortChecks && effectiveEffort === "xhigh" && modelSupportsEffort(model) && !modelSupportsXhigh(model)) {
       errors.push(
         `agent.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
           `model "${model}" supports low/medium/high/max only`,
