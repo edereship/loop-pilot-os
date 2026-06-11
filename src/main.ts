@@ -123,9 +123,6 @@ async function runLoop(configPath: string): Promise<number> {
       model: config.agent.model,
       // omit --effort flag for "auto" or models that do not support effort
       effort: effortSupported && effort !== "auto" ? effort : undefined,
-      // always inject CLAUDE_CODE_EFFORT_LEVEL for effort-supporting models so that
-      // Claude Code's settings.json env cannot override the TOML value (Finding 1/3)
-      effortEnvOverride: effortSupported ? effort : "auto",
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,

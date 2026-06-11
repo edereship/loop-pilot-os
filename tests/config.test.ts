@@ -89,7 +89,7 @@ describe("loadConfig", () => {
     const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
     expect(config.repo.defaultBranch).toBe("main");
     expect(config.agent.extraArgs).toEqual([]);
-    expect(config.agent.effort).toBe("max");
+    expect(config.agent.effort).toBe("auto");
     expect(config.safety.monitorTimeoutMinutes).toBeUndefined();
     expect(config.safety.notEngagedGuardMinutes).toBe(30);
     expect(config.safety.sessionHardTimeoutMinutes).toBe(120); // 省略時の既定

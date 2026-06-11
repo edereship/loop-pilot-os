@@ -30,7 +30,7 @@ const rawSchema = z.object({
     model: z.string(),
     allowed_tools: z.string(),
     extra_args: z.array(z.string()).default([]),
-    effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).default("max"),
+    effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).default("auto"),
   }).strict(),
   handoff: z.object({
     branch_prefix: z.string(),
@@ -117,7 +117,7 @@ export interface Config {
 // モデル名に含まれるサブストリング（小文字）が一致した場合のみ effort 対応とみなす allowlist。
 // Claude Code docs が effort 対応を明記しているのは Fable 5, Opus 4.x, Sonnet 4.6 のみ。
 // 未知・将来モデルは非サポートとして安全側に倒す（denylist では漏れが生じる）。
-const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus", "sonnet-4-6"];
+const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus", "sonnet"];
 
 /** モデルが effort フラグをサポートしているか（allowlist に合致する場合のみ対応とみなす）。 */
 export function modelSupportsEffort(model: string): boolean {
