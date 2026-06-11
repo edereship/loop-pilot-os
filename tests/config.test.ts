@@ -222,4 +222,50 @@ describe("loadConfig", () => {
       loadConfig(fixture("config-effort-extra-args-conflict.toml"), fullEnv),
     ).toThrow(/agent\.extra_args/);
   });
+
+  // Finding 4: ANTHROPIC_CUSTOM_MODEL_OPTION + _SUPPORTED_CAPABILITIES でカスタムモデルの
+  // allowlist チェックをスキップする（Claude Code 公式 capability オーバーライド機構）。
+  it("skips allowlist check when ANTHROPIC_CUSTOM_MODEL_OPTION matches and capabilities include effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-unsupported.toml"), {
+        ...fullEnv,
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-haiku-4-5-20251001",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 4: ANTHROPIC_CUSTOM_MODEL_OPTION が model と一致しない場合はスキップしない。
+  it("does not skip allowlist check when ANTHROPIC_CUSTOM_MODEL_OPTION does not match the config model", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-unsupported.toml"), {
+        ...fullEnv,
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "some-other-model",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 4: ANTHROPIC_DEFAULT_{X}_MODEL + _SUPPORTED_CAPABILITIES でピン留めデフォルトモデルの
+  // allowlist チェックをスキップする（Claude Code 公式 capability オーバーライド機構）。
+  it("skips allowlist check when ANTHROPIC_DEFAULT_{X}_MODEL matches and capabilities include effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-unsupported.toml"), {
+        ...fullEnv,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5-20251001",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 4: ANTHROPIC_DEFAULT_{X}_MODEL が model と一致しない場合はスキップしない。
+  it("does not skip allowlist check when ANTHROPIC_DEFAULT_{X}_MODEL does not match the config model", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-unsupported.toml"), {
+        ...fullEnv,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "some-other-model",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
 });

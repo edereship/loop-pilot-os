@@ -165,17 +165,45 @@ function modelDefaultsToMaxEffort(model: string): boolean {
 }
 
 /**
- * モデル名から導出した *_SUPPORTED_CAPABILITIES 環境変数に "effort" が含まれるか確認する。
- * これは Claude Code が定義する、プロバイダ固有モデル ID（Bedrock / Vertex / Foundry 等）に
- * effort 対応を宣言するための公式メカニズム。
- * 例: model "anthropic.claude-sonnet-4-6-20250514-v1:0" →
- *     env var "ANTHROPIC_CLAUDE_SONNET_4_6_20250514_V1_0_SUPPORTED_CAPABILITIES=effort"
+ * Claude Code が定義する *_SUPPORTED_CAPABILITIES 環境変数に "effort" が含まれるか確認する。
+ * 以下の 3 つのパターンを順に照合する。
+ *
+ * 1. モデル ID 由来変数（既存）:
+ *    例: model "anthropic.claude-sonnet-4-6-20250514-v1:0" →
+ *        ANTHROPIC_CLAUDE_SONNET_4_6_20250514_V1_0_SUPPORTED_CAPABILITIES=effort
+ *
+ * 2. カスタムモデルオプション（ANTHROPIC_CUSTOM_MODEL_OPTION が model と一致する場合）:
+ *    ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES=effort
+ *
+ * 3. デフォルトモデルエイリアスのピン留め（ANTHROPIC_DEFAULT_{X}_MODEL が model と一致する場合）:
+ *    例: ANTHROPIC_DEFAULT_OPUS_MODEL=my-gateway-model かつ
+ *        ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=effort
  */
 export function modelHasEffortCapabilityEnvVar(model: string, env: NodeJS.ProcessEnv): boolean {
+  function hasEffort(capVar: string | undefined): boolean {
+    return capVar !== undefined && capVar.split(",").map((s) => s.trim()).includes("effort");
+  }
+
+  // 1. Direct model-ID-derived variable.
   const prefix = model.toUpperCase().replace(/[^A-Z0-9]/g, "_");
-  const capVar = env[`${prefix}_SUPPORTED_CAPABILITIES`];
-  if (!capVar) return false;
-  return capVar.split(",").map((s) => s.trim()).includes("effort");
+  if (hasEffort(env[`${prefix}_SUPPORTED_CAPABILITIES`])) return true;
+
+  // 2. ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES when the custom model option matches.
+  if (env["ANTHROPIC_CUSTOM_MODEL_OPTION"] === model &&
+      hasEffort(env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"])) {
+    return true;
+  }
+
+  // 3. ANTHROPIC_DEFAULT_{X}_MODEL_SUPPORTED_CAPABILITIES for any pinned default model alias.
+  for (const [key, value] of Object.entries(env)) {
+    const match = /^ANTHROPIC_DEFAULT_(.+)_MODEL$/.exec(key);
+    if (match && value === model &&
+        hasEffort(env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`])) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // xhigh をサポートするのは Fable 5 と Opus 4.7+（README §model×effort 対応表）。
