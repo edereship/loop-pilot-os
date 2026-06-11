@@ -120,6 +120,7 @@ async function runLoop(configPath: string): Promise<number> {
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,
       effort: config.agent.effort === "auto" ? undefined : config.agent.effort,
+      stripEffortEnv: config.agent.effort === "auto",
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,

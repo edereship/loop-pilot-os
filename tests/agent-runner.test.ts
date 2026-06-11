@@ -199,6 +199,28 @@ describe("ClaudeAgentRunner.runSession", () => {
     }
   });
 
+  it("effort=undefined かつ stripEffortEnv=true のとき CLAUDE_CODE_EFFORT_LEVEL を除去する（agent.effort='auto' ケース）", async () => {
+    const prev = process.env["CLAUDE_CODE_EFFORT_LEVEL"];
+    process.env["CLAUDE_CODE_EFFORT_LEVEL"] = "low";
+    try {
+      const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+      const agent = new ClaudeAgentRunner(runner, {
+        model: "haiku",
+        effort: undefined,
+        stripEffortEnv: true,
+        allowedTools: "Edit",
+        extraArgs: [],
+        log: () => {},
+      });
+      await agent.runSession(ctx);
+      expect(runner.calls[0]!.args).not.toContain("--effort");
+      expect(runner.calls[0]!.opts.env!["CLAUDE_CODE_EFFORT_LEVEL"]).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env["CLAUDE_CODE_EFFORT_LEVEL"];
+      else process.env["CLAUDE_CODE_EFFORT_LEVEL"] = prev;
+    }
+  });
+
   it("extra_args をモデル指定の後ろへ連結する", async () => {
     const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
     const agent = new ClaudeAgentRunner(runner, {

@@ -44,8 +44,10 @@ function agentChildEnv(stripEffortLevel: boolean): Record<string, string> {
 
 interface AgentRunnerOptions {
   model: string;
-  /** undefined → omit --effort flag and leave CLAUDE_CODE_EFFORT_LEVEL untouched */
+  /** undefined → omit --effort flag; if stripEffortEnv is also falsy, CLAUDE_CODE_EFFORT_LEVEL is left untouched */
   effort: string | undefined;
+  /** Strip CLAUDE_CODE_EFFORT_LEVEL from child env even when effort is undefined (e.g. agent.effort="auto") */
+  stripEffortEnv?: boolean;
   allowedTools: string;
   extraArgs: string[];
   log: (line: string) => void;
@@ -160,7 +162,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     // env: 機密キーを除いた親環境を明示的に渡す（claude へのシークレット継承を断つ）。
     const opts: RunOptions = {
       cwd: ctx.worktreePath,
-      env: agentChildEnv(this.opts.effort !== undefined),
+      env: agentChildEnv(this.opts.effort !== undefined || (this.opts.stripEffortEnv ?? false)),
       onStdoutLine,
       ...(ctx.hardTimeoutMs !== undefined ? { timeoutMs: ctx.hardTimeoutMs } : {}),
     };
