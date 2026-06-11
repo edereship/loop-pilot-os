@@ -114,14 +114,15 @@ export interface Config {
   stateDbPath: string;
 }
 
-// モデル名に含まれるサブストリング（小文字）が一致した場合 effort を非サポートと判定する。
+// モデル名に含まれるサブストリング（小文字）が一致した場合のみ effort 対応とみなす allowlist。
 // Claude Code docs が effort 対応を明記しているのは Fable 5, Opus 4.x, Sonnet 4.6 のみ。
-const EFFORT_UNSUPPORTED_MODEL_SUBSTRINGS = ["haiku", "sonnet-4-5"];
+// 未知・将来モデルは非サポートとして安全側に倒す（denylist では漏れが生じる）。
+const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus", "sonnet-4-6"];
 
-/** モデルが effort フラグをサポートしているか（denylist に合致しない場合は対応とみなす）。 */
+/** モデルが effort フラグをサポートしているか（allowlist に合致する場合のみ対応とみなす）。 */
 export function modelSupportsEffort(model: string): boolean {
   const lower = model.toLowerCase();
-  return !EFFORT_UNSUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
+  return EFFORT_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
 }
 
 function formatIssuePath(issuePath: PropertyKey[]): string {
