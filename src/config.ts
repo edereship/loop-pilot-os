@@ -122,15 +122,22 @@ export interface Config {
 const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4", "sonnet-4-6", "sonnet-4.6"];
 // ベアエイリアスはサブストリングで照合すると誤ヒットするため完全一致で扱う。
 // "sonnet" → 最新 Sonnet（4.6）, "opus" → 最新 Opus（4.x）, "best" → Fable 5 / 最新 Opus
+// "opusplan" → Opus の plan モード（effort 対応）
 // にそれぞれ解決されるため effort 対応とみなす。
 // 注意: Bedrock / Vertex / Foundry 等サードパーティプロバイダでは "sonnet" が Sonnet 4.5 に
 // 解決される場合がある（4.5 は effort 非対応）。そのようなデプロイでは effort = "auto" を
 // 明示するか、バージョン付きモデル名（例: claude-sonnet-4-6）を使用すること。
-const EFFORT_SUPPORTED_MODEL_EXACT = new Set(["sonnet", "opus", "best"]);
+const EFFORT_SUPPORTED_MODEL_EXACT = new Set(["sonnet", "opus", "best", "opusplan"]);
+
+// "[1m]" サフィックスはコンテキストウィンドウ指定であり effort 対応可否に影響しない。
+// 照合前に除去することで "opus[1m]" → "opus" のような 1M バリアントを透過的に扱う。
+function normalizeModelForCapabilityCheck(model: string): string {
+  return model.toLowerCase().replace(/\[1m\]$/i, "");
+}
 
 /** モデルが effort フラグをサポートしているか（allowlist に合致する場合のみ対応とみなす）。 */
 export function modelSupportsEffort(model: string): boolean {
-  const lower = model.toLowerCase();
+  const lower = normalizeModelForCapabilityCheck(model);
   return EFFORT_SUPPORTED_MODEL_EXACT.has(lower) ||
     EFFORT_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
 }
@@ -139,11 +146,12 @@ export function modelSupportsEffort(model: string): boolean {
 // Opus 4.6 や Sonnet 4.6 は xhigh 非対応（low/medium/high/max のみ）。
 const XHIGH_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8"];
 // "fable"/"opus" ベアエイリアスは最新世代（xhigh 対応）に解決されるため完全一致で許可する。
+// "opus[1m]" は normalizeModelForCapabilityCheck により "opus" に正規化されてヒットする。
 const XHIGH_SUPPORTED_MODEL_EXACT = new Set(["fable", "opus", "best"]);
 
 /** モデルが xhigh effort をサポートしているか（Fable 5 / Opus 4.7+ のみ）。 */
 function modelSupportsXhigh(model: string): boolean {
-  const lower = model.toLowerCase();
+  const lower = normalizeModelForCapabilityCheck(model);
   return XHIGH_SUPPORTED_MODEL_EXACT.has(lower) ||
     XHIGH_SUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
 }

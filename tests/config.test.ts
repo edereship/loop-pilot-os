@@ -182,6 +182,22 @@ describe("loadConfig", () => {
     ).not.toThrow();
   });
 
+  // Finding 1: "opusplan" は Claude Code が文書化するベアエイリアス（plan モード Opus）。
+  // effort 対応とみなす（allowlist に含まれていないと default max で設定エラーになる）。
+  it("accepts the 'opusplan' alias with a non-auto effort value", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opusplan.toml"), fullEnv),
+    ).not.toThrow();
+  });
+
+  // Finding 3: "opus[1m]" は 1M コンテキストウィンドウ付き Opus のベアエイリアス。
+  // [1m] サフィックスは capability に影響しないため effort 対応とみなす。
+  it("accepts the 'opus[1m]' alias with a non-auto effort value", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opus1m.toml"), fullEnv),
+    ).not.toThrow();
+  });
+
   // Finding 3: effort 対応モデルでも xhigh 非対応モデル（Sonnet 4.6 等）では xhigh を拒否する。
   it("throws when xhigh effort is paired with a model that does not support xhigh", () => {
     expect(() =>
