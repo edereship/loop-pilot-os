@@ -40,6 +40,7 @@ function makeConfig(over: Partial<{
       idleRecheckSeconds: over.idleRecheckSeconds ?? 300,
     },
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
+    notify: { progress: false },
   } as unknown as Config;
 }
 

@@ -56,7 +56,9 @@ const rawSchema = z.object({
   digest: z.object({
     recent_merged_count: z.number().int().positive(),
   }).strict(),
-  notify: z.object({}).strict().optional(),
+  notify: z.object({
+    progress: z.boolean().default(false),
+  }).strict().optional(),
 }).strict();
 
 type RawConfig = z.infer<typeof rawSchema>;
@@ -108,6 +110,9 @@ export interface Config {
   };
   digest: {
     recentMergedCount: number;
+  };
+  notify: {
+    progress: boolean;
   };
   linearApiKey: string;
   slackWebhookUrl: string | undefined;
@@ -570,6 +575,9 @@ export function loadConfig(
     },
     digest: {
       recentMergedCount: raw.digest.recent_merged_count,
+    },
+    notify: {
+      progress: raw.notify?.progress ?? false,
     },
     linearApiKey: linearApiKey as string,
     slackWebhookUrl,

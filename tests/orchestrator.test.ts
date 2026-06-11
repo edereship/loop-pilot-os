@@ -24,6 +24,7 @@ function makeConfig(over: Partial<{
   monitorPollSeconds: number;
   idleRecheckSeconds: number;
   gateLabel: string;
+  notifyProgress: boolean;
 }> = {}): Config {
   return {
     product: { goal: over.goal ?? "ship the product" },
@@ -40,6 +41,7 @@ function makeConfig(over: Partial<{
       idleRecheckSeconds: over.idleRecheckSeconds ?? 300,
     },
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
+    notify: { progress: over.notifyProgress ?? false },
   } as unknown as Config;
 }
 
@@ -1385,5 +1387,77 @@ describe("Orchestrator 二重起動 — run lock 拒否（Fix 1）", () => {
 
     // 通知は一切送られていない
     expect(h.notifier.events).toHaveLength(0);
+  });
+});
+
+describe("Orchestrator 進捗通知 — notify.progress opt-in（ES-378）", () => {
+  it("progress=true: CLAIM 成功後に task_started、DONE 後に task_merged が通知される", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, notifyProgress: true });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const started = h.notifier.events.filter((e) => e.kind === "task_started");
+    expect(started).toHaveLength(1);
+    expect(started[0]).toEqual({
+      kind: "task_started",
+      identifier: "TY-1",
+      title: "Title for TY-1",
+    });
+
+    const merged = h.notifier.events.filter((e) => e.kind === "task_merged");
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toEqual({
+      kind: "task_merged",
+      identifier: "TY-1",
+      title: "Title for TY-1",
+      mergedCount: 1,
+    });
+  });
+
+  it("progress=false（既定）: task_started / task_merged は通知されない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const progress = h.notifier.events.filter(
+      (e) => e.kind === "task_started" || e.kind === "task_merged",
+    );
+    expect(progress).toHaveLength(0);
+
+    // 従来どおり run_started と halted(task_cap) は出る
+    expect(h.notifier.events.some((e) => e.kind === "run_started")).toBe(true);
+  });
+
+  it("progress=true: 2チケット逐次で各着手/完了が通知され mergedCount が正しい", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2, notifyProgress: true });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1, summary: "A" },
+      { kind: "completed", costUsd: 2, summary: "B" },
+    ];
+    h.monitor.verdicts = [
+      { kind: "done" }, { kind: "merged" },
+      { kind: "done" }, { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const started = h.notifier.events.filter((e) => e.kind === "task_started");
+    expect(started).toHaveLength(2);
+    expect(started.map((e) => (e as { identifier: string }).identifier)).toEqual(["TY-1", "TY-2"]);
+
+    const merged = h.notifier.events.filter((e) => e.kind === "task_merged");
+    expect(merged).toHaveLength(2);
+    expect((merged[0] as { mergedCount: number }).mergedCount).toBe(1);
+    expect((merged[1] as { mergedCount: number }).mergedCount).toBe(2);
   });
 });

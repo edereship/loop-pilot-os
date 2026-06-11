@@ -331,6 +331,13 @@ export class Orchestrator {
       const ctrl = await this.stopSession(session, "claim_failed", `transition(in_progress) failed: ${errMsg(err)}`);
       return ctrl;
     }
+    if (this.config.notify.progress) {
+      await this.notifier.notify({
+        kind: "task_started",
+        identifier: issue.identifier,
+        title: issue.title,
+      });
+    }
     return { control: "continue", session };
   }
 
@@ -572,6 +579,14 @@ export class Orchestrator {
     }
     const mergedCount = this.store.countMerged(this.runId);
     this.log(`merged ${issue.identifier} (merged_count=${mergedCount})`);
+    if (this.config.notify.progress) {
+      await this.notifier.notify({
+        kind: "task_merged",
+        identifier: issue.identifier,
+        title: issue.title,
+        mergedCount,
+      });
+    }
   }
 
   // ---- 共通の STOPPED 終端（仕様 §7） ----

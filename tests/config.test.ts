@@ -533,4 +533,16 @@ describe("loadConfig", () => {
     });
     expect(config.agent.effort).toBe("auto");
   });
+
+  // notify.progress: 既定 false（未設定 or empty [notify]）
+  it("defaults notify.progress to false when [notify] section is empty", () => {
+    const config = loadConfig(fixture("config-valid.toml"), fullEnv);
+    expect(config.notify.progress).toBe(false);
+  });
+
+  // notify.progress = true を明示的に設定
+  it("reads notify.progress = true when explicitly set", () => {
+    const config = loadConfig(fixture("config-notify-progress.toml"), fullEnv);
+    expect(config.notify.progress).toBe(true);
+  });
 });

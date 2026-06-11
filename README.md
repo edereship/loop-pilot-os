@@ -103,6 +103,7 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `loop.monitor_poll_seconds` | MONITOR のポーリング間隔 |
 | `loop.idle_recheck_seconds` | IDLE 時のキュー再確認間隔 |
 | `digest.recent_merged_count` | プロンプトに含める直近マージ済みセッション要約の件数 |
+| `notify.progress` | `true` で各チケットの着手/完了を Slack にも通知（既定 `false`・コンソールログは常時出力） |
 
 #### model × effort 対応表
 
