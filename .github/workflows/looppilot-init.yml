@@ -1,0 +1,15 @@
+name: LoopPilot Init
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, labeled]
+
+jobs:
+  init:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: team-yubune/loop-pilot/.github/workflows/init.yml@v1
+    secrets:
+      CODEX_REVIEW_REQUEST_TOKEN: ${{ secrets.CODEX_REVIEW_REQUEST_TOKEN }}
