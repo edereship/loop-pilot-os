@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { SqliteStore } from "../src/store.js";
-import { ConsoleSlackNotifier } from "../src/notifier.js";
+import { ConsoleSlackNotifier, formatNotifyEvent } from "../src/notifier.js";
 import { fixedClock, instantSleep } from "./fakes.js";
 
 // 注入する fetch のフェイク。応答は responses キューから順に取り出す。
@@ -241,5 +241,26 @@ describe("ConsoleSlackNotifier", () => {
     );
 
     await expect(notifier.probeReachability()).rejects.toThrow(/network down/);
+  });
+});
+
+describe("formatNotifyEvent", () => {
+  it("formats task_started with emoji, identifier and title", () => {
+    const text = formatNotifyEvent({
+      kind: "task_started",
+      identifier: "TY-123",
+      title: "Fix login bug",
+    });
+    expect(text).toBe("▶️ 着手: TY-123 Fix login bug");
+  });
+
+  it("formats task_merged with emoji, identifier, title and merged count", () => {
+    const text = formatNotifyEvent({
+      kind: "task_merged",
+      identifier: "TY-456",
+      title: "Add search",
+      mergedCount: 2,
+    });
+    expect(text).toBe("✅ 完了: TY-456 Add search（merged 2件）");
   });
 });

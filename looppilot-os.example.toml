@@ -58,3 +58,4 @@ recent_merged_count = 5
 
 [notify]
 # Slack Webhook は環境変数 SLACK_WEBHOOK_URL（未設定ならコンソールのみ）
+# progress = false              # true にすると各チケットの着手/完了を Slack にも通知（既定 false）
