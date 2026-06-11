@@ -114,7 +114,7 @@ cp looppilot-os.example.toml looppilot-os.toml
 | Haiku 4.5 / Sonnet 4.5 | **effort 非対応**（どの値もエラー） |
 
 * `xhigh` は Opus 4.7+/Fable 5 専用。`max` は Opus 4.6 以降・Sonnet 4.6 で可。
-* 不正な model×effort 組合せは claude 自身の起動エラーに委ねる（`stopped(exception)` → 通知）。
+* 不正な model×effort 組合せは起動前の設定検証（`loadConfig`）で fatal エラーとして報告される（セッションは開始しない）。
 
 状態 DB（`looppilot-os.db`）は `looppilot-os.toml` と同じディレクトリに作られます。
 

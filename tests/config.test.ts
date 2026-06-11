@@ -420,4 +420,56 @@ describe("loadConfig", () => {
       }),
     ).not.toThrow();
   });
+
+  // Finding 1: ANTHROPIC_DEFAULT_{X}_MODEL でベアエイリアスが別モデルにリマップされ、
+  // _SUPPORTED_CAPABILITIES が宣言されていない場合は allowlist を信用せずエラーとする。
+  it("throws when a supported alias is remapped via ANTHROPIC_DEFAULT_{X}_MODEL to an unknown model without capabilities", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-sonnet-alias.toml"), {
+        ...fullEnv,
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "old-gateway-sonnet-model",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 1: _SUPPORTED_CAPABILITIES に "effort" が宣言されていれば、ピン留めモデルでも許可する。
+  it("does not throw when a remapped alias has effort declared in ANTHROPIC_DEFAULT_{X}_MODEL_SUPPORTED_CAPABILITIES", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-sonnet-alias.toml"), {
+        ...fullEnv,
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "old-gateway-sonnet-model",
+        ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 2: "sonnet" ベアエイリアスで effort 未指定のとき、直接 Anthropic API（非サードパーティ）では "max" がデフォルト。
+  it("defaults effort to 'max' for 'sonnet' alias when no effort is specified and no third-party provider is set", () => {
+    const config = loadConfig(fixture("config-effort-sonnet-no-effort.toml"), fullEnv);
+    expect(config.agent.effort).toBe("max");
+  });
+
+  // Finding 2: "sonnet" ベアエイリアスで effort 未指定のとき、サードパーティプロバイダでは "auto" がデフォルト。
+  it("defaults effort to 'auto' for 'sonnet' alias when no effort is specified and a third-party provider is set", () => {
+    const config = loadConfig(fixture("config-effort-sonnet-no-effort.toml"), {
+      ...fullEnv,
+      CLAUDE_CODE_USE_BEDROCK: "1",
+    });
+    expect(config.agent.effort).toBe("auto");
+  });
+
+  // Finding 2: "opusplan" エイリアスで effort 未指定のとき、直接 Anthropic API では "max" がデフォルト。
+  it("defaults effort to 'max' for 'opusplan' alias when no effort is specified and no third-party provider is set", () => {
+    const config = loadConfig(fixture("config-effort-opusplan-no-effort.toml"), fullEnv);
+    expect(config.agent.effort).toBe("max");
+  });
+
+  // Finding 2: "opusplan" エイリアスで effort 未指定のとき、サードパーティプロバイダでは "auto" がデフォルト。
+  it("defaults effort to 'auto' for 'opusplan' alias when no effort is specified and a third-party provider is set", () => {
+    const config = loadConfig(fixture("config-effort-opusplan-no-effort.toml"), {
+      ...fullEnv,
+      CLAUDE_CODE_USE_BEDROCK: "1",
+    });
+    expect(config.agent.effort).toBe("auto");
+  });
 });

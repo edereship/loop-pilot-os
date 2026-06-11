@@ -293,6 +293,33 @@ function isThirdPartyProviderContext(env: NodeJS.ProcessEnv): boolean {
   );
 }
 
+/**
+ * ベアエイリアス（EFFORT_SUPPORTED_MODEL_EXACT に含まれる）が ANTHROPIC_DEFAULT_{X}_MODEL で
+ * 別モデルにリマップされているが _SUPPORTED_CAPABILITIES="effort" の宣言がない場合に true を返す。
+ * そのようなケースでは allowlist による effort 対応判定を信用できないため、
+ * 呼び出し元でエラーとして扱うか "auto" にフォールバックする。
+ */
+function isAliasPinnedToUnknownModel(model: string, env: NodeJS.ProcessEnv): boolean {
+  const normalizedModel = normalizeModelForCapabilityCheck(model);
+  if (!EFFORT_SUPPORTED_MODEL_EXACT.has(normalizedModel)) return false;
+
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    const match = /^ANTHROPIC_DEFAULT_(.+)_MODEL$/.exec(key);
+    if (!match) continue;
+    const aliasFromKey = match[1].toLowerCase();
+    if (aliasFromKey !== normalizedModel) continue;
+    // ピン先が自分自身（no-op）の場合はスキップ。
+    if (normalizeModelForCapabilityCheck(value) === normalizedModel) continue;
+    // 別モデルにリマップされている。effort capability が宣言されているか確認する。
+    const caps = env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`];
+    if (!caps || !caps.split(",").map((s) => s.trim()).includes("effort")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // xhigh をサポートするのは Fable 5 と Opus 4.7+（README §model×effort 対応表）。
 // Opus 4.6 や Sonnet 4.6 は xhigh 非対応（low/medium/high/max のみ）。
 const XHIGH_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8"];
@@ -375,20 +402,26 @@ export function loadConfig(
     const skipMaxCheck = effortAlwaysEnabled ||
       modelHasMaxEffortCapabilityEnvVar(model, env) ||
       modelSupportsEffort(model);
+    const isThirdParty = isThirdPartyProviderContext(env);
+    // ベアエイリアスが ANTHROPIC_DEFAULT_{X}_MODEL で capability 宣言なしに別モデルへ
+    // リマップされている場合、allowlist 判定を信用しない（Finding 1）。
+    const aliasPinnedToUnknown = !skipEffortChecks && isAliasPinnedToUnknownModel(model, env);
     // effort 未指定時のデフォルト:
     // - effortAlwaysEnabled が true: "max"（エスケープハッチ、全対応宣言）
     // - max_effort 宣言済み capability がある: "max"（明示的に max_effort が宣言された）
     //   ※ "effort" だけの宣言では "max" にしない（max_effort と effort は別 capability）
-    // - modelDefaultsToMaxEffort が true: "max"（バージョン確定済み・全プロバイダ対応）
-    // - それ以外: "auto"（"sonnet" 等の曖昧なエイリアス、Bedrock/Vertex での安全側）
+    // - modelDefaultsToMaxEffort が true かつ alias のリマップなし: "max"（バージョン確定済み・全プロバイダ対応）
+    // - 直接 Anthropic API（非サードパーティ）で EFFORT_SUPPORTED_MODEL_EXACT のエイリアス（Finding 2）:
+    //   "max"（"sonnet"/"opusplan" を Bedrock/Vertex 以外で使う直接 API ユーザ向け）
+    // - それ以外: "auto"（Bedrock/Vertex/Foundry での "sonnet"/"opusplan"、alias リマップ済み等）
     const canDefaultToMax = effortAlwaysEnabled ||
       modelHasMaxEffortCapabilityEnvVar(model, env) ||
-      modelDefaultsToMaxEffort(model);
+      (modelDefaultsToMaxEffort(model) && !aliasPinnedToUnknown) ||
+      (!isThirdParty && !aliasPinnedToUnknown &&
+        EFFORT_SUPPORTED_MODEL_EXACT.has(normalizeModelForCapabilityCheck(model)));
     effectiveEffort = rawEffort ?? (canDefaultToMax ? "max" : "auto");
 
-    const isThirdParty = isThirdPartyProviderContext(env);
-
-    if (!skipEffortChecks && effectiveEffort !== "auto" && !modelSupportsEffort(model)) {
+    if (!skipEffortChecks && effectiveEffort !== "auto" && (!modelSupportsEffort(model) || aliasPinnedToUnknown)) {
       errors.push(
         `agent.effort: model "${model}" does not support effort levels; ` +
           `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
