@@ -1,0 +1,42 @@
+[product]
+goal = "Minimal goal."
+
+[repo]
+path = "/home/me/myrepo"
+remote = "owner/name"
+
+[linear]
+team = "TY"
+project = "LoopPilot OS"
+opt_in_label = "ai-ok"
+[linear.states]
+todo = "Todo"
+in_progress = "In Progress"
+in_review = "In Review"
+done = "Done"
+
+[agent]
+model = "opus"
+allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"
+effort = "xhigh"
+
+[handoff]
+branch_prefix = "looppilot"
+pr_body_template = "Implements {identifier}: {title}\n\n{issue_url}\n"
+
+[looppilot]
+gate_label = "loop-pilot"
+state_comment_authors = ["github-actions[bot]"]
+
+[safety]
+max_tasks_per_run = 3
+max_cost_usd_per_session = 10.0
+
+[loop]
+monitor_poll_seconds = 60
+idle_recheck_seconds = 300
+
+[digest]
+recent_merged_count = 5
+
+[notify]

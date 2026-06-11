@@ -268,4 +268,76 @@ describe("loadConfig", () => {
       }),
     ).toThrow(/agent\.effort/);
   });
+
+  // Finding 3: "effort" のみ宣言されたカスタムモデルで effort 未指定のとき "max" ではなく "auto" をデフォルトにする。
+  // ("effort" と "max_effort" は別 capability — "effort" だけの宣言では max は許可されない)
+  it("defaults effort to 'auto' when capability declares only 'effort' (not 'max_effort')", () => {
+    const config = loadConfig(fixture("config-effort-custom-no-effort.toml"), {
+      ...fullEnv,
+      ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-haiku-4-5-20251001",
+      ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort",
+    });
+    expect(config.agent.effort).toBe("auto");
+  });
+
+  // Finding 3: "max_effort" が宣言されていれば "max" をデフォルトにする。
+  it("defaults effort to 'max' when capability declares 'max_effort'", () => {
+    const config = loadConfig(fixture("config-effort-custom-no-effort.toml"), {
+      ...fullEnv,
+      ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-haiku-4-5-20251001",
+      ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort,max_effort",
+    });
+    expect(config.agent.effort).toBe("max");
+  });
+
+  // Finding 1: Bedrock/Vertex/Foundry コンテキストで "sonnet" ベアエイリアス + 明示的 non-auto effort は拒否。
+  it("throws when 'sonnet' bare alias is paired with explicit non-auto effort on a third-party provider", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-sonnet-alias.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 1: サードパーティプロバイダでも capability オーバーライドがあれば許可する。
+  it("does not throw for 'sonnet' + explicit effort on a third-party provider when capability override exists", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-sonnet-alias.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "sonnet",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 2: Bedrock/Vertex/Foundry コンテキストで "opus" ベアエイリアス + xhigh は拒否。
+  it("throws when 'opus' bare alias is paired with xhigh on a third-party provider", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opus-xhigh.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_VERTEX: "1",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 2: "opus" + xhigh はサードパーティプロバイダなし（直接 API）では許可する。
+  it("accepts 'opus' bare alias with xhigh when no third-party provider context is set", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opus-xhigh.toml"), fullEnv),
+    ).not.toThrow();
+  });
+
+  // Finding 2: サードパーティプロバイダでも capability オーバーライドがあれば許可する。
+  it("does not throw for 'opus' + xhigh on a third-party provider when capability override exists", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opus-xhigh.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_FOUNDRY: "1",
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "opus",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort,xhigh_effort",
+      }),
+    ).not.toThrow();
+  });
 });
