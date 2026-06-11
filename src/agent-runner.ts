@@ -41,6 +41,7 @@ function agentChildEnv(): Record<string, string> {
 
 interface AgentRunnerOptions {
   model: string;
+  effort: string;
   allowedTools: string;
   extraArgs: string[];
   log: (line: string) => void;
@@ -108,6 +109,8 @@ export class ClaudeAgentRunner implements AgentRunner {
       this.opts.allowedTools,
       "--model",
       this.opts.model,
+      "--effort",
+      this.opts.effort,
       ...this.opts.extraArgs,
     ];
 

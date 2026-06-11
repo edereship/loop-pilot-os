@@ -119,6 +119,7 @@ async function runLoop(configPath: string): Promise<number> {
     });
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,
+      effort: config.agent.effort,
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,

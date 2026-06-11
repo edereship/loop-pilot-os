@@ -43,6 +43,7 @@ function runnerEmitting(
 function makeRunner(runner: FakeCommandRunner, logs: string[]): ClaudeAgentRunner {
   return new ClaudeAgentRunner(runner, {
     model: "opus",
+    effort: "max",
     allowedTools: "Edit,Write,Read,Glob,Grep,Bash",
     extraArgs: [],
     log: (line: string) => logs.push(line),
@@ -78,6 +79,8 @@ describe("ClaudeAgentRunner.runSession", () => {
       "Edit,Write,Read,Glob,Grep,Bash",
       "--model",
       "opus",
+      "--effort",
+      "max",
     ]);
     expect(call.opts.cwd).toBe("/wt");
     // 仕様§11: コスト一本化が基本。hardTimeoutMs 未指定なら timeoutMs は設定しない
@@ -153,13 +156,14 @@ describe("ClaudeAgentRunner.runSession", () => {
     const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
     const agent = new ClaudeAgentRunner(runner, {
       model: "opus",
+      effort: "max",
       allowedTools: "Edit",
       extraArgs: ["--add-dir", "/extra"],
       log: () => {},
     });
     await agent.runSession(ctx);
     const args = runner.calls[0]!.args;
-    expect(args.slice(-4)).toEqual(["--model", "opus", "--add-dir", "/extra"]);
+    expect(args.slice(-6)).toEqual(["--model", "opus", "--effort", "max", "--add-dir", "/extra"]);
   });
 
   it("subtype=success → completed{costUsd, summary=result}", async () => {
