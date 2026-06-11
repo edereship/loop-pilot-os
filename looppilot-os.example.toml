@@ -19,7 +19,12 @@ in_review = "In Review"
 done = "Done"
 
 [agent]
-model = "opus"                  # claude --model に渡す
+model = "claude-opus-4-6[1m]"  # claude --model に渡す（出荷既定: Opus 4.6 1M コンテキスト）
+effort = "max"                 # claude --effort に渡す（出荷既定: max）
+                               #   max:   Opus 4.6+ / Sonnet 4.6 で有効
+                               #   xhigh: Opus 4.7+ / Fable 5 専用
+                               #   Haiku 4.5 / Sonnet 4.5 は effort 非対応
+                               #   effort↑ は max_cost_usd_per_session を早く消費しレートリミットも食う
 allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"   # --allowedTools
 # extra_args = []               # 任意の追加 claude フラグ（既定なし）
 
