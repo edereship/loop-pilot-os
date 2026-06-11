@@ -188,4 +188,22 @@ describe("loadConfig", () => {
       loadConfig(fixture("config-effort-xhigh-unsupported.toml"), fullEnv),
     ).toThrow(/agent\.effort/);
   });
+
+  // Finding 2: CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 でカスタムモデル/ゲートウェイの allowlist チェックをスキップする。
+  it("does not throw for an unsupported model when CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 is set", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-unsupported.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: "1",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 3: extra_args に --effort を含めると agent.effort（CLAUDE_CODE_EFFORT_LEVEL）に
+  // 上書きされるため、重複設定はエラーとして拒否する。
+  it("throws when extra_args contains --effort (conflicts with agent.effort env override)", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-extra-args-conflict.toml"), fullEnv),
+    ).toThrow(/agent\.extra_args/);
+  });
 });

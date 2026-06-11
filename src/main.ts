@@ -117,7 +117,11 @@ async function runLoop(configPath: string): Promise<number> {
       optInLabel: config.linear.optInLabel,
       fetchFn: globalThis.fetch,
     });
-    const effortSupported = modelSupportsEffort(config.agent.model);
+    // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 はカスタムモデル/ゲートウェイ向けのエスケープハッチ。
+    // loadConfig がこの env を尊重して allowlist チェックをスキップするのと同様に、ここでも
+    // effort フラグ・環境変数の注入を有効にする（env が未設定の場合は通常の allowlist 照合）。
+    const effortAlwaysEnabled = process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
+    const effortSupported = effortAlwaysEnabled || modelSupportsEffort(config.agent.model);
     const effort = config.agent.effort;
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,

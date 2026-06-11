@@ -123,6 +123,9 @@ const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4", "sonnet-4-6", "son
 // ベアエイリアスはサブストリングで照合すると誤ヒットするため完全一致で扱う。
 // "sonnet" → 最新 Sonnet（4.6）, "opus" → 最新 Opus（4.x）, "best" → Fable 5 / 最新 Opus
 // にそれぞれ解決されるため effort 対応とみなす。
+// 注意: Bedrock / Vertex / Foundry 等サードパーティプロバイダでは "sonnet" が Sonnet 4.5 に
+// 解決される場合がある（4.5 は effort 非対応）。そのようなデプロイでは effort = "auto" を
+// 明示するか、バージョン付きモデル名（例: claude-sonnet-4-6）を使用すること。
 const EFFORT_SUPPORTED_MODEL_EXACT = new Set(["sonnet", "opus", "best"]);
 
 /** モデルが effort フラグをサポートしているか（allowlist に合致する場合のみ対応とみなす）。 */
@@ -194,7 +197,7 @@ export function loadConfig(
   // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 がセットされている場合はカスタムモデル/ゲートウェイ
   // デプロイ向けのエスケープハッチとして allowlist チェックをスキップする。
   if (result.success) {
-    const { model, effort } = result.data.agent;
+    const { model, effort, extra_args } = result.data.agent;
     const effortAlwaysEnabled = env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
     if (!effortAlwaysEnabled && effort !== "auto" && !modelSupportsEffort(model)) {
       errors.push(
@@ -206,6 +209,16 @@ export function loadConfig(
       errors.push(
         `agent.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
           `model "${model}" supports low/medium/high/max only`,
+      );
+    }
+    // CLAUDE_CODE_EFFORT_LEVEL env override（effortEnvOverride 経由で子プロセスに注入）は
+    // --effort フラグより優先されるため、extra_args に --effort を含めると agent.effort の
+    // 設定が無視されてしまう。effort の調整は agent.effort キーで一元管理すること。
+    if (extra_args.includes("--effort")) {
+      errors.push(
+        `agent.extra_args: "--effort" must not be set via extra_args; ` +
+          `use agent.effort instead (the CLAUDE_CODE_EFFORT_LEVEL env override injected at launch ` +
+          `takes precedence over --effort flags in extra_args)`,
       );
     }
   }
