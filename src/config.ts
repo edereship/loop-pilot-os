@@ -114,6 +114,16 @@ export interface Config {
   stateDbPath: string;
 }
 
+// モデル名に含まれるサブストリング（小文字）が一致した場合 effort を非サポートと判定する。
+// Claude Code docs が effort 対応を明記しているのは Fable 5, Opus 4.x, Sonnet 4.6 のみ。
+const EFFORT_UNSUPPORTED_MODEL_SUBSTRINGS = ["haiku", "sonnet-4-5"];
+
+/** モデルが effort フラグをサポートしているか（denylist に合致しない場合は対応とみなす）。 */
+export function modelSupportsEffort(model: string): boolean {
+  const lower = model.toLowerCase();
+  return !EFFORT_UNSUPPORTED_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
+}
+
 function formatIssuePath(issuePath: PropertyKey[]): string {
   return issuePath.map((segment) => String(segment)).join(".");
 }
@@ -156,6 +166,17 @@ export function loadConfig(
   if (!result.success) {
     for (const issue of result.error.issues) {
       errors.push(`${formatIssuePath(issue.path)}: ${issue.message}`);
+    }
+  }
+
+  // モデルと effort の組み合わせ検証（schema parse 成功後に実施）。
+  if (result.success) {
+    const { model, effort } = result.data.agent;
+    if (effort !== "auto" && !modelSupportsEffort(model)) {
+      errors.push(
+        `agent.effort: model "${model}" does not support effort levels; ` +
+          `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
+      );
     }
   }
 

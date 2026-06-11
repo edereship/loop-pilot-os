@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import process from "node:process";
 
 import type { TicketState } from "./types.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, modelSupportsEffort } from "./config.js";
 import { SqliteStore } from "./store.js";
 import { RealCommandRunner } from "./exec.js";
 import { ConsoleSlackNotifier } from "./notifier.js";
@@ -117,10 +117,15 @@ async function runLoop(configPath: string): Promise<number> {
       optInLabel: config.linear.optInLabel,
       fetchFn: globalThis.fetch,
     });
+    const effortSupported = modelSupportsEffort(config.agent.model);
+    const effort = config.agent.effort;
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,
-      effort: config.agent.effort === "auto" ? undefined : config.agent.effort,
-      stripEffortEnv: config.agent.effort === "auto",
+      // omit --effort flag for "auto" or models that do not support effort
+      effort: effortSupported && effort !== "auto" ? effort : undefined,
+      // always inject CLAUDE_CODE_EFFORT_LEVEL for effort-supporting models so that
+      // Claude Code's settings.json env cannot override the TOML value (Finding 1/3)
+      effortEnvOverride: effortSupported ? effort : undefined,
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,

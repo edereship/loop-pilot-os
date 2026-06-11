@@ -160,4 +160,11 @@ describe("loadConfig", () => {
       loadConfig(fixture("config-minimal.toml"), { LINEAR_API_KEY: "" }),
     ).toThrow(/LINEAR_API_KEY/);
   });
+
+  // Finding 2: effort 非対応モデル（Haiku 等）で auto 以外の effort を指定したとき config エラー。
+  it("throws when a non-effort model is paired with a non-auto effort value", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-unsupported.toml"), fullEnv),
+    ).toThrow(/agent\.effort/);
+  });
 });

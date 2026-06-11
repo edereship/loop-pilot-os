@@ -44,6 +44,7 @@ function makeRunner(runner: FakeCommandRunner, logs: string[]): ClaudeAgentRunne
   return new ClaudeAgentRunner(runner, {
     model: "opus",
     effort: "max",
+    effortEnvOverride: "max",
     allowedTools: "Edit,Write,Read,Glob,Grep,Bash",
     extraArgs: [],
     log: (line: string) => logs.push(line),
@@ -165,14 +166,14 @@ describe("ClaudeAgentRunner.runSession", () => {
     expect(runner.calls[0]!.args).not.toContain("--effort");
   });
 
-  it("effort を明示指定した場合、子プロセス env から CLAUDE_CODE_EFFORT_LEVEL を除去する（env 変数優先による config 無視を防ぐ）", async () => {
+  it("effortEnvOverride 指定時、子プロセス env の CLAUDE_CODE_EFFORT_LEVEL をその値で上書きする（親 env / Claude settings.json 由来の値を無視させる）", async () => {
     const prev = process.env["CLAUDE_CODE_EFFORT_LEVEL"];
     process.env["CLAUDE_CODE_EFFORT_LEVEL"] = "low";
     try {
       const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
       const logs: string[] = [];
-      await makeRunner(runner, logs).runSession(ctx); // effort="max"
-      expect(runner.calls[0]!.opts.env!["CLAUDE_CODE_EFFORT_LEVEL"]).toBeUndefined();
+      await makeRunner(runner, logs).runSession(ctx); // effort="max", effortEnvOverride="max"
+      expect(runner.calls[0]!.opts.env!["CLAUDE_CODE_EFFORT_LEVEL"]).toBe("max");
     } finally {
       if (prev === undefined) delete process.env["CLAUDE_CODE_EFFORT_LEVEL"];
       else process.env["CLAUDE_CODE_EFFORT_LEVEL"] = prev;
@@ -199,22 +200,22 @@ describe("ClaudeAgentRunner.runSession", () => {
     }
   });
 
-  it("effort=undefined かつ stripEffortEnv=true のとき CLAUDE_CODE_EFFORT_LEVEL を除去する（agent.effort='auto' ケース）", async () => {
+  it("effortEnvOverride='auto' のとき --effort フラグを出さず CLAUDE_CODE_EFFORT_LEVEL を 'auto' に設定する（agent.effort='auto' ケース）", async () => {
     const prev = process.env["CLAUDE_CODE_EFFORT_LEVEL"];
     process.env["CLAUDE_CODE_EFFORT_LEVEL"] = "low";
     try {
       const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
       const agent = new ClaudeAgentRunner(runner, {
-        model: "haiku",
+        model: "opus",
         effort: undefined,
-        stripEffortEnv: true,
+        effortEnvOverride: "auto",
         allowedTools: "Edit",
         extraArgs: [],
         log: () => {},
       });
       await agent.runSession(ctx);
       expect(runner.calls[0]!.args).not.toContain("--effort");
-      expect(runner.calls[0]!.opts.env!["CLAUDE_CODE_EFFORT_LEVEL"]).toBeUndefined();
+      expect(runner.calls[0]!.opts.env!["CLAUDE_CODE_EFFORT_LEVEL"]).toBe("auto");
     } finally {
       if (prev === undefined) delete process.env["CLAUDE_CODE_EFFORT_LEVEL"];
       else process.env["CLAUDE_CODE_EFFORT_LEVEL"] = prev;
