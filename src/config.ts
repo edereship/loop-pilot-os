@@ -30,7 +30,7 @@ const rawSchema = z.object({
     model: z.string(),
     allowed_tools: z.string(),
     extra_args: z.array(z.string()).default([]),
-    effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("max"),
+    effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).default("max"),
   }).strict(),
   handoff: z.object({
     branch_prefix: z.string(),

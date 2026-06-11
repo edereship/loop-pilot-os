@@ -28,12 +28,15 @@ const SENSITIVE_ENV_KEYS = [
   "GITHUB_ENTERPRISE_TOKEN",
 ];
 
-/** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。 */
-function agentChildEnv(): Record<string, string> {
+/** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。
+ * stripEffortLevel=true のとき CLAUDE_CODE_EFFORT_LEVEL も除去し、
+ * TOML の agent.effort が env 変数に黙って上書きされるのを防ぐ。*/
+function agentChildEnv(stripEffortLevel: boolean): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
     if (SENSITIVE_ENV_KEYS.includes(key)) continue;
+    if (stripEffortLevel && key === "CLAUDE_CODE_EFFORT_LEVEL") continue;
     out[key] = value;
   }
   return out;
@@ -41,7 +44,8 @@ function agentChildEnv(): Record<string, string> {
 
 interface AgentRunnerOptions {
   model: string;
-  effort: string;
+  /** undefined → omit --effort flag and leave CLAUDE_CODE_EFFORT_LEVEL untouched */
+  effort: string | undefined;
   allowedTools: string;
   extraArgs: string[];
   log: (line: string) => void;
@@ -95,6 +99,7 @@ export class ClaudeAgentRunner implements AgentRunner {
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
+    // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
     const args: string[] = [
       "-p",
       ctx.prompt,
@@ -109,8 +114,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       this.opts.allowedTools,
       "--model",
       this.opts.model,
-      "--effort",
-      this.opts.effort,
+      ...(this.opts.effort !== undefined ? ["--effort", this.opts.effort] : []),
       ...this.opts.extraArgs,
     ];
 
@@ -156,7 +160,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     // env: 機密キーを除いた親環境を明示的に渡す（claude へのシークレット継承を断つ）。
     const opts: RunOptions = {
       cwd: ctx.worktreePath,
-      env: agentChildEnv(),
+      env: agentChildEnv(this.opts.effort !== undefined),
       onStdoutLine,
       ...(ctx.hardTimeoutMs !== undefined ? { timeoutMs: ctx.hardTimeoutMs } : {}),
     };

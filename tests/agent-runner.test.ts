@@ -152,6 +152,53 @@ describe("ClaudeAgentRunner.runSession", () => {
     expect(args[i + 1]).toBe("7.50");
   });
 
+  it("effort が undefined のとき --effort フラグを args に含めない（effort 非対応モデル向け）", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+    const agent = new ClaudeAgentRunner(runner, {
+      model: "haiku",
+      effort: undefined,
+      allowedTools: "Edit",
+      extraArgs: [],
+      log: () => {},
+    });
+    await agent.runSession(ctx);
+    expect(runner.calls[0]!.args).not.toContain("--effort");
+  });
+
+  it("effort を明示指定した場合、子プロセス env から CLAUDE_CODE_EFFORT_LEVEL を除去する（env 変数優先による config 無視を防ぐ）", async () => {
+    const prev = process.env["CLAUDE_CODE_EFFORT_LEVEL"];
+    process.env["CLAUDE_CODE_EFFORT_LEVEL"] = "low";
+    try {
+      const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+      const logs: string[] = [];
+      await makeRunner(runner, logs).runSession(ctx); // effort="max"
+      expect(runner.calls[0]!.opts.env!["CLAUDE_CODE_EFFORT_LEVEL"]).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env["CLAUDE_CODE_EFFORT_LEVEL"];
+      else process.env["CLAUDE_CODE_EFFORT_LEVEL"] = prev;
+    }
+  });
+
+  it("effort が undefined のとき CLAUDE_CODE_EFFORT_LEVEL を子プロセス env へ引き継ぐ（env 変数による制御を尊重する）", async () => {
+    const prev = process.env["CLAUDE_CODE_EFFORT_LEVEL"];
+    process.env["CLAUDE_CODE_EFFORT_LEVEL"] = "low";
+    try {
+      const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+      const agent = new ClaudeAgentRunner(runner, {
+        model: "haiku",
+        effort: undefined,
+        allowedTools: "Edit",
+        extraArgs: [],
+        log: () => {},
+      });
+      await agent.runSession(ctx);
+      expect(runner.calls[0]!.opts.env!["CLAUDE_CODE_EFFORT_LEVEL"]).toBe("low");
+    } finally {
+      if (prev === undefined) delete process.env["CLAUDE_CODE_EFFORT_LEVEL"];
+      else process.env["CLAUDE_CODE_EFFORT_LEVEL"] = prev;
+    }
+  });
+
   it("extra_args をモデル指定の後ろへ連結する", async () => {
     const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
     const agent = new ClaudeAgentRunner(runner, {
