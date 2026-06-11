@@ -340,4 +340,84 @@ describe("loadConfig", () => {
       }),
     ).not.toThrow();
   });
+
+  // Finding 1 (opusplan): Bedrock/Vertex/Foundry コンテキストで "opusplan" ベアエイリアス +
+  // 明示的 non-auto effort は拒否（実行フェーズで Sonnet を使用するため）。
+  it("throws when 'opusplan' bare alias is paired with explicit non-auto effort on a third-party provider", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opusplan.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 1 (opusplan): サードパーティプロバイダでも capability オーバーライドがあれば許可する。
+  it("does not throw for 'opusplan' + explicit effort on a third-party provider when capability override exists", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opusplan.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "opusplan",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 2 (pinned alias): ANTHROPIC_DEFAULT_OPUS_MODEL でゲートウェイモデルにピン留めされた
+  // "opus" エイリアスでも capability env var が読まれ、xhigh_effort 宣言があれば許可する。
+  it("skips third-party xhigh check when ANTHROPIC_DEFAULT_OPUS_MODEL alias has xhigh_effort capability", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-opus-xhigh.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_VERTEX: "1",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "some-gateway-opus",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: "effort,xhigh_effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 3 (xhigh): "effort" のみ宣言されたカスタムモデルで xhigh を要求したときエラー。
+  it("throws when a model with only 'effort' capability is paired with xhigh effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-xhigh-unsupported.toml"), {
+        ...fullEnv,
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-sonnet-4-6",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 3 (xhigh): "effort,xhigh_effort" を宣言したカスタムモデルで xhigh を要求したときは許可。
+  it("does not throw when a model with 'effort,xhigh_effort' capability is paired with xhigh effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-xhigh-unsupported.toml"), {
+        ...fullEnv,
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-sonnet-4-6",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort,xhigh_effort",
+      }),
+    ).not.toThrow();
+  });
+
+  // Finding 3 (max): "effort" のみ宣言されたカスタムモデルで "max" を要求したときエラー。
+  it("throws when a model with only 'effort' capability is paired with max effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-custom-max.toml"), {
+        ...fullEnv,
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-haiku-4-5-20251001",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort",
+      }),
+    ).toThrow(/agent\.effort/);
+  });
+
+  // Finding 3 (max): "effort,max_effort" を宣言したカスタムモデルで "max" を要求したときは許可。
+  it("does not throw when a model with 'effort,max_effort' capability is paired with max effort", () => {
+    expect(() =>
+      loadConfig(fixture("config-effort-custom-max.toml"), {
+        ...fullEnv,
+        ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-haiku-4-5-20251001",
+        ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: "effort,max_effort",
+      }),
+    ).not.toThrow();
+  });
 });

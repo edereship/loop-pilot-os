@@ -129,16 +129,17 @@ const EFFORT_SUPPORTED_MODEL_SUBSTRINGS = [
 ];
 // ベアエイリアスはサブストリングで照合すると誤ヒットするため完全一致で扱う。
 // "sonnet" → 最新 Sonnet（4.6）, "opus" → 最新 Opus（4.x）, "best" → Fable 5 / 最新 Opus
-// "opusplan" → Opus の plan モード（effort 対応）
+// "opusplan" → Opus の plan モード（plan フェーズは Opus、実行フェーズは Sonnet を使用）
 // にそれぞれ解決されるため effort 対応とみなす。
-// 注意: Bedrock / Vertex / Foundry 等サードパーティプロバイダでは "sonnet" が Sonnet 4.5 に
-// 解決される場合がある（4.5 は effort 非対応）。そのようなデプロイでは effort = "auto" を
-// 明示するか、バージョン付きモデル名（例: claude-sonnet-4-6）を使用すること。
+// 注意: Bedrock / Vertex / Foundry 等サードパーティプロバイダでは "sonnet" および "opusplan"
+// の実行フェーズが Sonnet 4.5 に解決される場合がある（4.5 は effort 非対応）。
+// そのようなデプロイでは effort = "auto" を明示するか、バージョン付きモデル名を使用すること。
 const EFFORT_SUPPORTED_MODEL_EXACT = new Set(["sonnet", "opus", "best", "opusplan"]);
 // effort キーが未設定のときにデフォルト "max" を採用する（安全な）ベアエイリアスのセット。
 // "sonnet" はサードパーティプロバイダで Sonnet 4.5 に解決される可能性があるため除外する。
-// 未指定の既存設定を壊さないよう、"sonnet" は明示的に effort を指定した場合のみ許可する。
-const EFFORT_SAFE_DEFAULT_MODEL_EXACT = new Set(["opus", "best", "opusplan"]);
+// "opusplan" は実行フェーズで Sonnet を使用するため同様にサードパーティで Sonnet 4.5 に
+// 解決される可能性がある。未指定設定を安全側に倒すため除外する。
+const EFFORT_SAFE_DEFAULT_MODEL_EXACT = new Set(["opus", "best"]);
 
 // "[1m]" サフィックスはコンテキストウィンドウ指定であり effort 対応可否に影響しない。
 // 照合前に除去することで "opus[1m]" → "opus" のような 1M バリアントを透過的に扱う。
@@ -195,11 +196,18 @@ export function modelHasEffortCapabilityEnvVar(model: string, env: NodeJS.Proces
   }
 
   // 3. ANTHROPIC_DEFAULT_{X}_MODEL_SUPPORTED_CAPABILITIES for any pinned default model alias.
+  //    Also matches when the alias derived from the env key name (e.g. "OPUS" → "opus") equals
+  //    the normalized config model, so that ANTHROPIC_DEFAULT_OPUS_MODEL capabilities apply when
+  //    agent.model = "opus" even if the pinned value is a gateway model ID.
+  const normalizedModel = normalizeModelForCapabilityCheck(model);
   for (const [key, value] of Object.entries(env)) {
     const match = /^ANTHROPIC_DEFAULT_(.+)_MODEL$/.exec(key);
-    if (match && value === model &&
-        hasEffort(env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`])) {
-      return true;
+    if (match) {
+      const aliasFromKey = match[1].toLowerCase();
+      if ((value === model || aliasFromKey === normalizedModel) &&
+          hasEffort(env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`])) {
+        return true;
+      }
     }
   }
 
@@ -225,11 +233,48 @@ export function modelHasMaxEffortCapabilityEnvVar(model: string, env: NodeJS.Pro
     return true;
   }
 
+  const normalizedModel = normalizeModelForCapabilityCheck(model);
   for (const [key, value] of Object.entries(env)) {
     const match = /^ANTHROPIC_DEFAULT_(.+)_MODEL$/.exec(key);
-    if (match && value === model &&
-        hasMaxEffort(env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`])) {
-      return true;
+    if (match) {
+      const aliasFromKey = match[1].toLowerCase();
+      if ((value === model || aliasFromKey === normalizedModel) &&
+          hasMaxEffort(env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`])) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Claude Code が定義する *_SUPPORTED_CAPABILITIES 環境変数に "xhigh_effort" が含まれるか確認する。
+ * modelHasEffortCapabilityEnvVar と同じ 3 パターンで "xhigh_effort" を照合する。
+ * "effort" や "max_effort" だけが宣言されている場合は false を返す。
+ */
+export function modelHasXhighEffortCapabilityEnvVar(model: string, env: NodeJS.ProcessEnv): boolean {
+  function hasXhighEffort(capVar: string | undefined): boolean {
+    return capVar !== undefined && capVar.split(",").map((s) => s.trim()).includes("xhigh_effort");
+  }
+
+  const prefix = model.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  if (hasXhighEffort(env[`${prefix}_SUPPORTED_CAPABILITIES`])) return true;
+
+  if (env["ANTHROPIC_CUSTOM_MODEL_OPTION"] === model &&
+      hasXhighEffort(env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"])) {
+    return true;
+  }
+
+  const normalizedModel = normalizeModelForCapabilityCheck(model);
+  for (const [key, value] of Object.entries(env)) {
+    const match = /^ANTHROPIC_DEFAULT_(.+)_MODEL$/.exec(key);
+    if (match) {
+      const aliasFromKey = match[1].toLowerCase();
+      if ((value === model || aliasFromKey === normalizedModel) &&
+          hasXhighEffort(env[`ANTHROPIC_DEFAULT_${match[1]}_MODEL_SUPPORTED_CAPABILITIES`])) {
+        return true;
+      }
     }
   }
 
@@ -320,11 +365,20 @@ export function loadConfig(
     const { model, effort: rawEffort, extra_args } = result.data.agent;
     // capability env var または CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 がある場合は
     // allowlist チェックを全スキップする。
-    const skipEffortChecks = effortAlwaysEnabled || modelHasEffortCapabilityEnvVar(model, env);
+    const hasEffortEnvVar = modelHasEffortCapabilityEnvVar(model, env);
+    const skipEffortChecks = effortAlwaysEnabled || hasEffortEnvVar;
+    // xhigh / max はそれぞれ xhigh_effort / max_effort が宣言されている場合のみスキップする。
+    // "effort" のみ宣言されたカスタムモデルでも xhigh/max の level-specific チェックを通す。
+    const skipXhighCheck = effortAlwaysEnabled || modelHasXhighEffortCapabilityEnvVar(model, env);
+    // allowlist に含まれる標準モデルはすべて max を対応とみなすため skipMaxCheck = true。
+    // カスタムモデルで max_effort が宣言されていない場合は max を拒否する。
+    const skipMaxCheck = effortAlwaysEnabled ||
+      modelHasMaxEffortCapabilityEnvVar(model, env) ||
+      modelSupportsEffort(model);
     // effort 未指定時のデフォルト:
     // - effortAlwaysEnabled が true: "max"（エスケープハッチ、全対応宣言）
     // - max_effort 宣言済み capability がある: "max"（明示的に max_effort が宣言された）
-    //   ※ "effort" だけの宣言では "max" にしない（Finding 3: max_effort と effort は別能力）
+    //   ※ "effort" だけの宣言では "max" にしない（max_effort と effort は別 capability）
     // - modelDefaultsToMaxEffort が true: "max"（バージョン確定済み・全プロバイダ対応）
     // - それ以外: "auto"（"sonnet" 等の曖昧なエイリアス、Bedrock/Vertex での安全側）
     const canDefaultToMax = effortAlwaysEnabled ||
@@ -340,7 +394,7 @@ export function loadConfig(
           `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
       );
     }
-    // Finding 1: Bedrock/Vertex/Foundry では "sonnet" ベアエイリアスが Sonnet 4.5 に解決される
+    // Bedrock/Vertex/Foundry では "sonnet" ベアエイリアスが Sonnet 4.5 に解決される
     // 可能性があるため、明示的な non-auto effort は拒否する（バージョン付き ID またはオーバーライドを要求）。
     if (!skipEffortChecks && isThirdParty && normalizeModelForCapabilityCheck(model) === "sonnet" && effectiveEffort !== "auto") {
       errors.push(
@@ -348,18 +402,37 @@ export function loadConfig(
           `pin to a versioned model (e.g., claude-sonnet-4-6) or set agent.effort = "auto"`,
       );
     }
-    if (!skipEffortChecks && effectiveEffort === "xhigh" && modelSupportsEffort(model) && !modelSupportsXhigh(model)) {
+    // "opusplan" は実行フェーズで Sonnet を使用するため、Bedrock/Vertex/Foundry では
+    // Sonnet 4.5 に解決される可能性があり "sonnet" と同様に non-auto effort を拒否する。
+    if (!skipEffortChecks && isThirdParty && normalizeModelForCapabilityCheck(model) === "opusplan" && effectiveEffort !== "auto") {
+      errors.push(
+        `agent.effort: model "opusplan" execution phase may resolve to Sonnet 4.5 on Bedrock/Vertex/Foundry which does not support effort; ` +
+          `pin to a versioned model or set agent.effort = "auto"`,
+      );
+    }
+    // xhigh は xhigh_effort capability が宣言されているか allowlist でサポートが確認できる
+    // 場合のみ許可する（"effort" のみ宣言されたカスタムモデルでも xhigh は拒否）。
+    if (!skipXhighCheck && effectiveEffort === "xhigh" && (skipEffortChecks || modelSupportsEffort(model)) && !modelSupportsXhigh(model)) {
       errors.push(
         `agent.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
           `model "${model}" supports low/medium/high/max only`,
       );
     }
-    // Finding 2: Bedrock/Vertex/Foundry では "opus" ベアエイリアスが Opus 4.6 に解決される
+    // Bedrock/Vertex/Foundry では "opus" ベアエイリアスが Opus 4.6 に解決される
     // 可能性があるため、xhigh は拒否する（Opus 4.6 は xhigh 非対応）。
-    if (!skipEffortChecks && isThirdParty && normalizeModelForCapabilityCheck(model) === "opus" && effectiveEffort === "xhigh") {
+    if (!skipXhighCheck && isThirdParty && normalizeModelForCapabilityCheck(model) === "opus" && effectiveEffort === "xhigh") {
       errors.push(
         `agent.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
           `model "opus" on Bedrock/Vertex/Foundry resolves to Opus 4.6 which supports low/medium/high/max only`,
+      );
+    }
+    // max_effort capability が宣言されていないカスタムモデルで "max" を要求した場合は拒否する。
+    // "effort" と "max_effort" は別 capability であり、"effort" のみの宣言では max は非許可。
+    if (!skipMaxCheck && hasEffortEnvVar && effectiveEffort === "max") {
+      errors.push(
+        `agent.effort: effort level "max" requires "max_effort" capability; ` +
+          `model "${model}" declares "effort" but not "max_effort" ` +
+          `— add "max_effort" to the supported capabilities or use a lower effort level`,
       );
     }
     // CLAUDE_CODE_EFFORT_LEVEL env override（effortEnvOverride 経由で子プロセスに注入）は
