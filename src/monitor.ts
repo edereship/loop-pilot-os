@@ -105,12 +105,21 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
     }
 
     // §5.4 規則3-5: ここで初めてコメントを取得して信頼 state コメントを特定
-    const trusted = await this.findTrustedStateComment(prNumber);
-    if (trusted === null) {
+    const { stateComment, errorCommentCount, latestErrorBody } =
+      await this.scanTrustedComments(prNumber);
+
+    if (stateComment === null) {
+      if (errorCommentCount > 0) {
+        return {
+          kind: "workflow_failed",
+          errorBody: latestErrorBody!,
+          errorCommentCount,
+        };
+      }
       return { kind: "not_engaged" };
     }
 
-    const status = this.extractStatus(trusted.body);
+    const status = this.extractStatus(stateComment.body);
     if (status === null) {
       return { kind: "corrupted" };
     }
@@ -121,6 +130,13 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
       return { kind: "done" };
     }
     // initialized | waiting_codex | fixing
+    if (errorCommentCount > 0) {
+      return {
+        kind: "workflow_failed",
+        errorBody: latestErrorBody!,
+        errorCommentCount,
+      };
+    }
     return { kind: "in_progress" };
   }
 
@@ -182,10 +198,15 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
   /**
    * §5.4 のコメント特定4規則を適用して信頼 state コメントを返す。
    * 該当無し → null。複数該当 → 最後のもの（gh は作成昇順、配列末尾 = 最新）。
+   * また ⚠️ で始まる信頼著者コメント（state コメント以外）を集計する。
    */
-  private async findTrustedStateComment(
+  private async scanTrustedComments(
     prNumber: number,
-  ): Promise<IssueComment | null> {
+  ): Promise<{
+    stateComment: IssueComment | null;
+    errorCommentCount: number;
+    latestErrorBody: string | null;
+  }> {
     const result = await this.runner.run(
       "gh",
       [
@@ -205,18 +226,31 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
     const pages = JSON.parse(result.stdout) as IssueComment[][];
     const comments: IssueComment[] = pages.flat();
 
-    let found: IssueComment | null = null;
+    let stateComment: IssueComment | null = null;
+    let errorCommentCount = 0;
+    let latestErrorBody: string | null = null;
+
     for (const c of comments) {
       // 規則1: 信頼著者（user は削除/ghost で null になり得る → スキップ）
       if (!c.user || !this.trustedAuthors.includes(c.user.login)) continue;
-      // 規則2: 可視テキストで始まる
-      if (!c.body.startsWith(STATE_COMMENT_VISIBLE_TEXT)) continue;
-      // 規則3: 隠しマーカーを含む
-      if (!c.body.includes(STATE_COMMENT_OPEN)) continue;
-      // 規則4: 最後優先（上書きし続けて末尾を残す）
-      found = c;
+
+      // State comment check (existing rules 2-4)
+      if (
+        c.body.startsWith(STATE_COMMENT_VISIBLE_TEXT) &&
+        c.body.includes(STATE_COMMENT_OPEN)
+      ) {
+        stateComment = c;
+        continue;
+      }
+
+      // ⚠️ error comment check
+      if (c.body.startsWith("⚠️")) {
+        errorCommentCount++;
+        latestErrorBody = c.body;
+      }
     }
-    return found;
+
+    return { stateComment, errorCommentCount, latestErrorBody };
   }
 
   /**

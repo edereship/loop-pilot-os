@@ -738,6 +738,165 @@ describe("GhLoopPilotMonitor — gh 呼び出し形の固定 (§5.3)", () => {
   });
 });
 
+describe("GhLoopPilotMonitor.poll — ⚠️ error comment detection (ES-397)", () => {
+  it("⚠️コメント1件 + state=initialized → workflow_failed(count=1, body=⚠️コメント)", async () => {
+    const errorBody = "⚠️ **LoopPilot Workflow B failed before the auto-fix loop could start.**";
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          {
+            author: "github-actions[bot]",
+            body: stateCommentBody({ status: "initialized", stopReason: null }),
+          },
+          {
+            author: "github-actions[bot]",
+            body: errorBody,
+          },
+        ],
+      ]),
+    });
+    expect(await monitor.poll(50)).toEqual<MonitorVerdict>({
+      kind: "workflow_failed",
+      errorBody,
+      errorCommentCount: 1,
+    });
+  });
+
+  it("⚠️コメント2件 + stateコメントなし → workflow_failed(count=2, body=最新)", async () => {
+    const error1 = "⚠️ first failure";
+    const error2 = "⚠️ second failure";
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          { author: "github-actions[bot]", body: error1 },
+          { author: "github-actions[bot]", body: error2 },
+        ],
+      ]),
+    });
+    const verdict = await monitor.poll(51);
+    expect(verdict).toEqual<MonitorVerdict>({
+      kind: "workflow_failed",
+      errorBody: error2,
+      errorCommentCount: 2,
+    });
+  });
+
+  it("⚠️コメント0件 + state=initialized → in_progress（既存動作不変）", async () => {
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          {
+            author: "github-actions[bot]",
+            body: stateCommentBody({ status: "initialized", stopReason: null }),
+          },
+        ],
+      ]),
+    });
+    expect(await monitor.poll(52)).toEqual<MonitorVerdict>({ kind: "in_progress" });
+  });
+
+  it("⚠️コメント0件 + stateコメントなし → not_engaged（既存動作不変）", async () => {
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([[]]),
+    });
+    expect(await monitor.poll(53)).toEqual<MonitorVerdict>({ kind: "not_engaged" });
+  });
+
+  it("⚠️コメント1件 + state=done → done（done が優先）", async () => {
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          {
+            author: "github-actions[bot]",
+            body: stateCommentBody({ status: "done", stopReason: null }),
+          },
+          { author: "github-actions[bot]", body: "⚠️ old failure" },
+        ],
+      ]),
+    });
+    expect(await monitor.poll(54)).toEqual<MonitorVerdict>({ kind: "done" });
+  });
+
+  it("⚠️コメント1件 + state=stopped → stopped（stopped が優先）", async () => {
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          {
+            author: "github-actions[bot]",
+            body: stateCommentBody({ status: "stopped", stopReason: "max_iterations" }),
+          },
+          { author: "github-actions[bot]", body: "⚠️ old failure" },
+        ],
+      ]),
+    });
+    expect(await monitor.poll(55)).toEqual<MonitorVerdict>({
+      kind: "stopped",
+      stopReason: "max_iterations",
+    });
+  });
+
+  it("偽装著者の⚠️は無視し、信頼著者の⚠️のみカウントする", async () => {
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          { author: "attacker", body: "⚠️ fake error" },
+          {
+            author: "github-actions[bot]",
+            body: stateCommentBody({ status: "initialized", stopReason: null }),
+          },
+        ],
+      ]),
+    });
+    expect(await monitor.poll(56)).toEqual<MonitorVerdict>({ kind: "in_progress" });
+  });
+
+  it("stateコメントは⚠️カウントに含めない（STATE_COMMENT_VISIBLE_TEXT先頭はstate優先）", async () => {
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          {
+            author: "github-actions[bot]",
+            body: stateCommentBody({ status: "initialized", stopReason: null }),
+          },
+        ],
+      ]),
+    });
+    expect(await monitor.poll(57)).toEqual<MonitorVerdict>({ kind: "in_progress" });
+  });
+
+  it("⚠️が複数ページに跨ぐ場合でもカウントが正確", async () => {
+    const { monitor } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([
+        [
+          {
+            author: "github-actions[bot]",
+            body: stateCommentBody({ status: "waiting_codex", stopReason: null }),
+          },
+          { author: "github-actions[bot]", body: "⚠️ page 1 error" },
+        ],
+        [
+          { author: "github-actions[bot]", body: "⚠️ page 2 error" },
+        ],
+      ]),
+    });
+    const verdict = await monitor.poll(58);
+    expect(verdict).toEqual<MonitorVerdict>({
+      kind: "workflow_failed",
+      errorBody: "⚠️ page 2 error",
+      errorCommentCount: 2,
+    });
+  });
+});
+
 describe("GhLoopPilotMonitor — gh 失敗時は throw（オーケストレーターのバックオフ契約）", () => {
   // 仕様(§7 step6): gh pr view 失敗（非0 exit・空 stdout）で poll は誤分類せず reject する
   it("gh pr view が非0 exit・空 stdout を返したら poll は reject する", async () => {
