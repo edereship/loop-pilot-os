@@ -702,7 +702,7 @@ describe("回復 — in_review + PR が merged（仕様 §9 / カーネル §8: 
 
 describe("MONITOR — workflow_failed verdict (ES-397)", () => {
   it("workflow_failed → restarted(cost>0) → costUsd updated, polling continues to merged", async () => {
-    const config = makeConfig();
+    const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     const iss = issue("id-wf", "TY-WF1");
     h.source.queue = [iss];
