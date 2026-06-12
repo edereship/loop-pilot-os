@@ -22,6 +22,9 @@ import type {
   CommandResult,
   RunOptions,
   CommandRunner,
+  RecoveryContext,
+  RecoveryOutcome,
+  WorkflowRecovery,
 } from "../src/types.js";
 
 // 仕様 §7「状態語彙」: 各ユニオンのメンバを satisfies で固定する。
@@ -73,7 +76,7 @@ describe("状態語彙ユニオン（仕様 §7）", () => {
     expect(all.map(ensureExhaustive).length).toBe(3);
   });
 
-  it("FailureReason は仕様 §7 の 10 種の失敗理由を網羅する", () => {
+  it("FailureReason は仕様 §7 の 11 種の失敗理由を網羅する", () => {
     const all = [
       "agent_no_change",
       "cost_exceeded",
@@ -85,6 +88,7 @@ describe("状態語彙ユニオン（仕様 §7）", () => {
       "pr_closed",
       "claim_failed",
       "handoff_failed",
+      "workflow_setup_failed",
     ] as const satisfies readonly FailureReason[];
     // exhaustive switch で逆方向（FailureReason ⊆ all）も固定する。
     const ensureExhaustive = (r: FailureReason): (typeof all)[number] => {
@@ -99,6 +103,7 @@ describe("状態語彙ユニオン（仕様 §7）", () => {
         case "pr_closed":
         case "claim_failed":
         case "handoff_failed":
+        case "workflow_setup_failed":
           return r;
         default: {
           const never: never = r;
@@ -106,7 +111,7 @@ describe("状態語彙ユニオン（仕様 §7）", () => {
         }
       }
     };
-    expect(all.map(ensureExhaustive).length).toBe(10);
+    expect(all.map(ensureExhaustive).length).toBe(11);
   });
 
   it("TicketState は todo/in_progress/in_review/done の 4 値である", () => {
@@ -204,7 +209,7 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
     expect(variants).toHaveLength(3);
   });
 
-  it("MonitorVerdict は kind で 7 バリアントを判別でき、stopped は stopReason に null を保持できる（仕様 §6）", () => {
+  it("MonitorVerdict は kind で 8 バリアントを判別でき、stopped は stopReason に null を保持できる（仕様 §6）", () => {
     // 列挙順は precedence ではない（カーネル §2 注記）。網羅性のみ固定する。
     const variants = [
       { kind: "merged" },
@@ -215,6 +220,7 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
       { kind: "corrupted" },
       { kind: "not_engaged" },
       { kind: "pr_closed" },
+      { kind: "workflow_failed", errorBody: "⚠️ failure", errorCommentCount: 1 },
     ] as const satisfies readonly MonitorVerdict[];
 
     const describe = (v: MonitorVerdict): string => {
@@ -234,6 +240,8 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
           return "not_engaged";
         case "pr_closed":
           return "pr_closed";
+        case "workflow_failed":
+          return `workflow_failed(${v.errorCommentCount})`;
         default: {
           const never: never = v;
           return never;
@@ -241,6 +249,7 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
       }
     };
     expect(variants.map(describe)).toContain("stopped(no reason)");
+    expect(variants.map(describe)).toContain("workflow_failed(1)");
   });
 
   it("MergeReadiness は ready の真偽で headSha 有無と reason を判別できる（カーネル §5.3）", () => {
@@ -355,5 +364,28 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
     expect(git.prepareWorktree).toBeTypeOf("function");
     expect(monitor.poll).toBeTypeOf("function");
     expect(notifier.notify).toBeTypeOf("function");
+  });
+
+  it("RecoveryContext / RecoveryOutcome / WorkflowRecovery はインターフェースを満たす実装に代入できる", () => {
+    const ctx: RecoveryContext = {
+      worktreePath: "/tmp/wt",
+      branch: "looppilot/ty-1-fix",
+      prNumber: 42,
+      errorBody: "⚠️ workflow failed",
+      errorCommentCount: 1,
+      maxCostUsd: 2.0,
+    };
+    const outcomes = [
+      { kind: "restarted", costUsd: 0.5 },
+      { kind: "exhausted", costUsd: 1.5 },
+      { kind: "unrecoverable", costUsd: 0.3, message: "agent error" },
+    ] as const satisfies readonly RecoveryOutcome[];
+    const recovery: WorkflowRecovery = {
+      attemptRecovery: async (_ctx: RecoveryContext): Promise<RecoveryOutcome> =>
+        outcomes[0],
+    };
+    expect(ctx.prNumber).toBe(42);
+    expect(outcomes).toHaveLength(3);
+    expect(recovery.attemptRecovery).toBeTypeOf("function");
   });
 });

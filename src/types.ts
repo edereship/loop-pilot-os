@@ -12,7 +12,8 @@ export type FailureReason =
   | "merge_conflict"
   | "pr_closed"
   | "claim_failed"
-  | "handoff_failed";
+  | "handoff_failed"
+  | "workflow_setup_failed";
 
 // ---- ドメイン ----
 export interface EligibleIssue {
@@ -98,7 +99,8 @@ export type MonitorVerdict =
   | { kind: "in_progress" }     // state コメントあり・進行中（initialized|waiting_codex|fixing）
   | { kind: "corrupted" }       // 信頼著者の state コメントは在るが JSON 破損/不正 status
   | { kind: "not_engaged" }     // 信頼できる state コメント未出現
-  | { kind: "pr_closed" };      // マージ無しクローズ
+  | { kind: "pr_closed" }       // マージ無しクローズ
+  | { kind: "workflow_failed"; errorBody: string; errorCommentCount: number };
 export type MergeReadiness =
   | { ready: true; headSha: string }
   | { ready: false; reason: "ci_pending" | "ci_failed" | "conflict" | "blocked" | "unknown" };
@@ -117,6 +119,23 @@ export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */
   probeReachability(): Promise<void>;
+}
+
+// ---- ワークフロー回復（workflow-recovery.ts） ----
+export interface RecoveryContext {
+  worktreePath: string;
+  branch: string;
+  prNumber: number;
+  errorBody: string;
+  errorCommentCount: number;
+  maxCostUsd: number;
+}
+export type RecoveryOutcome =
+  | { kind: "restarted"; costUsd: number }
+  | { kind: "exhausted"; costUsd: number }
+  | { kind: "unrecoverable"; costUsd: number; message: string };
+export interface WorkflowRecovery {
+  attemptRecovery(ctx: RecoveryContext): Promise<RecoveryOutcome>;
 }
 
 // ---- 文脈バンドル（context-bundle.ts） ----

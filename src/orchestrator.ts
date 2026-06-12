@@ -168,6 +168,9 @@ export class Orchestrator {
       case "corrupted":
       case "not_engaged":
         return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+      // workflow_failed: ワークフロー回復は別モジュール（workflow-recovery.ts）で担う（ES-397）
+      case "workflow_failed":
+        return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
     }
   }
 
