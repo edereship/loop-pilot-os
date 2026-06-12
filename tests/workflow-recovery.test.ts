@@ -62,8 +62,24 @@ describe("AgentWorkflowRecovery", () => {
     expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.5, newFix: true });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeDefined();
-    expect(pushCall!.args).toEqual(["push", "origin", "looppilot/ty-1-fix"]);
+    // Push the verified HEAD as <branch>, not the named local ref — guards against the
+    // fix agent leaving the worktree on a detached HEAD / temporary branch (Finding 4).
+    expect(pushCall!.args).toEqual(["push", "origin", "HEAD:looppilot/ty-1-fix"]);
     expect(pushCall!.opts.cwd).toBe("/wt/ty-1");
+    // The branch was synced before the fix agent ran (Finding 3 review): fetch then reset.
+    const gitCMinusC = runner.calls.filter((c) => c.cmd === "git" && c.args[0] === "-C");
+    const fetchCall = gitCMinusC.find((c) => c.args.includes("fetch"));
+    const resetCall = gitCMinusC.find((c) => c.args.includes("reset"));
+    expect(fetchCall).toBeDefined();
+    expect(fetchCall!.args).toEqual(["-C", "/wt/ty-1", "fetch", "origin", "looppilot/ty-1-fix"]);
+    expect(resetCall).toBeDefined();
+    expect(resetCall!.args).toEqual([
+      "-C",
+      "/wt/ty-1",
+      "reset",
+      "--hard",
+      "origin/looppilot/ty-1-fix",
+    ]);
     const commentCall = runner.calls.find((c) => c.cmd === "gh" && c.args[0] === "pr");
     expect(commentCall).toBeDefined();
     expect(commentCall!.args).toEqual(["pr", "comment", "42", "-R", REMOTE, "-b", "/restart-review"]);
@@ -127,7 +143,10 @@ describe("AgentWorkflowRecovery", () => {
   });
 
   it("agent error → unrecoverable", async () => {
-    const { recovery, agent } = makeRecovery();
+    const { recovery, agent, runner } = makeRecovery();
+    // Sync runs before the agent (Finding 3 review); stub fetch/reset to succeed
+    // so the agent failure is what surfaces.
+    runner.on(["git", "-C"], { code: 0 });
     agent.outcomes = [{ kind: "error", costUsd: 0.1, message: "agent crashed" }];
 
     const result = await recovery.attemptRecovery(ctx());
@@ -140,7 +159,8 @@ describe("AgentWorkflowRecovery", () => {
   });
 
   it("agent cost_exceeded → unrecoverable", async () => {
-    const { recovery, agent } = makeRecovery();
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], { code: 0 });
     agent.outcomes = [{ kind: "cost_exceeded", costUsd: 2.0 }];
 
     const result = await recovery.attemptRecovery(ctx());
@@ -150,6 +170,45 @@ describe("AgentWorkflowRecovery", () => {
       costUsd: 2.0,
       message: "fix agent exceeded cost limit",
     });
+  });
+
+  it("git fetch failure during sync → unrecoverable, fix agent does not run (Finding 3 review)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    // First sync command (fetch) fails; reset would succeed but never runs.
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 1, stderr: "fatal: could not read from remote" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "should not run" }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toMatchObject<Partial<RecoveryOutcome>>({
+      kind: "unrecoverable",
+      costUsd: 0,
+    });
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("git fetch failed");
+    // Fix agent was never invoked because sync failed first.
+    expect(agent.contexts).toHaveLength(0);
+  });
+
+  it("git reset failure during sync → unrecoverable, fix agent does not run (Finding 3 review)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 1, stderr: "fatal: not a git repository" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "should not run" }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toMatchObject<Partial<RecoveryOutcome>>({
+      kind: "unrecoverable",
+      costUsd: 0,
+    });
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("git reset --hard origin/");
+    expect(agent.contexts).toHaveLength(0);
   });
 
   it("git push failure → unrecoverable with agent cost (Finding 4)", async () => {

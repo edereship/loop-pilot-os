@@ -836,6 +836,49 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     expect(s.failureReason).toBeNull();
   });
 
+  // Finding 2 (review): after a new fix is pushed (`newFix: true`), the engagement
+  // timer must reset — otherwise a crash-recovery / slow-failure session whose
+  // original monitorStartedAt is already past notEngagedGuardMinutes would be
+  // killed on the very next poll before the restarted workflow has any chance to
+  // advance the state comment.
+  it("workflow_failed → restarted(newFix) resets monitorStartedAt so guard does not fire next poll", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, notEngagedGuardMinutes: 30 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      // Old start: elapsed >> notEngagedGuardMinutes. If we don't reset on newFix,
+      // the *very next poll* in the pending-restart branch kills the session.
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.monitor.verdicts = [
+      // Poll 1 (adoption + first MONITOR iteration): a new fix is required.
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      // Poll 2 (after fix pushed, restart pending — state hasn't advanced yet):
+      // hasStateComment is false because the workflow hasn't picked up the restart.
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      // Poll 3: workflow finished re-review and merged.
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [
+      { kind: "restarted", costUsd: 0.2, newFix: true },  // first call: new fix pushed
+      { kind: "restarted", costUsd: 0, newFix: false },   // second call: handled count matches → pending
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    // Without the Finding 2 reset, the pending-restart guard would fire at poll 2
+    // (elapsed since the original start >> 30 min) and stopSession with
+    // monitor_never_engaged before the workflow finished. With the reset, the
+    // session reaches merged.
+    expect(s.state).toBe("merged");
+    expect(s.failureReason).toBeNull();
+    // monitorStartedAt is now anchored to the recovery clock (well after the
+    // original 2026-06-04 timestamp).
+    expect(s.monitorStartedAt!.startsWith("2026-06-05")).toBe(true);
+  });
+
   // Counterpart to Finding 3: when the restart never engaged (no state comment), the
   // always-on not-engaged guard still backstops indefinite polling.
   it("workflow_failed pending restart without state comment → not-engaged guard stops it", async () => {

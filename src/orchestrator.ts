@@ -553,11 +553,16 @@ export class Orchestrator {
               // counter, and record the handled error count so a backlog of pre-existing
               // comments isn't re-triggered on the next poll. Keyed on `newFix` rather
               // than cost so a legitimately zero-cost fix run still counts (Finding 2).
+              // Also reset monitorStartedAt so the not-engaged guard measures from the
+              // restart request — otherwise a crash-recovery or slow-failure session that
+              // already exceeded notEngagedGuardMinutes would be killed on the next poll
+              // before the restarted workflow has any chance to advance the state comment.
               const refreshed = this.store.getSession(session.id);
               this.store.updateSession(session.id, {
                 costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd,
                 workflowFixAttempts: refreshed.workflowFixAttempts + 1,
                 workflowHandledErrorCount: verdict.errorCommentCount,
+                monitorStartedAt: this.clock(),
               });
             } else {
               // Pending restart: the fix was already pushed and we're waiting for the

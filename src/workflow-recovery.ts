@@ -53,6 +53,17 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
       return { kind: "exhausted", costUsd: totalCostUsd };
     }
 
+    // Sync the local PR branch to origin before running the fix agent. MONITOR
+    // never fetches, so if LoopPilot has pushed review-fix commits since this
+    // worktree was created the local checkout is behind — the fix agent would
+    // edit a stale base and the later `git push` would be rejected as non-fast-
+    // forward, surfacing as `workflow_setup_failed` instead of recovering
+    // (Finding 3).
+    const syncError = await this.syncBranchToOrigin(ctx.branch, ctx.worktreePath);
+    if (syncError !== null) {
+      return { kind: "unrecoverable", costUsd: 0, message: syncError };
+    }
+
     const outcome = await this.agent.runSession({
       worktreePath: ctx.worktreePath,
       prompt: buildFixPrompt(ctx.errorBody),
@@ -138,9 +149,15 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
     branch: string,
     worktreePath: string,
   ): Promise<void> {
+    // Push the verified HEAD as `<branch>`, not the local ref named `<branch>`.
+    // The verification above (status clean + commits ahead of origin/<branch>) is
+    // measured against HEAD, but if the fix agent leaves the worktree on a
+    // temporary branch or detached HEAD, `git push origin <branch>` would push
+    // the unchanged PR branch — verification would succeed yet the restart would
+    // be sent without the fix (Finding 4).
     const result = await this.runner.run(
       "git",
-      ["push", "origin", branch],
+      ["push", "origin", `HEAD:${branch}`],
       { cwd: worktreePath },
     );
     if (result.code !== 0) {
@@ -148,6 +165,37 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
         `git push failed: ${result.stderr.trim() || `exit ${result.code}`}`,
       );
     }
+  }
+
+  /**
+   * Fast-forward the local checkout to `origin/<branch>` before running the fix.
+   * Returns an error message string on failure (so the caller can return
+   * `unrecoverable`), or null on success. We intentionally use `reset --hard`
+   * rather than `pull --ff-only`: the worktree is LoopPilot-owned for this
+   * session, no human edits ever land in it, and any local divergence would be
+   * stale state from a previous fix attempt that should be discarded.
+   */
+  private async syncBranchToOrigin(
+    branch: string,
+    worktreePath: string,
+  ): Promise<string | null> {
+    const fetchResult = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "fetch", "origin", branch],
+      { cwd: worktreePath },
+    );
+    if (fetchResult.code !== 0) {
+      return `git fetch failed: ${fetchResult.stderr.trim() || `exit ${fetchResult.code}`}`;
+    }
+    const resetResult = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "reset", "--hard", `origin/${branch}`],
+      { cwd: worktreePath },
+    );
+    if (resetResult.code !== 0) {
+      return `git reset --hard origin/${branch} failed: ${resetResult.stderr.trim() || `exit ${resetResult.code}`}`;
+    }
+    return null;
   }
 
   private async postRestartReview(prNumber: number): Promise<void> {

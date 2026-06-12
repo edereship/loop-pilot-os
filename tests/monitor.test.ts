@@ -739,7 +739,9 @@ describe("GhLoopPilotMonitor — gh 呼び出し形の固定 (§5.3)", () => {
 });
 
 describe("GhLoopPilotMonitor.poll — ⚠️ error comment detection (ES-397)", () => {
-  it("⚠️コメント1件 + state=initialized → workflow_failed(count=1, body=⚠️コメント)", async () => {
+  it("⚠️コメント1件 + state=initialized → workflow_failed(count=1, hasStateComment=false)", async () => {
+    // `initialized` is the pre-engagement state and does NOT count as a live state comment:
+    // suppressing the not-engaged guard on it would let an ignored /restart-review poll forever.
     const errorBody = "⚠️ **LoopPilot Workflow B failed before the auto-fix loop could start.**";
     const { monitor } = makeMonitor({
       view: prView(),
@@ -760,7 +762,7 @@ describe("GhLoopPilotMonitor.poll — ⚠️ error comment detection (ES-397)", 
       kind: "workflow_failed",
       errorBody,
       errorCommentCount: 1,
-      hasStateComment: true,
+      hasStateComment: false,
     });
   });
 

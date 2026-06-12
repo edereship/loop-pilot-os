@@ -132,11 +132,17 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
     }
     // initialized | waiting_codex | fixing
     if (errorCommentCount > 0) {
+      // `initialized` is the pre-engagement state the workflow stamps before it
+      // starts work, so it cannot prove the restarted review is live; only
+      // `waiting_codex`/`fixing` do. Suppressing the not-engaged guard on
+      // `initialized` would let an ignored `/restart-review` poll forever
+      // when monitor_timeout_minutes is unset.
+      const liveStatus = status.status === "waiting_codex" || status.status === "fixing";
       return {
         kind: "workflow_failed",
         errorBody: latestErrorBody!,
         errorCommentCount,
-        hasStateComment: true,
+        hasStateComment: liveStatus,
       };
     }
     return { kind: "in_progress" };
