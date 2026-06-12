@@ -222,7 +222,7 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
       { kind: "corrupted" },
       { kind: "not_engaged" },
       { kind: "pr_closed" },
-      { kind: "workflow_failed", errorBody: "⚠️ failure", errorCommentCount: 1 },
+      { kind: "workflow_failed", errorBody: "⚠️ failure", errorCommentCount: 1, hasStateComment: false },
     ] as const satisfies readonly MonitorVerdict[];
 
     const describe = (v: MonitorVerdict): string => {
@@ -380,7 +380,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
       maxCostUsd: 2.0,
     };
     const outcomes = [
-      { kind: "restarted", costUsd: 0.5 },
+      { kind: "restarted", costUsd: 0.5, newFix: true },
       { kind: "exhausted", costUsd: 1.5 },
       { kind: "unrecoverable", costUsd: 0.3, message: "agent error" },
     ] as const satisfies readonly RecoveryOutcome[];

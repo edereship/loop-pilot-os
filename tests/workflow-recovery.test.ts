@@ -59,7 +59,7 @@ describe("AgentWorkflowRecovery", () => {
 
     const result = await recovery.attemptRecovery(ctx());
 
-    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.5 });
+    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.5, newFix: true });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeDefined();
     expect(pushCall!.args).toEqual(["push", "origin", "looppilot/ty-1-fix"]);
@@ -77,7 +77,7 @@ describe("AgentWorkflowRecovery", () => {
       fixAttempts: 1,
       handledErrorCount: 1,
     }));
-    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0 });
+    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0, newFix: false });
   });
 
   it("backlog of pre-existing errors handled atomically: errorCommentCount=2, one fix covers both", async () => {
@@ -93,7 +93,7 @@ describe("AgentWorkflowRecovery", () => {
       fixAttempts: 0,
       handledErrorCount: 0,
     }));
-    expect(r1).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.3 });
+    expect(r1).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.3, newFix: true });
 
     // Caller persists: workflowFixAttempts=1, workflowHandledErrorCount=2.
     // Second call: same 2 errors, handledErrorCount=2 → already handled, no new fix.
@@ -102,7 +102,7 @@ describe("AgentWorkflowRecovery", () => {
       fixAttempts: 1,
       handledErrorCount: 2,
     }));
-    expect(r2).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0 });
+    expect(r2).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0, newFix: false });
   });
 
   it("exhausted: fixAttempts >= maxAttempts → exhausted", async () => {
@@ -232,11 +232,11 @@ describe("AgentWorkflowRecovery", () => {
     runner.on(["gh", "pr", "comment"], { code: 0 });
 
     const r1 = await recovery.attemptRecovery(ctx({ errorCommentCount: 1, fixAttempts: 0, handledErrorCount: 0 }));
-    expect(r1).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.3 });
+    expect(r1).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.3, newFix: true });
 
     // Caller persists fixAttempts=1, handledErrorCount=1, new error appears.
     const r2 = await recovery.attemptRecovery(ctx({ errorCommentCount: 2, fixAttempts: 1, handledErrorCount: 1 }));
-    expect(r2).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.4 });
+    expect(r2).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.4, newFix: true });
 
     // Caller persists fixAttempts=2, handledErrorCount=2, another new error.
     const r3 = await recovery.attemptRecovery(ctx({ errorCommentCount: 3, fixAttempts: 2, handledErrorCount: 2 }));

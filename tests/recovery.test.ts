@@ -708,10 +708,10 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     h.source.queue = [iss];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
     h.monitor.verdicts = [
-      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1 },
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
       { kind: "merged" },
     ];
-    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0.5 }];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0.5, newFix: true }];
 
     await h.orch.run();
 
@@ -729,7 +729,7 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     h.source.queue = [iss];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
     h.monitor.verdicts = [
-      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 3 },
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 3, hasStateComment: false },
     ];
     h.recovery.outcomes = [{ kind: "exhausted", costUsd: 1.0 }];
 
@@ -748,7 +748,7 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     h.source.queue = [iss];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
     h.monitor.verdicts = [
-      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1 },
+      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1, hasStateComment: false },
     ];
     h.recovery.outcomes = [{ kind: "unrecoverable", costUsd: 0.1, message: "agent crashed" }];
 
@@ -767,7 +767,7 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     h.source.queue = [iss];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
     h.monitor.verdicts = [
-      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1 },
+      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1, hasStateComment: false },
     ];
 
     await h.orch.run();
@@ -776,5 +776,86 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     expect(session.state).toBe("stopped");
     expect(session.failureReason).toBe("workflow_setup_failed");
     expect(session.stopDetail).toContain("workflow recovery error");
+  });
+
+  // Finding 2: a fix-agent run that legitimately reports costUsd:0 must still count as a
+  // completed attempt (increment workflowFixAttempts / record handled count), keyed on
+  // `newFix` rather than cost > 0.
+  it("workflow_failed → restarted(newFix, cost=0) → attempt counters still advance", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    const iss = issue("id-wfz", "TY-WFZ");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0, newFix: true }];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("merged");
+    // Counters advanced even though the fix run cost $0 (Finding 2).
+    expect(session.workflowFixAttempts).toBe(1);
+    expect(session.workflowHandledErrorCount).toBe(1);
+    // Only the implementation cost was added; the zero-cost fix added nothing.
+    expect(session.costUsd).toBe(1.0);
+  });
+
+  // Finding 3: after a handled failure, the stale ⚠️ comment keeps poll() returning
+  // workflow_failed even once the looppilot-state moved to fixing/waiting_codex. A live
+  // (hasStateComment) restarted review must NOT be killed by the not-engaged guard.
+  // The first verdict is consumed by crash-recovery adoption; the second drives the
+  // pending-restart branch inside monitorSession.
+  it("workflow_failed pending restart with live state comment → guard does not stop the review", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 }); // monitorTimeoutMinutes unset
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z", // elapsed >> notEngagedGuardMinutes (30)
+    });
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: true },
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: true },
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0, newFix: false }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged"); // guard skipped because a live state comment is present
+    expect(s.failureReason).toBeNull();
+  });
+
+  // Counterpart to Finding 3: when the restart never engaged (no state comment), the
+  // always-on not-engaged guard still backstops indefinite polling.
+  it("workflow_failed pending restart without state comment → not-engaged guard stops it", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 }); // monitorTimeoutMinutes unset
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z", // elapsed >> notEngagedGuardMinutes (30)
+    });
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0, newFix: false }];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("monitor_never_engaged");
   });
 });

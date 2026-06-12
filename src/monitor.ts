@@ -114,6 +114,7 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
           kind: "workflow_failed",
           errorBody: latestErrorBody!,
           errorCommentCount,
+          hasStateComment: false,
         };
       }
       return { kind: "not_engaged" };
@@ -135,6 +136,7 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
         kind: "workflow_failed",
         errorBody: latestErrorBody!,
         errorCommentCount,
+        hasStateComment: true,
       };
     }
     return { kind: "in_progress" };

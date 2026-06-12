@@ -760,6 +760,7 @@ describe("GhLoopPilotMonitor.poll — ⚠️ error comment detection (ES-397)", 
       kind: "workflow_failed",
       errorBody,
       errorCommentCount: 1,
+      hasStateComment: true,
     });
   });
 
@@ -780,6 +781,7 @@ describe("GhLoopPilotMonitor.poll — ⚠️ error comment detection (ES-397)", 
       kind: "workflow_failed",
       errorBody: error2,
       errorCommentCount: 2,
+      hasStateComment: false,
     });
   });
 
@@ -893,6 +895,7 @@ describe("GhLoopPilotMonitor.poll — ⚠️ error comment detection (ES-397)", 
       kind: "workflow_failed",
       errorBody: "⚠️ page 2 error",
       errorCommentCount: 2,
+      hasStateComment: true,
     });
   });
 });

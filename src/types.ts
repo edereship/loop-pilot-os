@@ -102,7 +102,16 @@ export type MonitorVerdict =
   | { kind: "corrupted" }       // 信頼著者の state コメントは在るが JSON 破損/不正 status
   | { kind: "not_engaged" }     // 信頼できる state コメント未出現
   | { kind: "pr_closed" }       // マージ無しクローズ
-  | { kind: "workflow_failed"; errorBody: string; errorCommentCount: number };
+  // hasStateComment: a live (non-stopped/non-done) looppilot-state comment is present
+  // alongside the ⚠️ error comment. The orchestrator uses this to tell an actively
+  // restarted review (state comment moved to fixing/waiting_codex) from one that never
+  // engaged, so the not-engaged guard does not kill a live review.
+  | {
+      kind: "workflow_failed";
+      errorBody: string;
+      errorCommentCount: number;
+      hasStateComment: boolean;
+    };
 export type MergeReadiness =
   | { ready: true; headSha: string }
   | { ready: false; reason: "ci_pending" | "ci_failed" | "conflict" | "blocked" | "unknown" };
@@ -139,7 +148,11 @@ export interface RecoveryContext {
   hardTimeoutMs?: number;
 }
 export type RecoveryOutcome =
-  | { kind: "restarted"; costUsd: number }
+  // `newFix` distinguishes "a new fix was pushed this poll" (increment the budget
+  // counter / record the handled error count) from "already handled, just waiting
+  // for the restarted workflow". Cost cannot be used for this because a fix-agent
+  // run may legitimately report costUsd: 0.
+  | { kind: "restarted"; costUsd: number; newFix: boolean }
   | { kind: "exhausted"; costUsd: number }
   | { kind: "unrecoverable"; costUsd: number; message: string };
 export interface WorkflowRecovery {

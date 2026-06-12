@@ -45,7 +45,7 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
     // Compare against handledErrorCount (the errorCommentCount at the last fix) rather
     // than fixAttempts, so a backlog of N pre-existing comments is handled atomically.
     if (ctx.errorCommentCount <= ctx.handledErrorCount) {
-      return { kind: "restarted", costUsd: 0 };
+      return { kind: "restarted", costUsd: 0, newFix: false };
     }
 
     // Budget: max fix-agent runs exhausted (Finding 2 — fixAttempts is durable, not in-memory).
@@ -131,7 +131,7 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
       `workflow fix attempt ${ctx.fixAttempts + 1}/${this.maxAttempts} ` +
         `for PR #${ctx.prNumber} (cost=$${outcome.costUsd.toFixed(2)})`,
     );
-    return { kind: "restarted", costUsd: outcome.costUsd };
+    return { kind: "restarted", costUsd: outcome.costUsd, newFix: true };
   }
 
   private async pushFix(

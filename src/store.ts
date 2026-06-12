@@ -148,6 +148,34 @@ export class SqliteStore {
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("user_version = 1");
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * 既存 DB へのスキーマ追従（ES-397）。
+   * `CREATE TABLE IF NOT EXISTS` は既存 task_session に列を追加しないため、
+   * workflow-recovery 導入前に作られた DB は古い列構成のまま残る。その状態で
+   * updateSession が workflow_fix_attempts / workflow_handled_error_count を書くと
+   * `no such column` で失敗する。欠けている列だけを冪等に ALTER TABLE で補う。
+   */
+  private migrate(): void {
+    const columns = new Set(
+      (
+        this.db.prepare(`PRAGMA table_info(task_session)`).all() as Array<{
+          name: string;
+        }>
+      ).map((c) => c.name),
+    );
+    if (!columns.has("workflow_fix_attempts")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN workflow_fix_attempts INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!columns.has("workflow_handled_error_count")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN workflow_handled_error_count INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
   }
 
   close(): void {

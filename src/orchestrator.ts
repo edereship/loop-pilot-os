@@ -548,10 +548,11 @@ export class Orchestrator {
             );
           }
           if (recoveryResult.kind === "restarted") {
-            if (recoveryResult.costUsd > 0) {
-              // A new fix was pushed: persist cost, increment budget counter, and record
-              // the handled error count so a backlog of pre-existing comments isn't
-              // re-triggered on the next poll (Findings 2 and 5).
+            if (recoveryResult.newFix) {
+              // A new fix was pushed this poll: persist cost, increment the budget
+              // counter, and record the handled error count so a backlog of pre-existing
+              // comments isn't re-triggered on the next poll. Keyed on `newFix` rather
+              // than cost so a legitimately zero-cost fix run still counts (Finding 2).
               const refreshed = this.store.getSession(session.id);
               this.store.updateSession(session.id, {
                 costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd,
@@ -559,15 +560,22 @@ export class Orchestrator {
                 workflowHandledErrorCount: verdict.errorCommentCount,
               });
             } else {
-              // Pending restart: fix already pushed, waiting for workflow to pick it up.
-              // Apply the optional monitor timeout as in_progress to avoid indefinite polling.
+              // Pending restart: the fix was already pushed and we're waiting for the
+              // workflow to pick it up. The old ⚠️ comment still masks the live
+              // looppilot-state, so distinguish an actively-progressing review from one
+              // that never re-engaged (Finding 3):
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
                 return await this.stopSession(session, "exception", "monitor timeout");
               }
-              // Always apply the not-engaged guard as a hard backstop so a missed or
-              // ignored /restart-review does not poll forever (Finding 1).
-              if (this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes) {
+              // Only fall back to the not-engaged guard while no live state comment
+              // exists, so an ignored /restart-review cannot poll forever — but a
+              // restarted review whose state moved to fixing/waiting_codex is treated
+              // as in-progress and never killed by the guard.
+              if (
+                !verdict.hasStateComment &&
+                this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes
+              ) {
                 return await this.stopSession(session, "monitor_never_engaged", null);
               }
             }
