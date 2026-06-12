@@ -18,6 +18,14 @@ function isHttp404(r: CommandResult): boolean {
   return r.code !== 0 && /\(HTTP 404\)\s*$/.test(r.stderr);
 }
 
+// GitHub Free の private リポではブランチ保護/ルールセット API が
+// "Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)" を返す。
+// 機能自体が利用不可 = 保護なしと同義なので安全にスキップする。
+// 権限不足の 403（"Must have admin rights"）は別原因なのでスキップしない。
+function isFeatureUnavailable403(r: CommandResult): boolean {
+  return r.code !== 0 && /Upgrade to GitHub Pro.*\(HTTP 403\)\s*$/.test(r.stderr);
+}
+
 // LOOPPILOT_STATE_COMMENT_AUTHORS の値を LoopPilot と同一パースする
 // （カンマ区切り → trim → 空除去）。state-manager.ts の getTrustedStateCommentAuthors と同規則。
 function parseAuthors(raw: string): string[] {
@@ -143,6 +151,7 @@ async function checkBranchProtection(
   try {
     const r = await runner.run("gh", ["api", `repos/${repoSlug}/branches/${branch}/protection`], opts);
     if (isHttp404(r)) return; // 保護なし = OK
+    if (isFeatureUnavailable403(r)) return; // Free plan private リポ: 機能未提供 = 保護なし = OK
     if (r.code !== 0) {
       errors.push(`gh: ブランチ保護を取得できません（${r.stderr.trim()}）`);
       return;
@@ -221,6 +230,7 @@ async function checkRulesets(
   try {
     const r = await runner.run("gh", ["api", `repos/${repoSlug}/rules/branches/${branch}`], opts);
     if (isHttp404(r)) return; // ルールセットなし = OK
+    if (isFeatureUnavailable403(r)) return; // Free plan private リポ: 機能未提供 = ルールセットなし = OK
     if (r.code !== 0) {
       errors.push(`gh: ブランチルールセットを取得できません（${r.stderr.trim()}）`);
       return;

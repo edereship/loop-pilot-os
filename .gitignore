@@ -8,3 +8,6 @@ dist/
 
 # 実設定はコミットしない（example のみコミット）
 looppilot-os.toml
+
+# 環境変数
+.env
