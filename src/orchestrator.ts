@@ -531,6 +531,7 @@ export class Orchestrator {
             errorBody: verdict.errorBody,
             errorCommentCount: verdict.errorCommentCount,
             maxCostUsd: this.config.safety.maxCostUsdPerFix,
+            hardTimeoutMs: this.config.safety.sessionHardTimeoutMinutes * 60_000,
           };
           let recoveryResult: RecoveryOutcome;
           try {
@@ -547,6 +548,13 @@ export class Orchestrator {
               const current = this.store.getSession(session.id);
               const newCost = (current.costUsd ?? 0) + recoveryResult.costUsd;
               this.store.updateSession(session.id, { costUsd: newCost });
+            } else {
+              // Pending restart: fix already pushed, waiting for workflow to pick it up.
+              // Apply the same monitor timeout as in_progress to avoid polling indefinitely.
+              const timeout = this.config.safety.monitorTimeoutMinutes;
+              if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
+                return await this.stopSession(session, "exception", "monitor timeout");
+              }
             }
             continue;
           }
@@ -554,6 +562,11 @@ export class Orchestrator {
             recoveryResult.kind === "exhausted"
               ? `workflow fix attempts exhausted (${this.config.safety.maxWorkflowFixAttempts}x)`
               : `workflow fix failed: ${recoveryResult.message}`;
+          if (recoveryResult.kind === "unrecoverable" && recoveryResult.costUsd > 0) {
+            const current = this.store.getSession(session.id);
+            const newCost = (current.costUsd ?? 0) + recoveryResult.costUsd;
+            this.store.updateSession(session.id, { costUsd: newCost });
+          }
           return await this.stopSession(
             session,
             "workflow_setup_failed",

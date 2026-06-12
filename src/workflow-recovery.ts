@@ -24,8 +24,8 @@ Do NOT push — the orchestrator handles pushing.`;
 }
 
 export class AgentWorkflowRecovery implements WorkflowRecovery {
-  private fixAttempts = 0;
-  private totalCostUsd = 0;
+  private fixAttemptsByPr = new Map<number, number>();
+  private totalCostUsdByPr = new Map<number, number>();
 
   constructor(
     private readonly agent: AgentRunner,
@@ -36,22 +36,27 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
   ) {}
 
   async attemptRecovery(ctx: RecoveryContext): Promise<RecoveryOutcome> {
-    if (ctx.errorCommentCount <= this.fixAttempts) {
+    const { prNumber } = ctx;
+    const fixAttempts = this.fixAttemptsByPr.get(prNumber) ?? 0;
+    const totalCostUsd = this.totalCostUsdByPr.get(prNumber) ?? 0;
+
+    if (ctx.errorCommentCount <= fixAttempts) {
       return { kind: "restarted", costUsd: 0 };
     }
 
-    if (this.fixAttempts >= this.maxAttempts) {
-      return { kind: "exhausted", costUsd: this.totalCostUsd };
+    if (fixAttempts >= this.maxAttempts) {
+      return { kind: "exhausted", costUsd: totalCostUsd };
     }
 
     const outcome = await this.agent.runSession({
       worktreePath: ctx.worktreePath,
       prompt: buildFixPrompt(ctx.errorBody),
       maxCostUsd: ctx.maxCostUsd,
+      ...(ctx.hardTimeoutMs !== undefined ? { hardTimeoutMs: ctx.hardTimeoutMs } : {}),
     });
 
     if (outcome.kind === "cost_exceeded") {
-      this.totalCostUsd += outcome.costUsd;
+      this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
       return {
         kind: "unrecoverable",
         costUsd: outcome.costUsd,
@@ -59,7 +64,7 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
       };
     }
     if (outcome.kind === "error") {
-      this.totalCostUsd += outcome.costUsd;
+      this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
       return {
         kind: "unrecoverable",
         costUsd: outcome.costUsd,
@@ -67,14 +72,15 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
       };
     }
 
-    this.totalCostUsd += outcome.costUsd;
+    this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
 
     await this.pushFix(ctx.branch, ctx.worktreePath);
     await this.postRestartReview(ctx.prNumber);
 
-    this.fixAttempts++;
+    const newAttempts = fixAttempts + 1;
+    this.fixAttemptsByPr.set(prNumber, newAttempts);
     this.log(
-      `workflow fix attempt ${this.fixAttempts}/${this.maxAttempts} ` +
+      `workflow fix attempt ${newAttempts}/${this.maxAttempts} ` +
         `for PR #${ctx.prNumber} (cost=$${outcome.costUsd.toFixed(2)})`,
     );
     return { kind: "restarted", costUsd: outcome.costUsd };

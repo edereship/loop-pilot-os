@@ -129,6 +129,8 @@ export interface RecoveryContext {
   errorBody: string;
   errorCommentCount: number;
   maxCostUsd: number;
+  /** Forwarded to the fix agent as a hard timeout backstop (ms). */
+  hardTimeoutMs?: number;
 }
 export type RecoveryOutcome =
   | { kind: "restarted"; costUsd: number }
