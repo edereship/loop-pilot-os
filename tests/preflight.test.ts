@@ -349,8 +349,31 @@ describe("runPreflight", () => {
     expect(errors.length).toBeGreaterThanOrEqual(3);
   });
 
-  // フェイルオープン回帰ガード: 非404 の gh エラー（403/500）を「保護なし=OK」と誤読してはならない（最重要の安全特性）
-  it("ブランチ保護 API が 403 を返したら fail-open せず違反として報告する", async () => {
+  // GitHub Free private リポで機能未提供の 403 は「保護なし = OK」として扱う
+  it("ブランチ保護 API が 'Upgrade to GitHub Pro' 403 を返したら保護なし扱いで OK", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 1,
+      stdout: "",
+      stderr: "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors).toHaveLength(0);
+  });
+
+  it("rulesets API が 'Upgrade to GitHub Pro' 403 を返したら保護なし扱いで OK", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 1,
+      stdout: "",
+      stderr: "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors).toHaveLength(0);
+  });
+
+  // フェイルオープン回帰ガード: 権限不足の 403 は引き続きエラーとして報告する（最重要の安全特性）
+  it("ブランチ保護 API が権限不足 403 を返したら fail-open せず違反として報告する", async () => {
     const r = passingRunner();
     r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
       code: 1,
