@@ -53,6 +53,8 @@ export interface TaskSessionRow {
   startedAt: string;
   monitorStartedAt: string | null; // in_review 入り時刻。未起動ガード/監視timeoutの起点（再起動でリセットしない）
   endedAt: string | null;
+  workflowFixAttempts: number;       // number of fix-agent runs for this session (budget counter)
+  workflowHandledErrorCount: number; // errorCommentCount at the time of the last successful fix (guard counter)
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -128,6 +130,10 @@ export interface RecoveryContext {
   prNumber: number;
   errorBody: string;
   errorCommentCount: number;
+  /** Durable count of fix-agent runs already completed for this session (budget counter). */
+  fixAttempts: number;
+  /** The errorCommentCount at the time of the last successful fix (guard counter). */
+  handledErrorCount: number;
   maxCostUsd: number;
   /** Forwarded to the fix agent as a hard timeout backstop (ms). */
   hardTimeoutMs?: number;

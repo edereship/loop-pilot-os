@@ -524,12 +524,16 @@ export class Orchestrator {
           continue;
         }
         case "workflow_failed": {
+          const current = this.store.getSession(session.id);
           const recoveryCtx: RecoveryContext = {
             worktreePath: session.worktreePath as string,
             branch: session.branch,
             prNumber,
             errorBody: verdict.errorBody,
             errorCommentCount: verdict.errorCommentCount,
+            // Pass durable counts so budget/guard survive process restarts (Finding 2).
+            fixAttempts: current.workflowFixAttempts,
+            handledErrorCount: current.workflowHandledErrorCount,
             maxCostUsd: this.config.safety.maxCostUsdPerFix,
             hardTimeoutMs: this.config.safety.sessionHardTimeoutMinutes * 60_000,
           };
@@ -545,15 +549,26 @@ export class Orchestrator {
           }
           if (recoveryResult.kind === "restarted") {
             if (recoveryResult.costUsd > 0) {
-              const current = this.store.getSession(session.id);
-              const newCost = (current.costUsd ?? 0) + recoveryResult.costUsd;
-              this.store.updateSession(session.id, { costUsd: newCost });
+              // A new fix was pushed: persist cost, increment budget counter, and record
+              // the handled error count so a backlog of pre-existing comments isn't
+              // re-triggered on the next poll (Findings 2 and 5).
+              const refreshed = this.store.getSession(session.id);
+              this.store.updateSession(session.id, {
+                costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd,
+                workflowFixAttempts: refreshed.workflowFixAttempts + 1,
+                workflowHandledErrorCount: verdict.errorCommentCount,
+              });
             } else {
               // Pending restart: fix already pushed, waiting for workflow to pick it up.
-              // Apply the same monitor timeout as in_progress to avoid polling indefinitely.
+              // Apply the optional monitor timeout as in_progress to avoid indefinite polling.
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
                 return await this.stopSession(session, "exception", "monitor timeout");
+              }
+              // Always apply the not-engaged guard as a hard backstop so a missed or
+              // ignored /restart-review does not poll forever (Finding 1).
+              if (this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes) {
+                return await this.stopSession(session, "monitor_never_engaged", null);
               }
             }
             continue;
@@ -563,9 +578,8 @@ export class Orchestrator {
               ? `workflow fix attempts exhausted (${this.config.safety.maxWorkflowFixAttempts}x)`
               : `workflow fix failed: ${recoveryResult.message}`;
           if (recoveryResult.kind === "unrecoverable" && recoveryResult.costUsd > 0) {
-            const current = this.store.getSession(session.id);
-            const newCost = (current.costUsd ?? 0) + recoveryResult.costUsd;
-            this.store.updateSession(session.id, { costUsd: newCost });
+            const refreshed = this.store.getSession(session.id);
+            this.store.updateSession(session.id, { costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd });
           }
           return await this.stopSession(
             session,

@@ -24,7 +24,9 @@ Do NOT push — the orchestrator handles pushing.`;
 }
 
 export class AgentWorkflowRecovery implements WorkflowRecovery {
-  private fixAttemptsByPr = new Map<number, number>();
+  // In-memory cost accumulator for reporting in the `exhausted` outcome only.
+  // Not persisted; resets on process restart. The orchestrator independently
+  // persists individual fix costs on the session row via RecoveryOutcome.costUsd.
   private totalCostUsdByPr = new Map<number, number>();
 
   constructor(
@@ -37,14 +39,17 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
 
   async attemptRecovery(ctx: RecoveryContext): Promise<RecoveryOutcome> {
     const { prNumber } = ctx;
-    const fixAttempts = this.fixAttemptsByPr.get(prNumber) ?? 0;
     const totalCostUsd = this.totalCostUsdByPr.get(prNumber) ?? 0;
 
-    if (ctx.errorCommentCount <= fixAttempts) {
+    // Guard: all existing errors were addressed by a previous fix run (Finding 5).
+    // Compare against handledErrorCount (the errorCommentCount at the last fix) rather
+    // than fixAttempts, so a backlog of N pre-existing comments is handled atomically.
+    if (ctx.errorCommentCount <= ctx.handledErrorCount) {
       return { kind: "restarted", costUsd: 0 };
     }
 
-    if (fixAttempts >= this.maxAttempts) {
+    // Budget: max fix-agent runs exhausted (Finding 2 — fixAttempts is durable, not in-memory).
+    if (ctx.fixAttempts >= this.maxAttempts) {
       return { kind: "exhausted", costUsd: totalCostUsd };
     }
 
@@ -74,13 +79,56 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
 
     this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
 
-    await this.pushFix(ctx.branch, ctx.worktreePath);
-    await this.postRestartReview(ctx.prNumber);
+    // Verify the fix agent actually committed its changes before pushing (Finding 3).
+    const statusResult = await this.runner.run(
+      "git",
+      ["-C", ctx.worktreePath, "status", "--porcelain"],
+      { cwd: ctx.worktreePath },
+    );
+    if (statusResult.stdout.trim() !== "") {
+      return {
+        kind: "unrecoverable",
+        costUsd: outcome.costUsd,
+        message: "fix agent left uncommitted changes",
+      };
+    }
+    const logResult = await this.runner.run(
+      "git",
+      ["-C", ctx.worktreePath, "log", `origin/${ctx.branch}..HEAD`, "--oneline"],
+      { cwd: ctx.worktreePath },
+    );
+    if (logResult.stdout.trim() === "") {
+      return {
+        kind: "unrecoverable",
+        costUsd: outcome.costUsd,
+        message: "fix agent made no commits",
+      };
+    }
 
-    const newAttempts = fixAttempts + 1;
-    this.fixAttemptsByPr.set(prNumber, newAttempts);
+    // Push the fix and post /restart-review. Return unrecoverable (with cost) on
+    // side-effect failures rather than throwing, so the orchestrator can persist
+    // the spend before stopping the session (Finding 4).
+    try {
+      await this.pushFix(ctx.branch, ctx.worktreePath);
+    } catch (err) {
+      return {
+        kind: "unrecoverable",
+        costUsd: outcome.costUsd,
+        message: `git push failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    try {
+      await this.postRestartReview(ctx.prNumber);
+    } catch (err) {
+      return {
+        kind: "unrecoverable",
+        costUsd: outcome.costUsd,
+        message: `restart review failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
     this.log(
-      `workflow fix attempt ${newAttempts}/${this.maxAttempts} ` +
+      `workflow fix attempt ${ctx.fixAttempts + 1}/${this.maxAttempts} ` +
         `for PR #${ctx.prNumber} (cost=$${outcome.costUsd.toFixed(2)})`,
     );
     return { kind: "restarted", costUsd: outcome.costUsd };

@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS task_session (
   agent_summary TEXT,
   started_at TEXT NOT NULL,
   monitor_started_at TEXT,
-  ended_at TEXT
+  ended_at TEXT,
+  workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
+  workflow_handled_error_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_session_active ON task_session(state)
   WHERE state NOT IN ('merged','stopped');
@@ -87,6 +89,8 @@ interface RawSessionRow {
   started_at: string;
   monitor_started_at: string | null;
   ended_at: string | null;
+  workflow_fix_attempts: number;
+  workflow_handled_error_count: number;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -106,6 +110,8 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     startedAt: r.started_at,
     monitorStartedAt: r.monitor_started_at,
     endedAt: r.ended_at,
+    workflowFixAttempts: r.workflow_fix_attempts,
+    workflowHandledErrorCount: r.workflow_handled_error_count,
   };
 }
 
@@ -121,6 +127,8 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   monitorStartedAt: "monitor_started_at",
   endedAt: "ended_at",
   runId: "run_id",
+  workflowFixAttempts: "workflow_fix_attempts",
+  workflowHandledErrorCount: "workflow_handled_error_count",
 };
 
 export class SqliteStore {
@@ -253,6 +261,8 @@ export class SqliteStore {
         | "monitorStartedAt"
         | "endedAt"
         | "runId"
+        | "workflowFixAttempts"
+        | "workflowHandledErrorCount"
       >
     >,
   ): void {
