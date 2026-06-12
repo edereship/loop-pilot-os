@@ -19,6 +19,7 @@ import { buildPrompt } from "./context-bundle.js";
 import { Orchestrator, type RunOutcome } from "./orchestrator.js";
 import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
+import { AgentWorkflowRecovery } from "./workflow-recovery.js";
 
 const EXIT_OK = 0;
 const EXIT_PREFLIGHT = 1;
@@ -153,6 +154,14 @@ async function runLoop(configPath: string): Promise<number> {
       trustedAuthors: config.looppilot.stateCommentAuthors,
     });
 
+    const recovery = new AgentWorkflowRecovery(
+      agent,
+      runner,
+      config.repo.remote,
+      config.safety.maxWorkflowFixAttempts,
+      logLine,
+    );
+
     const orchestrator = new Orchestrator({
       config,
       source,
@@ -165,6 +174,7 @@ async function runLoop(configPath: string): Promise<number> {
       clock: nowIso,
       sleep,
       log: logLine,
+      recovery,
     });
 
     // 停止シグナル → orchestrator.requestStop()（次の安全点でクリーン halt）。

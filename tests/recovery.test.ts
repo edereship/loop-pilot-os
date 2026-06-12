@@ -7,6 +7,7 @@ import {
   FakeGitPr,
   FakeMonitor,
   FakeNotifier,
+  FakeWorkflowRecovery,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
@@ -34,6 +35,8 @@ function makeConfig(over: Partial<{
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes,
       sessionHardTimeoutMinutes: 120,
+      maxWorkflowFixAttempts: 2,
+      maxCostUsdPerFix: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -64,6 +67,7 @@ interface Harness {
   git: FakeGitPr;
   monitor: FakeMonitor;
   notifier: FakeNotifier;
+  recovery: FakeWorkflowRecovery;
   sleepCalls: number[];
   logs: string[];
   promptArgs: PromptArgs[];
@@ -91,6 +95,7 @@ function makeHarness(config: Config): Harness {
     promptArgs.push(args);
     return `PROMPT for ${args.issue.identifier}`;
   };
+  const recovery = new FakeWorkflowRecovery();
   const orch = new Orchestrator({
     config,
     source,
@@ -103,8 +108,9 @@ function makeHarness(config: Config): Harness {
     clock: fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,
+    recovery,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
+  return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }
 
 /**
@@ -691,5 +697,84 @@ describe("回復 — in_review + PR が merged（仕様 §9 / カーネル §8: 
     expect(h.store.countTasksStarted(newRun.id)).toBe(1);
     // 回復で HALT していない（merged は成功終端）→ ループに入っている
     expect(getCalls).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("MONITOR — workflow_failed verdict (ES-397)", () => {
+  it("workflow_failed → restarted(cost>0) → costUsd updated, polling continues to merged", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const iss = issue("id-wf", "TY-WF1");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1 },
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0.5 }];
+
+    await h.orch.run();
+
+    expect(h.recovery.recoveryCalls).toHaveLength(1);
+    expect(h.recovery.recoveryCalls[0].errorBody).toBe("⚠️ failed");
+    const session = h.store.getSession(1);
+    expect(session.costUsd).toBe(1.5);
+    expect(session.state).toBe("merged");
+  });
+
+  it("workflow_failed → exhausted → stopSession(workflow_setup_failed)", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const iss = issue("id-wf2", "TY-WF2");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 3 },
+    ];
+    h.recovery.outcomes = [{ kind: "exhausted", costUsd: 1.0 }];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("stopped");
+    expect(session.failureReason).toBe("workflow_setup_failed");
+    expect(session.stopDetail).toContain("exhausted");
+  });
+
+  it("workflow_failed → unrecoverable → stopSession(workflow_setup_failed)", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const iss = issue("id-wf3", "TY-WF3");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1 },
+    ];
+    h.recovery.outcomes = [{ kind: "unrecoverable", costUsd: 0.1, message: "agent crashed" }];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("stopped");
+    expect(session.failureReason).toBe("workflow_setup_failed");
+    expect(session.stopDetail).toContain("agent crashed");
+  });
+
+  it("recovery throws → stopSession(workflow_setup_failed)", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const iss = issue("id-wf4", "TY-WF4");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1 },
+    ];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("stopped");
+    expect(session.failureReason).toBe("workflow_setup_failed");
+    expect(session.stopDetail).toContain("workflow recovery error");
   });
 });

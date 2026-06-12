@@ -11,6 +11,9 @@ import type {
   MergeReadiness,
   MonitorVerdict,
   PromptArgs,
+  RecoveryContext,
+  RecoveryOutcome,
+  WorkflowRecovery,
 } from "./types.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
@@ -29,6 +32,7 @@ export interface OrchestratorDeps {
   clock: () => string;
   sleep: (ms: number) => Promise<void>;
   log: (line: string) => void;
+  recovery: WorkflowRecovery;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -51,6 +55,7 @@ export class Orchestrator {
   private readonly clock: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: (line: string) => void;
+  private readonly recovery: WorkflowRecovery;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -67,6 +72,7 @@ export class Orchestrator {
     this.clock = deps.clock;
     this.sleep = deps.sleep;
     this.log = deps.log;
+    this.recovery = deps.recovery;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -516,6 +522,43 @@ export class Orchestrator {
             return await this.stopSession(session, "exception", "monitor timeout");
           }
           continue;
+        }
+        case "workflow_failed": {
+          const recoveryCtx: RecoveryContext = {
+            worktreePath: session.worktreePath as string,
+            branch: session.branch,
+            prNumber,
+            errorBody: verdict.errorBody,
+            errorCommentCount: verdict.errorCommentCount,
+            maxCostUsd: this.config.safety.maxCostUsdPerFix,
+          };
+          let recoveryResult: RecoveryOutcome;
+          try {
+            recoveryResult = await this.recovery.attemptRecovery(recoveryCtx);
+          } catch (err) {
+            return await this.stopSession(
+              session,
+              "workflow_setup_failed",
+              `workflow recovery error: ${errMsg(err)}`,
+            );
+          }
+          if (recoveryResult.kind === "restarted") {
+            if (recoveryResult.costUsd > 0) {
+              const current = this.store.getSession(session.id);
+              const newCost = (current.costUsd ?? 0) + recoveryResult.costUsd;
+              this.store.updateSession(session.id, { costUsd: newCost });
+            }
+            continue;
+          }
+          const detail =
+            recoveryResult.kind === "exhausted"
+              ? `workflow fix attempts exhausted (${this.config.safety.maxWorkflowFixAttempts}x)`
+              : `workflow fix failed: ${recoveryResult.message}`;
+          return await this.stopSession(
+            session,
+            "workflow_setup_failed",
+            detail,
+          );
         }
       }
     }

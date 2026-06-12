@@ -7,6 +7,7 @@ import {
   FakeGitPr,
   FakeMonitor,
   FakeNotifier,
+  FakeWorkflowRecovery,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
@@ -35,6 +36,8 @@ function makeConfig(over: Partial<{
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes,
       sessionHardTimeoutMinutes: 120,
+      maxWorkflowFixAttempts: 2,
+      maxCostUsdPerFix: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -92,6 +95,7 @@ function makeHarness(config: Config): Harness {
     promptArgs.push(args);
     return `PROMPT for ${args.issue.identifier}`;
   };
+  const recovery = new FakeWorkflowRecovery();
   const orch = new Orchestrator({
     config,
     source,
@@ -104,6 +108,7 @@ function makeHarness(config: Config): Harness {
     clock: fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,
+    recovery,
   });
   return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
 }
