@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import process from "node:process";
+import { config as dotenvConfig } from "dotenv";
 
 import type { TicketState } from "./types.js";
 import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar } from "./config.js";
@@ -37,12 +40,25 @@ function logLine(line: string): void {
   process.stdout.write(line + "\n");
 }
 
+const CONFIG_CANDIDATES = ["looppilot-os.toml", ".looppilot-os.toml"];
+
+function resolveDefaultConfigPath(): string {
+  for (const name of CONFIG_CANDIDATES) {
+    if (existsSync(name)) return name;
+  }
+  process.stderr.write(
+    `Error: no config file found (tried ${CONFIG_CANDIDATES.join(", ")}). ` +
+      `Use --config <path> to specify one.\n`,
+  );
+  process.exit(1);
+}
+
 function parseCli(argv: string[]): { command: string; configPath: string } {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
     options: {
-      config: { type: "string", default: "./looppilot-os.toml" },
+      config: { type: "string" },
     },
   });
   if (positionals.length > 1) {
@@ -50,7 +66,11 @@ function parseCli(argv: string[]): { command: string; configPath: string } {
     process.exit(1);
   }
   const command = positionals[0] ?? "";
-  return { command, configPath: values.config as string };
+  const configPath = values.config ?? resolveDefaultConfigPath();
+
+  dotenvConfig({ path: path.resolve(path.dirname(configPath), ".env") });
+
+  return { command, configPath };
 }
 
 async function runStatus(configPath: string): Promise<number> {
