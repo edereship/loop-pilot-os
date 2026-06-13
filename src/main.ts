@@ -40,7 +40,7 @@ function logLine(line: string): void {
   process.stdout.write(line + "\n");
 }
 
-const CONFIG_CANDIDATES = ["looppilot-os.toml"];
+const CONFIG_CANDIDATES = ["looppilot-os.toml", ".looppilot-os.toml"];
 
 function resolveDefaultConfigPath(): string {
   for (const name of CONFIG_CANDIDATES) {
