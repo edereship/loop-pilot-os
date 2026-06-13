@@ -40,7 +40,7 @@ function logLine(line: string): void {
   process.stdout.write(line + "\n");
 }
 
-const CONFIG_CANDIDATES = ["looppilot-os.toml", ".looppilot-os.toml"];
+const CONFIG_CANDIDATES = ["looppilot-os.toml"];
 
 function resolveDefaultConfigPath(): string {
   for (const name of CONFIG_CANDIDATES) {
@@ -53,7 +53,7 @@ function resolveDefaultConfigPath(): string {
   process.exit(1);
 }
 
-function parseCli(argv: string[]): { command: string; configPath: string } {
+function parseCli(argv: string[]): { command: string; configPath: string | null } {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
@@ -66,11 +66,7 @@ function parseCli(argv: string[]): { command: string; configPath: string } {
     process.exit(1);
   }
   const command = positionals[0] ?? "";
-  const configPath = values.config ?? resolveDefaultConfigPath();
-
-  dotenvConfig({ path: path.resolve(path.dirname(configPath), ".env") });
-
-  return { command, configPath };
+  return { command, configPath: values.config ?? null };
 }
 
 async function runStatus(configPath: string): Promise<number> {
@@ -252,14 +248,15 @@ async function runLoop(configPath: string): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  const { command, configPath } = parseCli(process.argv.slice(2));
+  const { command, configPath: rawConfigPath } = parseCli(process.argv.slice(2));
   switch (command) {
     case "run":
-      process.exitCode = await runLoop(configPath);
+    case "status": {
+      const configPath = rawConfigPath ?? resolveDefaultConfigPath();
+      dotenvConfig({ path: path.resolve(path.dirname(configPath), ".env"), quiet: true });
+      process.exitCode = await (command === "run" ? runLoop(configPath) : runStatus(configPath));
       return;
-    case "status":
-      process.exitCode = await runStatus(configPath);
-      return;
+    }
     default:
       process.stderr.write(
         "Usage: looppilot-os <run|status> [--config <path>]\n",
