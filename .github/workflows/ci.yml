@@ -26,3 +26,8 @@ jobs:
 
       - name: Check (typecheck src + tests + vitest)
         run: npm run check
+
+      - name: Check dist/ is up to date
+        run: |
+          npm run build
+          git diff --exit-code dist/ || (echo "::error::dist/ is out of date. Run 'npm run build' and commit the changes." && exit 1)
