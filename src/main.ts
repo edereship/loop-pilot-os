@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import process from "node:process";
+import { config as dotenvConfig } from "dotenv";
 
 import type { TicketState } from "./types.js";
 import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar } from "./config.js";
@@ -37,12 +40,25 @@ function logLine(line: string): void {
   process.stdout.write(line + "\n");
 }
 
-function parseCli(argv: string[]): { command: string; configPath: string } {
+const CONFIG_CANDIDATES = ["looppilot-os.toml", ".looppilot-os.toml"];
+
+function resolveDefaultConfigPath(): string {
+  for (const name of CONFIG_CANDIDATES) {
+    if (existsSync(name)) return name;
+  }
+  process.stderr.write(
+    `Error: no config file found (tried ${CONFIG_CANDIDATES.join(", ")}). ` +
+      `Use --config <path> to specify one.\n`,
+  );
+  process.exit(1);
+}
+
+function parseCli(argv: string[]): { command: string; configPath: string | null } {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
     options: {
-      config: { type: "string", default: "./looppilot-os.toml" },
+      config: { type: "string" },
     },
   });
   if (positionals.length > 1) {
@@ -50,7 +66,7 @@ function parseCli(argv: string[]): { command: string; configPath: string } {
     process.exit(1);
   }
   const command = positionals[0] ?? "";
-  return { command, configPath: values.config as string };
+  return { command, configPath: values.config ?? null };
 }
 
 async function runStatus(configPath: string): Promise<number> {
@@ -232,14 +248,15 @@ async function runLoop(configPath: string): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  const { command, configPath } = parseCli(process.argv.slice(2));
+  const { command, configPath: rawConfigPath } = parseCli(process.argv.slice(2));
   switch (command) {
     case "run":
-      process.exitCode = await runLoop(configPath);
+    case "status": {
+      const configPath = rawConfigPath ?? resolveDefaultConfigPath();
+      dotenvConfig({ path: path.resolve(path.dirname(configPath), ".env"), quiet: true });
+      process.exitCode = await (command === "run" ? runLoop(configPath) : runStatus(configPath));
       return;
-    case "status":
-      process.exitCode = await runStatus(configPath);
-      return;
+    }
     default:
       process.stderr.write(
         "Usage: looppilot-os <run|status> [--config <path>]\n",
