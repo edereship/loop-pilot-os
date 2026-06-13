@@ -1,4 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
+import Database from "better-sqlite3";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { SqliteStore } from "../src/store.js";
 import type { TaskSessionRow } from "../src/types.js";
 
@@ -273,6 +277,96 @@ describe("SqliteStore: session", () => {
 
     // 最新順（id DESC）に n 件
     expect(store.recentSessions(2).map((s) => s.id)).toEqual([b1.id, a2.id]);
+  });
+});
+
+describe("SqliteStore: schema migration (ES-397)", () => {
+  // 既存 DB（workflow-recovery 列が無い旧スキーマ）を開いても ALTER TABLE で
+  // 列が補われ、updateSession が `no such column` で失敗しないことを確認する。
+  it("adds workflow_* columns to a pre-existing task_session table", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "looppilot-migrate-"));
+    const dbPath = path.join(dir, "looppilot-os.db");
+    try {
+      // 旧スキーマ（新列なし）の task_session を持つ DB を直接用意する。
+      const legacy = new Database(dbPath);
+      legacy.exec(`
+        CREATE TABLE run (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT NOT NULL,
+          task_cap INTEGER NOT NULL,
+          state TEXT NOT NULL,
+          halt_reason TEXT
+        );
+        CREATE TABLE task_session (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id INTEGER NOT NULL REFERENCES run(id),
+          linear_issue_id TEXT NOT NULL,
+          linear_identifier TEXT NOT NULL,
+          issue_title TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          worktree_path TEXT,
+          pr_number INTEGER,
+          state TEXT NOT NULL,
+          cost_usd REAL,
+          failure_reason TEXT,
+          stop_detail TEXT,
+          agent_summary TEXT,
+          started_at TEXT NOT NULL,
+          monitor_started_at TEXT,
+          ended_at TEXT
+        );
+      `);
+      legacy.prepare(
+        `INSERT INTO run (started_at, task_cap, state, halt_reason)
+         VALUES ('2026-06-06T00:00:00.000Z', 3, 'running', NULL)`,
+      ).run();
+      legacy.prepare(
+        `INSERT INTO task_session
+           (run_id, linear_issue_id, linear_identifier, issue_title,
+            branch, worktree_path, state, started_at)
+         VALUES (1, 'issue-uuid-1', 'TY-1', 'Old task',
+                 'looppilot/ty-1', '/wt/ty-1', 'in_review', '2026-06-06T00:00:00.000Z')`,
+      ).run();
+      legacy.close();
+
+      // 旧 DB を開く → migrate() が列を補う。
+      const store = new SqliteStore(dbPath);
+      openStores.push(store);
+
+      // 既定値 0 で読めること。
+      const session = store.getSession(1);
+      expect(session.workflowFixAttempts).toBe(0);
+      expect(session.workflowHandledErrorCount).toBe(0);
+
+      // 新列への更新が `no such column` で失敗しないこと。
+      expect(() =>
+        store.updateSession(1, {
+          workflowFixAttempts: 1,
+          workflowHandledErrorCount: 2,
+        }),
+      ).not.toThrow();
+      const updated = store.getSession(1);
+      expect(updated.workflowFixAttempts).toBe(1);
+      expect(updated.workflowHandledErrorCount).toBe(2);
+    } finally {
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("opening a fresh DB twice is idempotent (no duplicate-column error)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "looppilot-migrate-"));
+    const dbPath = path.join(dir, "looppilot-os.db");
+    try {
+      const first = new SqliteStore(dbPath);
+      first.close();
+      // 2回目のオープンで ALTER TABLE が再実行されないこと（列が既に在る）。
+      expect(() => {
+        const second = new SqliteStore(dbPath);
+        openStores.push(second);
+      }).not.toThrow();
+    } finally {
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

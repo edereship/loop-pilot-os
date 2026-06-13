@@ -11,6 +11,9 @@ import type {
   MergeReadiness,
   MonitorVerdict,
   PromptArgs,
+  RecoveryContext,
+  RecoveryOutcome,
+  WorkflowRecovery,
 } from "./types.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
@@ -29,6 +32,7 @@ export interface OrchestratorDeps {
   clock: () => string;
   sleep: (ms: number) => Promise<void>;
   log: (line: string) => void;
+  recovery: WorkflowRecovery;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -51,6 +55,7 @@ export class Orchestrator {
   private readonly clock: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: (line: string) => void;
+  private readonly recovery: WorkflowRecovery;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -67,6 +72,7 @@ export class Orchestrator {
     this.clock = deps.clock;
     this.sleep = deps.sleep;
     this.log = deps.log;
+    this.recovery = deps.recovery;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -167,6 +173,9 @@ export class Orchestrator {
       case "in_progress":
       case "corrupted":
       case "not_engaged":
+        return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+      // workflow_failed: ワークフロー回復は別モジュール（workflow-recovery.ts）で担う（ES-397）
+      case "workflow_failed":
         return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
     }
   }
@@ -513,6 +522,83 @@ export class Orchestrator {
             return await this.stopSession(session, "exception", "monitor timeout");
           }
           continue;
+        }
+        case "workflow_failed": {
+          const current = this.store.getSession(session.id);
+          const recoveryCtx: RecoveryContext = {
+            worktreePath: session.worktreePath as string,
+            branch: session.branch,
+            prNumber,
+            errorBody: verdict.errorBody,
+            errorCommentCount: verdict.errorCommentCount,
+            // Pass durable counts so budget/guard survive process restarts (Finding 2).
+            fixAttempts: current.workflowFixAttempts,
+            handledErrorCount: current.workflowHandledErrorCount,
+            maxCostUsd: this.config.safety.maxCostUsdPerFix,
+            hardTimeoutMs: this.config.safety.sessionHardTimeoutMinutes * 60_000,
+          };
+          let recoveryResult: RecoveryOutcome;
+          try {
+            recoveryResult = await this.recovery.attemptRecovery(recoveryCtx);
+          } catch (err) {
+            return await this.stopSession(
+              session,
+              "workflow_setup_failed",
+              `workflow recovery error: ${errMsg(err)}`,
+            );
+          }
+          if (recoveryResult.kind === "restarted") {
+            if (recoveryResult.newFix) {
+              // A new fix was pushed this poll: persist cost, increment the budget
+              // counter, and record the handled error count so a backlog of pre-existing
+              // comments isn't re-triggered on the next poll. Keyed on `newFix` rather
+              // than cost so a legitimately zero-cost fix run still counts (Finding 2).
+              // Also reset monitorStartedAt so the not-engaged guard measures from the
+              // restart request — otherwise a crash-recovery or slow-failure session that
+              // already exceeded notEngagedGuardMinutes would be killed on the next poll
+              // before the restarted workflow has any chance to advance the state comment.
+              const refreshed = this.store.getSession(session.id);
+              this.store.updateSession(session.id, {
+                costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd,
+                workflowFixAttempts: refreshed.workflowFixAttempts + 1,
+                workflowHandledErrorCount: verdict.errorCommentCount,
+                monitorStartedAt: this.clock(),
+              });
+            } else {
+              // Pending restart: the fix was already pushed and we're waiting for the
+              // workflow to pick it up. The old ⚠️ comment still masks the live
+              // looppilot-state, so distinguish an actively-progressing review from one
+              // that never re-engaged (Finding 3):
+              const timeout = this.config.safety.monitorTimeoutMinutes;
+              if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
+                return await this.stopSession(session, "exception", "monitor timeout");
+              }
+              // Only fall back to the not-engaged guard while no live state comment
+              // exists, so an ignored /restart-review cannot poll forever — but a
+              // restarted review whose state moved to fixing/waiting_codex is treated
+              // as in-progress and never killed by the guard.
+              if (
+                !verdict.hasStateComment &&
+                this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes
+              ) {
+                return await this.stopSession(session, "monitor_never_engaged", null);
+              }
+            }
+            continue;
+          }
+          const detail =
+            recoveryResult.kind === "exhausted"
+              ? `workflow fix attempts exhausted (${this.config.safety.maxWorkflowFixAttempts}x)`
+              : `workflow fix failed: ${recoveryResult.message}`;
+          if (recoveryResult.kind === "unrecoverable" && recoveryResult.costUsd > 0) {
+            const refreshed = this.store.getSession(session.id);
+            this.store.updateSession(session.id, { costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd });
+          }
+          return await this.stopSession(
+            session,
+            "workflow_setup_failed",
+            detail,
+          );
         }
       }
     }

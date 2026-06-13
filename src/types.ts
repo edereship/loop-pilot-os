@@ -12,7 +12,8 @@ export type FailureReason =
   | "merge_conflict"
   | "pr_closed"
   | "claim_failed"
-  | "handoff_failed";
+  | "handoff_failed"
+  | "workflow_setup_failed";
 
 // ---- ドメイン ----
 export interface EligibleIssue {
@@ -52,6 +53,8 @@ export interface TaskSessionRow {
   startedAt: string;
   monitorStartedAt: string | null; // in_review 入り時刻。未起動ガード/監視timeoutの起点（再起動でリセットしない）
   endedAt: string | null;
+  workflowFixAttempts: number;       // number of fix-agent runs for this session (budget counter)
+  workflowHandledErrorCount: number; // errorCommentCount at the time of the last successful fix (guard counter)
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -98,7 +101,17 @@ export type MonitorVerdict =
   | { kind: "in_progress" }     // state コメントあり・進行中（initialized|waiting_codex|fixing）
   | { kind: "corrupted" }       // 信頼著者の state コメントは在るが JSON 破損/不正 status
   | { kind: "not_engaged" }     // 信頼できる state コメント未出現
-  | { kind: "pr_closed" };      // マージ無しクローズ
+  | { kind: "pr_closed" }       // マージ無しクローズ
+  // hasStateComment: a live (non-stopped/non-done) looppilot-state comment is present
+  // alongside the ⚠️ error comment. The orchestrator uses this to tell an actively
+  // restarted review (state comment moved to fixing/waiting_codex) from one that never
+  // engaged, so the not-engaged guard does not kill a live review.
+  | {
+      kind: "workflow_failed";
+      errorBody: string;
+      errorCommentCount: number;
+      hasStateComment: boolean;
+    };
 export type MergeReadiness =
   | { ready: true; headSha: string }
   | { ready: false; reason: "ci_pending" | "ci_failed" | "conflict" | "blocked" | "unknown" };
@@ -117,6 +130,33 @@ export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */
   probeReachability(): Promise<void>;
+}
+
+// ---- ワークフロー回復（workflow-recovery.ts） ----
+export interface RecoveryContext {
+  worktreePath: string;
+  branch: string;
+  prNumber: number;
+  errorBody: string;
+  errorCommentCount: number;
+  /** Durable count of fix-agent runs already completed for this session (budget counter). */
+  fixAttempts: number;
+  /** The errorCommentCount at the time of the last successful fix (guard counter). */
+  handledErrorCount: number;
+  maxCostUsd: number;
+  /** Forwarded to the fix agent as a hard timeout backstop (ms). */
+  hardTimeoutMs?: number;
+}
+export type RecoveryOutcome =
+  // `newFix` distinguishes "a new fix was pushed this poll" (increment the budget
+  // counter / record the handled error count) from "already handled, just waiting
+  // for the restarted workflow". Cost cannot be used for this because a fix-agent
+  // run may legitimately report costUsd: 0.
+  | { kind: "restarted"; costUsd: number; newFix: boolean }
+  | { kind: "exhausted"; costUsd: number }
+  | { kind: "unrecoverable"; costUsd: number; message: string };
+export interface WorkflowRecovery {
+  attemptRecovery(ctx: RecoveryContext): Promise<RecoveryOutcome>;
 }
 
 // ---- 文脈バンドル（context-bundle.ts） ----

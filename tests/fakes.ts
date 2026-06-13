@@ -13,6 +13,9 @@ import type {
   MergeReadiness,
   Notifier,
   NotifyEvent,
+  WorkflowRecovery,
+  RecoveryContext,
+  RecoveryOutcome,
 } from "../src/types.js";
 
 type StubResponder =
@@ -289,5 +292,22 @@ export class FakeNotifier implements Notifier {
 
   async probeReachability(): Promise<void> {
     // テストではプリフライト専用。no-op。
+  }
+}
+
+// ---- FakeWorkflowRecovery ----
+export class FakeWorkflowRecovery implements WorkflowRecovery {
+  outcomes: RecoveryOutcome[] = [];
+  recoveryCalls: RecoveryContext[] = [];
+
+  async attemptRecovery(ctx: RecoveryContext): Promise<RecoveryOutcome> {
+    this.recoveryCalls.push(ctx);
+    if (this.outcomes.length > 1) {
+      return this.outcomes.shift() as RecoveryOutcome;
+    }
+    if (this.outcomes.length === 1) {
+      return this.outcomes[0];
+    }
+    throw new Error("FakeWorkflowRecovery: no outcome queued");
   }
 }

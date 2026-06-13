@@ -7,6 +7,7 @@ import {
   FakeGitPr,
   FakeMonitor,
   FakeNotifier,
+  FakeWorkflowRecovery,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
@@ -34,6 +35,8 @@ function makeConfig(over: Partial<{
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes,
       sessionHardTimeoutMinutes: 120,
+      maxWorkflowFixAttempts: 2,
+      maxCostUsdPerFix: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -64,6 +67,7 @@ interface Harness {
   git: FakeGitPr;
   monitor: FakeMonitor;
   notifier: FakeNotifier;
+  recovery: FakeWorkflowRecovery;
   sleepCalls: number[];
   logs: string[];
   promptArgs: PromptArgs[];
@@ -91,6 +95,7 @@ function makeHarness(config: Config): Harness {
     promptArgs.push(args);
     return `PROMPT for ${args.issue.identifier}`;
   };
+  const recovery = new FakeWorkflowRecovery();
   const orch = new Orchestrator({
     config,
     source,
@@ -103,8 +108,9 @@ function makeHarness(config: Config): Harness {
     clock: fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,
+    recovery,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
+  return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }
 
 /**
@@ -691,5 +697,208 @@ describe("回復 — in_review + PR が merged（仕様 §9 / カーネル §8: 
     expect(h.store.countTasksStarted(newRun.id)).toBe(1);
     // 回復で HALT していない（merged は成功終端）→ ループに入っている
     expect(getCalls).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("MONITOR — workflow_failed verdict (ES-397)", () => {
+  it("workflow_failed → restarted(cost>0) → costUsd updated, polling continues to merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    const iss = issue("id-wf", "TY-WF1");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0.5, newFix: true }];
+
+    await h.orch.run();
+
+    expect(h.recovery.recoveryCalls).toHaveLength(1);
+    expect(h.recovery.recoveryCalls[0].errorBody).toBe("⚠️ failed");
+    const session = h.store.getSession(1);
+    expect(session.costUsd).toBe(1.5);
+    expect(session.state).toBe("merged");
+  });
+
+  it("workflow_failed → exhausted → stopSession(workflow_setup_failed)", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const iss = issue("id-wf2", "TY-WF2");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 3, hasStateComment: false },
+    ];
+    h.recovery.outcomes = [{ kind: "exhausted", costUsd: 1.0 }];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("stopped");
+    expect(session.failureReason).toBe("workflow_setup_failed");
+    expect(session.stopDetail).toContain("exhausted");
+  });
+
+  it("workflow_failed → unrecoverable → stopSession(workflow_setup_failed)", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const iss = issue("id-wf3", "TY-WF3");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1, hasStateComment: false },
+    ];
+    h.recovery.outcomes = [{ kind: "unrecoverable", costUsd: 0.1, message: "agent crashed" }];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("stopped");
+    expect(session.failureReason).toBe("workflow_setup_failed");
+    expect(session.stopDetail).toContain("agent crashed");
+  });
+
+  it("recovery throws → stopSession(workflow_setup_failed)", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const iss = issue("id-wf4", "TY-WF4");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ err", errorCommentCount: 1, hasStateComment: false },
+    ];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("stopped");
+    expect(session.failureReason).toBe("workflow_setup_failed");
+    expect(session.stopDetail).toContain("workflow recovery error");
+  });
+
+  // Finding 2: a fix-agent run that legitimately reports costUsd:0 must still count as a
+  // completed attempt (increment workflowFixAttempts / record handled count), keyed on
+  // `newFix` rather than cost > 0.
+  it("workflow_failed → restarted(newFix, cost=0) → attempt counters still advance", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    const iss = issue("id-wfz", "TY-WFZ");
+    h.source.queue = [iss];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "impl" }];
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0, newFix: true }];
+
+    await h.orch.run();
+
+    const session = h.store.getSession(1);
+    expect(session.state).toBe("merged");
+    // Counters advanced even though the fix run cost $0 (Finding 2).
+    expect(session.workflowFixAttempts).toBe(1);
+    expect(session.workflowHandledErrorCount).toBe(1);
+    // Only the implementation cost was added; the zero-cost fix added nothing.
+    expect(session.costUsd).toBe(1.0);
+  });
+
+  // Finding 3: after a handled failure, the stale ⚠️ comment keeps poll() returning
+  // workflow_failed even once the looppilot-state moved to fixing/waiting_codex. A live
+  // (hasStateComment) restarted review must NOT be killed by the not-engaged guard.
+  // The first verdict is consumed by crash-recovery adoption; the second drives the
+  // pending-restart branch inside monitorSession.
+  it("workflow_failed pending restart with live state comment → guard does not stop the review", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 }); // monitorTimeoutMinutes unset
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z", // elapsed >> notEngagedGuardMinutes (30)
+    });
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: true },
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: true },
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0, newFix: false }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged"); // guard skipped because a live state comment is present
+    expect(s.failureReason).toBeNull();
+  });
+
+  // Finding 2 (review): after a new fix is pushed (`newFix: true`), the engagement
+  // timer must reset — otherwise a crash-recovery / slow-failure session whose
+  // original monitorStartedAt is already past notEngagedGuardMinutes would be
+  // killed on the very next poll before the restarted workflow has any chance to
+  // advance the state comment.
+  it("workflow_failed → restarted(newFix) resets monitorStartedAt so guard does not fire next poll", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, notEngagedGuardMinutes: 30 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      // Old start: elapsed >> notEngagedGuardMinutes. If we don't reset on newFix,
+      // the *very next poll* in the pending-restart branch kills the session.
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.monitor.verdicts = [
+      // Poll 1 (adoption + first MONITOR iteration): a new fix is required.
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      // Poll 2 (after fix pushed, restart pending — state hasn't advanced yet):
+      // hasStateComment is false because the workflow hasn't picked up the restart.
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      // Poll 3: workflow finished re-review and merged.
+      { kind: "merged" },
+    ];
+    h.recovery.outcomes = [
+      { kind: "restarted", costUsd: 0.2, newFix: true },  // first call: new fix pushed
+      { kind: "restarted", costUsd: 0, newFix: false },   // second call: handled count matches → pending
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    // Without the Finding 2 reset, the pending-restart guard would fire at poll 2
+    // (elapsed since the original start >> 30 min) and stopSession with
+    // monitor_never_engaged before the workflow finished. With the reset, the
+    // session reaches merged.
+    expect(s.state).toBe("merged");
+    expect(s.failureReason).toBeNull();
+    // monitorStartedAt is now anchored to the recovery clock (well after the
+    // original 2026-06-04 timestamp).
+    expect(s.monitorStartedAt!.startsWith("2026-06-05")).toBe(true);
+  });
+
+  // Counterpart to Finding 3: when the restart never engaged (no state comment), the
+  // always-on not-engaged guard still backstops indefinite polling.
+  it("workflow_failed pending restart without state comment → not-engaged guard stops it", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 }); // monitorTimeoutMinutes unset
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z", // elapsed >> notEngagedGuardMinutes (30)
+    });
+    h.monitor.verdicts = [
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+      { kind: "workflow_failed", errorBody: "⚠️ failed", errorCommentCount: 1, hasStateComment: false },
+    ];
+    h.recovery.outcomes = [{ kind: "restarted", costUsd: 0, newFix: false }];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("monitor_never_engaged");
   });
 });
