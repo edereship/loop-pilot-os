@@ -902,3 +902,53 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     expect(s.failureReason).toBe("monitor_never_engaged");
   });
 });
+
+describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）", () => {
+  it("LoopPilot が in_progress（waiting_codex）→ 採用して MONITOR 再開、merged まで完走", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const originalStart = "2026-06-04T00:10:00.000Z";
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: originalStart,
+      autoRestartAttempts: 2,
+      pendingRestartReason: "workflow_crashed",
+      workflowFixAttempts: 1,
+      workflowHandledErrorCount: 1,
+    });
+    // poll 1 (recovery): in_progress → adopt
+    // poll 2 (monitorSession): done → merge
+    // poll 3 (monitorSession): merged → CONTINUE
+    h.monitor.verdicts = [{ kind: "in_progress" }, { kind: "done" }, { kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(newRun.id);
+    // monitorStartedAt is preserved
+    expect(s.monitorStartedAt).toBe(originalStart);
+    // Reset fields cleared
+    expect(s.failureReason).toBeNull();
+    expect(s.stopDetail).toBeNull();
+    expect(s.endedAt).not.toBeNull(); // re-set by done()
+    expect(s.autoRestartAttempts).toBe(0);
+    expect(s.pendingRestartReason).toBeNull();
+    expect(s.workflowFixAttempts).toBe(0);
+    expect(s.workflowHandledErrorCount).toBe(0);
+    // DONE 後段
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+    expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-100"] });
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+  });
+});
