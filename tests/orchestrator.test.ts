@@ -832,6 +832,59 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     const postComments = h.git.calls.filter((c) => c.method === "postComment");
     expect(postComments).toHaveLength(2);
   });
+
+  it("同じ stopReason が連続しても 2 回目以降の restart を抑制しない（stale は 1 poll だけ待つ）", async () => {
+    // Scenario: workflow_crashed → restart posted → workflow restarts and crashes again with the
+    // same reason before the next poll. The stale guard should give one poll grace, then allow
+    // the next restart attempt rather than suppressing indefinitely.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 1: restart #1 posted
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 2: stale grace period
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 3: restart #2 posted
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    // Two restarts posted despite same stop reason appearing consecutively
+    expect(postComments).toHaveLength(2);
+    expect(s.autoRestartAttempts).toBe(2);
+  });
+
+  it("同じ stopReason が 7 連続 → 3 回リスタートして上限超過で HALT", async () => {
+    // Each restart consumes 2 polls (one to post, one stale grace). After 3 restarts (6 polls)
+    // the 7th poll triggers a 4th attempt which exceeds the cap.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 1: restart #1
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 2: stale grace
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 3: restart #2
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 4: stale grace
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 5: restart #3
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 6: stale grace
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 7: attempt #4 → cap exceeded → HALT
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toContain("auto-restart limit");
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(3);
+  });
 });
 
 describe("Orchestrator 失敗系 — not_engaged ガード / monitor_timeout（仕様 §5.5 / §11 / カーネル §7.6）", () => {

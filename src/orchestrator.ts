@@ -564,12 +564,20 @@ export class Orchestrator {
           }
           if (category === "auto_restart") {
             // Stale: we already have a pending /restart-review for this exact stop reason.
+            // Grant one poll grace period in case the restart hasn't been consumed yet,
+            // then clear the pending state so subsequent polls with the same reason can
+            // trigger another restart attempt (the workflow may have consumed the first
+            // restart and crashed again with the same reason before the next poll).
             // The pending record is stored durably in DB so it survives process restarts
-            // (fixes ES-409 Findings 1, 2, 3). A different reason is NOT stale — LoopPilot
-            // must have consumed the prior restart and run before stopping again.
+            // (fixes ES-409 Findings 1, 2, 3).
             const stale =
               pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
             if (stale) {
+              // Clear now so the NEXT poll re-evaluates freshly. If the workflow consumed
+              // the restart and stopped again with the same reason, that next poll will
+              // treat it as a new stop and allow another restart (up to the cap).
+              pendingRestartReason = undefined;
+              this.store.updateSession(session.id, { pendingRestartReason: null });
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (
                 timeout !== undefined &&
