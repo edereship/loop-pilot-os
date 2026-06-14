@@ -128,7 +128,9 @@ export type NotifyEvent =
   | { kind: "idle"; detail: string }                      // キュー空
   | { kind: "run_started"; detail: string }               // 起動時
   | { kind: "task_started"; identifier: string; title: string }  // CLAIM 成功（opt-in）
-  | { kind: "task_merged"; identifier: string; title: string; mergedCount: number }; // DONE 完了（opt-in）
+  | { kind: "task_merged"; identifier: string; title: string; mergedCount: number } // DONE 完了（opt-in）
+  | { kind: "quota_waiting"; detail: string }             // 初回 Codex quota exhausted
+  | { kind: "quota_resumed"; detail: string };            // Codex quota 回復
 export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */

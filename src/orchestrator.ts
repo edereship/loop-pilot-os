@@ -164,8 +164,15 @@ export class Orchestrator {
         return await this.stopSession(session, "pr_closed", null);
       case "stopped": {
         const recoveryCategory = classifyStopReason(verdict.stopReason);
-        if (recoveryCategory === "review_done" || recoveryCategory === "auto_restart") {
-          // Resume MONITOR so monitorSession handles no_findings merge / auto_restart posting
+        if (
+          recoveryCategory === "review_done" ||
+          recoveryCategory === "auto_restart" ||
+          recoveryCategory === "quota_wait"
+        ) {
+          // Resume MONITOR so monitorSession handles no_findings merge,
+          // auto_restart posting, or quota retry (ES-410 Finding 2) — without
+          // adoption the documented quota retry loop halts immediately after a
+          // process restart instead of waiting an hour and retrying.
           return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
         }
         this.store.updateSession(session.id, { runId: this.runId });
@@ -443,6 +450,8 @@ export class Orchestrator {
     // state from autoRestartAttempts > 0 — that was too broad (blocked even different-reason
     // stops on recovery) and was set before posting (so a pre-post crash left a false block).
     let pendingRestartReason: string | undefined = session.pendingRestartReason ?? undefined;
+    let quotaRetryCount = 0;
+    let quotaResumedNotified = false;
     let firstPoll = true;
     while (true) {
       if (!firstPoll && this.interrupted) {
@@ -626,7 +635,85 @@ export class Orchestrator {
             });
             continue;
           }
-          // quota_wait / human_required / null → HALT
+          if (category === "quota_wait") {
+            const stale =
+              pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
+            if (stale) {
+              // Grant one poll grace period then clear, matching the auto_restart stale
+              // pattern. Without this, the loop stalls indefinitely when the restarted
+              // workflow hits quota again before any non-stopped verdict is observed
+              // (ES-410 Finding 1).
+              pendingRestartReason = undefined;
+              this.store.updateSession(session.id, { pendingRestartReason: null });
+              const timeout = this.config.safety.monitorTimeoutMinutes;
+              if (
+                timeout !== undefined &&
+                this.elapsedMinutesSinceMonitorStart(session.id) > timeout
+              ) {
+                return await this.stopSession(session, "exception", "monitor timeout");
+              }
+              continue;
+            }
+            quotaRetryCount += 1;
+            quotaResumedNotified = false;
+            if (quotaRetryCount > 6) {
+              return await this.stopSession(
+                session,
+                "looppilot_stopped",
+                `quota retry limit exceeded (${quotaRetryCount}x): ${verdict.stopReason}`,
+              );
+            }
+            if (quotaRetryCount === 1) {
+              await this.notifier.notify({
+                kind: "quota_waiting",
+                detail: `${session.linearIdentifier} ${verdict.stopReason}`,
+              });
+            }
+            const QUOTA_WAIT_MS = 60 * 60 * 1000;
+            const QUOTA_SLEEP_CHUNK_MS = 10_000;
+            for (let elapsed = 0; elapsed < QUOTA_WAIT_MS; elapsed += QUOTA_SLEEP_CHUNK_MS) {
+              if (this.interrupted) {
+                await this.haltForInterrupt();
+                return HALT;
+              }
+              await this.sleep(QUOTA_SLEEP_CHUNK_MS);
+            }
+            // Finding 3: re-check after the loop so a stop requested during
+            // the final sleep chunk halts before posting to the PR.
+            if (this.interrupted) {
+              await this.haltForInterrupt();
+              return HALT;
+            }
+            // Finding 1: a quota restart is a real restart boundary — clear any
+            // prior readiness-failure streak so errors before and after the
+            // hour-long wait are not treated as consecutive.
+            readinessFailures = 0;
+            // Finding 5: refresh monitor start so monitor_timeout_minutes and
+            // not-engaged guards measure from the restart, not from before the
+            // quota wait — otherwise the restarted workflow can be killed as
+            // "monitor timeout" before it has a chance to run.
+            this.store.updateSession(session.id, {
+              monitorStartedAt: this.clock(),
+            });
+            try {
+              await this.git.postComment(prNumber, "/restart-review");
+            } catch (err) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `/restart-review comment failed: ${errMsg(err)}`,
+              );
+            }
+            // Finding 4: persist the pending reason after a confirmed post so
+            // the next poll (and any process-restart recovery) recognises the
+            // restart is in flight and applies the stale guard above.
+            pendingRestartReason = verdict.stopReason ?? undefined;
+            this.store.updateSession(session.id, {
+              pendingRestartReason: verdict.stopReason,
+            });
+            continue;
+          }
+          // human_required / null → HALT
           return await this.stopSession(
             session,
             "looppilot_stopped",
@@ -648,6 +735,17 @@ export class Orchestrator {
           continue;
         }
         case "in_progress": {
+          if (quotaRetryCount > 0 && !quotaResumedNotified) {
+            await this.notifier.notify({
+              kind: "quota_resumed",
+              detail: `${session.linearIdentifier} quota recovered after ${quotaRetryCount} retries`,
+            });
+            // Reset counter so a new quota outage window starts fresh. The 6-attempt
+            // cap applies per outage episode; after a confirmed recovery the next
+            // exhaustion begins at count=1 again (ES-410 Finding 4).
+            quotaRetryCount = 0;
+            quotaResumedNotified = true;
+          }
           const timeout = this.config.safety.monitorTimeoutMinutes;
           if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
             return await this.stopSession(session, "exception", "monitor timeout");
