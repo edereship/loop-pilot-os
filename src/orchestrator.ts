@@ -556,12 +556,19 @@ export class Orchestrator {
             continue;
           }
           if (category === "auto_restart") {
-            // Finding 4: skip stale states (same stop reason returning before LoopPilot reacts)
-            if (pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason) {
-              continue;
-            }
-            // Finding 4: on recovery, wait for a non-stopped verdict before a new restart
-            if (requireNonStoppedBeforeRestart) {
+            // Stale states (same reason re-returning before LoopPilot consumes the comment)
+            // and the post-recovery guard must still respect monitor_timeout so the session
+            // cannot loop forever when the workflow stays stopped.
+            const stale =
+              pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
+            if (stale || requireNonStoppedBeforeRestart) {
+              const timeout = this.config.safety.monitorTimeoutMinutes;
+              if (
+                timeout !== undefined &&
+                this.elapsedMinutesSinceMonitorStart(session.id) > timeout
+              ) {
+                return await this.stopSession(session, "exception", "monitor timeout");
+              }
               continue;
             }
             pendingRestartReason = undefined; // clear before counting new event
@@ -573,10 +580,20 @@ export class Orchestrator {
                 `auto-restart limit exceeded (${autoRestartCount}x): ${verdict.stopReason}`,
               );
             }
+            // A real restart event breaks any prior readiness-failure streak: errors before
+            // and after the restarted review are not consecutive within the new attempt.
+            readinessFailures = 0;
+            // Persist the attempt count BEFORE posting so a crash between the comment
+            // succeeding and the next updateSession cannot bypass the 3-comment cap on
+            // recovery. monitorStartedAt is also reset here so the timeout/not-engaged
+            // guards measure from the restart point regardless of post outcome.
+            this.store.updateSession(session.id, {
+              autoRestartAttempts: autoRestartCount,
+              monitorStartedAt: this.clock(),
+            });
             if (verdict.stopReason === "state_conflict") {
               await this.sleep(30_000);
             }
-            // Finding 5: handle postComment failures as controlled halts
             try {
               await this.git.postComment(prNumber, "/restart-review");
             } catch (err) {
@@ -586,12 +603,6 @@ export class Orchestrator {
                 `/restart-review comment failed: ${errMsg(err)}`,
               );
             }
-            // Finding 1: persist count so the cap survives process restarts
-            // Finding 6: reset monitor start time so guards measure from the restart
-            this.store.updateSession(session.id, {
-              autoRestartAttempts: autoRestartCount,
-              monitorStartedAt: this.clock(),
-            });
             pendingRestartReason = verdict.stopReason;
             continue;
           }
