@@ -162,13 +162,19 @@ export class Orchestrator {
       case "pr_closed":
         this.store.updateSession(session.id, { runId: this.runId });
         return await this.stopSession(session, "pr_closed", null);
-      case "stopped":
+      case "stopped": {
+        const recoveryCategory = classifyStopReason(verdict.stopReason);
+        if (recoveryCategory === "review_done" || recoveryCategory === "auto_restart") {
+          // Resume MONITOR so monitorSession handles no_findings merge / auto_restart posting
+          return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+        }
         this.store.updateSession(session.id, { runId: this.runId });
         return await this.stopSession(
           session,
           "looppilot_stopped",
           verdict.stopReason ?? "looppilot stopped (no reason)",
         );
+      }
       // done / in_progress / corrupted / not_engaged = open 扱い → 採用して MONITOR 再開
       case "done":
       case "in_progress":
@@ -430,7 +436,12 @@ export class Orchestrator {
     // 猶予を与える（「現フェーズ群を完了してから停止」の従来契約を維持）。以降の poll 境界は
     // 無書込みの安全点なので、現 PR の解決を待たずクリーン HALT する（セッションは in_review の
     // まま＝再起動で回復可能）。
-    let autoRestartCount = 0;
+    // Finding 1: initialize from DB so the cap survives process restarts.
+    let autoRestartCount = session.autoRestartAttempts;
+    // Finding 4: in-memory stale-state guard (same reason after posting = stale poll).
+    let pendingRestartReason: string | null | undefined = undefined;
+    // Finding 4: on recovery, require at least one non-stopped verdict before a new restart.
+    let requireNonStoppedBeforeRestart = session.autoRestartAttempts > 0;
     let firstPoll = true;
     while (true) {
       if (!firstPoll && this.interrupted) {
@@ -455,8 +466,17 @@ export class Orchestrator {
       }
       pollFailures = 0;
       backoffMultiplier = 1;
-      // カーネル§7: 「ready のまま 2連続 throw」— done+ready 以外の評価を挟んだらストリークは断絶する
-      if (verdict.kind !== "done") mergeFailures = 0;
+      // Finding 4: clear pending restart tracking when workflow transitions away from stopped
+      if (verdict.kind !== "stopped") {
+        pendingRestartReason = undefined;
+        requireNonStoppedBeforeRestart = false;
+      }
+      // カーネル§7: reset merge-failure streak unless verdict is in a merge-ready path
+      // Finding 3: stopped(no_findings) shares the done-path streak, so exclude it from the reset
+      if (verdict.kind !== "done" &&
+          !(verdict.kind === "stopped" && classifyStopReason(verdict.stopReason) === "review_done")) {
+        mergeFailures = 0;
+      }
 
       switch (verdict.kind) {
         case "merged":
@@ -501,6 +521,9 @@ export class Orchestrator {
         case "stopped": {
           const category = classifyStopReason(verdict.stopReason);
           if (category === "review_done") {
+            // Workflow completed (no_findings) — treat same as done for merge streak
+            pendingRestartReason = undefined;
+            requireNonStoppedBeforeRestart = false;
             const outcome = await this.tryMerge(session, prNumber);
             if (outcome.kind === "merged") return CONTINUE;
             if (outcome.kind === "halt") return HALT;
@@ -533,6 +556,15 @@ export class Orchestrator {
             continue;
           }
           if (category === "auto_restart") {
+            // Finding 4: skip stale states (same stop reason returning before LoopPilot reacts)
+            if (pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason) {
+              continue;
+            }
+            // Finding 4: on recovery, wait for a non-stopped verdict before a new restart
+            if (requireNonStoppedBeforeRestart) {
+              continue;
+            }
+            pendingRestartReason = undefined; // clear before counting new event
             autoRestartCount += 1;
             if (autoRestartCount > 3) {
               return await this.stopSession(
@@ -544,7 +576,23 @@ export class Orchestrator {
             if (verdict.stopReason === "state_conflict") {
               await this.sleep(30_000);
             }
-            await this.git.postComment(prNumber, "/restart-review");
+            // Finding 5: handle postComment failures as controlled halts
+            try {
+              await this.git.postComment(prNumber, "/restart-review");
+            } catch (err) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `/restart-review comment failed: ${errMsg(err)}`,
+              );
+            }
+            // Finding 1: persist count so the cap survives process restarts
+            // Finding 6: reset monitor start time so guards measure from the restart
+            this.store.updateSession(session.id, {
+              autoRestartAttempts: autoRestartCount,
+              monitorStartedAt: this.clock(),
+            });
+            pendingRestartReason = verdict.stopReason;
             continue;
           }
           // quota_wait / human_required / null → HALT
