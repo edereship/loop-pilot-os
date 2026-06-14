@@ -438,10 +438,11 @@ export class Orchestrator {
     // まま＝再起動で回復可能）。
     // Finding 1: initialize from DB so the cap survives process restarts.
     let autoRestartCount = session.autoRestartAttempts;
-    // Finding 4: in-memory stale-state guard (same reason after posting = stale poll).
-    let pendingRestartReason: string | null | undefined = undefined;
-    // Finding 4: on recovery, require at least one non-stopped verdict before a new restart.
-    let requireNonStoppedBeforeRestart = session.autoRestartAttempts > 0;
+    // ES-409 Finding 2/3: initialize from the durable pending-reason record (null = no pending
+    // restart). This replaces the old requireNonStoppedBeforeRestart guard which derived stale
+    // state from autoRestartAttempts > 0 — that was too broad (blocked even different-reason
+    // stops on recovery) and was set before posting (so a pre-post crash left a false block).
+    let pendingRestartReason: string | undefined = session.pendingRestartReason ?? undefined;
     let firstPoll = true;
     while (true) {
       if (!firstPoll && this.interrupted) {
@@ -466,10 +467,13 @@ export class Orchestrator {
       }
       pollFailures = 0;
       backoffMultiplier = 1;
-      // Finding 4: clear pending restart tracking when workflow transitions away from stopped
+      // Clear the pending-restart record when LoopPilot transitions away from stopped — that
+      // confirms the /restart-review was consumed and the restart is no longer in flight.
       if (verdict.kind !== "stopped") {
-        pendingRestartReason = undefined;
-        requireNonStoppedBeforeRestart = false;
+        if (pendingRestartReason !== undefined) {
+          pendingRestartReason = undefined;
+          this.store.updateSession(session.id, { pendingRestartReason: null });
+        }
       }
       // カーネル§7: reset merge-failure streak unless verdict is in a merge-ready path
       // Finding 3: stopped(no_findings) shares the done-path streak, so exclude it from the reset
@@ -521,9 +525,12 @@ export class Orchestrator {
         case "stopped": {
           const category = classifyStopReason(verdict.stopReason);
           if (category === "review_done") {
-            // Workflow completed (no_findings) — treat same as done for merge streak
-            pendingRestartReason = undefined;
-            requireNonStoppedBeforeRestart = false;
+            // Workflow completed (no_findings) — treat same as done for merge streak.
+            // Also clear any pending restart since LoopPilot completed successfully.
+            if (pendingRestartReason !== undefined) {
+              pendingRestartReason = undefined;
+              this.store.updateSession(session.id, { pendingRestartReason: null });
+            }
             const outcome = await this.tryMerge(session, prNumber);
             if (outcome.kind === "merged") return CONTINUE;
             if (outcome.kind === "halt") return HALT;
@@ -556,12 +563,13 @@ export class Orchestrator {
             continue;
           }
           if (category === "auto_restart") {
-            // Stale states (same reason re-returning before LoopPilot consumes the comment)
-            // and the post-recovery guard must still respect monitor_timeout so the session
-            // cannot loop forever when the workflow stays stopped.
+            // Stale: we already have a pending /restart-review for this exact stop reason.
+            // The pending record is stored durably in DB so it survives process restarts
+            // (fixes ES-409 Findings 1, 2, 3). A different reason is NOT stale — LoopPilot
+            // must have consumed the prior restart and run before stopping again.
             const stale =
               pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
-            if (stale || requireNonStoppedBeforeRestart) {
+            if (stale) {
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (
                 timeout !== undefined &&
@@ -571,7 +579,6 @@ export class Orchestrator {
               }
               continue;
             }
-            pendingRestartReason = undefined; // clear before counting new event
             autoRestartCount += 1;
             if (autoRestartCount > 3) {
               return await this.stopSession(
@@ -583,12 +590,9 @@ export class Orchestrator {
             // A real restart event breaks any prior readiness-failure streak: errors before
             // and after the restarted review are not consecutive within the new attempt.
             readinessFailures = 0;
-            // Persist the attempt count BEFORE posting so a crash between the comment
-            // succeeding and the next updateSession cannot bypass the 3-comment cap on
-            // recovery. monitorStartedAt is also reset here so the timeout/not-engaged
-            // guards measure from the restart point regardless of post outcome.
+            // Reset monitorStartedAt before posting so the timeout/not-engaged guards
+            // measure from the restart point regardless of post outcome.
             this.store.updateSession(session.id, {
-              autoRestartAttempts: autoRestartCount,
               monitorStartedAt: this.clock(),
             });
             if (verdict.stopReason === "state_conflict") {
@@ -603,7 +607,15 @@ export class Orchestrator {
                 `/restart-review comment failed: ${errMsg(err)}`,
               );
             }
-            pendingRestartReason = verdict.stopReason;
+            // ES-409 Finding 3: persist attempt count and pending reason AFTER a confirmed
+            // post. A pre-post crash leaves autoRestartAttempts unchanged and
+            // pendingRestartReason null, so the next startup retries the post rather than
+            // stalling forever waiting for a non-stopped verdict.
+            pendingRestartReason = verdict.stopReason ?? undefined;
+            this.store.updateSession(session.id, {
+              autoRestartAttempts: autoRestartCount,
+              pendingRestartReason: verdict.stopReason,
+            });
             continue;
           }
           // quota_wait / human_required / null → HALT

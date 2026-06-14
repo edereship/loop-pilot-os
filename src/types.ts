@@ -56,6 +56,7 @@ export interface TaskSessionRow {
   workflowFixAttempts: number;       // number of fix-agent runs for this session (budget counter)
   workflowHandledErrorCount: number; // errorCommentCount at the time of the last successful fix (guard counter)
   autoRestartAttempts: number;       // number of /restart-review comments posted (durable cap counter)
+  pendingRestartReason: string | null; // stopReason for which the last /restart-review was posted, or null if none pending
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
