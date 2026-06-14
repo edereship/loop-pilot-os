@@ -264,6 +264,19 @@ export class Orchestrator {
       verdict = await this.monitor.poll(prNumber);
     } catch (err) {
       this.log(`recovery: poll threw for stopped session PR #${prNumber}, resuming MONITOR: ${errMsg(err)}`);
+      // A transient poll error means we have no verdict to compare against the exhaustion
+      // detail. If the session's stopDetail indicates a terminal counter exhaustion, do not
+      // revive it — we cannot confirm the stop reason changed, so preserve the terminal HALT.
+      if (
+        session.stopDetail !== null &&
+        (session.stopDetail.startsWith("auto-restart limit exceeded") ||
+          session.stopDetail.startsWith("quota retry limit exceeded"))
+      ) {
+        this.log(
+          `recovery: skipping exhausted stopped session PR #${prNumber} (poll error): ${session.stopDetail}`,
+        );
+        return CONTINUE;
+      }
       this.resetAndAdopt(session.id);
       return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
     }
@@ -328,8 +341,6 @@ export class Orchestrator {
       endedAt: null,
       autoRestartAttempts: 0,
       pendingRestartReason: null,
-      workflowFixAttempts: 0,
-      workflowHandledErrorCount: 0,
       monitorStartedAt: this.clock(),
     });
   }

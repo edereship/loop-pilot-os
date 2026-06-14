@@ -939,14 +939,15 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     // monitorStartedAt is refreshed at adoption to start a fresh monitoring window
     expect(s.monitorStartedAt).toMatch(/^2026-06-05T00:00:\d{2}\.\d{3}Z$/);
     expect(s.monitorStartedAt).not.toBe(originalStart);
-    // Reset fields cleared
+    // Adoption-reset fields cleared
     expect(s.failureReason).toBeNull();
     expect(s.stopDetail).toBeNull();
     expect(s.endedAt).not.toBeNull(); // re-set by done()
     expect(s.autoRestartAttempts).toBe(0);
     expect(s.pendingRestartReason).toBeNull();
-    expect(s.workflowFixAttempts).toBe(0);
-    expect(s.workflowHandledErrorCount).toBe(0);
+    // Workflow recovery counters are preserved across recovery (Finding 2)
+    expect(s.workflowFixAttempts).toBe(1);
+    expect(s.workflowHandledErrorCount).toBe(1);
     // DONE 後段
     expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
     expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-100"] });
@@ -1036,13 +1037,14 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     const s = h.store.getSession(crashed.id);
     expect(s.state).toBe("merged");
     expect(s.runId).toBe(newRun.id);
-    // Reset fields cleared
+    // Adoption-reset fields cleared
     expect(s.failureReason).toBeNull();
     expect(s.stopDetail).toBeNull();
     expect(s.autoRestartAttempts).toBe(0);
     expect(s.pendingRestartReason).toBeNull();
-    expect(s.workflowFixAttempts).toBe(0);
-    expect(s.workflowHandledErrorCount).toBe(0);
+    // Workflow recovery counters are preserved across recovery (Finding 2)
+    expect(s.workflowFixAttempts).toBe(2);
+    expect(s.workflowHandledErrorCount).toBe(3);
     // DONE 後段
     expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
     expect(h.store.countMerged(newRun.id)).toBe(1);
@@ -1262,6 +1264,46 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     expect(s.autoRestartAttempts).toBe(3);
     expect(s.failureReason).toBe("looppilot_stopped");
     expect(s.stopDetail).toBe("auto-restart limit exceeded (4x): workflow_crashed");
+    // No /restart-review posted, no PR adoption
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Log contains skip message
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(true);
+  });
+
+  it("auto-restart limit exhausted + poll が throw → 採用せず stopped のまま（Finding 1）", async () => {
+    // Regression: a transient poll error in the catch path bypassed the exhaustion guard
+    // (which only fires inside the switch on a successful verdict), causing resetAndAdopt()
+    // to clear stopDetail/autoRestartAttempts and revive a terminal session.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "auto-restart limit exceeded (4x): workflow_crashed",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 3,
+    });
+    // Poll throws a transient error — no verdict is available
+    h.monitor.poll = async () => {
+      throw new Error("API 502");
+    };
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session must NOT be adopted — terminal HALT must be preserved
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.stopDetail).toBe("auto-restart limit exceeded (4x): workflow_crashed");
+    expect(s.autoRestartAttempts).toBe(3);
     // No /restart-review posted, no PR adoption
     expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
     // Loop was entered (recovery did not HALT)
