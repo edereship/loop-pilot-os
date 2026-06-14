@@ -897,15 +897,15 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     expect(quotaEvents).toHaveLength(1);
   });
 
-  it("quota 回復（in_progress 検知）→ quota_resumed 通知（カウンタは保持）→ 再度 quota でリトライ可能", async () => {
+  it("quota 回復（in_progress 検知）→ quota_resumed 通知・カウンタリセット → 再度 quota で新エピソード開始", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
     h.monitor.verdicts = [
       { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #1 → count=1
-      { kind: "in_progress" },                               // 回復 → quota_resumed 通知、count はそのまま
-      { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #2 → count=2
+      { kind: "in_progress" },                               // 回復 → quota_resumed 通知、count リセット=0
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // 新エピソード retry #1 → count=1
       { kind: "done" },
       { kind: "merged" },
     ];
@@ -917,9 +917,9 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     // quota_resumed 通知が送られた
     const resumed = h.notifier.events.filter((e) => e.kind === "quota_resumed");
     expect(resumed).toHaveLength(1);
-    // quota_waiting 通知は初回のみ（カウンタをリセットしないため 2 回目は count!=1 で通知しない）
+    // quota_waiting 通知は各エピソードの初回（count===1）に送られるため2回
     const waiting = h.notifier.events.filter((e) => e.kind === "quota_waiting");
-    expect(waiting).toHaveLength(1);
+    expect(waiting).toHaveLength(2);
     // postComment は2回（各サイクル1回ずつ）
     const postComments = h.git.calls.filter((c) => c.method === "postComment");
     expect(postComments).toHaveLength(2);

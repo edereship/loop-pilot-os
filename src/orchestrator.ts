@@ -740,9 +740,10 @@ export class Orchestrator {
               kind: "quota_resumed",
               detail: `${session.linearIdentifier} quota recovered after ${quotaRetryCount} retries`,
             });
-            // Do NOT reset quotaRetryCount — the count must survive in_progress
-            // states (initialized/waiting_codex/fixing → in_progress) so the
-            // 6-attempt cap is reached if quota is exhausted again (ES-410 Finding 2).
+            // Reset counter so a new quota outage window starts fresh. The 6-attempt
+            // cap applies per outage episode; after a confirmed recovery the next
+            // exhaustion begins at count=1 again (ES-410 Finding 4).
+            quotaRetryCount = 0;
             quotaResumedNotified = true;
           }
           const timeout = this.config.safety.monitorTimeoutMinutes;
