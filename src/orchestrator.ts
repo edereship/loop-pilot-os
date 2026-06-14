@@ -275,15 +275,22 @@ export class Orchestrator {
           recoveryCategory === "auto_restart" ||
           recoveryCategory === "quota_wait"
         ) {
-          // If the prior stop was a terminal counter exhaustion, do not revive.
-          // resetAndAdopt would zero autoRestartAttempts/pendingRestartReason, letting
-          // each daemon restart post another full round of /restart-review comments
+          // If the prior stop was a terminal counter exhaustion for the SAME reason,
+          // do not revive. resetAndAdopt would zero autoRestartAttempts/pendingRestartReason,
+          // letting each daemon restart post another full round of /restart-review comments
           // instead of honouring the terminal HALT (ES-411).
+          // Compare against the current verdict.stopReason so that a different new stop
+          // reason (e.g. test_failure after workflow_crashed was exhausted) gets a fresh
+          // restart budget rather than being silently skipped.
           if (
             (recoveryCategory === "auto_restart" &&
-              session.stopDetail?.startsWith("auto-restart limit exceeded")) ||
+              session.stopDetail !== null &&
+              session.stopDetail.startsWith("auto-restart limit exceeded") &&
+              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason) ||
             (recoveryCategory === "quota_wait" &&
-              session.stopDetail?.startsWith("quota retry limit exceeded"))
+              session.stopDetail !== null &&
+              session.stopDetail.startsWith("quota retry limit exceeded") &&
+              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason)
           ) {
             this.log(
               `recovery: skipping exhausted stopped session PR #${prNumber}: ${session.stopDetail}`,
@@ -1069,6 +1076,12 @@ async function retry(times: number, fn: () => Promise<void>): Promise<void> {
  * done() は issue.id（transition）と issue.identifier（ログ）しか使わないため、
  * title 等は記録済みの値で埋め、未保持フィールドは安全な既定で埋める。
  */
+/** Extracts the stop reason embedded after the last ": " in an exhaustion detail string. */
+function extractExhaustedStopReason(stopDetail: string): string {
+  const idx = stopDetail.lastIndexOf(": ");
+  return idx === -1 ? "" : stopDetail.slice(idx + 2);
+}
+
 function reconstructIssue(session: TaskSessionRow): EligibleIssue {
   return {
     id: session.linearIssueId,

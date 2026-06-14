@@ -1270,6 +1270,50 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(true);
   });
 
+  it("auto-restart limit exhausted for reason A, PR now shows reason B → session recovered with fresh counter", async () => {
+    // Regression: the prefix-only check ("auto-restart limit exceeded") fired even when the
+    // current stop reason differed from the one that exhausted the counter, silently skipping
+    // recovery for a new failure type. The fix compares the embedded reason in stopDetail
+    // against the current verdict.stopReason before suppressing recovery.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      // Exhausted for workflow_crashed
+      stopDetail: "auto-restart limit exceeded (4x): workflow_crashed",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 3,
+    });
+    // PR now shows a DIFFERENT auto-restart reason (test_failure)
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "test_failure" }, // poll 1 (recovery): adopt
+      { kind: "stopped", stopReason: "test_failure" }, // poll 2 (monitorSession): postComment
+      { kind: "merged" },                               // poll 3 (monitorSession): done
+    ];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    // Session MUST be adopted and recovered, not skipped
+    expect(s.state).toBe("merged");
+    // autoRestartAttempts was reset to 0 at adoption, then incremented to 1 for test_failure
+    expect(s.autoRestartAttempts).toBe(1);
+    // /restart-review was posted for the new reason
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(true);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Skip log must NOT be present (it was not skipped)
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(false);
+  });
+
   it("quota retry limit exhausted → PR still shows codex_usage_limit → session stays stopped, loop enters", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
