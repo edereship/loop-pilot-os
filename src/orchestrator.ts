@@ -268,7 +268,19 @@ export class Orchestrator {
       return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
     }
     switch (verdict.kind) {
-      case "stopped":
+      case "stopped": {
+        const recoveryCategory = classifyStopReason(verdict.stopReason);
+        if (
+          recoveryCategory === "review_done" ||
+          recoveryCategory === "auto_restart" ||
+          recoveryCategory === "quota_wait"
+        ) {
+          this.resetAndAdopt(session.id);
+          return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+        }
+        // human_required / null → LoopPilot has not yet restarted; skip
+        return CONTINUE;
+      }
       case "pr_closed":
         return CONTINUE;
       case "merged":
@@ -296,6 +308,7 @@ export class Orchestrator {
       pendingRestartReason: null,
       workflowFixAttempts: 0,
       workflowHandledErrorCount: 0,
+      monitorStartedAt: this.clock(),
     });
   }
 

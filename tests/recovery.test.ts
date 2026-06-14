@@ -936,8 +936,9 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     const s = h.store.getSession(crashed.id);
     expect(s.state).toBe("merged");
     expect(s.runId).toBe(newRun.id);
-    // monitorStartedAt is preserved
-    expect(s.monitorStartedAt).toBe(originalStart);
+    // monitorStartedAt is refreshed at adoption to start a fresh monitoring window
+    expect(s.monitorStartedAt).toMatch(/^2026-06-05T00:00:\d{2}\.\d{3}Z$/);
+    expect(s.monitorStartedAt).not.toBe(originalStart);
     // Reset fields cleared
     expect(s.failureReason).toBeNull();
     expect(s.stopDetail).toBeNull();
@@ -1160,5 +1161,122 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     expect(s.failureReason).toBeNull();
     // Log contains recovery message
     expect(h.logs.some((l) => l.includes("recovery: poll threw for stopped session"))).toBe(true);
+  });
+
+  it("no_findings（review_done）→ resetAndAdopt + adoptAndMonitor → monitorSession が tryMerge → merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // poll 1 (recovery): no_findings → adopt
+    // poll 2 (monitorSession): no_findings → tryMerge → merged (checkMergeReadiness default ready)
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "no_findings" },
+      { kind: "stopped", stopReason: "no_findings" },
+    ];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(h.store.latestRun()!.id);
+    // tryMerge called during monitorSession
+    expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(true);
+    // monitorStartedAt refreshed at adoption
+    expect(s.monitorStartedAt).toMatch(/^2026-06-05T00:00:\d{2}\.\d{3}Z$/);
+    expect(s.monitorStartedAt).not.toBe("2026-06-04T00:10:00.000Z");
+    // DONE 後段
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+  });
+
+  it("auto_restart (workflow_crashed) → resetAndAdopt + adoptAndMonitor → monitorSession が postComment → merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // poll 1 (recovery): workflow_crashed → adopt
+    // poll 2 (monitorSession): workflow_crashed → postComment(/restart-review)
+    // poll 3 (monitorSession): merged
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },
+      { kind: "stopped", stopReason: "workflow_crashed" },
+      { kind: "merged" },
+    ];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    // postComment was called by monitorSession's auto_restart handler
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(true);
+  });
+
+  it("superseded stopped session (newer session for same issue exists) → not recovered", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Old stopped session for issue-A
+    const oldRun = h.store.createRun(3, "2026-06-03T00:00:00.000Z");
+    const oldSession = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Old attempt",
+      branch: "looppilot/ty-1-old",
+      worktreePath: "/wt/ty-1-old",
+      now: "2026-06-03T00:00:01.000Z",
+    });
+    h.store.updateSession(oldSession.id, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      prNumber: 100,
+      endedAt: "2026-06-03T01:00:00.000Z",
+    });
+    // Newer session for the same issue (in_review) — supersedes the old stopped session
+    const newSession = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Retry attempt",
+      branch: "looppilot/ty-1-retry",
+      worktreePath: "/wt/ty-1-retry",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(newSession.id, { state: "in_review", prNumber: 200 });
+    // The in_review session will be processed by activeSessions recovery; configure its poll
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Old stopped session was NOT adopted (not in stoppedSessionsWithPr because superseded)
+    const old = h.store.getSession(oldSession.id);
+    expect(old.state).toBe("stopped"); // unchanged
+    expect(old.runId).toBe(oldRun.id); // not re-parented
   });
 });
