@@ -140,6 +140,13 @@ export class Orchestrator {
       }
       if (ctrl.control === "halt") return HALT;
     }
+
+    // 3) stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）
+    for (const session of this.store.stoppedSessionsWithPr("looppilot_stopped")) {
+      const ctrl = await this.recoverStoppedByLooppilot(session, session.prNumber as number);
+      if (ctrl.control === "halt") return HALT;
+    }
+
     return CONTINUE;
   }
 
@@ -244,6 +251,98 @@ export class Orchestrator {
       `crash recovery: no open PR; manual cleanup: ` +
       `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
     return await this.stopSession(session, "exception", detail);
+  }
+
+  /**
+   * stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）。
+   * 採用時は state を in_review へ原子的に遷移させる（resetAndAdopt）ことで、
+   * 遷移途中のクラッシュでも activeSessions() から回復可能な状態を維持する。
+   */
+  private async recoverStoppedByLooppilot(session: TaskSessionRow, prNumber: number): Promise<RunControl> {
+    let verdict: MonitorVerdict;
+    try {
+      verdict = await this.monitor.poll(prNumber);
+    } catch (err) {
+      this.log(`recovery: poll threw for stopped session PR #${prNumber}, resuming MONITOR: ${errMsg(err)}`);
+      // A transient poll error means we have no verdict to compare against the exhaustion
+      // detail. If the session's stopDetail indicates a terminal counter exhaustion, do not
+      // revive it — we cannot confirm the stop reason changed, so preserve the terminal HALT.
+      if (
+        session.stopDetail !== null &&
+        (session.stopDetail.startsWith("auto-restart limit exceeded") ||
+          session.stopDetail.startsWith("quota retry limit exceeded"))
+      ) {
+        this.log(
+          `recovery: skipping exhausted stopped session PR #${prNumber} (poll error): ${session.stopDetail}`,
+        );
+        return CONTINUE;
+      }
+      this.resetAndAdopt(session.id);
+      return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+    }
+    switch (verdict.kind) {
+      case "stopped": {
+        const recoveryCategory = classifyStopReason(verdict.stopReason);
+        if (
+          recoveryCategory === "review_done" ||
+          recoveryCategory === "auto_restart" ||
+          recoveryCategory === "quota_wait"
+        ) {
+          // If the prior stop was a terminal counter exhaustion for the SAME reason,
+          // do not revive. resetAndAdopt would zero autoRestartAttempts/pendingRestartReason,
+          // letting each daemon restart post another full round of /restart-review comments
+          // instead of honouring the terminal HALT (ES-411).
+          // Compare against the current verdict.stopReason so that a different new stop
+          // reason (e.g. test_failure after workflow_crashed was exhausted) gets a fresh
+          // restart budget rather than being silently skipped.
+          if (
+            (recoveryCategory === "auto_restart" &&
+              session.stopDetail !== null &&
+              session.stopDetail.startsWith("auto-restart limit exceeded") &&
+              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason) ||
+            (recoveryCategory === "quota_wait" &&
+              session.stopDetail !== null &&
+              session.stopDetail.startsWith("quota retry limit exceeded") &&
+              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason)
+          ) {
+            this.log(
+              `recovery: skipping exhausted stopped session PR #${prNumber}: ${session.stopDetail}`,
+            );
+            return CONTINUE;
+          }
+          this.resetAndAdopt(session.id);
+          return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+        }
+        // human_required / null → LoopPilot has not yet restarted; skip
+        return CONTINUE;
+      }
+      case "pr_closed":
+        return CONTINUE;
+      case "merged":
+        this.resetAndAdopt(session.id);
+        await this.recoverDone(session);
+        return CONTINUE;
+      case "done":
+      case "in_progress":
+      case "corrupted":
+      case "not_engaged":
+      case "workflow_failed":
+        this.resetAndAdopt(session.id);
+        return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+    }
+  }
+
+  private resetAndAdopt(sessionId: number): void {
+    this.store.updateSession(sessionId, {
+      state: "in_review",
+      runId: this.runId,
+      failureReason: null,
+      stopDetail: null,
+      endedAt: null,
+      autoRestartAttempts: 0,
+      pendingRestartReason: null,
+      monitorStartedAt: this.clock(),
+    });
   }
 
   /** 回復経路の DONE 後段。セッション行から最小 issue を再構成して done() を再利用する。 */
@@ -988,6 +1087,12 @@ async function retry(times: number, fn: () => Promise<void>): Promise<void> {
  * done() は issue.id（transition）と issue.identifier（ログ）しか使わないため、
  * title 等は記録済みの値で埋め、未保持フィールドは安全な既定で埋める。
  */
+/** Extracts the stop reason embedded after the last ": " in an exhaustion detail string. */
+function extractExhaustedStopReason(stopDetail: string): string {
+  const idx = stopDetail.lastIndexOf(": ");
+  return idx === -1 ? "" : stopDetail.slice(idx + 2);
+}
+
 function reconstructIssue(session: TaskSessionRow): EligibleIssue {
   return {
     id: session.linearIssueId,

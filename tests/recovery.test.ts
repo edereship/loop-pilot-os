@@ -902,3 +902,539 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
     expect(s.failureReason).toBe("monitor_never_engaged");
   });
 });
+
+describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）", () => {
+  it("LoopPilot が in_progress（waiting_codex）→ 採用して MONITOR 再開、merged まで完走", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const originalStart = "2026-06-04T00:10:00.000Z";
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: originalStart,
+      autoRestartAttempts: 2,
+      pendingRestartReason: "workflow_crashed",
+      workflowFixAttempts: 1,
+      workflowHandledErrorCount: 1,
+    });
+    // poll 1 (recovery): in_progress → adopt
+    // poll 2 (monitorSession): done → merge
+    // poll 3 (monitorSession): merged → CONTINUE
+    h.monitor.verdicts = [{ kind: "in_progress" }, { kind: "done" }, { kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(newRun.id);
+    // monitorStartedAt is refreshed at adoption to start a fresh monitoring window
+    expect(s.monitorStartedAt).toMatch(/^2026-06-05T00:00:\d{2}\.\d{3}Z$/);
+    expect(s.monitorStartedAt).not.toBe(originalStart);
+    // Adoption-reset fields cleared
+    expect(s.failureReason).toBeNull();
+    expect(s.stopDetail).toBeNull();
+    expect(s.endedAt).not.toBeNull(); // re-set by done()
+    expect(s.autoRestartAttempts).toBe(0);
+    expect(s.pendingRestartReason).toBeNull();
+    // Workflow recovery counters are preserved across recovery (Finding 2)
+    expect(s.workflowFixAttempts).toBe(1);
+    expect(s.workflowHandledErrorCount).toBe(1);
+    // DONE 後段
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+    expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-100"] });
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+  });
+
+  it("LoopPilot がまだ stopped → スキップし、ループに入る（SELECT → idle）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // LoopPilot is still stopped
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "human_required" }];
+    // Loop enters SELECT → idle → requestStop
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session unchanged (still stopped) — not adopted into new run
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(s).toHaveLength(0);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("PR がクローズ済み（pr_closed verdict）→ スキップ", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.monitor.verdicts = [{ kind: "pr_closed" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session not adopted — skipped
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(s).toHaveLength(0);
+    // Loop was entered
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("PR がマージ済み（merged verdict）→ recoverDone → merged 永続化 + transition(done)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 1,
+      workflowFixAttempts: 2,
+      workflowHandledErrorCount: 3,
+    });
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(newRun.id);
+    // Adoption-reset fields cleared
+    expect(s.failureReason).toBeNull();
+    expect(s.stopDetail).toBeNull();
+    expect(s.autoRestartAttempts).toBe(0);
+    expect(s.pendingRestartReason).toBeNull();
+    // Workflow recovery counters are preserved across recovery (Finding 2)
+    expect(s.workflowFixAttempts).toBe(2);
+    expect(s.workflowHandledErrorCount).toBe(3);
+    // DONE 後段
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+    expect(h.store.countMerged(newRun.id)).toBe(1);
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+    // Loop entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("OS 起因の停止（cost_exceeded）→ stoppedSessionsWithPr に含まれず回復対象外", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "cost_exceeded",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // monitor.poll was never called (session not queried)
+    expect(h.monitor.pollCalls).toHaveLength(0);
+    // Loop was entered
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("stopped + looppilot_stopped + prNumber=null → 回復対象外", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      // prNumber not set (null)
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // monitor.poll was never called
+    expect(h.monitor.pollCalls).toHaveLength(0);
+    // Loop was entered
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("採用セッションが taskCap にカウントされ、ループ先頭で cap 到達 → HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.source.queue = [issue("issue-Q", "TY-99")];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+    // taskCap=1 reached → HALT at loop start, TY-99 not started
+    expect(newRun.state).toBe("halted");
+    expect(newRun.haltReason).toContain("task cap reached");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+    expect(h.source.queue.map((i) => i.identifier)).toEqual(["TY-99"]);
+  });
+
+  it("poll が throw → 採用して MONITOR 再開、monitorSession に委ねる", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // First poll throws (recovery), second returns merged (monitorSession)
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    let thrown = false;
+    h.monitor.poll = async (pr: number) => {
+      if (!thrown) {
+        thrown = true;
+        throw new Error("API 502");
+      }
+      return origPoll(pr);
+    };
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(h.store.latestRun()!.id);
+    expect(s.failureReason).toBeNull();
+    // Log contains recovery message
+    expect(h.logs.some((l) => l.includes("recovery: poll threw for stopped session"))).toBe(true);
+  });
+
+  it("no_findings（review_done）→ resetAndAdopt + adoptAndMonitor → monitorSession が tryMerge → merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // poll 1 (recovery): no_findings → adopt
+    // poll 2 (monitorSession): no_findings → tryMerge → merged (checkMergeReadiness default ready)
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "no_findings" },
+      { kind: "stopped", stopReason: "no_findings" },
+    ];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(h.store.latestRun()!.id);
+    // tryMerge called during monitorSession
+    expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(true);
+    // monitorStartedAt refreshed at adoption
+    expect(s.monitorStartedAt).toMatch(/^2026-06-05T00:00:\d{2}\.\d{3}Z$/);
+    expect(s.monitorStartedAt).not.toBe("2026-06-04T00:10:00.000Z");
+    // DONE 後段
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+  });
+
+  it("auto_restart (workflow_crashed) → resetAndAdopt + adoptAndMonitor → monitorSession が postComment → merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // poll 1 (recovery): workflow_crashed → adopt
+    // poll 2 (monitorSession): workflow_crashed → postComment(/restart-review)
+    // poll 3 (monitorSession): merged
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },
+      { kind: "stopped", stopReason: "workflow_crashed" },
+      { kind: "merged" },
+    ];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    // postComment was called by monitorSession's auto_restart handler
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(true);
+  });
+
+  it("auto-restart limit exhausted → PR still shows workflow_crashed → session stays stopped, loop enters", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      // stopDetail written by monitorSession when autoRestartCount > 3
+      stopDetail: "auto-restart limit exceeded (4x): workflow_crashed",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 3,
+    });
+    // PR still shows the same stop reason that exhausted the counter
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "workflow_crashed" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session must NOT be adopted — counters must stay intact
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.autoRestartAttempts).toBe(3);
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("auto-restart limit exceeded (4x): workflow_crashed");
+    // No /restart-review posted, no PR adoption
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Log contains skip message
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(true);
+  });
+
+  it("auto-restart limit exhausted + poll が throw → 採用せず stopped のまま（Finding 1）", async () => {
+    // Regression: a transient poll error in the catch path bypassed the exhaustion guard
+    // (which only fires inside the switch on a successful verdict), causing resetAndAdopt()
+    // to clear stopDetail/autoRestartAttempts and revive a terminal session.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "auto-restart limit exceeded (4x): workflow_crashed",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 3,
+    });
+    // Poll throws a transient error — no verdict is available
+    h.monitor.poll = async () => {
+      throw new Error("API 502");
+    };
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session must NOT be adopted — terminal HALT must be preserved
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.stopDetail).toBe("auto-restart limit exceeded (4x): workflow_crashed");
+    expect(s.autoRestartAttempts).toBe(3);
+    // No /restart-review posted, no PR adoption
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Log contains skip message
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(true);
+  });
+
+  it("auto-restart limit exhausted for reason A, PR now shows reason B → session recovered with fresh counter", async () => {
+    // Regression: the prefix-only check ("auto-restart limit exceeded") fired even when the
+    // current stop reason differed from the one that exhausted the counter, silently skipping
+    // recovery for a new failure type. The fix compares the embedded reason in stopDetail
+    // against the current verdict.stopReason before suppressing recovery.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      // Exhausted for workflow_crashed
+      stopDetail: "auto-restart limit exceeded (4x): workflow_crashed",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 3,
+    });
+    // PR now shows a DIFFERENT auto-restart reason (test_failure)
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "test_failure" }, // poll 1 (recovery): adopt
+      { kind: "stopped", stopReason: "test_failure" }, // poll 2 (monitorSession): postComment
+      { kind: "merged" },                               // poll 3 (monitorSession): done
+    ];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    // Session MUST be adopted and recovered, not skipped
+    expect(s.state).toBe("merged");
+    // autoRestartAttempts was reset to 0 at adoption, then incremented to 1 for test_failure
+    expect(s.autoRestartAttempts).toBe(1);
+    // /restart-review was posted for the new reason
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(true);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Skip log must NOT be present (it was not skipped)
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(false);
+  });
+
+  it("quota retry limit exhausted → PR still shows codex_usage_limit → session stays stopped, loop enters", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      // stopDetail written by monitorSession when quotaRetryCount > 6
+      stopDetail: "quota retry limit exceeded (7x): codex_usage_limit",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // PR still shows the quota-exhausted stop reason
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "codex_usage_limit" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session must NOT be adopted
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("quota retry limit exceeded (7x): codex_usage_limit");
+    // No /restart-review posted
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Log contains skip message
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(true);
+  });
+
+  it("superseded stopped session (newer session for same issue exists) → not recovered", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Old stopped session for issue-A
+    const oldRun = h.store.createRun(3, "2026-06-03T00:00:00.000Z");
+    const oldSession = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Old attempt",
+      branch: "looppilot/ty-1-old",
+      worktreePath: "/wt/ty-1-old",
+      now: "2026-06-03T00:00:01.000Z",
+    });
+    h.store.updateSession(oldSession.id, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      prNumber: 100,
+      endedAt: "2026-06-03T01:00:00.000Z",
+    });
+    // Newer session for the same issue (in_review) — supersedes the old stopped session
+    const newSession = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Retry attempt",
+      branch: "looppilot/ty-1-retry",
+      worktreePath: "/wt/ty-1-retry",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(newSession.id, { state: "in_review", prNumber: 200 });
+    // The in_review session will be processed by activeSessions recovery; configure its poll
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Old stopped session was NOT adopted (not in stoppedSessionsWithPr because superseded)
+    const old = h.store.getSession(oldSession.id);
+    expect(old.state).toBe("stopped"); // unchanged
+    expect(old.runId).toBe(oldRun.id); // not re-parented
+  });
+});

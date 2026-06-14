@@ -225,6 +225,61 @@ describe("SqliteStore: session", () => {
     expect(store.knownIssueIds().sort()).toEqual(["i-a", "i-b", "i-c", "i-d"]);
   });
 
+  it("stoppedSessionsWithPr returns stopped sessions with matching failure_reason and non-null pr_number", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const run = store.createRun(3, clock());
+
+    // stopped + looppilot_stopped + prNumber → included
+    const a = seedSession(store, run.id, clock(), { linearIssueId: "i-a", linearIdentifier: "TY-1", branch: "b-a" });
+    store.updateSession(a.id, { state: "stopped", failureReason: "looppilot_stopped", prNumber: 100 });
+
+    // stopped + looppilot_stopped + prNumber=null → excluded
+    const b = seedSession(store, run.id, clock(), { linearIssueId: "i-b", linearIdentifier: "TY-2", branch: "b-b" });
+    store.updateSession(b.id, { state: "stopped", failureReason: "looppilot_stopped" });
+
+    // stopped + cost_exceeded (OS-caused) + prNumber → excluded
+    const c = seedSession(store, run.id, clock(), { linearIssueId: "i-c", linearIdentifier: "TY-3", branch: "b-c" });
+    store.updateSession(c.id, { state: "stopped", failureReason: "cost_exceeded", prNumber: 200 });
+
+    // in_review (not stopped) → excluded
+    const d = seedSession(store, run.id, clock(), { linearIssueId: "i-d", linearIdentifier: "TY-4", branch: "b-d" });
+    store.updateSession(d.id, { state: "in_review", prNumber: 300 });
+
+    const result = store.stoppedSessionsWithPr("looppilot_stopped");
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe(a.id);
+    expect(result[0].state).toBe("stopped");
+    expect(result[0].failureReason).toBe("looppilot_stopped");
+    expect(result[0].prNumber).toBe(100);
+  });
+
+  it("stoppedSessionsWithPr excludes superseded sessions when a newer session exists for the same issue", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const run = store.createRun(3, clock());
+
+    // Issue A: old stopped session superseded by a newer in_review session → excluded
+    const a1 = seedSession(store, run.id, clock(), { linearIssueId: "i-a", linearIdentifier: "TY-1", branch: "b-a1" });
+    store.updateSession(a1.id, { state: "stopped", failureReason: "looppilot_stopped", prNumber: 100 });
+    const a2 = seedSession(store, run.id, clock(), { linearIssueId: "i-a", linearIdentifier: "TY-1", branch: "b-a2" });
+    store.updateSession(a2.id, { state: "in_review", prNumber: 200 });
+
+    // Issue A: also verify that a superseded-by-stopped session (newer stopped row) is excluded
+    const a3 = seedSession(store, run.id, clock(), { linearIssueId: "i-a", linearIdentifier: "TY-1", branch: "b-a3" });
+    store.updateSession(a3.id, { state: "stopped", failureReason: "cost_exceeded", prNumber: 300 });
+
+    // Issue B: only stopped session (no newer) → included
+    const b = seedSession(store, run.id, clock(), { linearIssueId: "i-b", linearIdentifier: "TY-2", branch: "b-b" });
+    store.updateSession(b.id, { state: "stopped", failureReason: "looppilot_stopped", prNumber: 400 });
+
+    const result = store.stoppedSessionsWithPr("looppilot_stopped");
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe(b.id);
+    // a1 excluded because a2 and a3 (newer sessions) exist for the same issue
+    // a3 excluded because failure_reason is cost_exceeded (not looppilot_stopped)
+  });
+
   // カーネル §2/§7: recentMergedSummaries は merged のみを ended_at 降順で n 件
   it("recentMergedSummaries returns only merged sessions, newest-ended first, limited to n", () => {
     const store = newStore();
