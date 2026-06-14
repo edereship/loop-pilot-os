@@ -1007,4 +1007,158 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     // Loop was entered
     expect(h.source.eligibleCalls).toHaveLength(1);
   });
+
+  it("PR がマージ済み（merged verdict）→ recoverDone → merged 永続化 + transition(done)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 1,
+      workflowFixAttempts: 2,
+      workflowHandledErrorCount: 3,
+    });
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(newRun.id);
+    // Reset fields cleared
+    expect(s.failureReason).toBeNull();
+    expect(s.stopDetail).toBeNull();
+    expect(s.autoRestartAttempts).toBe(0);
+    expect(s.pendingRestartReason).toBeNull();
+    expect(s.workflowFixAttempts).toBe(0);
+    expect(s.workflowHandledErrorCount).toBe(0);
+    // DONE 後段
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+    expect(h.store.countMerged(newRun.id)).toBe(1);
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+    // Loop entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("OS 起因の停止（cost_exceeded）→ stoppedSessionsWithPr に含まれず回復対象外", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "cost_exceeded",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // monitor.poll was never called (session not queried)
+    expect(h.monitor.pollCalls).toHaveLength(0);
+    // Loop was entered
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("stopped + looppilot_stopped + prNumber=null → 回復対象外", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      // prNumber not set (null)
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // monitor.poll was never called
+    expect(h.monitor.pollCalls).toHaveLength(0);
+    // Loop was entered
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("採用セッションが taskCap にカウントされ、ループ先頭で cap 到達 → HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.source.queue = [issue("issue-Q", "TY-99")];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    expect(h.store.countTasksStarted(newRun.id)).toBe(1);
+    // taskCap=1 reached → HALT at loop start, TY-99 not started
+    expect(newRun.state).toBe("halted");
+    expect(newRun.haltReason).toContain("task cap reached");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+    expect(h.source.queue.map((i) => i.identifier)).toEqual(["TY-99"]);
+  });
+
+  it("poll が throw → 採用して MONITOR 再開、monitorSession に委ねる", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // First poll throws (recovery), second returns merged (monitorSession)
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    let thrown = false;
+    h.monitor.poll = async (pr: number) => {
+      if (!thrown) {
+        thrown = true;
+        throw new Error("API 502");
+      }
+      return origPoll(pr);
+    };
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.runId).toBe(h.store.latestRun()!.id);
+    expect(s.failureReason).toBeNull();
+    // Log contains recovery message
+    expect(h.logs.some((l) => l.includes("recovery: poll threw for stopped session"))).toBe(true);
+  });
 });
