@@ -830,8 +830,10 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
-    // 7回連続 codex_usage_limit（6回リトライ後、7回目で上限超過）
-    h.monitor.verdicts = Array.from({ length: 7 }, () => ({
+    // 各リトライは2 poll を消費する（post + stale grace）。6 リトライ後、13回目の poll で
+    // 7回目の試行となり上限超過で HALT。これは auto_restart の同名テスト（同じ stopReason が
+    // 7 連続 → 上限超過）と同じ stale ガード設計を quota_wait にも適用したもの。
+    h.monitor.verdicts = Array.from({ length: 13 }, () => ({
       kind: "stopped" as const,
       stopReason: "codex_usage_limit",
     }));
@@ -842,7 +844,7 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("looppilot_stopped");
     expect(s.stopDetail).toContain("quota retry limit");
-    // postComment は6回呼ばれた（7回目は上限超過で HALT）
+    // postComment は6回呼ばれた（13回目で上限超過、stale grace の poll は post しない）
     const postComments = h.git.calls.filter((c) => c.method === "postComment");
     expect(postComments).toHaveLength(6);
     // HALT 通知が送られた

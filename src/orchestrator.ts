@@ -164,8 +164,15 @@ export class Orchestrator {
         return await this.stopSession(session, "pr_closed", null);
       case "stopped": {
         const recoveryCategory = classifyStopReason(verdict.stopReason);
-        if (recoveryCategory === "review_done" || recoveryCategory === "auto_restart") {
-          // Resume MONITOR so monitorSession handles no_findings merge / auto_restart posting
+        if (
+          recoveryCategory === "review_done" ||
+          recoveryCategory === "auto_restart" ||
+          recoveryCategory === "quota_wait"
+        ) {
+          // Resume MONITOR so monitorSession handles no_findings merge,
+          // auto_restart posting, or quota retry (ES-410 Finding 2) — without
+          // adoption the documented quota retry loop halts immediately after a
+          // process restart instead of waiting an hour and retrying.
           return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
         }
         this.store.updateSession(session.id, { runId: this.runId });
@@ -628,6 +635,23 @@ export class Orchestrator {
             continue;
           }
           if (category === "quota_wait") {
+            // Finding 4: mirror auto_restart's stale guard so a queued
+            // `/restart-review` (still pending in the GitHub Actions queue)
+            // isn't charged as another retry that would sleep a second hour.
+            const stale =
+              pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
+            if (stale) {
+              pendingRestartReason = undefined;
+              this.store.updateSession(session.id, { pendingRestartReason: null });
+              const timeout = this.config.safety.monitorTimeoutMinutes;
+              if (
+                timeout !== undefined &&
+                this.elapsedMinutesSinceMonitorStart(session.id) > timeout
+              ) {
+                return await this.stopSession(session, "exception", "monitor timeout");
+              }
+              continue;
+            }
             quotaRetryCount += 1;
             if (quotaRetryCount > 6) {
               return await this.stopSession(
@@ -651,6 +675,23 @@ export class Orchestrator {
               }
               await this.sleep(QUOTA_SLEEP_CHUNK_MS);
             }
+            // Finding 3: re-check after the loop so a stop requested during
+            // the final sleep chunk halts before posting to the PR.
+            if (this.interrupted) {
+              await this.haltForInterrupt();
+              return HALT;
+            }
+            // Finding 1: a quota restart is a real restart boundary — clear any
+            // prior readiness-failure streak so errors before and after the
+            // hour-long wait are not treated as consecutive.
+            readinessFailures = 0;
+            // Finding 5: refresh monitor start so monitor_timeout_minutes and
+            // not-engaged guards measure from the restart, not from before the
+            // quota wait — otherwise the restarted workflow can be killed as
+            // "monitor timeout" before it has a chance to run.
+            this.store.updateSession(session.id, {
+              monitorStartedAt: this.clock(),
+            });
             try {
               await this.git.postComment(prNumber, "/restart-review");
             } catch (err) {
@@ -660,6 +701,13 @@ export class Orchestrator {
                 `/restart-review comment failed: ${errMsg(err)}`,
               );
             }
+            // Finding 4: persist the pending reason after a confirmed post so
+            // the next poll (and any process-restart recovery) recognises the
+            // restart is in flight and applies the stale guard above.
+            pendingRestartReason = verdict.stopReason ?? undefined;
+            this.store.updateSession(session.id, {
+              pendingRestartReason: verdict.stopReason,
+            });
             continue;
           }
           // human_required / null → HALT
