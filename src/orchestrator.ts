@@ -635,14 +635,16 @@ export class Orchestrator {
             continue;
           }
           if (category === "quota_wait") {
-            // Finding 4: mirror auto_restart's stale guard so a queued
-            // `/restart-review` (still pending in the GitHub Actions queue)
-            // isn't charged as another retry that would sleep a second hour.
+            // Keep the pending restart guard active until a non-stopped verdict
+            // confirms the /restart-review was consumed. Clearing it after a
+            // single stale poll would make the next identical stopped verdict look
+            // like a fresh quota failure and trigger another 1-hour sleep while
+            // the restart is still queued in GitHub Actions (ES-410 Finding 1).
+            // The pending reason is cleared by the top-level non-stopped guard
+            // (above) when the restarted workflow actually begins.
             const stale =
               pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
             if (stale) {
-              pendingRestartReason = undefined;
-              this.store.updateSession(session.id, { pendingRestartReason: null });
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (
                 timeout !== undefined &&
