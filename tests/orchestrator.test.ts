@@ -798,19 +798,147 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
   });
 
-  it("quota_wait (codex_usage_limit) → human_required と同扱い HALT", async () => {
+  it("quota_wait (codex_usage_limit) → 1時間待機 → /restart-review 投稿して続行し、最終的に merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "codex_usage_limit" },
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.git.calls).toContainEqual({
+      method: "postComment",
+      args: [100, "/restart-review"],
+    });
+    // 1時間 sleep（10秒 × 360チャンク）が含まれる
+    const tenSecSleeps = h.sleepCalls.filter((ms) => ms === 10_000);
+    expect(tenSecSleeps.length).toBe(360);
+    // 初回 quota_waiting 通知が送られた
+    const quotaEvents = h.notifier.events.filter((e) => e.kind === "quota_waiting");
+    expect(quotaEvents).toHaveLength(1);
+  });
+
+  it("quota_wait リトライ6回超 → HALT + Slack 通知", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
-    h.monitor.verdicts = [{ kind: "stopped", stopReason: "codex_usage_limit" }];
+    // 7回連続 codex_usage_limit（6回リトライ後、7回目で上限超過）
+    h.monitor.verdicts = Array.from({ length: 7 }, () => ({
+      kind: "stopped" as const,
+      stopReason: "codex_usage_limit",
+    }));
 
     await h.orch.run();
 
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("looppilot_stopped");
-    expect(s.stopDetail).toBe("codex_usage_limit");
+    expect(s.stopDetail).toContain("quota retry limit");
+    // postComment は6回呼ばれた（7回目は上限超過で HALT）
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(6);
+    // HALT 通知が送られた
+    const haltEvents = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(haltEvents.length).toBeGreaterThanOrEqual(1);
+    // quota_waiting 通知は初回のみ（1回）
+    const quotaWaiting = h.notifier.events.filter((e) => e.kind === "quota_waiting");
+    expect(quotaWaiting).toHaveLength(1);
+  });
+
+  it("quota 回復（in_progress 検知）→ quota_resumed 通知 + カウンタリセット → 再度 quota でリトライ可能", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #1
+      { kind: "in_progress" },                               // 回復 → カウンタリセット
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #1（リセット後）
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    // quota_resumed 通知が送られた
+    const resumed = h.notifier.events.filter((e) => e.kind === "quota_resumed");
+    expect(resumed).toHaveLength(1);
+    // quota_waiting 通知は各サイクルの初回（2回）
+    const waiting = h.notifier.events.filter((e) => e.kind === "quota_waiting");
+    expect(waiting).toHaveLength(2);
+    // postComment は2回（各サイクル1回ずつ）
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(2);
+  });
+
+  it("quota リトライと autoRestartCount は独立（quota リトライが autoRestartCount に影響しない）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },   // auto_restart #1
+      { kind: "stopped", stopReason: "codex_usage_limit" },  // quota retry #1
+      // stale ガード: pendingRestartReason="workflow_crashed" が残っているので
+      // 異なる reason を使って stale と一致させない
+      { kind: "stopped", stopReason: "action_timeout" },     // auto_restart #2
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    // autoRestartAttempts は 2（quota リトライは含まない）
+    expect(s.autoRestartAttempts).toBe(2);
+  });
+
+  it("quota sleep 中に requestStop() → sleep を中断して HALT（セッションは in_review のまま）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "codex_usage_limit" }];
+
+    // 10秒チャンクの3回目で requestStop() を呼ぶ
+    let tenSecChunks = 0;
+    const origSleepImpl = async (ms: number): Promise<void> => {
+      h.sleepCalls.push(ms);
+      if (ms === 10_000) {
+        tenSecChunks += 1;
+        if (tenSecChunks === 3) {
+          h.orch.requestStop();
+        }
+      }
+    };
+    // DI の sleep を差し替え
+    (h.orch as unknown as { sleep: (ms: number) => Promise<void> }).sleep = origSleepImpl;
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // セッションは in_review のまま（クリーン停止）
+    expect(s.state).toBe("in_review");
+    expect(s.failureReason).toBeNull();
+    // Run は halted(user_interrupt)
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    // 360チャンク全部は走っていない（途中で中断）
+    expect(tenSecChunks).toBeLessThan(360);
+    // postComment は呼ばれていない（sleep 中断で /restart-review 投稿前に停止）
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
   });
 
   it("auto_restart 2 回で成功（上限 3 内）→ merged", async () => {

@@ -263,4 +263,20 @@ describe("formatNotifyEvent", () => {
     });
     expect(text).toBe("✅ 完了: TY-456 Add search（merged 2件）");
   });
+
+  it("formats quota_waiting with hourglass emoji and detail", () => {
+    const text = formatNotifyEvent({
+      kind: "quota_waiting",
+      detail: "TY-789 codex_usage_limit (retry 1/6)",
+    });
+    expect(text).toBe("⏳ Codex quota 待機中: TY-789 codex_usage_limit (retry 1/6)");
+  });
+
+  it("formats quota_resumed with refresh emoji and detail", () => {
+    const text = formatNotifyEvent({
+      kind: "quota_resumed",
+      detail: "TY-789 quota recovered after 2 retries",
+    });
+    expect(text).toBe("🔄 Codex quota 回復: TY-789 quota recovered after 2 retries");
+  });
 });

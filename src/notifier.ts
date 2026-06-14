@@ -22,6 +22,10 @@ export function formatNotifyEvent(event: NotifyEvent): string {
       return `▶️ 着手: ${event.identifier} ${event.title}`;
     case "task_merged":
       return `✅ 完了: ${event.identifier} ${event.title}（merged ${event.mergedCount}件）`;
+    case "quota_waiting":
+      return `⏳ Codex quota 待機中: ${event.detail}`;
+    case "quota_resumed":
+      return `🔄 Codex quota 回復: ${event.detail}`;
   }
 }
 

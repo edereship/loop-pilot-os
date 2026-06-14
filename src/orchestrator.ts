@@ -443,6 +443,7 @@ export class Orchestrator {
     // state from autoRestartAttempts > 0 — that was too broad (blocked even different-reason
     // stops on recovery) and was set before posting (so a pre-post crash left a false block).
     let pendingRestartReason: string | undefined = session.pendingRestartReason ?? undefined;
+    let quotaRetryCount = 0;
     let firstPoll = true;
     while (true) {
       if (!firstPoll && this.interrupted) {
@@ -626,7 +627,42 @@ export class Orchestrator {
             });
             continue;
           }
-          // quota_wait / human_required / null → HALT
+          if (category === "quota_wait") {
+            quotaRetryCount += 1;
+            if (quotaRetryCount > 6) {
+              return await this.stopSession(
+                session,
+                "looppilot_stopped",
+                `quota retry limit exceeded (${quotaRetryCount}x): ${verdict.stopReason}`,
+              );
+            }
+            if (quotaRetryCount === 1) {
+              await this.notifier.notify({
+                kind: "quota_waiting",
+                detail: `${session.linearIdentifier} ${verdict.stopReason}`,
+              });
+            }
+            const QUOTA_WAIT_MS = 60 * 60 * 1000;
+            const QUOTA_SLEEP_CHUNK_MS = 10_000;
+            for (let elapsed = 0; elapsed < QUOTA_WAIT_MS; elapsed += QUOTA_SLEEP_CHUNK_MS) {
+              if (this.interrupted) {
+                await this.haltForInterrupt();
+                return HALT;
+              }
+              await this.sleep(QUOTA_SLEEP_CHUNK_MS);
+            }
+            try {
+              await this.git.postComment(prNumber, "/restart-review");
+            } catch (err) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `/restart-review comment failed: ${errMsg(err)}`,
+              );
+            }
+            continue;
+          }
+          // human_required / null → HALT
           return await this.stopSession(
             session,
             "looppilot_stopped",
@@ -648,6 +684,13 @@ export class Orchestrator {
           continue;
         }
         case "in_progress": {
+          if (quotaRetryCount > 0) {
+            await this.notifier.notify({
+              kind: "quota_resumed",
+              detail: `${session.linearIdentifier} quota recovered after ${quotaRetryCount} retries`,
+            });
+            quotaRetryCount = 0;
+          }
           const timeout = this.config.safety.monitorTimeoutMinutes;
           if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
             return await this.stopSession(session, "exception", "monitor timeout");
