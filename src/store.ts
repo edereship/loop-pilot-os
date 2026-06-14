@@ -352,6 +352,17 @@ export class SqliteStore {
     return rows.map(toSessionRow);
   }
 
+  stoppedSessionsWithPr(failureReason: FailureReason): TaskSessionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM task_session
+         WHERE state = 'stopped' AND failure_reason = ? AND pr_number IS NOT NULL
+         ORDER BY id ASC`,
+      )
+      .all(failureReason) as RawSessionRow[];
+    return rows.map(toSessionRow);
+  }
+
   activeIssueIds(): string[] {
     const rows = this.db
       .prepare(
