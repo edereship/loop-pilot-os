@@ -275,6 +275,21 @@ export class Orchestrator {
           recoveryCategory === "auto_restart" ||
           recoveryCategory === "quota_wait"
         ) {
+          // If the prior stop was a terminal counter exhaustion, do not revive.
+          // resetAndAdopt would zero autoRestartAttempts/pendingRestartReason, letting
+          // each daemon restart post another full round of /restart-review comments
+          // instead of honouring the terminal HALT (ES-411).
+          if (
+            (recoveryCategory === "auto_restart" &&
+              session.stopDetail?.startsWith("auto-restart limit exceeded")) ||
+            (recoveryCategory === "quota_wait" &&
+              session.stopDetail?.startsWith("quota retry limit exceeded"))
+          ) {
+            this.log(
+              `recovery: skipping exhausted stopped session PR #${prNumber}: ${session.stopDetail}`,
+            );
+            return CONTINUE;
+          }
           this.resetAndAdopt(session.id);
           return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
         }

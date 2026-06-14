@@ -1233,6 +1233,78 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     expect(h.git.calls.some((c) => c.method === "postComment")).toBe(true);
   });
 
+  it("auto-restart limit exhausted → PR still shows workflow_crashed → session stays stopped, loop enters", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      // stopDetail written by monitorSession when autoRestartCount > 3
+      stopDetail: "auto-restart limit exceeded (4x): workflow_crashed",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      autoRestartAttempts: 3,
+    });
+    // PR still shows the same stop reason that exhausted the counter
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "workflow_crashed" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session must NOT be adopted — counters must stay intact
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.autoRestartAttempts).toBe(3);
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("auto-restart limit exceeded (4x): workflow_crashed");
+    // No /restart-review posted, no PR adoption
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Log contains skip message
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(true);
+  });
+
+  it("quota retry limit exhausted → PR still shows codex_usage_limit → session stays stopped, loop enters", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      // stopDetail written by monitorSession when quotaRetryCount > 6
+      stopDetail: "quota retry limit exceeded (7x): codex_usage_limit",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // PR still shows the quota-exhausted stop reason
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "codex_usage_limit" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session must NOT be adopted
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("quota retry limit exceeded (7x): codex_usage_limit");
+    // No /restart-review posted
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+    // Log contains skip message
+    expect(h.logs.some((l) => l.includes("skipping exhausted stopped session"))).toBe(true);
+  });
+
   it("superseded stopped session (newer session for same issue exists) → not recovered", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
