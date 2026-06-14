@@ -951,4 +951,60 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     expect(h.git.calls).toContainEqual({ method: "mergePr", args: [100, "sha-100"] });
     expect(h.store.countTasksStarted(newRun.id)).toBe(1);
   });
+
+  it("LoopPilot がまだ stopped → スキップし、ループに入る（SELECT → idle）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // LoopPilot is still stopped
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "human_required" }];
+    // Loop enters SELECT → idle → requestStop
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session unchanged (still stopped) — not adopted into new run
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(s).toHaveLength(0);
+    // Loop was entered (recovery did not HALT)
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
+
+  it("PR がクローズ済み（pr_closed verdict）→ スキップ", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    seedCrashedSession(h.store, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      stopDetail: "human_required",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.monitor.verdicts = [{ kind: "pr_closed" }];
+    const origGetNext = h.source.getNextEligible.bind(h.source);
+    h.source.getNextEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetNext(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Session not adopted — skipped
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(s).toHaveLength(0);
+    // Loop was entered
+    expect(h.source.eligibleCalls).toHaveLength(1);
+  });
 });
