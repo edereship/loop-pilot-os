@@ -140,6 +140,13 @@ export class Orchestrator {
       }
       if (ctrl.control === "halt") return HALT;
     }
+
+    // 3) stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）
+    for (const session of this.store.stoppedSessionsWithPr("looppilot_stopped")) {
+      const ctrl = await this.recoverStoppedByLooppilot(session, session.prNumber as number);
+      if (ctrl.control === "halt") return HALT;
+    }
+
     return CONTINUE;
   }
 
@@ -244,6 +251,47 @@ export class Orchestrator {
       `crash recovery: no open PR; manual cleanup: ` +
       `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
     return await this.stopSession(session, "exception", detail);
+  }
+
+  /** stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）。 */
+  private async recoverStoppedByLooppilot(session: TaskSessionRow, prNumber: number): Promise<RunControl> {
+    let verdict: MonitorVerdict;
+    try {
+      verdict = await this.monitor.poll(prNumber);
+    } catch (err) {
+      this.log(`recovery: poll threw for stopped session PR #${prNumber}, resuming MONITOR: ${errMsg(err)}`);
+      this.resetStoppedSession(session.id);
+      return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+    }
+    switch (verdict.kind) {
+      case "stopped":
+      case "pr_closed":
+        return CONTINUE;
+      case "merged":
+        this.store.updateSession(session.id, { runId: this.runId });
+        this.resetStoppedSession(session.id);
+        await this.recoverDone(session);
+        return CONTINUE;
+      case "done":
+      case "in_progress":
+      case "corrupted":
+      case "not_engaged":
+      case "workflow_failed":
+        this.resetStoppedSession(session.id);
+        return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+    }
+  }
+
+  private resetStoppedSession(sessionId: number): void {
+    this.store.updateSession(sessionId, {
+      failureReason: null,
+      stopDetail: null,
+      endedAt: null,
+      autoRestartAttempts: 0,
+      pendingRestartReason: null,
+      workflowFixAttempts: 0,
+      workflowHandledErrorCount: 0,
+    });
   }
 
   /** 回復経路の DONE 後段。セッション行から最小 issue を再構成して done() を再利用する。 */
