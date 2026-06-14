@@ -253,14 +253,18 @@ export class Orchestrator {
     return await this.stopSession(session, "exception", detail);
   }
 
-  /** stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）。 */
+  /**
+   * stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）。
+   * 採用時は state を in_review へ原子的に遷移させる（resetAndAdopt）ことで、
+   * 遷移途中のクラッシュでも activeSessions() から回復可能な状態を維持する。
+   */
   private async recoverStoppedByLooppilot(session: TaskSessionRow, prNumber: number): Promise<RunControl> {
     let verdict: MonitorVerdict;
     try {
       verdict = await this.monitor.poll(prNumber);
     } catch (err) {
       this.log(`recovery: poll threw for stopped session PR #${prNumber}, resuming MONITOR: ${errMsg(err)}`);
-      this.resetStoppedSession(session.id);
+      this.resetAndAdopt(session.id);
       return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
     }
     switch (verdict.kind) {
@@ -268,8 +272,7 @@ export class Orchestrator {
       case "pr_closed":
         return CONTINUE;
       case "merged":
-        this.store.updateSession(session.id, { runId: this.runId });
-        this.resetStoppedSession(session.id);
+        this.resetAndAdopt(session.id);
         await this.recoverDone(session);
         return CONTINUE;
       case "done":
@@ -277,13 +280,15 @@ export class Orchestrator {
       case "corrupted":
       case "not_engaged":
       case "workflow_failed":
-        this.resetStoppedSession(session.id);
+        this.resetAndAdopt(session.id);
         return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
     }
   }
 
-  private resetStoppedSession(sessionId: number): void {
+  private resetAndAdopt(sessionId: number): void {
     this.store.updateSession(sessionId, {
+      state: "in_review",
+      runId: this.runId,
       failureReason: null,
       stopDetail: null,
       endedAt: null,
