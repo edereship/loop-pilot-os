@@ -348,6 +348,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
       ): Promise<number> => 1,
       addLabel: async (_prNumber: number, _label: string): Promise<void> => {},
       mergePr: async (_prNumber: number, _headSha: string): Promise<void> => {},
+      postComment: async (_prNumber: number, _body: string): Promise<void> => {},
       discardWorktree: async (_branch: string, _worktreePath: string): Promise<void> => {},
     };
     const monitor: LoopPilotMonitor = {

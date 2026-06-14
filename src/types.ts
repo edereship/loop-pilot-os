@@ -90,6 +90,7 @@ export interface GitPrManager {
   pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number>;
   addLabel(prNumber: number, label: string): Promise<void>;
   mergePr(prNumber: number, headSha: string): Promise<void>;     // squash --match-head-commit
+  postComment(prNumber: number, body: string): Promise<void>;
   discardWorktree(branch: string, worktreePath: string): Promise<void>; // cost_exceeded 時の破棄
 }
 
