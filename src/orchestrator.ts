@@ -15,6 +15,7 @@ import type {
   RecoveryOutcome,
   WorkflowRecovery,
 } from "./types.js";
+import { classifyStopReason } from "./stop-reason.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
@@ -161,13 +162,19 @@ export class Orchestrator {
       case "pr_closed":
         this.store.updateSession(session.id, { runId: this.runId });
         return await this.stopSession(session, "pr_closed", null);
-      case "stopped":
+      case "stopped": {
+        const recoveryCategory = classifyStopReason(verdict.stopReason);
+        if (recoveryCategory === "review_done" || recoveryCategory === "auto_restart") {
+          // Resume MONITOR so monitorSession handles no_findings merge / auto_restart posting
+          return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+        }
         this.store.updateSession(session.id, { runId: this.runId });
         return await this.stopSession(
           session,
           "looppilot_stopped",
           verdict.stopReason ?? "looppilot stopped (no reason)",
         );
+      }
       // done / in_progress / corrupted / not_engaged = open 扱い → 採用して MONITOR 再開
       case "done":
       case "in_progress":
@@ -429,6 +436,13 @@ export class Orchestrator {
     // 猶予を与える（「現フェーズ群を完了してから停止」の従来契約を維持）。以降の poll 境界は
     // 無書込みの安全点なので、現 PR の解決を待たずクリーン HALT する（セッションは in_review の
     // まま＝再起動で回復可能）。
+    // Finding 1: initialize from DB so the cap survives process restarts.
+    let autoRestartCount = session.autoRestartAttempts;
+    // ES-409 Finding 2/3: initialize from the durable pending-reason record (null = no pending
+    // restart). This replaces the old requireNonStoppedBeforeRestart guard which derived stale
+    // state from autoRestartAttempts > 0 — that was too broad (blocked even different-reason
+    // stops on recovery) and was set before posting (so a pre-post crash left a false block).
+    let pendingRestartReason: string | undefined = session.pendingRestartReason ?? undefined;
     let firstPoll = true;
     while (true) {
       if (!firstPoll && this.interrupted) {
@@ -453,8 +467,20 @@ export class Orchestrator {
       }
       pollFailures = 0;
       backoffMultiplier = 1;
-      // カーネル§7: 「ready のまま 2連続 throw」— done+ready 以外の評価を挟んだらストリークは断絶する
-      if (verdict.kind !== "done") mergeFailures = 0;
+      // Clear the pending-restart record when LoopPilot transitions away from stopped — that
+      // confirms the /restart-review was consumed and the restart is no longer in flight.
+      if (verdict.kind !== "stopped") {
+        if (pendingRestartReason !== undefined) {
+          pendingRestartReason = undefined;
+          this.store.updateSession(session.id, { pendingRestartReason: null });
+        }
+      }
+      // カーネル§7: reset merge-failure streak unless verdict is in a merge-ready path
+      // Finding 3: stopped(no_findings) shares the done-path streak, so exclude it from the reset
+      if (verdict.kind !== "done" &&
+          !(verdict.kind === "stopped" && classifyStopReason(verdict.stopReason) === "review_done")) {
+        mergeFailures = 0;
+      }
 
       switch (verdict.kind) {
         case "merged":
@@ -496,12 +522,117 @@ export class Orchestrator {
           mergeFailures = 0; // ready 連続を断ち切る事象が起きたらリセット
           continue;
         }
-        case "stopped":
+        case "stopped": {
+          const category = classifyStopReason(verdict.stopReason);
+          if (category === "review_done") {
+            // Workflow completed (no_findings) — treat same as done for merge streak.
+            // Also clear any pending restart since LoopPilot completed successfully.
+            if (pendingRestartReason !== undefined) {
+              pendingRestartReason = undefined;
+              this.store.updateSession(session.id, { pendingRestartReason: null });
+            }
+            const outcome = await this.tryMerge(session, prNumber);
+            if (outcome.kind === "merged") return CONTINUE;
+            if (outcome.kind === "halt") return HALT;
+            if (outcome.kind === "readiness_failed") {
+              readinessFailures += 1;
+              mergeFailures = 0;
+              if (readinessFailures >= 5) {
+                return await this.stopSession(
+                  session,
+                  "exception",
+                  `merge readiness check failed 5x: ${outcome.error}`,
+                );
+              }
+              backoffMultiplier = Math.min(2 ** readinessFailures, 8);
+              continue;
+            }
+            readinessFailures = 0;
+            if (outcome.kind === "merge_failed") {
+              mergeFailures += 1;
+              if (mergeFailures >= 2) {
+                return await this.stopSession(
+                  session,
+                  "ci_failed",
+                  `merge call failed under ready verdict: ${outcome.error}`,
+                );
+              }
+              continue;
+            }
+            mergeFailures = 0;
+            continue;
+          }
+          if (category === "auto_restart") {
+            // Stale: we already have a pending /restart-review for this exact stop reason.
+            // Grant one poll grace period in case the restart hasn't been consumed yet,
+            // then clear the pending state so subsequent polls with the same reason can
+            // trigger another restart attempt (the workflow may have consumed the first
+            // restart and crashed again with the same reason before the next poll).
+            // The pending record is stored durably in DB so it survives process restarts
+            // (fixes ES-409 Findings 1, 2, 3).
+            const stale =
+              pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
+            if (stale) {
+              // Clear now so the NEXT poll re-evaluates freshly. If the workflow consumed
+              // the restart and stopped again with the same reason, that next poll will
+              // treat it as a new stop and allow another restart (up to the cap).
+              pendingRestartReason = undefined;
+              this.store.updateSession(session.id, { pendingRestartReason: null });
+              const timeout = this.config.safety.monitorTimeoutMinutes;
+              if (
+                timeout !== undefined &&
+                this.elapsedMinutesSinceMonitorStart(session.id) > timeout
+              ) {
+                return await this.stopSession(session, "exception", "monitor timeout");
+              }
+              continue;
+            }
+            autoRestartCount += 1;
+            if (autoRestartCount > 3) {
+              return await this.stopSession(
+                session,
+                "looppilot_stopped",
+                `auto-restart limit exceeded (${autoRestartCount}x): ${verdict.stopReason}`,
+              );
+            }
+            // A real restart event breaks any prior readiness-failure streak: errors before
+            // and after the restarted review are not consecutive within the new attempt.
+            readinessFailures = 0;
+            // Reset monitorStartedAt before posting so the timeout/not-engaged guards
+            // measure from the restart point regardless of post outcome.
+            this.store.updateSession(session.id, {
+              monitorStartedAt: this.clock(),
+            });
+            if (verdict.stopReason === "state_conflict") {
+              await this.sleep(30_000);
+            }
+            try {
+              await this.git.postComment(prNumber, "/restart-review");
+            } catch (err) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `/restart-review comment failed: ${errMsg(err)}`,
+              );
+            }
+            // ES-409 Finding 3: persist attempt count and pending reason AFTER a confirmed
+            // post. A pre-post crash leaves autoRestartAttempts unchanged and
+            // pendingRestartReason null, so the next startup retries the post rather than
+            // stalling forever waiting for a non-stopped verdict.
+            pendingRestartReason = verdict.stopReason ?? undefined;
+            this.store.updateSession(session.id, {
+              autoRestartAttempts: autoRestartCount,
+              pendingRestartReason: verdict.stopReason,
+            });
+            continue;
+          }
+          // quota_wait / human_required / null → HALT
           return await this.stopSession(
             session,
             "looppilot_stopped",
             verdict.stopReason ?? "looppilot stopped (no reason)",
           );
+        }
         case "pr_closed":
           return await this.stopSession(session, "pr_closed", null);
         case "corrupted":

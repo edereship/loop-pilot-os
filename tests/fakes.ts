@@ -247,6 +247,11 @@ export class FakeGitPr implements GitPrManager {
     this.takeFailure("mergePr");
   }
 
+  async postComment(prNumber: number, body: string): Promise<void> {
+    this.calls.push({ method: "postComment", args: [prNumber, body] });
+    this.takeFailure("postComment");
+  }
+
   async discardWorktree(branch: string, worktreePath: string): Promise<void> {
     this.calls.push({ method: "discardWorktree", args: [branch, worktreePath] });
     this.takeFailure("discardWorktree");

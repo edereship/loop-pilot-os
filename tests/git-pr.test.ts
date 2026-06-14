@@ -471,3 +471,32 @@ describe("GitPrManager.discardWorktree", () => {
     expect(runner.calls).toHaveLength(2);
   });
 });
+
+describe("GitPrManager.postComment", () => {
+  it("issues gh api to post a comment on the given PR number", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "api"], { code: 0, stdout: "{}", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.postComment(42, "/restart-review");
+
+    expect(runner.calls[0]).toEqual({
+      cmd: "gh",
+      args: [
+        "api",
+        "repos/owner/name/issues/42/comments",
+        "-f",
+        "body=/restart-review",
+      ],
+      opts: { cwd: "/repo" },
+    });
+  });
+
+  it("throws when gh api exits non-zero", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "api"], { code: 1, stdout: "", stderr: "Not Found" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.postComment(42, "hello")).rejects.toThrow(/postComment.*Not Found/);
+  });
+});

@@ -226,6 +226,25 @@ export class GitPrManager implements GitPrManagerInterface {
     }
   }
 
+  async postComment(prNumber: number, body: string): Promise<void> {
+    const { repoPath, remote } = this.opts;
+    const res = await this.runner.run(
+      "gh",
+      [
+        "api",
+        `repos/${remote}/issues/${prNumber}/comments`,
+        "-f",
+        `body=${body}`,
+      ],
+      { cwd: repoPath },
+    );
+    if (res.code !== 0) {
+      throw new Error(
+        `postComment failed for PR #${prNumber}: ${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
+  }
+
   async discardWorktree(branch: string, worktreePath: string): Promise<void> {
     const { repoPath } = this.opts;
     await this.runner.run(

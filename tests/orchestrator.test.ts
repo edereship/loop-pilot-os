@@ -648,6 +648,245 @@ describe("Orchestrator 失敗系 — MONITOR verdict 写像（仕様 §5.5 / §5
   });
 });
 
+describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
+  it("auto_restart (workflow_crashed) → postComment('/restart-review') して続行し、最終的に merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.git.calls).toContainEqual({
+      method: "postComment",
+      args: [100, "/restart-review"],
+    });
+    // auto_restart 投稿時の Slack 通知は不要
+    const haltEvents = h.notifier.events.filter(
+      (e) => e.kind === "halted" && (e as { reason: string }).reason === "looppilot_stopped",
+    );
+    expect(haltEvents).toHaveLength(0);
+  });
+
+  it.each([
+    "workflow_crashed",
+    "action_timeout",
+    "state_conflict",
+    "max_turns_exceeded",
+    "test_failure",
+  ])("auto_restart (%s) → postComment + polling 続行", async (reason) => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: reason },
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(true);
+  });
+
+  it("auto_restart 3回超 → HALT + Slack 通知", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // 4 consecutive auto_restart stopReasons (exceeds limit of 3)
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },
+      { kind: "stopped", stopReason: "action_timeout" },
+      { kind: "stopped", stopReason: "max_turns_exceeded" },
+      { kind: "stopped", stopReason: "test_failure" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toContain("auto-restart limit");
+    // postComment は 3 回呼ばれた（4回目は上限超過で HALT）
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(3);
+    // HALT 通知が送られた
+    const haltEvents = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(haltEvents.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("state_conflict → 30 秒 sleep を挟んでから postComment", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, monitorPollSeconds: 60 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "state_conflict" },
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    // 30 秒 sleep が挟まれている
+    expect(h.sleepCalls).toContain(30_000);
+    expect(h.git.calls).toContainEqual({
+      method: "postComment",
+      args: [100, "/restart-review"],
+    });
+  });
+
+  it("no_findings → done と同等にマージ試行", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "no_findings" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(true);
+    // postComment は呼ばれない（auto_restart ではない）
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+  });
+
+  it("no_findings + ci_failed → stopped(ci_failed)（tryMerge の既存挙動を維持）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "no_findings" }];
+    h.monitor.readiness.set(100, { ready: false, reason: "ci_failed" });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+  });
+
+  it("human_required (loop_detected) → 既存 HALT 動作", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "loop_detected" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("loop_detected");
+    expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
+  });
+
+  it("quota_wait (codex_usage_limit) → human_required と同扱い HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: "codex_usage_limit" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toBe("codex_usage_limit");
+  });
+
+  it("auto_restart 2 回で成功（上限 3 内）→ merged", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },
+      { kind: "stopped", stopReason: "action_timeout" },
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(2);
+  });
+
+  it("同じ stopReason が連続しても 2 回目以降の restart を抑制しない（stale は 1 poll だけ待つ）", async () => {
+    // Scenario: workflow_crashed → restart posted → workflow restarts and crashes again with the
+    // same reason before the next poll. The stale guard should give one poll grace, then allow
+    // the next restart attempt rather than suppressing indefinitely.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 1: restart #1 posted
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 2: stale grace period
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 3: restart #2 posted
+      { kind: "done" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    // Two restarts posted despite same stop reason appearing consecutively
+    expect(postComments).toHaveLength(2);
+    expect(s.autoRestartAttempts).toBe(2);
+  });
+
+  it("同じ stopReason が 7 連続 → 3 回リスタートして上限超過で HALT", async () => {
+    // Each restart consumes 2 polls (one to post, one stale grace). After 3 restarts (6 polls)
+    // the 7th poll triggers a 4th attempt which exceeds the cap.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 1: restart #1
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 2: stale grace
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 3: restart #2
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 4: stale grace
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 5: restart #3
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 6: stale grace
+      { kind: "stopped", stopReason: "workflow_crashed" }, // poll 7: attempt #4 → cap exceeded → HALT
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.stopDetail).toContain("auto-restart limit");
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(3);
+  });
+});
+
 describe("Orchestrator 失敗系 — not_engaged ガード / monitor_timeout（仕様 §5.5 / §11 / カーネル §7.6）", () => {
   it("not_engaged かつ経過 > not_engaged_guard_minutes → stopped(monitor_never_engaged, detail=null)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3, notEngagedGuardMinutes: 30 });

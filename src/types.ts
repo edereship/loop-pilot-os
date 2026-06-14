@@ -55,6 +55,8 @@ export interface TaskSessionRow {
   endedAt: string | null;
   workflowFixAttempts: number;       // number of fix-agent runs for this session (budget counter)
   workflowHandledErrorCount: number; // errorCommentCount at the time of the last successful fix (guard counter)
+  autoRestartAttempts: number;       // number of /restart-review comments posted (durable cap counter)
+  pendingRestartReason: string | null; // stopReason for which the last /restart-review was posted, or null if none pending
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -90,6 +92,7 @@ export interface GitPrManager {
   pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number>;
   addLabel(prNumber: number, label: string): Promise<void>;
   mergePr(prNumber: number, headSha: string): Promise<void>;     // squash --match-head-commit
+  postComment(prNumber: number, body: string): Promise<void>;
   discardWorktree(branch: string, worktreePath: string): Promise<void>; // cost_exceeded 時の破棄
 }
 

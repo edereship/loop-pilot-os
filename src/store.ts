@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS task_session (
   monitor_started_at TEXT,
   ended_at TEXT,
   workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
-  workflow_handled_error_count INTEGER NOT NULL DEFAULT 0
+  workflow_handled_error_count INTEGER NOT NULL DEFAULT 0,
+  auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
+  pending_restart_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_session_active ON task_session(state)
   WHERE state NOT IN ('merged','stopped');
@@ -91,6 +93,8 @@ interface RawSessionRow {
   ended_at: string | null;
   workflow_fix_attempts: number;
   workflow_handled_error_count: number;
+  auto_restart_attempts: number;
+  pending_restart_reason: string | null;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -112,6 +116,8 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     endedAt: r.ended_at,
     workflowFixAttempts: r.workflow_fix_attempts,
     workflowHandledErrorCount: r.workflow_handled_error_count,
+    autoRestartAttempts: r.auto_restart_attempts,
+    pendingRestartReason: r.pending_restart_reason,
   };
 }
 
@@ -129,6 +135,8 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   runId: "run_id",
   workflowFixAttempts: "workflow_fix_attempts",
   workflowHandledErrorCount: "workflow_handled_error_count",
+  autoRestartAttempts: "auto_restart_attempts",
+  pendingRestartReason: "pending_restart_reason",
 };
 
 export class SqliteStore {
@@ -174,6 +182,16 @@ export class SqliteStore {
     if (!columns.has("workflow_handled_error_count")) {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN workflow_handled_error_count INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!columns.has("auto_restart_attempts")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN auto_restart_attempts INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!columns.has("pending_restart_reason")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN pending_restart_reason TEXT`,
       );
     }
   }
@@ -291,6 +309,8 @@ export class SqliteStore {
         | "runId"
         | "workflowFixAttempts"
         | "workflowHandledErrorCount"
+        | "autoRestartAttempts"
+        | "pendingRestartReason"
       >
     >,
   ): void {
