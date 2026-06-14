@@ -831,9 +831,9 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
     // not_engaged を挟むと pending が解除されて次の codex_usage_limit が fresh failure に
-    // なる。in_progress と異なり quotaRetryCount をリセットしないため、7回で上限超過。
-    // （同じ reason が連続しても stale ガードが保持されるため、連続 stopped では上限に
-    // 達しない — stale ガードの動作は別テスト "stale quota poll" で検証する。）
+    // なる。quotaRetryCount はリセットされないため、7回で上限超過。
+    // （同じ reason が連続する場合は 1 ポーリング分の stale ガード後に fresh 扱いになる —
+    // stale ガードの動作は別テスト "stale quota poll" で検証する。）
     h.monitor.verdicts = [
       { kind: "stopped", stopReason: "codex_usage_limit" }, // retry #1
       { kind: "not_engaged" },                              // pending を解除
@@ -872,12 +872,12 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
-    // /restart-review 投稿後に GHA がキュー待ちのまま同じ stopped が 2 回続いても、
-    // stale ガードが保持されるため追加 sleep・追加 post は発生しない。
+    // /restart-review 投稿後に GHA がキュー待ちのまま同じ stopped が続いても、
+    // 1 ポーリング分の stale ガードにより追加 sleep・追加 post は発生しない。
+    // （2 回目の stale は pending を解除して次を fresh 扱いにする — Finding 1 修正後の動作）
     h.monitor.verdicts = [
       { kind: "stopped", stopReason: "codex_usage_limit" }, // fresh → 1hr sleep + post
-      { kind: "stopped", stopReason: "codex_usage_limit" }, // stale → no sleep, no post
-      { kind: "stopped", stopReason: "codex_usage_limit" }, // stale → no sleep, no post
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // stale → no sleep, no post (clears pending)
       { kind: "in_progress" },                              // /restart-review 消費を確認
       { kind: "done" },                                     // → tryMerge → merged
     ];
@@ -897,15 +897,15 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     expect(quotaEvents).toHaveLength(1);
   });
 
-  it("quota 回復（in_progress 検知）→ quota_resumed 通知 + カウンタリセット → 再度 quota でリトライ可能", async () => {
+  it("quota 回復（in_progress 検知）→ quota_resumed 通知（カウンタは保持）→ 再度 quota でリトライ可能", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
     h.monitor.verdicts = [
-      { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #1
-      { kind: "in_progress" },                               // 回復 → カウンタリセット
-      { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #1（リセット後）
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #1 → count=1
+      { kind: "in_progress" },                               // 回復 → quota_resumed 通知、count はそのまま
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // quota retry #2 → count=2
       { kind: "done" },
       { kind: "merged" },
     ];
@@ -917,9 +917,9 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     // quota_resumed 通知が送られた
     const resumed = h.notifier.events.filter((e) => e.kind === "quota_resumed");
     expect(resumed).toHaveLength(1);
-    // quota_waiting 通知は各サイクルの初回（2回）
+    // quota_waiting 通知は初回のみ（カウンタをリセットしないため 2 回目は count!=1 で通知しない）
     const waiting = h.notifier.events.filter((e) => e.kind === "quota_waiting");
-    expect(waiting).toHaveLength(2);
+    expect(waiting).toHaveLength(1);
     // postComment は2回（各サイクル1回ずつ）
     const postComments = h.git.calls.filter((c) => c.method === "postComment");
     expect(postComments).toHaveLength(2);

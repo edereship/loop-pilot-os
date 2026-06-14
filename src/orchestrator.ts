@@ -451,6 +451,7 @@ export class Orchestrator {
     // stops on recovery) and was set before posting (so a pre-post crash left a false block).
     let pendingRestartReason: string | undefined = session.pendingRestartReason ?? undefined;
     let quotaRetryCount = 0;
+    let quotaResumedNotified = false;
     let firstPoll = true;
     while (true) {
       if (!firstPoll && this.interrupted) {
@@ -635,16 +636,15 @@ export class Orchestrator {
             continue;
           }
           if (category === "quota_wait") {
-            // Keep the pending restart guard active until a non-stopped verdict
-            // confirms the /restart-review was consumed. Clearing it after a
-            // single stale poll would make the next identical stopped verdict look
-            // like a fresh quota failure and trigger another 1-hour sleep while
-            // the restart is still queued in GitHub Actions (ES-410 Finding 1).
-            // The pending reason is cleared by the top-level non-stopped guard
-            // (above) when the restarted workflow actually begins.
             const stale =
               pendingRestartReason !== undefined && pendingRestartReason === verdict.stopReason;
             if (stale) {
+              // Grant one poll grace period then clear, matching the auto_restart stale
+              // pattern. Without this, the loop stalls indefinitely when the restarted
+              // workflow hits quota again before any non-stopped verdict is observed
+              // (ES-410 Finding 1).
+              pendingRestartReason = undefined;
+              this.store.updateSession(session.id, { pendingRestartReason: null });
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (
                 timeout !== undefined &&
@@ -655,6 +655,7 @@ export class Orchestrator {
               continue;
             }
             quotaRetryCount += 1;
+            quotaResumedNotified = false;
             if (quotaRetryCount > 6) {
               return await this.stopSession(
                 session,
@@ -734,12 +735,15 @@ export class Orchestrator {
           continue;
         }
         case "in_progress": {
-          if (quotaRetryCount > 0) {
+          if (quotaRetryCount > 0 && !quotaResumedNotified) {
             await this.notifier.notify({
               kind: "quota_resumed",
               detail: `${session.linearIdentifier} quota recovered after ${quotaRetryCount} retries`,
             });
-            quotaRetryCount = 0;
+            // Do NOT reset quotaRetryCount — the count must survive in_progress
+            // states (initialized/waiting_codex/fixing → in_progress) so the
+            // 6-attempt cap is reached if quota is exhausted again (ES-410 Finding 2).
+            quotaResumedNotified = true;
           }
           const timeout = this.config.safety.monitorTimeoutMinutes;
           if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
