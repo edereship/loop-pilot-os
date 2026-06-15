@@ -418,15 +418,19 @@ async function checkClaude(
       return;
     }
     const auth = await runner.run("claude", ["auth", "status", "--json"], opts);
-    if (auth.code !== 0) {
-      errors.push(`claude: 認証状態を取得できません（${auth.stderr.trim()}）`);
-      return;
-    }
+    // ログアウト時は exit code 1（公式リファレンス）かつ stdout は {"loggedIn":false} を返す。
+    // exit code で早期 return すると本来の remediation（claude auth login）に到達できないため、
+    // 先に stdout の JSON をパースし loggedIn フィールドで判定する（ES-416 の設計契約）。
     let parsed: { loggedIn?: boolean };
     try {
       parsed = JSON.parse(auth.stdout);
     } catch {
-      errors.push(`claude: 認証状態を判定できません（claude auth status の出力をパースできません: ${auth.stdout.trim()}）`);
+      // JSON が得られない場合のみ、コマンド失敗（非ゼロ exit）を実行失敗として扱う。
+      if (auth.code !== 0) {
+        errors.push(`claude: 認証状態を取得できません（${auth.stderr.trim()}）`);
+      } else {
+        errors.push(`claude: 認証状態を判定できません（claude auth status の出力をパースできません: ${auth.stdout.trim()}）`);
+      }
       return;
     }
     if (parsed.loggedIn !== true) {

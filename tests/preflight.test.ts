@@ -322,6 +322,16 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("claude") && e.includes("認証されていません"))).toBe(true);
   });
 
+  it("claude がログアウト状態（exit 1 + loggedIn:false）でも認証 remediation を返す（ES-416: 公式 CLI は未ログイン時 exit 1）", async () => {
+    const r = passingRunner();
+    // 公式リファレンス: ログイン時 exit 0 / 未ログイン時 exit 1。exit code ではなく
+    // stdout の loggedIn で判定するため、「認証状態を取得できません」ではなく remediation を返す。
+    r.on(["claude", "auth", "status", "--json"], { code: 1, stdout: '{"loggedIn":false}\n', stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("claude") && e.includes("認証されていません"))).toBe(true);
+    expect(errors.some((e) => e.includes("認証状態を取得できません"))).toBe(false);
+  });
+
   it("claude auth status の出力がパース不能なら NG（ES-416: 判定不能）", async () => {
     const r = passingRunner();
     r.on(["claude", "auth", "status", "--json"], { code: 0, stdout: "not json\n", stderr: "" });
