@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runPreflight } from "../src/preflight.js";
+import { runPreflight, normalizeRemote } from "../src/preflight.js";
 import { FakeCommandRunner } from "./fakes.js";
 import type { Notifier, NotifyEvent, TicketState } from "../src/types.js";
 import type { Config } from "../src/config.js";
@@ -51,6 +51,8 @@ function passingRunner(): FakeCommandRunner {
   r.on(["git", "-C", "/abs/repo", "status", "--porcelain"], { code: 0, stdout: "", stderr: "" });
   // §9.3: remote 到達
   r.on(["git", "-C", "/abs/repo", "ls-remote", "origin", "HEAD"], { code: 0, stdout: "deadbeef\tHEAD\n", stderr: "" });
+  // ES-415: origin URL が repo.remote と一致
+  r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
   // §9.4: gh 認証
   r.on(["gh", "auth", "status"], { code: 0, stdout: "Logged in", stderr: "" });
   // §9.4: push 権限
@@ -389,6 +391,43 @@ describe("runPreflight", () => {
     expect(errors.filter((e) => e.includes("root"))).toEqual([]);
   });
 
+  // ---- ES-415: origin URL と repo.remote の一致検証 ----
+
+  it("HTTPS origin が repo.remote と一致すればエラーなし（ES-415）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("origin") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("SSH origin が repo.remote と不一致なら NG（ES-415）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("HTTPS origin の owner 違いは NG（ES-415）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/different-owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("大小・.git 有無の表記ゆれを吸収して正当な一致では誤検知しない（ES-415）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/Owner/Name\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("origin") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("git remote get-url が失敗したら取得不能エラー（ES-415）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 2, stdout: "", stderr: "fatal: No such remote 'origin'" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin の URL を取得できません"))).toBe(true);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),
@@ -462,5 +501,41 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("ブランチルールセットを取得できません"))).toBe(true);
     expect(errors.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("normalizeRemote", () => {
+  it("SSH 形式を owner/name に正規化する", () => {
+    expect(normalizeRemote("git@github.com:owner/name.git")).toBe("owner/name");
+  });
+
+  it("SSH 形式 .git なしを正規化する", () => {
+    expect(normalizeRemote("git@github.com:owner/name")).toBe("owner/name");
+  });
+
+  it("SSH URL 形式を正規化する", () => {
+    expect(normalizeRemote("ssh://git@github.com/owner/name.git")).toBe("owner/name");
+  });
+
+  it("HTTPS 形式を正規化する", () => {
+    expect(normalizeRemote("https://github.com/owner/name.git")).toBe("owner/name");
+  });
+
+  it("HTTPS 形式 .git なしを正規化する", () => {
+    expect(normalizeRemote("https://github.com/owner/name")).toBe("owner/name");
+  });
+
+  it("大文字を小文字化する", () => {
+    expect(normalizeRemote("https://github.com/Owner/Name.git")).toBe("owner/name");
+    expect(normalizeRemote("git@github.com:Owner/Name.git")).toBe("owner/name");
+  });
+
+  it("前後の空白・改行を除去する", () => {
+    expect(normalizeRemote("  git@github.com:owner/name.git\n")).toBe("owner/name");
+  });
+
+  it("パース不能な文字列は null を返す", () => {
+    expect(normalizeRemote("not-a-url")).toBeNull();
+    expect(normalizeRemote("")).toBeNull();
   });
 });

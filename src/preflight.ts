@@ -46,6 +46,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<string[]> {
   // カーネル §9: 全項目を実行して集約。各 check 内で try/catch し、途中 throw しない。
   await checkGitClean(runner, repoPath, branch, opts, errors);          // §9.2
   await checkRemote(runner, repoPath, opts, errors);                   // §9.3（Step 4b で追加）
+  await checkOriginMatchesRemote(runner, repoPath, repoSlug, opts, errors); // ES-415
   await checkGhAuth(runner, opts, errors);                             // §9.4 認証（Step 4b で追加）
   await checkPushPermission(runner, repoSlug, opts, errors);           // §9.4 push 権限（Step 4b で追加）
   await checkBranchProtection(runner, repoSlug, branch, opts, errors); // §9.4 保護（Step 5 で追加）
@@ -102,6 +103,50 @@ async function checkRemote(
     }
   } catch (e) {
     errors.push(`git: remote 到達確認に失敗しました（${(e as Error).message}）`);
+  }
+}
+
+// ---- ES-415: origin URL と repo.remote の一致検証 ----
+
+// Git remote URL を owner/name に正規化する。パース不能なら null。
+export function normalizeRemote(url: string): string | null {
+  const trimmed = url.trim();
+  // SSH: git@github.com:owner/name.git
+  const sshColon = trimmed.match(/^git@[^:]+:(.+?)(?:\.git)?$/);
+  if (sshColon) return sshColon[1].toLowerCase();
+  // SSH URL: ssh://git@github.com/owner/name.git
+  // HTTPS: https://github.com/owner/name(.git)
+  try {
+    const parsed = new URL(trimmed);
+    const path = parsed.pathname.replace(/^\//, "").replace(/\.git$/, "");
+    return path.length > 0 ? path.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function checkOriginMatchesRemote(
+  runner: CommandRunner,
+  repoPath: string,
+  repoSlug: string,
+  opts: { cwd: string },
+  errors: string[],
+): Promise<void> {
+  try {
+    const r = await runner.run("git", ["-C", repoPath, "remote", "get-url", "origin"], opts);
+    if (r.code !== 0) {
+      errors.push(`git: origin の URL を取得できません（${r.stderr.trim()}）`);
+      return;
+    }
+    const normalized = normalizeRemote(r.stdout);
+    const expected = repoSlug.toLowerCase();
+    if (normalized == null || normalized !== expected) {
+      errors.push(
+        `git: ローカルリポの origin (${r.stdout.trim()}) が repo.remote (${repoSlug}) と一致しません`,
+      );
+    }
+  } catch (e) {
+    errors.push(`git: origin 一致確認に失敗しました（${(e as Error).message}）`);
   }
 }
 
