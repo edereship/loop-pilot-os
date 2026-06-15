@@ -67,8 +67,9 @@ function passingRunner(): FakeCommandRunner {
   r.on(["gh", "api", "repos/owner/name/actions/variables/LOOPPILOT_AUTO_MERGE"], { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" });
   // §9.9: STATE_COMMENT_AUTHORS 未設定 → 404（リポ既定 github-actions[bot]）
   r.on(["gh", "api", "repos/owner/name/actions/variables/LOOPPILOT_STATE_COMMENT_AUTHORS"], { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" });
-  // §9.8: claude 起動可
+  // §9.8: claude 起動可 + 認証済み
   r.on(["claude", "--version"], { code: 0, stdout: "2.1.165 (Claude Code)\n", stderr: "" });
+  r.on(["claude", "auth", "status", "--json"], { code: 0, stdout: '{"loggedIn":true}\n', stderr: "" });
   return r;
 }
 
@@ -304,7 +305,38 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["claude", "--version"], { code: 127, stdout: "", stderr: "command not found" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
-    expect(errors.some((e) => e.includes("claude"))).toBe(true);
+    expect(errors.some((e) => e.includes("claude") && e.includes("起動できません"))).toBe(true);
+  });
+
+  it("claude auth status が非ゼロ終了なら NG（ES-416: コマンド失敗）", async () => {
+    const r = passingRunner();
+    r.on(["claude", "auth", "status", "--json"], { code: 1, stdout: "", stderr: "auth subcommand failed" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("claude") && e.includes("認証状態を取得できません"))).toBe(true);
+  });
+
+  it("claude がログアウト状態なら NG（ES-416: loggedIn:false）", async () => {
+    const r = passingRunner();
+    r.on(["claude", "auth", "status", "--json"], { code: 0, stdout: '{"loggedIn":false}\n', stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("claude") && e.includes("認証されていません"))).toBe(true);
+  });
+
+  it("claude がログアウト状態（exit 1 + loggedIn:false）でも認証 remediation を返す（ES-416: 公式 CLI は未ログイン時 exit 1）", async () => {
+    const r = passingRunner();
+    // 公式リファレンス: ログイン時 exit 0 / 未ログイン時 exit 1。exit code ではなく
+    // stdout の loggedIn で判定するため、「認証状態を取得できません」ではなく remediation を返す。
+    r.on(["claude", "auth", "status", "--json"], { code: 1, stdout: '{"loggedIn":false}\n', stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("claude") && e.includes("認証されていません"))).toBe(true);
+    expect(errors.some((e) => e.includes("認証状態を取得できません"))).toBe(false);
+  });
+
+  it("claude auth status の出力がパース不能なら NG（ES-416: 判定不能）", async () => {
+    const r = passingRunner();
+    r.on(["claude", "auth", "status", "--json"], { code: 0, stdout: "not json\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("claude") && e.includes("認証状態を判定できません"))).toBe(true);
   });
 
   it("Slack Webhook が非2xxなら NG（仕様 §9.10）", async () => {
