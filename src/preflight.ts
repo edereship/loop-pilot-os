@@ -123,6 +123,9 @@ export function normalizeRemote(url: string): string | null {
     const host = sshColon[2];
     const rawPath = sshColon[3];
     if (!GITHUB_HOSTS.has(host.toLowerCase())) return null;
+    // ssh.github.com is only valid as SSH-over-HTTPS at port 443 (ssh://...); SCP-style
+    // URLs cannot express a port, so reject ssh.github.com in this context.
+    if (host.toLowerCase() === "ssh.github.com") return null;
     // GitHub SSH requires the 'git' user; explicit non-git users are rejected.
     if (user !== undefined && user.toLowerCase() !== "git") return null;
     const path = rawPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
@@ -147,6 +150,10 @@ export function normalizeRemote(url: string): string | null {
         parsed.port === "443";
       const isDefaultSshPort = parsed.protocol === "ssh:" && parsed.port === "22";
       if (!isSshOverHttps && !isDefaultSshPort) return null;
+    }
+    // For SSH protocol, GitHub only accepts user 'git'; reject any explicit non-git user.
+    if (parsed.protocol === "ssh:" && parsed.username !== "" && parsed.username.toLowerCase() !== "git") {
+      return null;
     }
     const path = parsed.pathname.replace(/^\//, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;

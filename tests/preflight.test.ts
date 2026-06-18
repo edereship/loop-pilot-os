@@ -800,6 +800,40 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
   });
 
+  // Finding 1 (current iteration): SCP-form ssh.github.com fetch/push URL must be rejected
+  it("SCP 形式の ssh.github.com fetch URL は NG（Finding 1: ssh.github.com SCP）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@ssh.github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@ssh.github.com:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("SCP 形式の ssh.github.com push URL は NG（Finding 1: ssh.github.com SCP push）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@ssh.github.com:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 2 (current iteration): non-git SSH URL users must be rejected
+  it("非 git ユーザー付き SSH URL の fetch URL は NG（Finding 2: non-git SSH URL user）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://alice@github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://alice@github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("alice"))).toBe(true);
+  });
+
+  it("非 git ユーザー付き SSH URL の push URL は NG（Finding 2: non-git SSH URL push user）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://alice@github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("alice"))).toBe(true);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),
@@ -1009,5 +1043,27 @@ describe("normalizeRemote", () => {
   it("SSH 形式の末尾スラッシュを除去して正規化する（Finding 1）", () => {
     expect(normalizeRemote("git@github.com:owner/name.git/")).toBe("owner/name");
     expect(normalizeRemote("git@github.com:owner/name/")).toBe("owner/name");
+  });
+
+  // Finding 1 (current iteration): SCP-form ssh.github.com cannot express port 443
+  it("SCP 形式の ssh.github.com は null を返す（Finding 1: ssh.github.com SCP rejection）", () => {
+    expect(normalizeRemote("git@ssh.github.com:owner/name.git")).toBeNull();
+  });
+
+  it("ユーザーなし SCP 形式の ssh.github.com は null を返す（Finding 1: ssh.github.com SCP userless）", () => {
+    expect(normalizeRemote("ssh.github.com:owner/name.git")).toBeNull();
+  });
+
+  // Finding 2 (current iteration): non-git SSH URL users must be rejected
+  it("非 git ユーザー付き SSH URL は null を返す（Finding 2: non-git SSH URL user）", () => {
+    expect(normalizeRemote("ssh://alice@github.com/owner/name.git")).toBeNull();
+  });
+
+  it("git ユーザー付き SSH URL は正規化する（Finding 2: git SSH URL user ok）", () => {
+    expect(normalizeRemote("ssh://git@github.com/owner/name.git")).toBe("owner/name");
+  });
+
+  it("ユーザーなし SSH URL は正規化する（Finding 2: userless SSH URL ok）", () => {
+    expect(normalizeRemote("ssh://github.com/owner/name.git")).toBe("owner/name");
   });
 });
