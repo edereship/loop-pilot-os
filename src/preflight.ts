@@ -117,10 +117,15 @@ export function normalizeRemote(url: string): string | null {
   // SSH SCP: [user@]github.com:path — user@ is optional (SSH config may supply User git).
   // Absolute-path SCP (git@github.com:/owner/name) has a leading slash which we strip.
   // Guard path not starting with '//' to avoid matching scheme-based URLs (https://...).
-  const sshColon = trimmed.match(/^(?:[^@/:]+@)?([^/:]+):(.+)$/);
-  if (sshColon && !sshColon[2].startsWith("//")) {
-    if (!GITHUB_HOSTS.has(sshColon[1].toLowerCase())) return null;
-    const path = sshColon[2].replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
+  const sshColon = trimmed.match(/^(?:([^@/:]+)@)?([^/:]+):(.+)$/);
+  if (sshColon && !sshColon[3].startsWith("//")) {
+    const user = sshColon[1];
+    const host = sshColon[2];
+    const rawPath = sshColon[3];
+    if (!GITHUB_HOSTS.has(host.toLowerCase())) return null;
+    // GitHub SSH requires the 'git' user; explicit non-git users are rejected.
+    if (user !== undefined && user.toLowerCase() !== "git") return null;
+    const path = rawPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   }
   // SSH URL: ssh://git@github.com/owner/name.git
@@ -131,6 +136,8 @@ export function normalizeRemote(url: string): string | null {
     // Only accept transport protocols GitHub actually uses; reject file://, git://, etc.
     if (!["https:", "ssh:"].includes(parsed.protocol)) return null;
     if (!GITHUB_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+    // Reject URLs with query strings or fragments — never valid for git push.
+    if (parsed.search !== "" || parsed.hash !== "") return null;
     // Reject non-standard ports. Accepted explicit ports: ssh.github.com:443 (SSH-over-HTTPS)
     // and ssh:22 (standard SSH port not normalized by URL parser for the ssh: scheme).
     if (parsed.port !== "") {
@@ -217,10 +224,14 @@ async function checkOriginMatchesRemote(
       // normalizeRemote returned null — classify to determine the right action.
       const trimmedFetch = fetchUrl.trim();
       // SCP format: [user@]host:path — user is optional (SSH config may specify User git).
-      // Path must not start with '/' to avoid matching scheme:opaque-path URLs.
-      const fetchScpMatch = trimmedFetch.match(/^(?:[^@/:]+@)?([^/:]+):([^/].*)$/);
+      // Guard path against '//' to avoid matching scheme-based URLs (https://...).
+      // Absolute-path SCP (git@alias:/owner/name) has a leading slash which we strip.
+      const _fScpRaw = trimmedFetch.match(/^(?:([^@/:]+)@)?([^/:]+):(.+)$/);
+      const fetchScpMatch = _fScpRaw && !_fScpRaw[3].startsWith("//") ? _fScpRaw : null;
       if (fetchScpMatch) {
-        const fetchHost = fetchScpMatch[1].toLowerCase();
+        const fetchUser = fetchScpMatch[1];
+        const fetchHost = fetchScpMatch[2].toLowerCase();
+        const rawFetchPath = fetchScpMatch[3];
         if (isIPv4Address(fetchHost) || isLikelyRealDomain(fetchHost)) {
           // IPv4 address or real domain hostname but not GitHub — reject.
           errors.push(
@@ -231,12 +242,17 @@ async function checkOriginMatchesRemote(
           // We cannot resolve SSH config to verify the actual hostname, so only accept
           // aliases whose name contains "github" — aliases that don't reference GitHub
           // by name are treated as potentially pointing to a different host and rejected.
-          if (!/github/i.test(fetchHost)) {
+          if (fetchUser !== undefined && fetchUser.toLowerCase() !== "git") {
+            // Explicit non-git user on alias remote — GitHub SSH requires user 'git'.
+            errors.push(
+              `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+            );
+          } else if (!/github/i.test(fetchHost)) {
             errors.push(
               `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
             );
           } else {
-            const aliasPath = fetchScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+            const aliasPath = rawFetchPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
             if (aliasPath !== expected) {
               errors.push(
                 `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
@@ -299,9 +315,14 @@ async function checkOriginMatchesRemote(
           } else {
             const trimmedPush = pushUrl.trim();
             // SCP format: [user@]host:path — user is optional (SSH config may specify User git).
-            const pushScpMatch = trimmedPush.match(/^(?:[^@/:]+@)?([^/:]+):([^/].*)$/);
+            // Guard path against '//' to avoid matching scheme-based URLs.
+            // Absolute-path SCP (git@alias:/owner/name) has a leading slash which we strip.
+            const _pScpRaw = trimmedPush.match(/^(?:([^@/:]+)@)?([^/:]+):(.+)$/);
+            const pushScpMatch = _pScpRaw && !_pScpRaw[3].startsWith("//") ? _pScpRaw : null;
             if (pushScpMatch) {
-              const pushHost = pushScpMatch[1].toLowerCase();
+              const pushUser = pushScpMatch[1];
+              const pushHost = pushScpMatch[2].toLowerCase();
+              const rawPushPath = pushScpMatch[3];
               if (isIPv4Address(pushHost) || isLikelyRealDomain(pushHost)) {
                 // IPv4 address or real domain hostname but not GitHub — reject.
                 errors.push(
@@ -311,12 +332,17 @@ async function checkOriginMatchesRemote(
                 // SSH config alias. Only accept when the alias name contains "github" —
                 // aliases that don't reference GitHub by name are rejected as potentially
                 // pointing to a different host.
-                if (!/github/i.test(pushHost)) {
+                if (pushUser !== undefined && pushUser.toLowerCase() !== "git") {
+                  // Explicit non-git user on alias remote — GitHub SSH requires user 'git'.
+                  errors.push(
+                    `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                  );
+                } else if (!/github/i.test(pushHost)) {
                   errors.push(
                     `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                   );
                 } else {
-                  const aliasPath = pushScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+                  const aliasPath = rawPushPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
                   if (aliasPath !== expected) {
                     errors.push(
                       `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,

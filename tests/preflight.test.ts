@@ -697,6 +697,66 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
 
+  // Finding 1: non-git explicit user on GitHub SSH remote must be rejected
+  it("非 git ユーザー付き GitHub SSH (alice@github.com:...) の fetch URL は NG（Finding 1: non-git SSH user）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "alice@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "alice@github.com:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("非 git ユーザー付き SSH alias (alice@github-work:...) の fetch URL は NG（Finding 1: non-git alias user）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "alice@github-work:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "alice@github-work:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("非 git ユーザー付き SSH alias の push URL は NG（Finding 1: non-git alias push user）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "alice@github-work:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3: query string or fragment in HTTPS URL must be rejected even when path matches
+  it("クエリ文字列付き HTTPS URL はパスが一致してもエラー（Finding 3: query-string rejection）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git?token=ghp_test\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://github.com/owner/name.git?token=ghp_test\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("ghp_test"))).toBe(true);
+  });
+
+  // Finding 4: SSH alias with absolute SCP path must be accepted when path matches
+  it("SSH config alias の絶対パス SCP (git@github-work:/owner/name.git) がパス一致ならエラーなし（Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github-work:/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("SSH config alias の絶対パス SCP でパスが不一致なら NG（Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github-work:/owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:/owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("絶対パス SCP の push URL (git@github-work:/owner/name.git) がパス一致ならエラーなし（Finding 4 push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
+
   // Finding 1: SCP-style remote with query-string token must not leak token in error message
   it("SCP URL のクエリ文字列トークンをエラーメッセージで秘匿する（Finding 1: SCP query-string token）", async () => {
     const r = passingRunner();
@@ -899,6 +959,28 @@ describe("normalizeRemote", () => {
 
   it("標準 SSH ポート 22 の明示指定は owner/name に正規化する（Finding 4 境界）", () => {
     expect(normalizeRemote("ssh://git@github.com:22/owner/name.git")).toBe("owner/name");
+  });
+
+  // Finding 1: non-git explicit SSH user must be rejected for GitHub hosts
+  it("非 git ユーザー付き GitHub SCP は null を返す（Finding 1: non-git user）", () => {
+    expect(normalizeRemote("alice@github.com:owner/name.git")).toBeNull();
+  });
+
+  it("git ユーザー付き GitHub SCP は正規化する（Finding 1: git user ok）", () => {
+    expect(normalizeRemote("git@github.com:owner/name.git")).toBe("owner/name");
+  });
+
+  it("ユーザーなし GitHub SCP は正規化する（Finding 1: userless ok）", () => {
+    expect(normalizeRemote("github.com:owner/name.git")).toBe("owner/name");
+  });
+
+  // Finding 3: query string or fragment must be rejected in URL-parsed remotes
+  it("クエリ文字列付き HTTPS URL はパスが正しくても null を返す（Finding 3）", () => {
+    expect(normalizeRemote("https://github.com/owner/name.git?token=bad")).toBeNull();
+  });
+
+  it("フラグメント付き HTTPS URL は null を返す（Finding 3）", () => {
+    expect(normalizeRemote("https://github.com/owner/name.git#frag")).toBeNull();
   });
 
   // Finding 1: non-GitHub URL schemes must be rejected
