@@ -181,18 +181,34 @@ async function checkOriginMatchesRemote(
         );
       }
     } else {
-      // normalizeRemote returned null: either a parseable URL with a non-GitHub host (e.g.
-      // https://gitlab.com/...) or an SCP-format SSH config alias (e.g. git@github-work:...).
-      // For parseable URLs the host mismatch is detectable — flag the error.
-      // For unparseable URLs (SSH config aliases), reachability was already confirmed by
-      // checkRemote; we cannot determine the owner/repo from the alias, so skip this check.
-      try {
-        new URL(fetchUrl.trim());
+      // normalizeRemote returned null — classify to determine the right action.
+      const trimmedFetch = fetchUrl.trim();
+      const fetchScpMatch = trimmedFetch.match(/^git@([^:]+):(.+)$/);
+      if (fetchScpMatch) {
+        if (fetchScpMatch[1].toLowerCase().includes(".")) {
+          // Real domain hostname (e.g., gitlab.com) but not GitHub — reject (ES-415 Finding 1).
+          errors.push(
+            `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+          );
+        }
+        // else: SSH config alias (no dot in hostname) — cannot resolve host; skip this check.
+      } else if (!trimmedFetch.includes("://")) {
+        // No URL scheme and not SCP-format — local path or bare remote name — reject (ES-415 Finding 2).
         errors.push(
           `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
         );
-      } catch {
-        // Unparseable URL — SSH config alias or similar; skip the host/path check.
+      } else {
+        // Scheme-based URL — check parseability to detect non-GitHub host mismatch.
+        try {
+          new URL(trimmedFetch);
+          // Parseable but normalizeRemote returned null → non-GitHub host → reject.
+          errors.push(
+            `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+          );
+        } catch {
+          // Malformed scheme URL (e.g., non-numeric port with embedded credentials) — skip to
+          // avoid exposing credentials through error messages.
+        }
       }
     }
 
@@ -215,13 +231,38 @@ async function checkOriginMatchesRemote(
               );
             }
           } else {
-            try {
-              new URL(pushUrl.trim());
+            const trimmedPush = pushUrl.trim();
+            const pushScpMatch = trimmedPush.match(/^git@([^:]+):(.+)$/);
+            if (pushScpMatch) {
+              if (pushScpMatch[1].toLowerCase().includes(".")) {
+                // Real domain hostname but not GitHub — reject (ES-415 Finding 1).
+                errors.push(
+                  `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
+              } else {
+                // SSH config alias — compare by path (ES-415 Finding 3).
+                const aliasPath = pushScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+                if (aliasPath !== expected) {
+                  errors.push(
+                    `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                  );
+                }
+              }
+            } else if (!trimmedPush.includes("://")) {
+              // Local path — reject (ES-415 Finding 2).
               errors.push(
                 `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
               );
-            } catch {
-              // Unparseable push URL — SSH config alias; skip.
+            } else {
+              try {
+                new URL(trimmedPush);
+                // Parseable but non-GitHub — reject.
+                errors.push(
+                  `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
+              } catch {
+                // Malformed scheme URL — skip.
+              }
             }
           }
         }

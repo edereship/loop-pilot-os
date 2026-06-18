@@ -534,6 +534,33 @@ describe("runPreflight", () => {
     expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
   });
 
+  // ES-415 Finding 1: non-GitHub SCP remotes (real domain hostname) must be rejected
+  it("非 GitHub SCP remote (git@gitlab.com:...) の fetch URL は NG（ES-415 Finding 1: non-GitHub SCP）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gitlab.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gitlab.com:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // ES-415 Finding 2: local-path remotes must be rejected
+  it("ローカルパス remote は NG（ES-415 Finding 2: local-path remote）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "/srv/git/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "/srv/git/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // ES-415 Finding 3: SSH config alias push URL with mismatched path must be rejected
+  it("SSH config alias の push URL でパスが不一致なら NG（ES-415 Finding 3: SSH-alias push path mismatch）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
   // ES-415 Finding 2: unparseable remote URLs must not expose credentials in error messages
   it("パース不能な URL は origin エラーを生成せず認証情報を漏洩しない（ES-415 Finding 2）", async () => {
     const r = passingRunner();
