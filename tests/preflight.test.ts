@@ -697,6 +697,32 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
 
+  // Finding 1: SCP-style remote with query-string token must not leak token in error message
+  it("SCP URL のクエリ文字列トークンをエラーメッセージで秘匿する（Finding 1: SCP query-string token）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/wrong.git?token=ghp_scp_secret\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("ghp_scp_secret"))).toBe(true);
+  });
+
+  // Finding 2: SSH config alias with no "github" in name must be rejected (unknown target host)
+  it("非 GitHub bare alias (git@gitlab:...) は NG（Finding 2: non-GitHub bare alias）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gitlab:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gitlab:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3: push URL with leading whitespace must be rejected even though normalizeRemote trims
+  it("先頭に空白のある push URL は NG（Finding 3: whitespace-padded push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: " git@github.com:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("空白") && e.includes("push URL"))).toBe(true);
+  });
+
   // Finding 4: push URL with nonstandard port must be rejected
   it("非標準ポート付き HTTPS push URL (github.com:8443) は NG（Finding 4）", async () => {
     const r = passingRunner();

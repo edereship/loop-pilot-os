@@ -162,10 +162,12 @@ function redactUrl(url: string): string {
     return parsed.toString();
   } catch {
     // SCP-format SSH URLs (git@host:path) use 'git' as the conventional username — not a
-    // secret token — so they are safe to display. Other unparseable strings may carry
-    // credentials (e.g. https://token@host:notaport/path), so emit a safe placeholder.
+    // secret token — so they are safe to display. Strip query string and fragment first:
+    // they carry no semantic meaning for git remotes but could carry tokens
+    // (e.g. git@github.com:owner/name.git?token=ghp_...).
+    // Other unparseable strings may carry credentials, so emit a safe placeholder.
     if (/^git@[^:]+:.+$/.test(url.trim())) {
-      return url.trim();
+      return url.trim().replace(/[?#].*$/, "");
     }
     return "[unparseable URL]";
   }
@@ -225,12 +227,21 @@ async function checkOriginMatchesRemote(
             `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
           );
         } else {
-          // SSH config alias (no dot, or non-standard TLD like "github.com-work") — compare by path.
-          const aliasPath = fetchScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
-          if (aliasPath !== expected) {
+          // SSH config alias (no dot, or non-standard TLD like "github.com-work").
+          // We cannot resolve SSH config to verify the actual hostname, so only accept
+          // aliases whose name contains "github" — aliases that don't reference GitHub
+          // by name are treated as potentially pointing to a different host and rejected.
+          if (!/github/i.test(fetchHost)) {
             errors.push(
               `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
             );
+          } else {
+            const aliasPath = fetchScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+            if (aliasPath !== expected) {
+              errors.push(
+                `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
+            }
           }
         }
       } else if (!trimmedFetch.includes("://")) {
@@ -270,6 +281,14 @@ async function checkOriginMatchesRemote(
       } else {
         for (const pushUrl of pushUrls) {
           if (pushUrl === fetchUrl) continue;
+          // A push URL with leading or trailing whitespace would cause `git push` to fail
+          // even though normalizeRemote's internal trim() would otherwise report a match.
+          if (pushUrl !== pushUrl.trim()) {
+            errors.push(
+              `git: origin の push URL に先頭または末尾の空白があります。git push はこの URL で失敗します（remote.origin.pushurl を確認してください）`,
+            );
+            continue;
+          }
           const normalized = normalizeRemote(pushUrl);
           if (normalized !== null) {
             if (normalized !== expected) {
@@ -289,12 +308,20 @@ async function checkOriginMatchesRemote(
                   `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
               } else {
-                // SSH config alias (no dot, or non-standard TLD like "github.com-work") — compare by path.
-                const aliasPath = pushScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
-                if (aliasPath !== expected) {
+                // SSH config alias. Only accept when the alias name contains "github" —
+                // aliases that don't reference GitHub by name are rejected as potentially
+                // pointing to a different host.
+                if (!/github/i.test(pushHost)) {
                   errors.push(
                     `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                   );
+                } else {
+                  const aliasPath = pushScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+                  if (aliasPath !== expected) {
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                    );
+                  }
                 }
               }
             } else if (!trimmedPush.includes("://")) {
