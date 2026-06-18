@@ -517,6 +517,33 @@ describe("runPreflight", () => {
     expect(errors.filter((e) => e.includes("origin") && e.includes("一致しません"))).toEqual([]);
   });
 
+  // ES-415 Finding 1: SSH config aliases (non-standard hostnames) must not be rejected
+  it("SSH config alias の fetch URL は origin 一致チェックをスキップする（ES-415 Finding 1）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("SSH config alias の push URL は push URL 一致チェックをスキップする（ES-415 Finding 1）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  // ES-415 Finding 2: unparseable remote URLs must not expose credentials in error messages
+  it("パース不能な URL は origin エラーを生成せず認証情報を漏洩しない（ES-415 Finding 2）", async () => {
+    const r = passingRunner();
+    // `:notaport` makes the URL unparseable (non-numeric port); the token must not appear in errors.
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://ghp_leak@github.com:notaport/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://ghp_leak@github.com:notaport/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.every((e) => !e.includes("ghp_leak"))).toBe(true);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),

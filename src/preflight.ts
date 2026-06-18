@@ -147,7 +147,13 @@ function redactUrl(url: string): string {
     parsed.hash = "";
     return parsed.toString();
   } catch {
-    return url.trim();
+    // SCP-format SSH URLs (git@host:path) use 'git' as the conventional username — not a
+    // secret token — so they are safe to display. Other unparseable strings may carry
+    // credentials (e.g. https://token@host:notaport/path), so emit a safe placeholder.
+    if (/^git@[^:]+:.+$/.test(url.trim())) {
+      return url.trim();
+    }
+    return "[unparseable URL]";
   }
 }
 
@@ -168,10 +174,26 @@ async function checkOriginMatchesRemote(
     }
     const fetchUrl = fetchR.stdout.trim();
     const normalizedFetch = normalizeRemote(fetchUrl);
-    if (normalizedFetch == null || normalizedFetch !== expected) {
-      errors.push(
-        `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-      );
+    if (normalizedFetch !== null) {
+      if (normalizedFetch !== expected) {
+        errors.push(
+          `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+        );
+      }
+    } else {
+      // normalizeRemote returned null: either a parseable URL with a non-GitHub host (e.g.
+      // https://gitlab.com/...) or an SCP-format SSH config alias (e.g. git@github-work:...).
+      // For parseable URLs the host mismatch is detectable — flag the error.
+      // For unparseable URLs (SSH config aliases), reachability was already confirmed by
+      // checkRemote; we cannot determine the owner/repo from the alias, so skip this check.
+      try {
+        new URL(fetchUrl.trim());
+        errors.push(
+          `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+        );
+      } catch {
+        // Unparseable URL — SSH config alias or similar; skip the host/path check.
+      }
     }
 
     // push URL が fetch URL と異なる場合（remote.origin.pushurl 設定時）を検証
@@ -186,10 +208,21 @@ async function checkOriginMatchesRemote(
         for (const pushUrl of pushUrls) {
           if (pushUrl === fetchUrl) continue;
           const normalized = normalizeRemote(pushUrl);
-          if (normalized == null || normalized !== expected) {
-            errors.push(
-              `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-            );
+          if (normalized !== null) {
+            if (normalized !== expected) {
+              errors.push(
+                `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
+            }
+          } else {
+            try {
+              new URL(pushUrl.trim());
+              errors.push(
+                `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
+            } catch {
+              // Unparseable push URL — SSH config alias; skip.
+            }
           }
         }
       }
