@@ -834,6 +834,99 @@ describe("runPreflight", () => {
     expect(errors.every((e) => !e.includes("alice"))).toBe(true);
   });
 
+  // Finding 1 (current iteration): HTTPS to ssh.github.com must be rejected
+  it("HTTPS fetch URL が ssh.github.com を使用していれば NG（Finding 1: HTTPS ssh.github.com fetch）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://ssh.github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://ssh.github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("HTTPS push URL が ssh.github.com を使用していれば NG（Finding 1: HTTPS ssh.github.com push）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://ssh.github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 2 (current iteration): push URLs with empty SSH user to real GitHub hosts must be rejected
+  it("ユーザーなし SSH push URL は NG（Finding 2: userless SSH push URL rejection）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("ユーザー"))).toBe(true);
+  });
+
+  it("ssh.github.com:443 の push URL でユーザーなしなら NG（Finding 2: SSH-over-HTTPS userless push）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://ssh.github.com:443/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("ユーザー"))).toBe(true);
+  });
+
+  it("git ユーザー付き SSH push URL はユーザーエラーなし（Finding 2: explicit git user ok）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("ユーザー"))).toEqual([]);
+  });
+
+  // Finding 3 (current iteration): SSH config aliases resolved via ssh -G
+  it("ssh -G で github.com に解決される SSH config alias は origin 一致チェックを通過する（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ssh -G で github.com に解決される alias でパスが不一致なら NG（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
+    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("ssh -G が利用不能な場合は SSH config alias を拒否する（Finding 3: ssh -G fallback reject）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    // No ssh -G stub → FakeCommandRunner throws → conservative reject
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("ssh -G で非 GitHub ホストに解決される alias は NG（Finding 3: non-GitHub alias）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname gitlab.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("push URL の SSH config alias が ssh -G で github.com に解決されパスが一致すればエラーなし（Finding 3 push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("push URL の SSH config alias が ssh -G で github.com に解決されパスが不一致なら NG（Finding 3 push URL path mismatch）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
+    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),
@@ -1048,6 +1141,15 @@ describe("normalizeRemote", () => {
   // Finding 1 (current iteration): SCP-form ssh.github.com cannot express port 443
   it("SCP 形式の ssh.github.com は null を返す（Finding 1: ssh.github.com SCP rejection）", () => {
     expect(normalizeRemote("git@ssh.github.com:owner/name.git")).toBeNull();
+  });
+
+  // Finding 1 (current iteration): HTTPS to ssh.github.com must be rejected
+  it("HTTPS の ssh.github.com URL は null を返す（Finding 1: HTTPS ssh.github.com rejection）", () => {
+    expect(normalizeRemote("https://ssh.github.com/owner/name.git")).toBeNull();
+  });
+
+  it("HTTPS の ssh.github.com URL (.git なし) は null を返す（Finding 1: HTTPS ssh.github.com no .git）", () => {
+    expect(normalizeRemote("https://ssh.github.com/owner/name")).toBeNull();
   });
 
   it("ユーザーなし SCP 形式の ssh.github.com は null を返す（Finding 1: ssh.github.com SCP userless）", () => {

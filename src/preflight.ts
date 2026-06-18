@@ -151,6 +151,9 @@ export function normalizeRemote(url: string): string | null {
       const isDefaultSshPort = parsed.protocol === "ssh:" && parsed.port === "22";
       if (!isSshOverHttps && !isDefaultSshPort) return null;
     }
+    // ssh.github.com is only valid with the ssh: protocol (SSH-over-HTTPS at port 443);
+    // https://ssh.github.com/... is not a valid Git transport endpoint.
+    if (parsed.protocol === "https:" && parsed.hostname.toLowerCase() === "ssh.github.com") return null;
     // For SSH protocol, GitHub only accepts user 'git'; reject any explicit non-git user.
     if (parsed.protocol === "ssh:" && parsed.username !== "" && parsed.username.toLowerCase() !== "git") {
       return null;
@@ -255,9 +258,29 @@ async function checkOriginMatchesRemote(
               `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
             );
           } else if (!/github/i.test(fetchHost)) {
-            errors.push(
-              `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-            );
+            // Alias name lacks "github" — probe ssh -G to resolve the effective hostname (Finding 3).
+            let fetchAliasToGitHub = false;
+            try {
+              const sshG = await runner.run("ssh", ["-G", fetchHost], opts);
+              if (sshG.code === 0) {
+                const hl = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
+                fetchAliasToGitHub = hl ? hl.slice("hostname ".length).trim().toLowerCase() === "github.com" : false;
+              }
+            } catch {
+              // ssh not available or failed — conservatively reject.
+            }
+            if (!fetchAliasToGitHub) {
+              errors.push(
+                `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
+            } else {
+              const aliasPath = rawFetchPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+              if (aliasPath !== expected) {
+                errors.push(
+                  `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
+              }
+            }
           } else {
             const aliasPath = rawFetchPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
             if (aliasPath !== expected) {
@@ -318,6 +341,20 @@ async function checkOriginMatchesRemote(
               errors.push(
                 `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
               );
+            } else {
+              // Path matches — verify SSH push URLs carry an explicit 'git' user (Finding 2).
+              // An empty SSH username causes git push to connect as the OS user, which GitHub rejects.
+              try {
+                const pp = new URL(pushUrl.trim());
+                if (pp.protocol === "ssh:" && pp.username === "" && GITHUB_HOSTS.has(pp.hostname.toLowerCase())) {
+                  errors.push(
+                    `git: origin の push URL (${redactUrl(pushUrl)}) は SSH ユーザーが指定されていません。` +
+                      "GitHub SSH は 'git' ユーザーを要求します（ssh://git@github.com/... 形式を使用するか、SSH config に 'User git' を設定してください）",
+                  );
+                }
+              } catch {
+                // Not a parseable scheme URL — normalizeRemote accepted it via another branch.
+              }
             }
           } else {
             const trimmedPush = pushUrl.trim();
@@ -345,9 +382,29 @@ async function checkOriginMatchesRemote(
                     `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                   );
                 } else if (!/github/i.test(pushHost)) {
-                  errors.push(
-                    `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-                  );
+                  // Alias name lacks "github" — probe ssh -G to resolve the effective hostname (Finding 3).
+                  let pushAliasToGitHub = false;
+                  try {
+                    const sshG = await runner.run("ssh", ["-G", pushHost], opts);
+                    if (sshG.code === 0) {
+                      const hl = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
+                      pushAliasToGitHub = hl ? hl.slice("hostname ".length).trim().toLowerCase() === "github.com" : false;
+                    }
+                  } catch {
+                    // ssh not available or failed — conservatively reject.
+                  }
+                  if (!pushAliasToGitHub) {
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                    );
+                  } else {
+                    const aliasPath = rawPushPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+                    if (aliasPath !== expected) {
+                      errors.push(
+                        `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                      );
+                    }
+                  }
                 } else {
                   const aliasPath = rawPushPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
                   if (aliasPath !== expected) {
