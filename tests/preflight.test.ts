@@ -571,6 +571,43 @@ describe("runPreflight", () => {
     expect(errors.every((e) => !e.includes("ghp_leak"))).toBe(true);
   });
 
+  // Finding 1: SSH config alias (no-dot) fetch URL with mismatched path must be rejected
+  it("SSH config alias の fetch URL でパスが不一致なら NG（Finding 1: SSH-alias fetch path mismatch）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github-work:owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 2: dotted SSH config alias (e.g. "github.com-work") must be accepted when path matches
+  it("ドット含む SSH config alias (github.com-work) が repo.remote と一致すればエラーなし（Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com-work:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com-work:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ドット含む SSH config alias (github.com-work) でパスが不一致なら NG（Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com-work:owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com-work:owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3: malformed push URL (different from fetch) must emit an error without leaking credentials
+  it("不正な push URL はエラーを報告し認証情報を漏洩しない（Finding 3: malformed push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    // Malformed push URL with embedded credential; notaport makes URL unparseable
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://ghp_secret@github.com:notaport/owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("ghp_secret"))).toBe(true);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),

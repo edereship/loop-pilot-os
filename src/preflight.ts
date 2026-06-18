@@ -157,6 +157,15 @@ function redactUrl(url: string): string {
   }
 }
 
+// Returns true when the hostname looks like a real domain (e.g. "gitlab.com") rather than
+// an SSH config alias (e.g. "github.com-work", "github-work"). Real-domain TLDs are
+// letters-only; alias suffixes like "com-work" contain hyphens or digits.
+function isLikelyRealDomain(host: string): boolean {
+  const lastDot = host.lastIndexOf(".");
+  if (lastDot === -1) return false;
+  return /^[a-z]{2,}$/i.test(host.slice(lastDot + 1));
+}
+
 async function checkOriginMatchesRemote(
   runner: CommandRunner,
   repoPath: string,
@@ -185,13 +194,20 @@ async function checkOriginMatchesRemote(
       const trimmedFetch = fetchUrl.trim();
       const fetchScpMatch = trimmedFetch.match(/^git@([^:]+):(.+)$/);
       if (fetchScpMatch) {
-        if (fetchScpMatch[1].toLowerCase().includes(".")) {
-          // Real domain hostname (e.g., gitlab.com) but not GitHub — reject (ES-415 Finding 1).
+        if (isLikelyRealDomain(fetchScpMatch[1].toLowerCase())) {
+          // Real domain hostname (e.g., gitlab.com) but not GitHub — reject.
           errors.push(
             `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
           );
+        } else {
+          // SSH config alias (no dot, or non-standard TLD like "github.com-work") — compare by path.
+          const aliasPath = fetchScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+          if (aliasPath !== expected) {
+            errors.push(
+              `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+            );
+          }
         }
-        // else: SSH config alias (no dot in hostname) — cannot resolve host; skip this check.
       } else if (!trimmedFetch.includes("://")) {
         // No URL scheme and not SCP-format — local path or bare remote name — reject (ES-415 Finding 2).
         errors.push(
@@ -234,13 +250,13 @@ async function checkOriginMatchesRemote(
             const trimmedPush = pushUrl.trim();
             const pushScpMatch = trimmedPush.match(/^git@([^:]+):(.+)$/);
             if (pushScpMatch) {
-              if (pushScpMatch[1].toLowerCase().includes(".")) {
-                // Real domain hostname but not GitHub — reject (ES-415 Finding 1).
+              if (isLikelyRealDomain(pushScpMatch[1].toLowerCase())) {
+                // Real domain hostname but not GitHub — reject.
                 errors.push(
                   `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
               } else {
-                // SSH config alias — compare by path (ES-415 Finding 3).
+                // SSH config alias (no dot, or non-standard TLD like "github.com-work") — compare by path.
                 const aliasPath = pushScpMatch[2].replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
                 if (aliasPath !== expected) {
                   errors.push(
@@ -249,7 +265,7 @@ async function checkOriginMatchesRemote(
                 }
               }
             } else if (!trimmedPush.includes("://")) {
-              // Local path — reject (ES-415 Finding 2).
+              // Local path — reject.
               errors.push(
                 `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
               );
@@ -261,7 +277,10 @@ async function checkOriginMatchesRemote(
                   `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
               } catch {
-                // Malformed scheme URL — skip.
+                // Malformed scheme URL — report error without exposing raw URL (Finding 3).
+                errors.push(
+                  `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
               }
             }
           }
