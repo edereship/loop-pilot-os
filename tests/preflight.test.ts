@@ -608,6 +608,60 @@ describe("runPreflight", () => {
     expect(errors.every((e) => !e.includes("ghp_secret"))).toBe(true);
   });
 
+  // Finding 1: non-GitHub URL schemes must be rejected
+  it("file:// scheme で github.com ホストの URL は NG（Finding 1: scheme restriction）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "file://github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "file://github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 2: IPv4 SCP remotes must be rejected (not treated as SSH config aliases)
+  it("IPv4 SCP remote は NG（Finding 2: IPv4 SCP rejection）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@192.168.1.10:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@192.168.1.10:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("IPv4 SCP の push URL は NG（Finding 2: IPv4 push URL rejection）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@192.168.1.10:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3: userless SSH config alias (no git@ prefix) must be accepted when path matches
+  it("ユーザーなし SSH alias (github-work:owner/name.git) がパス一致ならエラーなし（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "github-work:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "github-work:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ユーザーなし SSH alias でパスが不一致なら NG（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "github-work:owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "github-work:owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 4: mixed pushurls with both a valid URL and an empty entry must be rejected
+  it("push URL リストに有効 URL と空エントリが混在する場合はエラー（Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], {
+      code: 0,
+      stdout: "git@github.com:owner/name.git\n\n",
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL がありません"))).toBe(true);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),
@@ -744,6 +798,20 @@ describe("normalizeRemote", () => {
 
   it("非 GitHub SSH URL (bitbucket) は null を返す", () => {
     expect(normalizeRemote("ssh://git@bitbucket.org/owner/name.git")).toBeNull();
+  });
+
+  // Finding 1: non-GitHub URL schemes must be rejected
+  it("file:// スキームは null を返す（Finding 1: scheme restriction）", () => {
+    expect(normalizeRemote("file://github.com/owner/name.git")).toBeNull();
+  });
+
+  it("git:// スキームは null を返す（Finding 1: scheme restriction）", () => {
+    expect(normalizeRemote("git://github.com/owner/name.git")).toBeNull();
+  });
+
+  // Finding 2: IPv4 SCP remotes must not normalize
+  it("IPv4 SCP remote は null を返す（Finding 2: IPv4 rejection）", () => {
+    expect(normalizeRemote("git@192.168.1.10:owner/name.git")).toBeNull();
   });
 
   // Finding 1: 末尾スラッシュの正規化

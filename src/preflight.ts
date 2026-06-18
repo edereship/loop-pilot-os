@@ -126,6 +126,8 @@ export function normalizeRemote(url: string): string | null {
   // HTTPS: https://github.com/owner/name(.git)
   try {
     const parsed = new URL(trimmed);
+    // Only accept transport protocols GitHub actually uses; reject file://, git://, etc.
+    if (!["https:", "ssh:"].includes(parsed.protocol)) return null;
     if (!GITHUB_HOSTS.has(parsed.hostname.toLowerCase())) return null;
     const path = parsed.pathname.replace(/^\//, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
@@ -166,6 +168,12 @@ function isLikelyRealDomain(host: string): boolean {
   return /^[a-z]{2,}$/i.test(host.slice(lastDot + 1));
 }
 
+// Returns true for bare IPv4 addresses (e.g. "192.168.1.10"). These are never GitHub
+// hosts and must not be accepted as SSH config aliases.
+function isIPv4Address(host: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
 async function checkOriginMatchesRemote(
   runner: CommandRunner,
   repoPath: string,
@@ -192,10 +200,13 @@ async function checkOriginMatchesRemote(
     } else {
       // normalizeRemote returned null — classify to determine the right action.
       const trimmedFetch = fetchUrl.trim();
-      const fetchScpMatch = trimmedFetch.match(/^git@([^:]+):(.+)$/);
+      // SCP format: [user@]host:path — user is optional (SSH config may specify User git).
+      // Path must not start with '/' to avoid matching scheme:opaque-path URLs.
+      const fetchScpMatch = trimmedFetch.match(/^(?:[^@/:]+@)?([^/:]+):([^/].*)$/);
       if (fetchScpMatch) {
-        if (isLikelyRealDomain(fetchScpMatch[1].toLowerCase())) {
-          // Real domain hostname (e.g., gitlab.com) but not GitHub — reject.
+        const fetchHost = fetchScpMatch[1].toLowerCase();
+        if (isIPv4Address(fetchHost) || isLikelyRealDomain(fetchHost)) {
+          // IPv4 address or real domain hostname but not GitHub — reject.
           errors.push(
             `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
           );
@@ -231,8 +242,14 @@ async function checkOriginMatchesRemote(
     // push URL が fetch URL と異なる場合（remote.origin.pushurl 設定時）を検証
     const pushR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "--push", "--all", "origin"], opts);
     if (pushR.code === 0) {
-      const pushUrls = pushR.stdout.trim().split("\n").filter((u) => u.length > 0);
-      if (pushUrls.length === 0) {
+      // Split on newlines without pre-trimming so that empty pushurl entries are preserved.
+      // Git always appends a trailing newline; strip only that final empty element.
+      const rawPushLines = pushR.stdout.split("\n");
+      const pushLines =
+        rawPushLines[rawPushLines.length - 1] === "" ? rawPushLines.slice(0, -1) : rawPushLines;
+      const hasEmptyPushUrl = pushLines.some((u) => u.length === 0);
+      const pushUrls = pushLines.filter((u) => u.length > 0);
+      if (hasEmptyPushUrl || pushUrls.length === 0) {
         // remote.origin.pushurl が空文字に設定されていると exit 0 で URL なしになる。
         // この状態では git push が "no path specified" で失敗するため事前に拒否する。
         errors.push("git: origin に有効な push URL がありません（remote.origin.pushurl が空に設定されています）");
@@ -248,10 +265,12 @@ async function checkOriginMatchesRemote(
             }
           } else {
             const trimmedPush = pushUrl.trim();
-            const pushScpMatch = trimmedPush.match(/^git@([^:]+):(.+)$/);
+            // SCP format: [user@]host:path — user is optional (SSH config may specify User git).
+            const pushScpMatch = trimmedPush.match(/^(?:[^@/:]+@)?([^/:]+):([^/].*)$/);
             if (pushScpMatch) {
-              if (isLikelyRealDomain(pushScpMatch[1].toLowerCase())) {
-                // Real domain hostname but not GitHub — reject.
+              const pushHost = pushScpMatch[1].toLowerCase();
+              if (isIPv4Address(pushHost) || isLikelyRealDomain(pushHost)) {
+                // IPv4 address or real domain hostname but not GitHub — reject.
                 errors.push(
                   `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
