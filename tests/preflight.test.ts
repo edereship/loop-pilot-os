@@ -466,6 +466,13 @@ describe("runPreflight", () => {
     expect(errors.filter((e) => e.includes("push URL"))).toEqual([]);
   });
 
+  it("push URL が空リストなら NG（ES-415 Finding 3: empty pushurl）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL がありません"))).toBe(true);
+  });
+
   it("複数 push URL のうち1つが不一致なら NG（ES-415 P2 multi push fix）", async () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
@@ -484,6 +491,30 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
     expect(errors.every((e) => !e.includes("ghp_secret_token"))).toBe(true);
+  });
+
+  it("クエリ文字列トークンをエラーメッセージで秘匿する（ES-415 Finding 2: query-string credential）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/wrong.git?token=ghp_query_secret\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("ghp_query_secret"))).toBe(true);
+  });
+
+  it("末尾スラッシュ付き HTTPS origin が repo.remote と一致すればエラーなし（ES-415 Finding 1: trailing slash）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name/\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://github.com/owner/name/\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("origin") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("末尾スラッシュ付き .git/ HTTPS origin が repo.remote と一致すればエラーなし（ES-415 Finding 1）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git/\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://github.com/owner/name.git/\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("origin") && e.includes("一致しません"))).toEqual([]);
   });
 
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
@@ -622,5 +653,19 @@ describe("normalizeRemote", () => {
 
   it("非 GitHub SSH URL (bitbucket) は null を返す", () => {
     expect(normalizeRemote("ssh://git@bitbucket.org/owner/name.git")).toBeNull();
+  });
+
+  // Finding 1: 末尾スラッシュの正規化
+  it("HTTPS URL の末尾スラッシュを除去して正規化する（Finding 1）", () => {
+    expect(normalizeRemote("https://github.com/owner/name/")).toBe("owner/name");
+  });
+
+  it("HTTPS URL の .git/ を除去して正規化する（Finding 1）", () => {
+    expect(normalizeRemote("https://github.com/owner/name.git/")).toBe("owner/name");
+  });
+
+  it("SSH 形式の末尾スラッシュを除去して正規化する（Finding 1）", () => {
+    expect(normalizeRemote("git@github.com:owner/name.git/")).toBe("owner/name");
+    expect(normalizeRemote("git@github.com:owner/name/")).toBe("owner/name");
   });
 });

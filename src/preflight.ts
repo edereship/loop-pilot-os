@@ -118,7 +118,7 @@ export function normalizeRemote(url: string): string | null {
   const sshColon = trimmed.match(/^git@([^:]+):(.+)$/);
   if (sshColon) {
     if (!GITHUB_HOSTS.has(sshColon[1].toLowerCase())) return null;
-    const path = sshColon[2].replace(/\.git$/i, "");
+    const path = sshColon[2].replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   }
   // SSH URL: ssh://git@github.com/owner/name.git
@@ -127,7 +127,7 @@ export function normalizeRemote(url: string): string | null {
   try {
     const parsed = new URL(trimmed);
     if (!GITHUB_HOSTS.has(parsed.hostname.toLowerCase())) return null;
-    const path = parsed.pathname.replace(/^\//, "").replace(/\.git$/i, "");
+    const path = parsed.pathname.replace(/^\//, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   } catch {
     return null;
@@ -140,9 +140,12 @@ function redactUrl(url: string): string {
     if (parsed.username || parsed.password) {
       parsed.username = "***";
       parsed.password = "";
-      return parsed.toString();
     }
-    return url.trim();
+    // Strip query string and fragment — git remote URLs never use them,
+    // but a misconfigured URL could carry a token there (e.g. ?token=ghp_...).
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
   } catch {
     return url.trim();
   }
@@ -175,13 +178,19 @@ async function checkOriginMatchesRemote(
     const pushR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "--push", "--all", "origin"], opts);
     if (pushR.code === 0) {
       const pushUrls = pushR.stdout.trim().split("\n").filter((u) => u.length > 0);
-      for (const pushUrl of pushUrls) {
-        if (pushUrl === fetchUrl) continue;
-        const normalized = normalizeRemote(pushUrl);
-        if (normalized == null || normalized !== expected) {
-          errors.push(
-            `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-          );
+      if (pushUrls.length === 0) {
+        // remote.origin.pushurl が空文字に設定されていると exit 0 で URL なしになる。
+        // この状態では git push が "no path specified" で失敗するため事前に拒否する。
+        errors.push("git: origin に有効な push URL がありません（remote.origin.pushurl が空に設定されています）");
+      } else {
+        for (const pushUrl of pushUrls) {
+          if (pushUrl === fetchUrl) continue;
+          const normalized = normalizeRemote(pushUrl);
+          if (normalized == null || normalized !== expected) {
+            errors.push(
+              `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+            );
+          }
         }
       }
     }
