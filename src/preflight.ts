@@ -108,22 +108,43 @@ async function checkRemote(
 
 // ---- ES-415: origin URL と repo.remote の一致検証 ----
 
-// Git remote URL を owner/name に正規化する。パース不能または GitHub 以外のホストなら null。
+const GITHUB_HOSTS = new Set(["github.com", "ssh.github.com"]);
+
+// Git remote URL を owner/name に正規化する。
+// GitHub 以外のホスト、パース不能な URL は null を返す。
 export function normalizeRemote(url: string): string | null {
   const trimmed = url.trim();
-  // SSH: git@github.com:owner/name.git (host must be github.com; case-insensitive)
-  const sshColon = trimmed.match(/^git@github\.com:(.+?)(?:\.git)?$/i);
-  if (sshColon) return sshColon[1].toLowerCase();
+  // SSH: git@github.com:owner/name.git
+  const sshColon = trimmed.match(/^git@([^:]+):(.+)$/);
+  if (sshColon) {
+    if (!GITHUB_HOSTS.has(sshColon[1].toLowerCase())) return null;
+    const path = sshColon[2].replace(/\.git$/i, "");
+    return path.length > 0 ? path.toLowerCase() : null;
+  }
   // SSH URL: ssh://git@github.com/owner/name.git
+  // SSH-over-HTTPS: ssh://git@ssh.github.com:443/owner/name.git
   // HTTPS: https://github.com/owner/name(.git)
   try {
     const parsed = new URL(trimmed);
-    if (parsed.hostname.toLowerCase() !== "github.com") return null;
-    // Strip .git suffix case-insensitively (e.g. .GIT) before lowercasing.
+    if (!GITHUB_HOSTS.has(parsed.hostname.toLowerCase())) return null;
     const path = parsed.pathname.replace(/^\//, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   } catch {
     return null;
+  }
+}
+
+function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url.trim());
+    if (parsed.username || parsed.password) {
+      parsed.username = "***";
+      parsed.password = "";
+      return parsed.toString();
+    }
+    return url.trim();
+  } catch {
+    return url.trim();
   }
 }
 
@@ -135,32 +156,33 @@ async function checkOriginMatchesRemote(
   errors: string[],
 ): Promise<void> {
   try {
-    const r = await runner.run("git", ["-C", repoPath, "remote", "get-url", "origin"], opts);
-    if (r.code !== 0) {
-      errors.push(`git: origin の URL を取得できません（${r.stderr.trim()}）`);
+    const expected = repoSlug.toLowerCase();
+
+    const fetchR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "origin"], opts);
+    if (fetchR.code !== 0) {
+      errors.push(`git: origin の URL を取得できません（${fetchR.stderr.trim()}）`);
       return;
     }
-    const expected = repoSlug.toLowerCase();
-    const normalized = normalizeRemote(r.stdout);
-    if (normalized == null || normalized !== expected) {
+    const fetchUrl = fetchR.stdout.trim();
+    const normalizedFetch = normalizeRemote(fetchUrl);
+    if (normalizedFetch == null || normalizedFetch !== expected) {
       errors.push(
-        `git: ローカルリポの origin (${r.stdout.trim()}) が repo.remote (${repoSlug}) と一致しません`,
+        `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
       );
     }
-    // Also verify the push URL. When remote.origin.pushurl is configured, git push uses it
-    // instead of the fetch URL, potentially targeting a different repository.
-    const pushR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "--push", "origin"], opts);
-    if (pushR.code !== 0) {
-      errors.push(`git: origin の push URL を取得できません（${pushR.stderr.trim()}）`);
-      return;
-    }
-    // Skip redundant check when push URL is identical to fetch URL (no pushurl configured).
-    if (pushR.stdout.trim() !== r.stdout.trim()) {
-      const pushNormalized = normalizeRemote(pushR.stdout);
-      if (pushNormalized == null || pushNormalized !== expected) {
-        errors.push(
-          `git: ローカルリポの origin push URL (${pushR.stdout.trim()}) が repo.remote (${repoSlug}) と一致しません`,
-        );
+
+    // push URL が fetch URL と異なる場合（remote.origin.pushurl 設定時）を検証
+    const pushR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "--push", "--all", "origin"], opts);
+    if (pushR.code === 0) {
+      const pushUrls = pushR.stdout.trim().split("\n").filter((u) => u.length > 0);
+      for (const pushUrl of pushUrls) {
+        if (pushUrl === fetchUrl) continue;
+        const normalized = normalizeRemote(pushUrl);
+        if (normalized == null || normalized !== expected) {
+          errors.push(
+            `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+          );
+        }
       }
     }
   } catch (e) {
