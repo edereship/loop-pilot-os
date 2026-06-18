@@ -263,8 +263,18 @@ async function checkOriginMatchesRemote(
             try {
               const sshG = await runner.run("ssh", ["-G", fetchHost], opts);
               if (sshG.code === 0) {
-                const hl = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
-                fetchAliasToGitHub = hl ? hl.slice("hostname ".length).trim().toLowerCase() === "github.com" : false;
+                const sshGLines = sshG.stdout.split("\n");
+                const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
+                const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
+                const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
+                // Accept github.com on port 22 (standard SSH) or ssh.github.com on port 443
+                // (SSH-over-HTTPS). Any other host or non-standard port is rejected.
+                if (resolvedHost === "github.com") {
+                  fetchAliasToGitHub = resolvedPort === "22" || resolvedPort === null;
+                } else if (resolvedHost === "ssh.github.com") {
+                  fetchAliasToGitHub = resolvedPort === "443";
+                }
               }
             } catch {
               // ssh not available or failed — conservatively reject.
@@ -387,8 +397,18 @@ async function checkOriginMatchesRemote(
                   try {
                     const sshG = await runner.run("ssh", ["-G", pushHost], opts);
                     if (sshG.code === 0) {
-                      const hl = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
-                      pushAliasToGitHub = hl ? hl.slice("hostname ".length).trim().toLowerCase() === "github.com" : false;
+                      const sshGLines = sshG.stdout.split("\n");
+                      const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
+                      const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                      const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
+                      const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
+                      // Accept github.com on port 22 (standard SSH) or ssh.github.com on port 443
+                      // (SSH-over-HTTPS). Any other host or non-standard port is rejected.
+                      if (resolvedHost === "github.com") {
+                        pushAliasToGitHub = resolvedPort === "22" || resolvedPort === null;
+                      } else if (resolvedHost === "ssh.github.com") {
+                        pushAliasToGitHub = resolvedPort === "443";
+                      }
                     }
                   } catch {
                     // ssh not available or failed — conservatively reject.
