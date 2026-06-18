@@ -662,6 +662,58 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("push URL がありません"))).toBe(true);
   });
 
+  // Finding 1: absolute SCP path (git@github.com:/owner/name.git) must be accepted
+  it("絶対パス SCP (git@github.com:/owner/name.git) がパス一致ならエラーなし（Finding 1）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com:/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  // Finding 2: trailing-dot non-GitHub SCP host must be rejected
+  it("末尾ドット付き非 GitHub SCP (git@gitlab.com.:...) は NG（Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gitlab.com.:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gitlab.com.:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3: userless GitHub SCP (github.com:owner/name.git) must be accepted
+  it("ユーザーなし GitHub SCP (github.com:owner/name.git) がパス一致ならエラーなし（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "github.com:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ユーザーなし GitHub SCP でパスが不一致なら NG（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "github.com:owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "github.com:owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 4: push URL with nonstandard port must be rejected
+  it("非標準ポート付き HTTPS push URL (github.com:8443) は NG（Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "https://github.com:8443/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("非標準ポート付き SSH push URL (github.com:2222) は NG（Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@github.com:2222/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),
@@ -798,6 +850,29 @@ describe("normalizeRemote", () => {
 
   it("非 GitHub SSH URL (bitbucket) は null を返す", () => {
     expect(normalizeRemote("ssh://git@bitbucket.org/owner/name.git")).toBeNull();
+  });
+
+  // Finding 1: absolute SCP path (leading slash after colon) must normalize correctly
+  it("絶対パス SCP (git@github.com:/owner/name.git) を owner/name に正規化する（Finding 1）", () => {
+    expect(normalizeRemote("git@github.com:/owner/name.git")).toBe("owner/name");
+  });
+
+  // Finding 3: userless GitHub SCP (github.com:path) must normalize correctly
+  it("ユーザーなし GitHub SCP (github.com:owner/name.git) を owner/name に正規化する（Finding 3）", () => {
+    expect(normalizeRemote("github.com:owner/name.git")).toBe("owner/name");
+  });
+
+  // Finding 4: nonstandard ports must be rejected
+  it("非標準ポート付き HTTPS URL は null を返す（Finding 4）", () => {
+    expect(normalizeRemote("https://github.com:8443/owner/name.git")).toBeNull();
+  });
+
+  it("非標準ポート付き SSH URL は null を返す（Finding 4）", () => {
+    expect(normalizeRemote("ssh://git@github.com:2222/owner/name.git")).toBeNull();
+  });
+
+  it("標準 SSH ポート 22 の明示指定は owner/name に正規化する（Finding 4 境界）", () => {
+    expect(normalizeRemote("ssh://git@github.com:22/owner/name.git")).toBe("owner/name");
   });
 
   // Finding 1: non-GitHub URL schemes must be rejected

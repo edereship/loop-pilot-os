@@ -114,11 +114,13 @@ const GITHUB_HOSTS = new Set(["github.com", "ssh.github.com"]);
 // GitHub 以外のホスト、パース不能な URL は null を返す。
 export function normalizeRemote(url: string): string | null {
   const trimmed = url.trim();
-  // SSH: git@github.com:owner/name.git
-  const sshColon = trimmed.match(/^git@([^:]+):(.+)$/);
-  if (sshColon) {
+  // SSH SCP: [user@]github.com:path — user@ is optional (SSH config may supply User git).
+  // Absolute-path SCP (git@github.com:/owner/name) has a leading slash which we strip.
+  // Guard path not starting with '//' to avoid matching scheme-based URLs (https://...).
+  const sshColon = trimmed.match(/^(?:[^@/:]+@)?([^/:]+):(.+)$/);
+  if (sshColon && !sshColon[2].startsWith("//")) {
     if (!GITHUB_HOSTS.has(sshColon[1].toLowerCase())) return null;
-    const path = sshColon[2].replace(/\/+$/, "").replace(/\.git$/i, "");
+    const path = sshColon[2].replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   }
   // SSH URL: ssh://git@github.com/owner/name.git
@@ -129,6 +131,16 @@ export function normalizeRemote(url: string): string | null {
     // Only accept transport protocols GitHub actually uses; reject file://, git://, etc.
     if (!["https:", "ssh:"].includes(parsed.protocol)) return null;
     if (!GITHUB_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+    // Reject non-standard ports. Accepted explicit ports: ssh.github.com:443 (SSH-over-HTTPS)
+    // and ssh:22 (standard SSH port not normalized by URL parser for the ssh: scheme).
+    if (parsed.port !== "") {
+      const isSshOverHttps =
+        parsed.protocol === "ssh:" &&
+        parsed.hostname.toLowerCase() === "ssh.github.com" &&
+        parsed.port === "443";
+      const isDefaultSshPort = parsed.protocol === "ssh:" && parsed.port === "22";
+      if (!isSshOverHttps && !isDefaultSshPort) return null;
+    }
     const path = parsed.pathname.replace(/^\//, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   } catch {
@@ -162,10 +174,12 @@ function redactUrl(url: string): string {
 // Returns true when the hostname looks like a real domain (e.g. "gitlab.com") rather than
 // an SSH config alias (e.g. "github.com-work", "github-work"). Real-domain TLDs are
 // letters-only; alias suffixes like "com-work" contain hyphens or digits.
+// Trailing dots (FQDN absolute notation, e.g. "gitlab.com.") are stripped before inspection.
 function isLikelyRealDomain(host: string): boolean {
-  const lastDot = host.lastIndexOf(".");
+  const stripped = host.replace(/\.+$/, "");
+  const lastDot = stripped.lastIndexOf(".");
   if (lastDot === -1) return false;
-  return /^[a-z]{2,}$/i.test(host.slice(lastDot + 1));
+  return /^[a-z]{2,}$/i.test(stripped.slice(lastDot + 1));
 }
 
 // Returns true for bare IPv4 addresses (e.g. "192.168.1.10"). These are never GitHub
