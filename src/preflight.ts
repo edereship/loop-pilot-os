@@ -247,29 +247,20 @@ async function checkOriginMatchesRemote(
         const fetchUser = fetchScpMatch[1];
         const fetchHost = fetchScpMatch[2].toLowerCase();
         const rawFetchPath = fetchScpMatch[3];
-        if (isIPv4Address(fetchHost) || isLikelyRealDomain(fetchHost)) {
-          // IPv4 address or real domain hostname but not GitHub — reject.
+        if (isIPv4Address(fetchHost)) {
           errors.push(
             `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
           );
         } else {
-          // SSH config alias (no dot, or non-standard TLD like "github.com-work").
-          // We cannot resolve SSH config to verify the actual hostname, so only accept
-          // aliases whose name contains "github" — aliases that don't reference GitHub
-          // by name are treated as potentially pointing to a different host and rejected.
           if (fetchUser !== undefined && fetchUser.toLowerCase() !== "git") {
-            // Explicit non-git user on alias remote — GitHub SSH requires user 'git'.
             errors.push(
               `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
             );
           } else {
-            // Probe ssh -G for ALL aliases to verify the alias resolves to an actual GitHub
-            // host and uses the 'git' SSH user. This covers aliases whose name contains
-            // "github" but may point at a different host (Finding 2) and non-git user
-            // configurations that GitHub would reject (Finding 3).
             let fetchAliasToGitHub = false;
             try {
-              const sshG = await runner.run("ssh", ["-G", fetchHost], opts);
+              const sshTarget = fetchUser ? `${fetchUser}@${fetchHost}` : fetchHost;
+              const sshG = await runner.run("ssh", ["-G", sshTarget], opts);
               if (sshG.code === 0) {
                 const sshGLines = sshG.stdout.split("\n");
                 const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
@@ -362,10 +353,22 @@ async function checkOriginMatchesRemote(
               try {
                 const pp = new URL(pushUrl.trim());
                 if (pp.protocol === "ssh:" && pp.username === "" && GITHUB_HOSTS.has(pp.hostname.toLowerCase())) {
-                  errors.push(
-                    `git: origin の push URL (${redactUrl(pushUrl)}) は SSH ユーザーが指定されていません。` +
-                      "GitHub SSH は 'git' ユーザーを要求します（ssh://git@github.com/... 形式を使用するか、SSH config に 'User git' を設定してください）",
-                  );
+                  let sshUserOk = false;
+                  try {
+                    const sshG = await runner.run("ssh", ["-G", pp.hostname], opts);
+                    if (sshG.code === 0) {
+                      const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
+                      sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
+                    }
+                  } catch {
+                    // ssh not available — fall through to reject.
+                  }
+                  if (!sshUserOk) {
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) は SSH ユーザーが指定されていません。` +
+                        "GitHub SSH は 'git' ユーザーを要求します（ssh://git@github.com/... 形式を使用するか、SSH config に 'User git' を設定してください）",
+                    );
+                  }
                 }
               } catch {
                 // Not a parseable scheme URL — normalizeRemote accepted it via another branch.
@@ -382,28 +385,20 @@ async function checkOriginMatchesRemote(
               const pushUser = pushScpMatch[1];
               const pushHost = pushScpMatch[2].toLowerCase();
               const rawPushPath = pushScpMatch[3];
-              if (isIPv4Address(pushHost) || isLikelyRealDomain(pushHost)) {
-                // IPv4 address or real domain hostname but not GitHub — reject.
+              if (isIPv4Address(pushHost)) {
                 errors.push(
                   `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
               } else {
-                // SSH config alias. Only accept when the alias name contains "github" —
-                // aliases that don't reference GitHub by name are rejected as potentially
-                // pointing to a different host.
                 if (pushUser !== undefined && pushUser.toLowerCase() !== "git") {
-                  // Explicit non-git user on alias remote — GitHub SSH requires user 'git'.
                   errors.push(
                     `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                   );
                 } else {
-                  // Probe ssh -G for ALL aliases to verify the alias resolves to an actual GitHub
-                  // host and uses the 'git' SSH user. This covers aliases whose name contains
-                  // "github" but may point at a different host (Finding 2) and non-git user
-                  // configurations that GitHub would reject (Finding 3).
                   let pushAliasToGitHub = false;
                   try {
-                    const sshG = await runner.run("ssh", ["-G", pushHost], opts);
+                    const sshTarget = pushUser ? `${pushUser}@${pushHost}` : pushHost;
+                    const sshG = await runner.run("ssh", ["-G", sshTarget], opts);
                     if (sshG.code === 0) {
                       const sshGLines = sshG.stdout.split("\n");
                       const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));

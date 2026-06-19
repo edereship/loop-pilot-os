@@ -522,7 +522,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
@@ -531,7 +531,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
   });
@@ -587,7 +587,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com-work:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com-work:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "github.com-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github.com-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
@@ -741,7 +741,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github-work:/owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:/owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
@@ -758,7 +758,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:/owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github-work"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
   });
@@ -883,7 +883,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
@@ -892,7 +892,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -910,7 +910,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname gitlab.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname gitlab.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -919,7 +919,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
   });
@@ -928,7 +928,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
   });
@@ -938,7 +938,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
@@ -947,7 +947,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/other.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -956,7 +956,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -965,7 +965,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
   });
@@ -975,7 +975,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -984,7 +984,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
   });
@@ -1010,7 +1010,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github-work:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "github-work"], { code: 0, stdout: "hostname gitlab.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github-work"], { code: 0, stdout: "hostname gitlab.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -1029,7 +1029,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser alice\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser alice\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -1038,7 +1038,7 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "gh"], { code: 0, stdout: "hostname github.com\nuser alice\nport 22\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser alice\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
   });
