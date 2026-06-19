@@ -1043,6 +1043,63 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
   });
 
+  // Finding 1 (password in SSH URL): ssh://git:secret@github.com/... must be rejected
+  it("パスワード付き SSH fetch URL は NG（Finding 1: SSH URL password）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git:secret@github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git:secret@github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("secret"))).toBe(true);
+  });
+
+  it("パスワード付き SSH push URL は NG（Finding 1: SSH URL password push）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git:token@github.com/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("token"))).toBe(true);
+  });
+
+  // Finding 2 (honor core.sshCommand): alias resolved via custom ssh -F config must be accepted
+  it("core.sshCommand 設定時はそのオプションを ssh -G に渡して alias を解決する（Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "ssh -F /custom/config\n", stderr: "" });
+    r.on(["ssh", "-F", "/custom/config", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("core.sshCommand 設定時の push URL alias も同オプションで解決する（Finding 2 push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "ssh -F /custom/config\n", stderr: "" });
+    r.on(["ssh", "-F", "/custom/config", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  // Finding 3 (userless SCP push URL): github.com:owner/name.git as a distinct push URL must check SSH user
+  it("ユーザーなし GitHub SCP の push URL で SSH 設定が非 git ユーザーを返す場合は NG（Finding 3）", async () => {
+    const r = passingRunner();
+    // fetch URL has explicit git@ user; push URL is the userless SCP form (different from fetch URL)
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "github.com:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "github.com"], { code: 0, stdout: "hostname github.com\nuser root\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("ユーザー"))).toBe(true);
+  });
+
+  it("ユーザーなし GitHub SCP の push URL で SSH 設定が git ユーザーを返す場合はエラーなし（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "github.com:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("ユーザー"))).toEqual([]);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),
@@ -1287,5 +1344,14 @@ describe("normalizeRemote", () => {
 
   it("ユーザーなし SSH URL は正規化する（Finding 2: userless SSH URL ok）", () => {
     expect(normalizeRemote("ssh://github.com/owner/name.git")).toBe("owner/name");
+  });
+
+  // Finding 1 (current iteration): SSH URLs with a password component must be rejected
+  it("パスワード付き SSH URL は null を返す（Finding 1: SSH URL password rejection）", () => {
+    expect(normalizeRemote("ssh://git:secret@github.com/owner/name.git")).toBeNull();
+  });
+
+  it("ユーザーのみ（パスワードなし）SSH URL は正規化する（Finding 1: no password ok）", () => {
+    expect(normalizeRemote("ssh://git@github.com/owner/name.git")).toBe("owner/name");
   });
 });

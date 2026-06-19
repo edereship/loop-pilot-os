@@ -163,6 +163,10 @@ export function normalizeRemote(url: string): string | null {
     if (parsed.protocol === "ssh:" && parsed.username !== "" && parsed.username.toLowerCase() !== "git") {
       return null;
     }
+    // Reject SSH URLs with a password — embedded passwords in git remote URLs are never valid credentials.
+    if (parsed.protocol === "ssh:" && parsed.password !== "") {
+      return null;
+    }
     const path = parsed.pathname.replace(/^\//, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   } catch {
@@ -210,6 +214,26 @@ function isLikelyRealDomain(host: string): boolean {
 // hosts and must not be accepted as SSH config aliases.
 function isIPv4Address(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+// Returns extra args to pass to ssh when core.sshCommand is configured (e.g. ["-F", "/path/config"]).
+// Falls back to [] when unset or when the command is not recognisably ssh.
+async function getGitSshArgs(
+  runner: CommandRunner,
+  repoPath: string,
+  opts: { cwd: string },
+): Promise<string[]> {
+  try {
+    const r = await runner.run("git", ["-C", repoPath, "config", "--get", "core.sshCommand"], opts);
+    if (r.code !== 0 || !r.stdout.trim()) return [];
+    const parts = r.stdout.trim().split(/\s+/);
+    const bin = parts[0];
+    // Only pass through extra args when the configured binary is ssh or an absolute path to ssh.
+    if (bin !== "ssh" && !bin.endsWith("/ssh")) return [];
+    return parts.slice(1);
+  } catch {
+    return [];
+  }
 }
 
 async function checkOriginMatchesRemote(
@@ -260,7 +284,8 @@ async function checkOriginMatchesRemote(
             let fetchAliasToGitHub = false;
             try {
               const sshTarget = fetchUser ? `${fetchUser}@${fetchHost}` : fetchHost;
-              const sshG = await runner.run("ssh", ["-G", sshTarget], opts);
+              const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
+              const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
               if (sshG.code === 0) {
                 const sshGLines = sshG.stdout.split("\n");
                 const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
@@ -373,6 +398,32 @@ async function checkOriginMatchesRemote(
               } catch {
                 // Not a parseable scheme URL — normalizeRemote accepted it via another branch.
               }
+              // Finding 3: userless SCP push URL directly naming a GitHub host (e.g. github.com:owner/name.git).
+              // new URL() does not parse it as an ssh: URL, so the block above does not apply.
+              // OpenSSH defaults to the OS user when no User is specified; verify via ssh -G.
+              const _pUlScpRaw = pushUrl.trim().match(/^(?:([^@/:]+)@)?([^/:]+):(.+)$/);
+              if (_pUlScpRaw && !_pUlScpRaw[3].startsWith("//")) {
+                const _pUlUser = _pUlScpRaw[1];
+                const _pUlHost = _pUlScpRaw[2].toLowerCase();
+                if (_pUlUser === undefined && GITHUB_HOSTS.has(_pUlHost) && _pUlHost !== "ssh.github.com") {
+                  let sshUserOk = false;
+                  try {
+                    const sshG = await runner.run("ssh", ["-G", _pUlHost], opts);
+                    if (sshG.code === 0) {
+                      const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
+                      sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
+                    }
+                  } catch {
+                    // ssh unavailable — conservatively reject.
+                  }
+                  if (!sshUserOk) {
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) は SSH ユーザーが指定されていません。` +
+                        "GitHub SSH は 'git' ユーザーを要求します（git@github.com:... 形式を使用するか、SSH config に 'User git' を設定してください）",
+                    );
+                  }
+                }
+              }
             }
           } else {
             const trimmedPush = pushUrl.trim();
@@ -398,7 +449,8 @@ async function checkOriginMatchesRemote(
                   let pushAliasToGitHub = false;
                   try {
                     const sshTarget = pushUser ? `${pushUser}@${pushHost}` : pushHost;
-                    const sshG = await runner.run("ssh", ["-G", sshTarget], opts);
+                    const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
+                    const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
                     if (sshG.code === 0) {
                       const sshGLines = sshG.stdout.split("\n");
                       const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
