@@ -125,9 +125,11 @@ cp looppilot-os.example.toml looppilot-os.toml
 API キー・Webhook は**ファイルに書かず**環境変数で渡します。
 
 ```bash
-export LINEAR_API_KEY="lin_api_..."      # 必須
+export LINEAR_API_KEY="lin_api_..."      # 必須（書き込み可能なキー）
 export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."  # 任意
 ```
+
+> **注意**: `LINEAR_API_KEY` にはチケットの状態遷移（In Progress / In Review / Done）を行うため**書き込み可能な API キー**が必要です。Linear の個人 API キーはユーザー権限を継承するため通常は問題ありませんが、OAuth トークンで read-only スコープに絞っている場合は状態遷移時に失敗します。
 
 `SLACK_WEBHOOK_URL` 未設定時は**コンソール通知のみ**（コンソールは常時オン）。設定時はプリフライトで Webhook へ直接 POST して到達性を検証します（非 2xx ならプリフライト失敗）。
 
@@ -140,7 +142,7 @@ export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."  # 任意
 3. `gh auth status` 成功 ∧ リポへの push 権限あり ∧ **デフォルトブランチを単独マージ可能**（必須レビュー > 0 やマージ制限があると NG — ループに人間レビュアーが不在のため）
 4. `gate_label`（`loop-pilot`）が対象リポのラベルに存在（大小無視）
 5. Actions 変数 `LOOPPILOT_AUTO_MERGE` が未設定 or `false`（**オーケが唯一のマージャー**）
-6. Linear: API キーで viewer 取得 ∧ team・project・4 状態・opt_in_label が解決できる
+6. Linear: API キーで viewer 取得 ∧ team・project・4 状態・opt_in_label が解決できる（※ read クエリのみで検証。書き込み権限の有無は検証しません — 無副作用で照会する手段が Linear API に存在しないため）
 7. `claude --version` 成功
 8. state-comment 著者の整合: リポの `LOOPPILOT_STATE_COMMENT_AUTHORS`（未設定なら既定 `github-actions[bot]`）が `looppilot.state_comment_authors` に包含される（不整合だと Monitor が信頼コメントを発見できず `monitor_never_engaged` で全停止するため）
 9. Slack 設定時は Webhook へ直接 POST して到達性確認
