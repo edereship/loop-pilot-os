@@ -240,6 +240,7 @@ function splitShellArgs(cmd: string): string[] {
     } else {
       if (c === "'") inSingle = true;
       else if (c === '"') inDouble = true;
+      else if (c === "\\" && i + 1 < cmd.length) { i++; current += cmd[i]; }
       else if (/\s/.test(c)) {
         if (current.length > 0) { args.push(current); current = ""; }
       } else current += c;
@@ -249,34 +250,69 @@ function splitShellArgs(cmd: string): string[] {
   return args;
 }
 
-// Returns extra args to pass to ssh when a custom SSH command is configured (e.g. ["-F", "/path/config"]).
+// Returns the SSH binary and extra args to pass when resolving aliases via ssh -G.
 // Git's SSH command selection order: GIT_SSH_COMMAND env var > core.sshCommand git config > GIT_SSH env var.
-// GIT_SSH only names a binary with no extra args, so it contributes no args here.
-// Falls back to [] when unset or when the command is not recognisably ssh.
-async function getGitSshArgs(
+// GIT_SSH names only a binary (no extra args); it is used as the SSH executable so that wrapper
+// scripts which exec OpenSSH with custom options honour those options during alias resolution.
+async function getGitSshConfig(
   runner: CommandRunner,
   repoPath: string,
   opts: { cwd: string },
-): Promise<string[]> {
+): Promise<{ sshBin: string; extraArgs: string[] }> {
   // GIT_SSH_COMMAND takes precedence over core.sshCommand.
   const envCmd = process.env.GIT_SSH_COMMAND;
   if (envCmd && envCmd.trim()) {
     const parts = splitShellArgs(envCmd.trim());
     const bin = parts[0];
-    if (bin !== "ssh" && !bin.endsWith("/ssh")) return [];
-    return parts.slice(1);
+    if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: "ssh", extraArgs: [] };
+    return { sshBin: bin, extraArgs: parts.slice(1) };
   }
   try {
     const r = await runner.run("git", ["-C", repoPath, "config", "--get", "core.sshCommand"], opts);
-    if (r.code !== 0 || !r.stdout.trim()) return [];
-    const parts = splitShellArgs(r.stdout.trim());
-    const bin = parts[0];
-    // Only pass through extra args when the configured binary is ssh or an absolute path to ssh.
-    if (bin !== "ssh" && !bin.endsWith("/ssh")) return [];
-    return parts.slice(1);
+    if (r.code === 0 && r.stdout.trim()) {
+      const parts = splitShellArgs(r.stdout.trim());
+      const bin = parts[0];
+      // Only pass through extra args when the configured binary is ssh or an absolute path to ssh.
+      if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: "ssh", extraArgs: [] };
+      return { sshBin: bin, extraArgs: parts.slice(1) };
+    }
   } catch {
-    return [];
+    // Fall through to GIT_SSH check.
   }
+  // GIT_SSH names a binary with no extra args. Use it directly so that simple wrappers that
+  // exec OpenSSH (e.g. exec ssh -F /custom/config "$@") pass those options to ssh -G.
+  const gitSshEnv = process.env.GIT_SSH;
+  if (gitSshEnv && gitSshEnv.trim()) {
+    return { sshBin: gitSshEnv.trim(), extraArgs: [] };
+  }
+  return { sshBin: "ssh", extraArgs: [] };
+}
+
+// For SCP-format (e.g. git@github.com:path) or ssh:// URLs that name a GitHub host directly,
+// return the ssh -G target string and expected hostname so callers can verify SSH config hasn't
+// redirected the host to a different server. Returns null for HTTPS or non-GitHub hosts.
+function extractDirectGitHubSshTarget(trimmed: string): { target: string; expectedHost: string } | null {
+  // SCP format: [user@]host:path — ssh.github.com cannot be expressed without a port in SCP so reject it.
+  const scpM = trimmed.match(/^(?:([^@/:]+)@)?([^/:]+):(.+)$/);
+  if (scpM && !scpM[3].startsWith("//")) {
+    const user = scpM[1];
+    const host = scpM[2].toLowerCase();
+    if (GITHUB_HOSTS.has(host) && host !== "ssh.github.com") {
+      return { target: user ? `${user}@${host}` : host, expectedHost: host };
+    }
+    return null;
+  }
+  // ssh:// URL
+  try {
+    const p = new URL(trimmed);
+    if (p.protocol === "ssh:" && GITHUB_HOSTS.has(p.hostname.toLowerCase())) {
+      const host = p.hostname.toLowerCase();
+      return { target: p.username ? `${p.username}@${host}` : host, expectedHost: host };
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 async function checkOriginMatchesRemote(
@@ -288,6 +324,7 @@ async function checkOriginMatchesRemote(
 ): Promise<void> {
   try {
     const expected = repoSlug.toLowerCase();
+    const gitSshCfg = await getGitSshConfig(runner, repoPath, opts);
 
     const fetchR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "origin"], opts);
     if (fetchR.code !== 0) {
@@ -301,6 +338,26 @@ async function checkOriginMatchesRemote(
         errors.push(
           `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
         );
+      } else {
+        // Finding 3: for SSH/SCP URLs that name a GitHub host directly, verify SSH config hasn't
+        // redirected the host via HostName to a different server. Fail-open if ssh is unavailable.
+        const directSsh = extractDirectGitHubSshTarget(fetchUrl.trim());
+        if (directSsh !== null) {
+          try {
+            const sshG3 = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", directSsh.target], opts);
+            if (sshG3.code === 0) {
+              const hl3 = sshG3.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
+              const resolvedHost3 = hl3 ? hl3.slice("hostname ".length).trim().toLowerCase() : null;
+              if (resolvedHost3 !== null && resolvedHost3 !== directSsh.expectedHost) {
+                errors.push(
+                  `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
+              }
+            }
+          } catch {
+            // ssh not available — fail-open
+          }
+        }
       }
     } else {
       // normalizeRemote returned null — classify to determine the right action.
@@ -327,8 +384,7 @@ async function checkOriginMatchesRemote(
             let fetchAliasToGitHub = false;
             try {
               const sshTarget = fetchUser ? `${fetchUser}@${fetchHost}` : fetchHost;
-              const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
-              const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
+              const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
               if (sshG.code === 0) {
                 const sshGLines = sshG.stdout.split("\n");
                 const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
@@ -386,13 +442,18 @@ async function checkOriginMatchesRemote(
               errors.push(
                 `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
               );
+            } else if (parsedFetch.password !== "" || parsedFetch.search !== "" || parsedFetch.hash !== "") {
+              // Extra URL components (password, query string, fragment) are not valid for SSH alias
+              // fetch URLs. Git never uses them for remote access, but they could carry credentials.
+              errors.push(
+                `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
             } else {
               let fetchAliasToGitHub = false;
               try {
                 const sshAlias = parsedFetch.hostname.toLowerCase();
                 const sshTarget = urlUser ? `${urlUser}@${sshAlias}` : sshAlias;
-                const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
-                const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
+                const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
                 if (sshG.code === 0) {
                   const sshGLines = sshG.stdout.split("\n");
                   const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
@@ -482,8 +543,7 @@ async function checkOriginMatchesRemote(
                 if (pp.protocol === "ssh:" && pp.username === "" && GITHUB_HOSTS.has(pp.hostname.toLowerCase())) {
                   let sshUserOk = false;
                   try {
-                    const pUrlSshArgs = await getGitSshArgs(runner, repoPath, opts);
-                    const sshG = await runner.run("ssh", [...pUrlSshArgs, "-G", pp.hostname], opts);
+                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", pp.hostname], opts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
                       sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
@@ -511,8 +571,7 @@ async function checkOriginMatchesRemote(
                 if (_pUlUser === undefined && GITHUB_HOSTS.has(_pUlHost) && _pUlHost !== "ssh.github.com") {
                   let sshUserOk = false;
                   try {
-                    const pScpSshArgs = await getGitSshArgs(runner, repoPath, opts);
-                    const sshG = await runner.run("ssh", [...pScpSshArgs, "-G", _pUlHost], opts);
+                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", _pUlHost], opts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
                       sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
@@ -526,6 +585,24 @@ async function checkOriginMatchesRemote(
                         "GitHub SSH は 'git' ユーザーを要求します（git@github.com:... 形式を使用するか、SSH config に 'User git' を設定してください）",
                     );
                   }
+                }
+              }
+              // Finding 3: verify direct GitHub SSH push URLs haven't been HostName-redirected by SSH config.
+              const directPushSsh = extractDirectGitHubSshTarget(pushUrl.trim());
+              if (directPushSsh !== null) {
+                try {
+                  const sshG3p = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", directPushSsh.target], opts);
+                  if (sshG3p.code === 0) {
+                    const hl3p = sshG3p.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
+                    const resolvedHost3p = hl3p ? hl3p.slice("hostname ".length).trim().toLowerCase() : null;
+                    if (resolvedHost3p !== null && resolvedHost3p !== directPushSsh.expectedHost) {
+                      errors.push(
+                        `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                      );
+                    }
+                  }
+                } catch {
+                  // ssh not available — fail-open
                 }
               }
             }
@@ -553,8 +630,7 @@ async function checkOriginMatchesRemote(
                   let pushAliasToGitHub = false;
                   try {
                     const sshTarget = pushUser ? `${pushUser}@${pushHost}` : pushHost;
-                    const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
-                    const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
+                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
                     if (sshG.code === 0) {
                       const sshGLines = sshG.stdout.split("\n");
                       const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
@@ -610,13 +686,18 @@ async function checkOriginMatchesRemote(
                     errors.push(
                       `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                     );
+                  } else if (parsedPush.password !== "" || parsedPush.search !== "" || parsedPush.hash !== "") {
+                    // Extra URL components (password, query string, fragment) are not valid for SSH alias
+                    // push URLs. Git never uses them for remote access, but they could carry credentials.
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                    );
                   } else {
                     let pushAliasToGitHub = false;
                     try {
                       const sshAlias = parsedPush.hostname.toLowerCase();
                       const sshTarget = purlUser ? `${purlUser}@${sshAlias}` : sshAlias;
-                      const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
-                      const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
+                      const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
                       if (sshG.code === 0) {
                         const sshGLines = sshG.stdout.split("\n");
                         const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
