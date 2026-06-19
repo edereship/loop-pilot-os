@@ -148,12 +148,16 @@ export function normalizeRemote(url: string): string | null {
     }
     // Reject non-standard ports. Accepted explicit ports: ssh.github.com:443 (SSH-over-HTTPS)
     // and ssh:22 (standard SSH port not normalized by URL parser for the ssh: scheme).
+    // ssh.github.com on port 22 is explicitly rejected — that host only accepts SSH-over-HTTPS at 443.
     if (parsed.port !== "") {
       const isSshOverHttps =
         parsed.protocol === "ssh:" &&
         parsed.hostname.toLowerCase() === "ssh.github.com" &&
         parsed.port === "443";
-      const isDefaultSshPort = parsed.protocol === "ssh:" && parsed.port === "22";
+      const isDefaultSshPort =
+        parsed.protocol === "ssh:" &&
+        parsed.port === "22" &&
+        parsed.hostname.toLowerCase() !== "ssh.github.com";
       if (!isSshOverHttps && !isDefaultSshPort) return null;
     }
     // ssh.github.com is only valid with the ssh: protocol (SSH-over-HTTPS at port 443);
@@ -216,6 +220,35 @@ function isIPv4Address(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 }
 
+// Tokenize a shell command string, respecting single- and double-quoted segments.
+// Double-quoted segments support backslash-escape for the next character; single-quoted do not.
+// Used to parse GIT_SSH_COMMAND / core.sshCommand so that paths with spaces survive the split.
+function splitShellArgs(cmd: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (inSingle) {
+      if (c === "'") inSingle = false;
+      else current += c;
+    } else if (inDouble) {
+      if (c === '"') inDouble = false;
+      else if (c === "\\" && i + 1 < cmd.length) { i++; current += cmd[i]; }
+      else current += c;
+    } else {
+      if (c === "'") inSingle = true;
+      else if (c === '"') inDouble = true;
+      else if (/\s/.test(c)) {
+        if (current.length > 0) { args.push(current); current = ""; }
+      } else current += c;
+    }
+  }
+  if (current.length > 0) args.push(current);
+  return args;
+}
+
 // Returns extra args to pass to ssh when a custom SSH command is configured (e.g. ["-F", "/path/config"]).
 // Git's SSH command selection order: GIT_SSH_COMMAND env var > core.sshCommand git config > GIT_SSH env var.
 // GIT_SSH only names a binary with no extra args, so it contributes no args here.
@@ -228,7 +261,7 @@ async function getGitSshArgs(
   // GIT_SSH_COMMAND takes precedence over core.sshCommand.
   const envCmd = process.env.GIT_SSH_COMMAND;
   if (envCmd && envCmd.trim()) {
-    const parts = envCmd.trim().split(/\s+/);
+    const parts = splitShellArgs(envCmd.trim());
     const bin = parts[0];
     if (bin !== "ssh" && !bin.endsWith("/ssh")) return [];
     return parts.slice(1);
@@ -236,7 +269,7 @@ async function getGitSshArgs(
   try {
     const r = await runner.run("git", ["-C", repoPath, "config", "--get", "core.sshCommand"], opts);
     if (r.code !== 0 || !r.stdout.trim()) return [];
-    const parts = r.stdout.trim().split(/\s+/);
+    const parts = splitShellArgs(r.stdout.trim());
     const bin = parts[0];
     // Only pass through extra args when the configured binary is ssh or an absolute path to ssh.
     if (bin !== "ssh" && !bin.endsWith("/ssh")) return [];
@@ -369,10 +402,12 @@ async function checkOriginMatchesRemote(
                   const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
                   const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
                   const userOk = resolvedUser === "git";
+                  // An explicit port in the URL overrides the SSH config default port.
+                  const effectivePort = parsedFetch.port !== "" ? parsedFetch.port : resolvedPort;
                   if (resolvedHost === "github.com") {
-                    fetchAliasToGitHub = (resolvedPort === "22" || resolvedPort === null) && userOk;
+                    fetchAliasToGitHub = (effectivePort === "22" || effectivePort === null) && userOk;
                   } else if (resolvedHost === "ssh.github.com") {
-                    fetchAliasToGitHub = resolvedPort === "443" && userOk;
+                    fetchAliasToGitHub = effectivePort === "443" && userOk;
                   }
                 }
               } catch {
@@ -591,10 +626,12 @@ async function checkOriginMatchesRemote(
                         const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
                         const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
                         const userOk = resolvedUser === "git";
+                        // An explicit port in the URL overrides the SSH config default port.
+                        const effectivePort = parsedPush.port !== "" ? parsedPush.port : resolvedPort;
                         if (resolvedHost === "github.com") {
-                          pushAliasToGitHub = (resolvedPort === "22" || resolvedPort === null) && userOk;
+                          pushAliasToGitHub = (effectivePort === "22" || effectivePort === null) && userOk;
                         } else if (resolvedHost === "ssh.github.com") {
-                          pushAliasToGitHub = resolvedPort === "443" && userOk;
+                          pushAliasToGitHub = effectivePort === "443" && userOk;
                         }
                       }
                     } catch {
@@ -633,6 +670,8 @@ async function checkOriginMatchesRemote(
           }
         }
       }
+    } else {
+      errors.push(`git: origin の push URL を取得できません（${pushR.stderr.trim()}）`);
     }
   } catch (e) {
     errors.push(`git: origin 一致確認に失敗しました（${(e as Error).message}）`);

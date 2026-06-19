@@ -1268,6 +1268,78 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("ブランチルールセットを取得できません"))).toBe(true);
     expect(errors.length).toBeGreaterThanOrEqual(1);
   });
+
+  // Finding 1 (current iteration): ssh.github.com:22 via URL must be rejected
+  it("ssh://git@ssh.github.com:22 の fetch URL は NG（Finding 1: ssh.github.com port 22 rejection）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@ssh.github.com:22/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@ssh.github.com:22/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("ssh://git@ssh.github.com:22 の push URL は NG（Finding 1: ssh.github.com port 22 push rejection）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@ssh.github.com:22/owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 2 (current iteration): quoted path in core.sshCommand must be preserved
+  it("core.sshCommand のパスにスペースが含まれる場合は引用符を正しく解析する（Finding 2: quoted SSH args）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: 'ssh -F "/Users/me/ssh config"\n', stderr: "" });
+    r.on(["ssh", "-F", "/Users/me/ssh config", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("GIT_SSH_COMMAND のパスにスペースが含まれる場合は引用符を正しく解析する（Finding 2: quoted GIT_SSH_COMMAND args）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-F", "/Users/me/ssh config", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = 'ssh -F "/Users/me/ssh config"';
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  // Finding 3 (current iteration): push URL lookup failure must fail closed
+  it("push URL 取得が失敗したら fail-closed でエラーになる（Finding 3: push URL lookup failure）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 2, stdout: "", stderr: "fatal: No such remote 'origin'" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("取得できません"))).toBe(true);
+  });
+
+  // Finding 4 (current iteration): explicit port in ssh:// alias URL must be honoured
+  it("ssh:// alias に明示ポートがある場合そのポートで検証する（Finding 4: explicit port fetch URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
+    // ssh -G says github.com:22, but URL specifies port 2222 — must reject
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("push URL の ssh:// alias に明示ポートがある場合そのポートで検証する（Finding 4: explicit port push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
+    // ssh -G says github.com:22, but URL specifies port 2222 — must reject
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
 });
 
 describe("normalizeRemote", () => {
@@ -1330,6 +1402,10 @@ describe("normalizeRemote", () => {
   it("ポートなし ssh.github.com SSH URL は null を返す（Finding 1: port 443 必須）", () => {
     // ssh.github.com on port 22 (the SSH default) is not a valid git endpoint.
     expect(normalizeRemote("ssh://git@ssh.github.com/owner/name.git")).toBeNull();
+  });
+
+  it("ssh.github.com:22 の SSH URL は null を返す（Finding 1: ssh.github.com port 22 rejection）", () => {
+    expect(normalizeRemote("ssh://git@ssh.github.com:22/owner/name.git")).toBeNull();
   });
 
   it("非 GitHub SSH URL (bitbucket) は null を返す", () => {
