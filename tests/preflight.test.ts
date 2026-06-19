@@ -1806,6 +1806,85 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
+
+  // Finding 1 (iteration 10): origin URL comparison runs before remote reachability probe
+  it("checkOriginMatchesRemote は checkRemote より前に実行される（Finding 1 iteration 10）", async () => {
+    const r = passingRunner();
+    // origin points at a different repo — mismatch should be detected
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com:owner/other.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+    // Verify that the origin URL check was invoked (get-url) before the remote probe (ls-remote)
+    const getUrlIdx = r.calls.findIndex((c) => c.args.includes("get-url"));
+    const lsRemoteIdx = r.calls.findIndex((c) => c.args.includes("ls-remote"));
+    expect(getUrlIdx).toBeLessThan(lsRemoteIdx);
+  });
+
+  // Finding 2 (iteration 10): custom SSH command + ssh -G failure must fail closed
+  it("カスタム SSH コマンド使用時に ssh -G が失敗すると fail-closed（Finding 2 iteration 10: custom SSH fail closed）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "/custom/ssh-wrapper\n", stderr: "" });
+    // ssh -G probe fails (non-zero exit)
+    r.on(["/custom/ssh-wrapper", "-G", "git@github.com"], { code: 1, stdout: "", stderr: "error" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("カスタム SSH コマンド使用時に ssh -G が hostname を返さないと fail-closed（Finding 2 iteration 10: missing hostname）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "/custom/ssh-wrapper\n", stderr: "" });
+    // ssh -G succeeds but omits hostname
+    r.on(["/custom/ssh-wrapper", "-G", "git@github.com"], { code: 0, stdout: "user git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("カスタム SSH コマンド使用時に push URL の ssh -G が失敗すると fail-closed（Finding 2 iteration 10: push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "/custom/ssh-wrapper\n", stderr: "" });
+    r.on(["/custom/ssh-wrapper", "-G", "git@github.com"], { code: 1, stdout: "", stderr: "error" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("デフォルト ssh 使用時に ssh -G が失敗しても fail-open のまま（Finding 2 iteration 10: default ssh fail-open）", async () => {
+    const r = passingRunner();
+    // No custom SSH command — default ssh
+    // ssh -G throws because no stub exists → catch fires → fail-open (isCustomSsh = false)
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors).toEqual([]);
+  });
+
+  // Finding 3 (iteration 10): resolved SSH user must be compared case-sensitively
+  it("ssh -G で大文字 Git ユーザーに解決される場合は NG（Finding 3 iteration 10: case-sensitive user）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    // SSH config resolves to user "Git" (capital G) — must be rejected
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser Git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
+  });
+
+  it("ssh -G で大文字 GIT ユーザーに解決される push URL は NG（Finding 3 iteration 10: case-sensitive push user）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser GIT\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("直接 GitHub SSH URL で ssh -G が大文字 Git ユーザーを返す場合は NG（Finding 3 iteration 10: direct URL case user）", async () => {
+    const r = passingRunner();
+    // Direct GitHub SSH URL — ssh -G resolves user to "Git" (capital G)
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser Git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
+  });
 });
 
 describe("normalizeRemote", () => {

@@ -45,8 +45,8 @@ export async function runPreflight(deps: PreflightDeps): Promise<string[]> {
 
   // カーネル §9: 全項目を実行して集約。各 check 内で try/catch し、途中 throw しない。
   await checkGitClean(runner, repoPath, branch, opts, errors);          // §9.2
-  await checkRemote(runner, repoPath, opts, errors);                   // §9.3（Step 4b で追加）
   await checkOriginMatchesRemote(runner, repoPath, repoSlug, opts, errors); // ES-415
+  await checkRemote(runner, repoPath, opts, errors);                   // §9.3（Step 4b で追加）
   await checkGhAuth(runner, opts, errors);                             // §9.4 認証（Step 4b で追加）
   await checkPushPermission(runner, repoSlug, opts, errors);           // §9.4 push 権限（Step 4b で追加）
   await checkBranchProtection(runner, repoSlug, branch, opts, errors); // §9.4 保護（Step 5 で追加）
@@ -374,6 +374,7 @@ async function checkOriginMatchesRemote(
   try {
     const expected = repoSlug.toLowerCase();
     const gitSshCfg = await getGitSshConfig(runner, repoPath, opts);
+    const isCustomSsh = gitSshCfg.sshBin !== "ssh" || gitSshCfg.extraArgs.length > 0;
 
     const fetchR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "origin"], opts);
     if (fetchR.code !== 0) {
@@ -407,7 +408,7 @@ async function checkOriginMatchesRemote(
               const pl3 = lines3.find((l) => l.toLowerCase().startsWith("port "));
               const resolvedPort3 = pl3 ? pl3.slice("port ".length).trim() : null;
               const ul3 = lines3.find((l) => l.toLowerCase().startsWith("user "));
-              const resolvedUser3 = ul3 ? ul3.slice("user ".length).trim().toLowerCase() : null;
+              const resolvedUser3 = ul3 ? ul3.slice("user ".length).trim() : null;
               if (resolvedHost3 !== null && resolvedHost3 !== directSsh.expectedHost) {
                 // Allow the documented GitHub SSH-over-HTTPS setup where github.com is mapped
                 // to ssh.github.com at port 443 via SSH config HostName/Port directives.
@@ -438,9 +439,22 @@ async function checkOriginMatchesRemote(
                   `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
               }
+              if (isCustomSsh && (resolvedHost3 === null || resolvedUser3 === null)) {
+                errors.push(
+                  `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
+              }
+            } else if (isCustomSsh) {
+              errors.push(
+                `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
             }
           } catch {
-            // ssh not available — fail-open
+            if (isCustomSsh) {
+              errors.push(
+                `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
+            }
           }
         }
       }
@@ -484,7 +498,7 @@ async function checkOriginMatchesRemote(
                 const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                 const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                 const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
-                const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
+                const resolvedUser = ul ? ul.slice("user ".length).trim() : null;
                 // GitHub SSH only accepts user 'git'; reject aliases resolving to any other user.
                 const userOk = resolvedUser === "git";
                 // Accept github.com on port 22 (standard SSH) or ssh.github.com on port 443
@@ -559,7 +573,7 @@ async function checkOriginMatchesRemote(
                   const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                   const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                   const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
-                  const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
+                  const resolvedUser = ul ? ul.slice("user ".length).trim() : null;
                   const userOk = resolvedUser === "git";
                   // Trust the port reported by ssh -G; the URL port was already passed via -p so
                   // ssh selects the correct Host block and reports the effective port directly.
@@ -644,7 +658,7 @@ async function checkOriginMatchesRemote(
                     const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", pp.hostname], opts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
-                      sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
+                      sshUserOk = ul ? ul.slice("user ".length).trim() === "git" : false;
                     }
                   } catch {
                     // ssh not available — fall through to reject.
@@ -672,7 +686,7 @@ async function checkOriginMatchesRemote(
                     const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", _pUlHost], opts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
-                      sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
+                      sshUserOk = ul ? ul.slice("user ".length).trim() === "git" : false;
                     }
                   } catch {
                     // ssh unavailable — conservatively reject.
@@ -701,7 +715,7 @@ async function checkOriginMatchesRemote(
                     const pl3p = lines3p.find((l) => l.toLowerCase().startsWith("port "));
                     const resolvedPort3p = pl3p ? pl3p.slice("port ".length).trim() : null;
                     const ul3p = lines3p.find((l) => l.toLowerCase().startsWith("user "));
-                    const resolvedUser3p = ul3p ? ul3p.slice("user ".length).trim().toLowerCase() : null;
+                    const resolvedUser3p = ul3p ? ul3p.slice("user ".length).trim() : null;
                     if (resolvedHost3p !== null && resolvedHost3p !== directPushSsh.expectedHost) {
                       // Allow the documented GitHub SSH-over-HTTPS setup where github.com is mapped
                       // to ssh.github.com at port 443 via SSH config HostName/Port directives.
@@ -732,9 +746,22 @@ async function checkOriginMatchesRemote(
                         `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                       );
                     }
+                    if (isCustomSsh && (resolvedHost3p === null || resolvedUser3p === null)) {
+                      errors.push(
+                        `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                      );
+                    }
+                  } else if (isCustomSsh) {
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                    );
                   }
                 } catch {
-                  // ssh not available — fail-open
+                  if (isCustomSsh) {
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                    );
+                  }
                 }
               }
             }
@@ -776,7 +803,7 @@ async function checkOriginMatchesRemote(
                       const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                       const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                       const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
-                      const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
+                      const resolvedUser = ul ? ul.slice("user ".length).trim() : null;
                       // GitHub SSH only accepts user 'git'; reject aliases resolving to any other user.
                       const userOk = resolvedUser === "git";
                       // Accept github.com on port 22 (standard SSH) or ssh.github.com on port 443
@@ -848,7 +875,7 @@ async function checkOriginMatchesRemote(
                         const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                         const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                         const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
-                        const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
+                        const resolvedUser = ul ? ul.slice("user ".length).trim() : null;
                         const userOk = resolvedUser === "git";
                         // Trust the port reported by ssh -G; the URL port was already passed via -p.
                         if (resolvedHost === "github.com") {
