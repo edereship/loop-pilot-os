@@ -1545,22 +1545,22 @@ describe("runPreflight", () => {
     expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
 
-  // Finding 3 (iteration 6): explicit port in ssh.github.com:443 URL takes precedence over ssh -G default
-  it("ssh.github.com:443 URL で SSH 設定がデフォルトポート 22 を報告しても明示ポートを優先してエラーなし（Finding 3 iteration 6）", async () => {
+  // Finding 3 (iteration 6): explicit port in ssh.github.com:443 URL is passed to ssh -G as -p
+  it("ssh.github.com:443 URL の明示ポートを -p で ssh -G に渡してエラーなし（Finding 3 iteration 6）", async () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@ssh.github.com:443/owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@ssh.github.com:443/owner/name.git\n", stderr: "" });
-    // Without a matching Host block, ssh -G reports port 22 (the SSH default) for ssh.github.com.
-    r.on(["ssh", "-G", "git@ssh.github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 22\n", stderr: "" });
+    // ssh -G is now called with -p 443; command-line port takes precedence over any config Port directive.
+    r.on(["ssh", "-p", "443", "-G", "git@ssh.github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("origin") && e.includes("一致しません"))).toEqual([]);
   });
 
-  it("ssh.github.com:443 push URL で SSH 設定がデフォルトポート 22 を報告しても明示ポートを優先してエラーなし（Finding 3 iteration 6 push URL）", async () => {
+  it("ssh.github.com:443 push URL の明示ポートを -p で ssh -G に渡してエラーなし（Finding 3 iteration 6 push URL）", async () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@ssh.github.com:443/owner/name.git\n", stderr: "" });
-    r.on(["ssh", "-G", "git@ssh.github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 22\n", stderr: "" });
+    r.on(["ssh", "-p", "443", "-G", "git@ssh.github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
   });
@@ -1680,6 +1680,89 @@ describe("runPreflight", () => {
       if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
       else process.env.GIT_SSH_COMMAND = origEnv;
     }
+  });
+
+  // Finding 1 (iteration 8): single-quoted $VAR in GIT_SSH_COMMAND must not be expanded
+  it("GIT_SSH_COMMAND の単一引用符内 $HOME は展開しない（Finding 1 iteration 8: single-quoted vars not expanded）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    // Single-quoted '$HOME/cfg' must reach ssh as the literal string, not expanded.
+    r.on(["ssh", "-F", "$HOME/cfg", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "ssh -F '$HOME/cfg'";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  // Finding 2 (iteration 8): mixed-case GitHub hostname must be probed with original case
+  it("大文字 GitHub.com SCP URL を元のケースで ssh -G に渡す（Finding 2 iteration 8: host case preserved）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@GitHub.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@GitHub.com:owner/name.git\n", stderr: "" });
+    // Must be probed with the original mixed-case hostname so case-sensitive Host blocks are matched.
+    r.on(["ssh", "-G", "git@GitHub.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("大文字 GitHub.com SCP URL で SSH config がリダイレクトしている場合は NG（Finding 2 iteration 8: mixed-case host redirect detected）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@GitHub.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@GitHub.com:owner/name.git\n", stderr: "" });
+    // Host block for 'GitHub.com' (capital G) redirects to evil server; must be caught with original case.
+    r.on(["ssh", "-G", "git@GitHub.com"], { code: 0, stdout: "hostname evil.example.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3 (iteration 8): explicit URL port is passed to ssh -G to select the correct Host block
+  it("ssh://git@github.com:22 で SSH config が port 443 にリダイレクトしている場合は NG（Finding 3 iteration 8: port conflict）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@github.com:22/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@github.com:22/owner/name.git\n", stderr: "" });
+    // SSH config: Host github.com → HostName ssh.github.com, Port 443 (SSH-over-HTTPS).
+    // With -p 22 on the command line, SSH overrides the config Port, so effective port is 22.
+    r.on(["ssh", "-p", "22", "-G", "git@github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("push URL ssh://git@github.com:22 で SSH config が port 443 にリダイレクトしている場合は NG（Finding 3 iteration 8: port conflict push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@github.com:22/owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-p", "22", "-G", "git@github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 4 (iteration 8): SSH user override via GIT_SSH_COMMAND must be detected on direct URLs
+  it("直接 GitHub SSH URL で GIT_SSH_COMMAND が -l alice でユーザーを上書きしている場合は NG（Finding 4 iteration 8）", async () => {
+    const r = passingRunner();
+    // passingRunner origin: git@github.com:owner/name.git (direct GitHub SSH)
+    r.on(["ssh", "-l", "alice", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser alice\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "ssh -l alice";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  it("直接 GitHub SSH URL で GIT_SSH_COMMAND が git ユーザーを使用する場合はエラーなし（Finding 4 iteration 8: git user ok）", async () => {
+    const r = passingRunner();
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
   });
 });
 

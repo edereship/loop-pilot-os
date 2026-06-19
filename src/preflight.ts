@@ -220,9 +220,17 @@ function isIPv4Address(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 }
 
+// Sentinel used inside splitShellArgs to protect dollar signs that appeared inside
+// single-quoted segments from variable expansion in expandShellWord. Single-quoted
+// strings in shell never undergo $VAR substitution; this sentinel lets expandEnvVars
+// skip them while expandShellWord restores the literal '$' afterward.
+const SINGLE_QUOTE_DOLLAR = "\x01";
+
 // Tokenize a shell command string, respecting single- and double-quoted segments.
 // Double-quoted segments support backslash-escape for the next character; single-quoted do not.
 // Used to parse GIT_SSH_COMMAND / core.sshCommand so that paths with spaces survive the split.
+// Dollar signs inside single-quoted segments are replaced with SINGLE_QUOTE_DOLLAR so that
+// subsequent expandShellWord calls do not expand them.
 function splitShellArgs(cmd: string): string[] {
   const args: string[] = [];
   let current = "";
@@ -232,6 +240,7 @@ function splitShellArgs(cmd: string): string[] {
     const c = cmd[i];
     if (inSingle) {
       if (c === "'") inSingle = false;
+      else if (c === "$") current += SINGLE_QUOTE_DOLLAR; // single quotes suppress $VAR expansion
       else current += c;
     } else if (inDouble) {
       if (c === '"') inDouble = false;
@@ -268,6 +277,9 @@ function expandEnvVars(s: string): string {
 // Expand a single shell word: leading ~ / ~/ to HOME, then $VAR / ${VAR} references.
 // Git runs GIT_SSH_COMMAND and core.sshCommand through the shell, so both tilde and
 // variable expansion happen before the command reaches the SSH binary.
+// SINGLE_QUOTE_DOLLAR sentinels (written by splitShellArgs for '$' inside single-quoted
+// segments) survive expandEnvVars unchanged and are restored to '$' here so callers
+// receive the correct literal value without variable substitution.
 function expandShellWord(s: string): string {
   const home = process.env.HOME;
   let result = s;
@@ -275,7 +287,8 @@ function expandShellWord(s: string): string {
     if (result === "~") result = home;
     else if (result.startsWith("~/")) result = home + result.slice(1);
   }
-  return expandEnvVars(result);
+  result = expandEnvVars(result);
+  return result.replace(/\x01/g, "$");
 }
 
 // Returns the SSH binary and extra args to pass when resolving aliases via ssh -G.
@@ -328,9 +341,10 @@ function extractDirectGitHubSshTarget(
   const scpM = trimmed.match(/^(?:([^@/:]+)@)?([^/:]+):(.+)$/);
   if (scpM && !scpM[3].startsWith("//")) {
     const user = scpM[1];
-    const host = scpM[2].toLowerCase();
+    const rawHost = scpM[2]; // preserve original case for ssh -G target (OpenSSH Host matching is case-sensitive)
+    const host = rawHost.toLowerCase();
     if (GITHUB_HOSTS.has(host) && host !== "ssh.github.com") {
-      return { target: user ? `${user}@${host}` : host, expectedHost: host, explicitPort: null };
+      return { target: user ? `${user}@${rawHost}` : rawHost, expectedHost: host, explicitPort: null };
     }
     return null;
   }
@@ -338,10 +352,11 @@ function extractDirectGitHubSshTarget(
   try {
     const p = new URL(trimmed);
     if (p.protocol === "ssh:" && GITHUB_HOSTS.has(p.hostname.toLowerCase())) {
-      const host = p.hostname.toLowerCase();
-      // Preserve the URL's explicit port so callers can prefer it over the SSH-reported default
-      // (ssh -G without -p reports port 22 when there is no matching Host block in SSH config).
-      return { target: p.username ? `${p.username}@${host}` : host, expectedHost: host, explicitPort: p.port || null };
+      const rawHost = p.hostname; // preserve original case for ssh -G target
+      const host = rawHost.toLowerCase();
+      // Pass the URL's explicit port via -p to ssh -G so that the correct Host block is selected
+      // (ssh -G without -p selects the default-port block, which may differ from the URL port).
+      return { target: p.username ? `${p.username}@${rawHost}` : rawHost, expectedHost: host, explicitPort: p.port || null };
     }
   } catch {
     // ignore
@@ -373,19 +388,26 @@ async function checkOriginMatchesRemote(
           `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
         );
       } else {
-        // Finding 3: for SSH/SCP URLs that name a GitHub host directly, verify SSH config hasn't
-        // redirected the host via HostName to a different server or remapped it to a non-standard
-        // port. Fail-open if ssh is unavailable.
+        // Finding 3 / Finding 4: for SSH/SCP URLs that name a GitHub host directly, verify SSH
+        // config hasn't redirected the host via HostName to a different server, remapped it to a
+        // non-standard port, or overridden the user to a non-git account. Fail-open if ssh is
+        // unavailable.
         const directSsh = extractDirectGitHubSshTarget(fetchUrl.trim());
         if (directSsh !== null) {
           try {
-            const sshG3 = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", directSsh.target], opts);
+            // Pass the URL's explicit port to ssh -G so it selects the Host block that Git will
+            // actually use. Without -p, ssh -G uses the default-port block, which may differ when
+            // the URL carries an explicit non-default port.
+            const portArgs3 = directSsh.explicitPort ? ["-p", directSsh.explicitPort] : [];
+            const sshG3 = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgs3, "-G", directSsh.target], opts);
             if (sshG3.code === 0) {
               const lines3 = sshG3.stdout.split("\n");
               const hl3 = lines3.find((l) => l.toLowerCase().startsWith("hostname "));
               const resolvedHost3 = hl3 ? hl3.slice("hostname ".length).trim().toLowerCase() : null;
               const pl3 = lines3.find((l) => l.toLowerCase().startsWith("port "));
               const resolvedPort3 = pl3 ? pl3.slice("port ".length).trim() : null;
+              const ul3 = lines3.find((l) => l.toLowerCase().startsWith("user "));
+              const resolvedUser3 = ul3 ? ul3.slice("user ".length).trim().toLowerCase() : null;
               if (resolvedHost3 !== null && resolvedHost3 !== directSsh.expectedHost) {
                 // Allow the documented GitHub SSH-over-HTTPS setup where github.com is mapped
                 // to ssh.github.com at port 443 via SSH config HostName/Port directives.
@@ -400,15 +422,21 @@ async function checkOriginMatchesRemote(
                 }
               } else if (resolvedHost3 !== null && resolvedPort3 !== null) {
                 // github.com accepts only port 22; ssh.github.com accepts only port 443 (SSH-over-HTTPS).
+                // ssh -G was invoked with the URL's explicit port (if any), so resolvedPort3 already
+                // reflects the effective port — no need to override it with the URL port separately.
                 const expectedPort3 = directSsh.expectedHost === "ssh.github.com" ? "443" : "22";
-                // The URL's explicit port takes precedence over the SSH-config-reported port;
-                // ssh -G without -p reports port 22 when no Host block covers the target.
-                const effectivePort3 = directSsh.explicitPort ?? resolvedPort3;
-                if (effectivePort3 !== expectedPort3) {
+                if (resolvedPort3 !== expectedPort3) {
                   errors.push(
                     `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                   );
                 }
+              }
+              // Finding 4: SSH command options (e.g. GIT_SSH_COMMAND='ssh -l alice') can override
+              // the user in the URL target. GitHub only accepts user 'git'; reject any other.
+              if (resolvedUser3 !== null && resolvedUser3 !== "git") {
+                errors.push(
+                  `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
               }
             }
           } catch {
@@ -652,18 +680,23 @@ async function checkOriginMatchesRemote(
                   }
                 }
               }
-              // Finding 3: verify direct GitHub SSH push URLs haven't been HostName-redirected by SSH
-              // config or remapped to a non-standard port.
+              // Finding 3 / Finding 4: verify direct GitHub SSH push URLs haven't been
+              // HostName-redirected by SSH config, remapped to a non-standard port, or had their
+              // user overridden to a non-git account by SSH command options.
               const directPushSsh = extractDirectGitHubSshTarget(pushUrl.trim());
               if (directPushSsh !== null) {
                 try {
-                  const sshG3p = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", directPushSsh.target], opts);
+                  // Pass the URL's explicit port to ssh -G so the correct Host block is selected.
+                  const portArgs3p = directPushSsh.explicitPort ? ["-p", directPushSsh.explicitPort] : [];
+                  const sshG3p = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgs3p, "-G", directPushSsh.target], opts);
                   if (sshG3p.code === 0) {
                     const lines3p = sshG3p.stdout.split("\n");
                     const hl3p = lines3p.find((l) => l.toLowerCase().startsWith("hostname "));
                     const resolvedHost3p = hl3p ? hl3p.slice("hostname ".length).trim().toLowerCase() : null;
                     const pl3p = lines3p.find((l) => l.toLowerCase().startsWith("port "));
                     const resolvedPort3p = pl3p ? pl3p.slice("port ".length).trim() : null;
+                    const ul3p = lines3p.find((l) => l.toLowerCase().startsWith("user "));
+                    const resolvedUser3p = ul3p ? ul3p.slice("user ".length).trim().toLowerCase() : null;
                     if (resolvedHost3p !== null && resolvedHost3p !== directPushSsh.expectedHost) {
                       // Allow the documented GitHub SSH-over-HTTPS setup where github.com is mapped
                       // to ssh.github.com at port 443 via SSH config HostName/Port directives.
@@ -677,15 +710,22 @@ async function checkOriginMatchesRemote(
                         );
                       }
                     } else if (resolvedHost3p !== null && resolvedPort3p !== null) {
-                      // github.com accepts only port 22; ssh.github.com accepts only port 443 (SSH-over-HTTPS).
+                      // github.com accepts only port 22; ssh.github.com accepts only port 443.
+                      // ssh -G was called with the URL's explicit port, so resolvedPort3p already
+                      // reflects the effective port.
                       const expectedPort3p = directPushSsh.expectedHost === "ssh.github.com" ? "443" : "22";
-                      // The URL's explicit port takes precedence over the SSH-config-reported port.
-                      const effectivePort3p = directPushSsh.explicitPort ?? resolvedPort3p;
-                      if (effectivePort3p !== expectedPort3p) {
+                      if (resolvedPort3p !== expectedPort3p) {
                         errors.push(
                           `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                         );
                       }
+                    }
+                    // Finding 4: SSH command options can override the push URL user; GitHub only
+                    // accepts user 'git'.
+                    if (resolvedUser3p !== null && resolvedUser3p !== "git") {
+                      errors.push(
+                        `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                      );
                     }
                   }
                 } catch {
