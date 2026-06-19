@@ -250,6 +250,21 @@ function splitShellArgs(cmd: string): string[] {
   return args;
 }
 
+// Expand bare $VAR and ${VAR} references using process.env. Unrecognised names are left
+// as-is so that a missing variable causes an ssh invocation error (handled by callers) rather
+// than silently producing an empty path. Shell features beyond simple variable substitution
+// (backticks, $(...), arithmetic expansion) are intentionally not handled.
+function expandEnvVars(s: string): string {
+  return s.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (match, braced: string | undefined, simple: string | undefined) => {
+      const name = braced ?? simple ?? "";
+      const val = process.env[name];
+      return val !== undefined ? val : match;
+    },
+  );
+}
+
 // Returns the SSH binary and extra args to pass when resolving aliases via ssh -G.
 // Git's SSH command selection order: GIT_SSH_COMMAND env var > core.sshCommand git config > GIT_SSH env var.
 // GIT_SSH names only a binary (no extra args); it is used as the SSH executable so that wrapper
@@ -265,15 +280,23 @@ async function getGitSshConfig(
     const parts = splitShellArgs(envCmd.trim());
     const bin = parts[0];
     if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: "ssh", extraArgs: [] };
-    return { sshBin: bin, extraArgs: parts.slice(1) };
+    // Git executes GIT_SSH_COMMAND through the shell, so $HOME and ${VAR} references in
+    // the arguments are shell-expanded before the command reaches the SSH binary. We
+    // replicate that for simple variable references so paths like "$HOME/.ssh/config" resolve
+    // correctly when we invoke the binary directly for `ssh -G` alias checks.
+    return { sshBin: bin, extraArgs: parts.slice(1).map(expandEnvVars) };
   }
   try {
     const r = await runner.run("git", ["-C", repoPath, "config", "--get", "core.sshCommand"], opts);
     if (r.code === 0 && r.stdout.trim()) {
       const parts = splitShellArgs(r.stdout.trim());
       const bin = parts[0];
-      // Only pass through extra args when the configured binary is ssh or an absolute path to ssh.
-      if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: "ssh", extraArgs: [] };
+      // Git uses core.sshCommand as the SSH executable for fetch/push. When it is a wrapper
+      // binary (not literally `ssh`), invoke it directly for `ssh -G` alias resolution so
+      // that aliases it resolves are honoured. Extra args are only forwarded when the binary
+      // itself is ssh (or a path ending in /ssh) because wrapper binaries typically forward
+      // them internally already.
+      if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: bin, extraArgs: [] };
       return { sshBin: bin, extraArgs: parts.slice(1) };
     }
   } catch {
@@ -340,18 +363,30 @@ async function checkOriginMatchesRemote(
         );
       } else {
         // Finding 3: for SSH/SCP URLs that name a GitHub host directly, verify SSH config hasn't
-        // redirected the host via HostName to a different server. Fail-open if ssh is unavailable.
+        // redirected the host via HostName to a different server or remapped it to a non-standard
+        // port. Fail-open if ssh is unavailable.
         const directSsh = extractDirectGitHubSshTarget(fetchUrl.trim());
         if (directSsh !== null) {
           try {
             const sshG3 = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", directSsh.target], opts);
             if (sshG3.code === 0) {
-              const hl3 = sshG3.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
+              const lines3 = sshG3.stdout.split("\n");
+              const hl3 = lines3.find((l) => l.toLowerCase().startsWith("hostname "));
               const resolvedHost3 = hl3 ? hl3.slice("hostname ".length).trim().toLowerCase() : null;
+              const pl3 = lines3.find((l) => l.toLowerCase().startsWith("port "));
+              const resolvedPort3 = pl3 ? pl3.slice("port ".length).trim() : null;
               if (resolvedHost3 !== null && resolvedHost3 !== directSsh.expectedHost) {
                 errors.push(
                   `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
+              } else if (resolvedHost3 !== null && resolvedPort3 !== null) {
+                // github.com accepts only port 22; ssh.github.com accepts only port 443 (SSH-over-HTTPS).
+                const expectedPort3 = directSsh.expectedHost === "ssh.github.com" ? "443" : "22";
+                if (resolvedPort3 !== expectedPort3) {
+                  errors.push(
+                    `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                  );
+                }
               }
             }
           } catch {
@@ -587,18 +622,30 @@ async function checkOriginMatchesRemote(
                   }
                 }
               }
-              // Finding 3: verify direct GitHub SSH push URLs haven't been HostName-redirected by SSH config.
+              // Finding 3: verify direct GitHub SSH push URLs haven't been HostName-redirected by SSH
+              // config or remapped to a non-standard port.
               const directPushSsh = extractDirectGitHubSshTarget(pushUrl.trim());
               if (directPushSsh !== null) {
                 try {
                   const sshG3p = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", directPushSsh.target], opts);
                   if (sshG3p.code === 0) {
-                    const hl3p = sshG3p.stdout.split("\n").find((l) => l.toLowerCase().startsWith("hostname "));
+                    const lines3p = sshG3p.stdout.split("\n");
+                    const hl3p = lines3p.find((l) => l.toLowerCase().startsWith("hostname "));
                     const resolvedHost3p = hl3p ? hl3p.slice("hostname ".length).trim().toLowerCase() : null;
+                    const pl3p = lines3p.find((l) => l.toLowerCase().startsWith("port "));
+                    const resolvedPort3p = pl3p ? pl3p.slice("port ".length).trim() : null;
                     if (resolvedHost3p !== null && resolvedHost3p !== directPushSsh.expectedHost) {
                       errors.push(
                         `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                       );
+                    } else if (resolvedHost3p !== null && resolvedPort3p !== null) {
+                      // github.com accepts only port 22; ssh.github.com accepts only port 443 (SSH-over-HTTPS).
+                      const expectedPort3p = directPushSsh.expectedHost === "ssh.github.com" ? "443" : "22";
+                      if (resolvedPort3p !== expectedPort3p) {
+                        errors.push(
+                          `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                        );
+                      }
                     }
                   }
                 } catch {

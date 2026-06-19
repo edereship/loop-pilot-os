@@ -1430,6 +1430,91 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
+
+  // Finding 1 (this iteration): GIT_SSH_COMMAND with $HOME variable expansion
+  it("GIT_SSH_COMMAND の $HOME 変数を展開して alias を解決する（Finding 1 iteration 5: env var expansion）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    const homeDir = process.env.HOME ?? "/home/runner";
+    r.on(["ssh", "-F", `${homeDir}/.ssh/gh config`, "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = 'ssh -F "$HOME/.ssh/gh config"';
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  it("GIT_SSH_COMMAND の ${HOME} 変数を展開して alias を解決する（Finding 1 iteration 5: braced env var expansion）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    const homeDir = process.env.HOME ?? "/home/runner";
+    r.on(["ssh", "-F", `${homeDir}/.ssh/gh config`, "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = 'ssh -F "${HOME}/.ssh/gh config"';
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  // Finding 2 (this iteration): core.sshCommand wrapper binary used for alias resolution
+  it("core.sshCommand がラッパーバイナリの場合はそのバイナリで alias を解決する（Finding 2 iteration 5: wrapper binary）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "/usr/local/bin/my-ssh-wrapper\n", stderr: "" });
+    r.on(["/usr/local/bin/my-ssh-wrapper", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("core.sshCommand がラッパーバイナリの場合の push URL alias も同バイナリで解決する（Finding 2 iteration 5: wrapper binary push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "/usr/local/bin/my-ssh-wrapper\n", stderr: "" });
+    r.on(["/usr/local/bin/my-ssh-wrapper", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  // Finding 3 (this iteration): direct GitHub SSH push URL with non-standard port
+  it("SSH config が github.com の push URL を非標準ポートにリダイレクトしている場合は NG（Finding 3 iteration 5: push URL port redirect）", async () => {
+    const r = passingRunner();
+    // fetch is HTTPS; push is direct GitHub SSH SCP so the port check applies
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("SSH config が github.com の fetch URL を非標準ポートにリダイレクトしている場合は NG（Finding 3 iteration 5: fetch URL port redirect）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    // SSH config maps github.com to port 2222
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("SSH config が github.com を標準ポート 22 に設定している場合はエラーなし（Finding 3 iteration 5: standard port ok）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
 });
 
 describe("normalizeRemote", () => {
