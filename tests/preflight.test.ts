@@ -1100,6 +1100,100 @@ describe("runPreflight", () => {
     expect(errors.filter((e) => e.includes("push URL") && e.includes("ユーザー"))).toEqual([]);
   });
 
+  // Finding 2 (current iteration): ssh:// aliases resolved via ssh -G
+  it("ssh:// alias (ssh://git@gh/owner/name.git) が github.com に解決されパスが一致すればエラーなし（Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@gh/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh/owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ssh:// alias でパスが不一致なら NG（Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@gh/owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh/owner/other.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("ssh:// alias が非 GitHub ホストに解決される場合は NG（Finding 2: non-GitHub alias）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@gh/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh/owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname gitlab.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("ssh:// alias が利用不能な場合は保守的に拒否する（Finding 2: ssh -G fallback reject）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@gh/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh/owner/name.git\n", stderr: "" });
+    // No ssh -G stub → FakeCommandRunner throws → conservative reject
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("push URL の ssh:// alias が github.com に解決されパスが一致すればエラーなし（Finding 2 push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh/owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("push URL の ssh:// alias でパスが不一致なら NG（Finding 2 push URL path mismatch）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh/owner/other.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3 (current iteration): GIT_SSH_COMMAND env var honored in alias resolution
+  it("GIT_SSH_COMMAND 設定時はそのオプションを ssh -G に渡して alias を解決する（Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-F", "/env/config", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "ssh -F /env/config";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) {
+        delete process.env.GIT_SSH_COMMAND;
+      } else {
+        process.env.GIT_SSH_COMMAND = origEnv;
+      }
+    }
+  });
+
+  // Finding 4 (current iteration): getGitSshArgs reused for userless push URL checks
+  it("core.sshCommand 設定時はユーザーなし SSH URL push URL の ssh -G 検証でも同オプションを使用する（Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://github.com/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "ssh -F /custom/config\n", stderr: "" });
+    r.on(["ssh", "-F", "/custom/config", "-G", "github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("ユーザー"))).toEqual([]);
+  });
+
+  it("core.sshCommand 設定時はユーザーなし SCP push URL の ssh -G 検証でも同オプションを使用する（Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "ssh -F /custom/config\n", stderr: "" });
+    r.on(["ssh", "-F", "/custom/config", "-G", "github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("ユーザー"))).toEqual([]);
+  });
+
   it("全項目合格なら空配列を返す（仕様 §9）", async () => {
     const errors = await runPreflight({
       config: makeConfig(),

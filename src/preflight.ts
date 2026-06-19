@@ -216,13 +216,23 @@ function isIPv4Address(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 }
 
-// Returns extra args to pass to ssh when core.sshCommand is configured (e.g. ["-F", "/path/config"]).
+// Returns extra args to pass to ssh when a custom SSH command is configured (e.g. ["-F", "/path/config"]).
+// Git's SSH command selection order: GIT_SSH_COMMAND env var > core.sshCommand git config > GIT_SSH env var.
+// GIT_SSH only names a binary with no extra args, so it contributes no args here.
 // Falls back to [] when unset or when the command is not recognisably ssh.
 async function getGitSshArgs(
   runner: CommandRunner,
   repoPath: string,
   opts: { cwd: string },
 ): Promise<string[]> {
+  // GIT_SSH_COMMAND takes precedence over core.sshCommand.
+  const envCmd = process.env.GIT_SSH_COMMAND;
+  if (envCmd && envCmd.trim()) {
+    const parts = envCmd.trim().split(/\s+/);
+    const bin = parts[0];
+    if (bin !== "ssh" && !bin.endsWith("/ssh")) return [];
+    return parts.slice(1);
+  }
   try {
     const r = await runner.run("git", ["-C", repoPath, "config", "--get", "core.sshCommand"], opts);
     if (r.code !== 0 || !r.stdout.trim()) return [];
@@ -329,11 +339,68 @@ async function checkOriginMatchesRemote(
       } else {
         // Scheme-based URL — check parseability to detect non-GitHub host mismatch.
         try {
-          new URL(trimmedFetch);
-          // Parseable but normalizeRemote returned null → non-GitHub host → reject.
-          errors.push(
-            `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-          );
+          const parsedFetch = new URL(trimmedFetch);
+          if (
+            parsedFetch.protocol === "ssh:" &&
+            !GITHUB_HOSTS.has(parsedFetch.hostname.toLowerCase()) &&
+            parsedFetch.hostname !== "" &&
+            !isIPv4Address(parsedFetch.hostname)
+          ) {
+            // ssh:// URL with a non-GitHub, non-IP hostname — may be an SSH config alias.
+            const urlUser = parsedFetch.username;
+            if (urlUser !== "" && urlUser.toLowerCase() !== "git") {
+              // Explicit non-git user — reject outright.
+              errors.push(
+                `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+              );
+            } else {
+              let fetchAliasToGitHub = false;
+              try {
+                const sshAlias = parsedFetch.hostname.toLowerCase();
+                const sshTarget = urlUser ? `${urlUser}@${sshAlias}` : sshAlias;
+                const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
+                const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
+                if (sshG.code === 0) {
+                  const sshGLines = sshG.stdout.split("\n");
+                  const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
+                  const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                  const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
+                  const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
+                  const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
+                  const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
+                  const userOk = resolvedUser === "git";
+                  if (resolvedHost === "github.com") {
+                    fetchAliasToGitHub = (resolvedPort === "22" || resolvedPort === null) && userOk;
+                  } else if (resolvedHost === "ssh.github.com") {
+                    fetchAliasToGitHub = resolvedPort === "443" && userOk;
+                  }
+                }
+              } catch {
+                // ssh not available or failed — conservatively reject.
+              }
+              if (!fetchAliasToGitHub) {
+                errors.push(
+                  `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
+              } else {
+                const aliasPath = parsedFetch.pathname
+                  .replace(/^\//, "")
+                  .replace(/\/+$/, "")
+                  .replace(/\.git$/i, "")
+                  .toLowerCase();
+                if (aliasPath !== expected) {
+                  errors.push(
+                    `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                  );
+                }
+              }
+            }
+          } else {
+            // Parseable but normalizeRemote returned null → non-GitHub host or invalid config → reject.
+            errors.push(
+              `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+            );
+          }
         } catch {
           // Malformed scheme URL (e.g., non-numeric port with embedded credentials) — skip to
           // avoid exposing credentials through error messages.
@@ -380,7 +447,8 @@ async function checkOriginMatchesRemote(
                 if (pp.protocol === "ssh:" && pp.username === "" && GITHUB_HOSTS.has(pp.hostname.toLowerCase())) {
                   let sshUserOk = false;
                   try {
-                    const sshG = await runner.run("ssh", ["-G", pp.hostname], opts);
+                    const pUrlSshArgs = await getGitSshArgs(runner, repoPath, opts);
+                    const sshG = await runner.run("ssh", [...pUrlSshArgs, "-G", pp.hostname], opts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
                       sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
@@ -408,7 +476,8 @@ async function checkOriginMatchesRemote(
                 if (_pUlUser === undefined && GITHUB_HOSTS.has(_pUlHost) && _pUlHost !== "ssh.github.com") {
                   let sshUserOk = false;
                   try {
-                    const sshG = await runner.run("ssh", ["-G", _pUlHost], opts);
+                    const pScpSshArgs = await getGitSshArgs(runner, repoPath, opts);
+                    const sshG = await runner.run("ssh", [...pScpSshArgs, "-G", _pUlHost], opts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
                       sshUserOk = ul ? ul.slice("user ".length).trim().toLowerCase() === "git" : false;
@@ -493,11 +562,67 @@ async function checkOriginMatchesRemote(
               );
             } else {
               try {
-                new URL(trimmedPush);
-                // Parseable but non-GitHub — reject.
-                errors.push(
-                  `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-                );
+                const parsedPush = new URL(trimmedPush);
+                if (
+                  parsedPush.protocol === "ssh:" &&
+                  !GITHUB_HOSTS.has(parsedPush.hostname.toLowerCase()) &&
+                  parsedPush.hostname !== "" &&
+                  !isIPv4Address(parsedPush.hostname)
+                ) {
+                  // ssh:// URL with a non-GitHub, non-IP hostname — may be an SSH config alias.
+                  const purlUser = parsedPush.username;
+                  if (purlUser !== "" && purlUser.toLowerCase() !== "git") {
+                    errors.push(
+                      `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                    );
+                  } else {
+                    let pushAliasToGitHub = false;
+                    try {
+                      const sshAlias = parsedPush.hostname.toLowerCase();
+                      const sshTarget = purlUser ? `${purlUser}@${sshAlias}` : sshAlias;
+                      const gitSshArgs = await getGitSshArgs(runner, repoPath, opts);
+                      const sshG = await runner.run("ssh", [...gitSshArgs, "-G", sshTarget], opts);
+                      if (sshG.code === 0) {
+                        const sshGLines = sshG.stdout.split("\n");
+                        const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
+                        const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                        const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
+                        const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
+                        const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
+                        const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
+                        const userOk = resolvedUser === "git";
+                        if (resolvedHost === "github.com") {
+                          pushAliasToGitHub = (resolvedPort === "22" || resolvedPort === null) && userOk;
+                        } else if (resolvedHost === "ssh.github.com") {
+                          pushAliasToGitHub = resolvedPort === "443" && userOk;
+                        }
+                      }
+                    } catch {
+                      // ssh not available or failed — conservatively reject.
+                    }
+                    if (!pushAliasToGitHub) {
+                      errors.push(
+                        `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                      );
+                    } else {
+                      const aliasPath = parsedPush.pathname
+                        .replace(/^\//, "")
+                        .replace(/\/+$/, "")
+                        .replace(/\.git$/i, "")
+                        .toLowerCase();
+                      if (aliasPath !== expected) {
+                        errors.push(
+                          `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                        );
+                      }
+                    }
+                  }
+                } else {
+                  // Parseable but normalizeRemote returned null → non-GitHub host or invalid config → reject.
+                  errors.push(
+                    `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                  );
+                }
               } catch {
                 // Malformed scheme URL — report error without exposing raw URL (Finding 3).
                 errors.push(
