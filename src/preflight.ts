@@ -158,7 +158,11 @@ export function normalizeRemote(url: string): string | null {
         parsed.protocol === "ssh:" &&
         parsed.port === "22" &&
         parsed.hostname.toLowerCase() !== "ssh.github.com";
-      if (!isSshOverHttps && !isDefaultSshPort) return null;
+      const isGitHubSshOverHttpsRemapPort =
+        parsed.protocol === "ssh:" &&
+        parsed.hostname.toLowerCase() === "github.com" &&
+        parsed.port === "443";
+      if (!isSshOverHttps && !isDefaultSshPort && !isGitHubSshOverHttpsRemapPort) return null;
     }
     // ssh.github.com is only valid with the ssh: protocol (SSH-over-HTTPS at port 443);
     // https://ssh.github.com/... is not a valid Git transport endpoint.
@@ -230,6 +234,18 @@ function isLikelyRealDomain(host: string): boolean {
 // hosts and must not be accepted as SSH config aliases.
 function isIPv4Address(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function mergeEnvAssignments(
+  opts: { cwd: string },
+  envAssignments: Record<string, string>,
+): { cwd: string; env?: Record<string, string> } {
+  if (Object.keys(envAssignments).length === 0) return opts;
+  const baseEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) baseEnv[k] = v;
+  }
+  return { ...opts, env: { ...baseEnv, ...envAssignments } };
 }
 
 // Sentinel used inside splitShellArgs to protect dollar signs that appeared inside
@@ -311,20 +327,25 @@ async function getGitSshConfig(
   runner: CommandRunner,
   repoPath: string,
   opts: { cwd: string },
-): Promise<{ sshBin: string; extraArgs: string[] }> {
+): Promise<{ sshBin: string; extraArgs: string[]; envAssignments: Record<string, string> }> {
   // GIT_SSH_COMMAND takes precedence over core.sshCommand.
   const envCmd = process.env.GIT_SSH_COMMAND;
   if (envCmd && envCmd.trim()) {
     const parts = splitShellArgs(envCmd.trim());
     // Git runs GIT_SSH_COMMAND through the shell, so ~ and $VAR in the executable path and
     // arguments are expanded before the command runs. Replicate that here.
-    // Skip any leading KEY=VALUE shell environment assignments — the shell sets them before
-    // exec, but our ssh -G probe does not go through a shell, so they are not the binary.
+    // Capture leading KEY=VALUE shell environment assignments — the shell sets them before
+    // exec, so we pass them as env vars when invoking the SSH probe.
     let binIdx = 0;
-    while (binIdx < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[binIdx])) binIdx++;
+    const envAssignments: Record<string, string> = {};
+    while (binIdx < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[binIdx])) {
+      const eqIdx = parts[binIdx].indexOf("=");
+      envAssignments[parts[binIdx].slice(0, eqIdx)] = expandShellWord(parts[binIdx].slice(eqIdx + 1));
+      binIdx++;
+    }
     if (binIdx < parts.length) {
       const bin = expandShellWord(parts[binIdx]);
-      return { sshBin: bin, extraArgs: parts.slice(binIdx + 1).map(expandShellWord) };
+      return { sshBin: bin, extraArgs: parts.slice(binIdx + 1).map(expandShellWord), envAssignments };
     }
   }
   try {
@@ -333,12 +354,17 @@ async function getGitSshConfig(
       const parts = splitShellArgs(r.stdout.trim());
       // Git runs core.sshCommand through the shell, so ~ and $VAR in the executable path and
       // arguments are expanded before the command runs. Replicate that here.
-      // Skip any leading KEY=VALUE shell environment assignments (same reasoning as above).
+      // Capture leading KEY=VALUE shell environment assignments (same reasoning as above).
       let binIdx = 0;
-      while (binIdx < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[binIdx])) binIdx++;
+      const envAssignments: Record<string, string> = {};
+      while (binIdx < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[binIdx])) {
+        const eqIdx = parts[binIdx].indexOf("=");
+        envAssignments[parts[binIdx].slice(0, eqIdx)] = expandShellWord(parts[binIdx].slice(eqIdx + 1));
+        binIdx++;
+      }
       if (binIdx < parts.length) {
         const bin = expandShellWord(parts[binIdx]);
-        return { sshBin: bin, extraArgs: parts.slice(binIdx + 1).map(expandShellWord) };
+        return { sshBin: bin, extraArgs: parts.slice(binIdx + 1).map(expandShellWord), envAssignments };
       }
     }
   } catch {
@@ -348,9 +374,9 @@ async function getGitSshConfig(
   // exec OpenSSH (e.g. exec ssh -F /custom/config "$@") pass those options to ssh -G.
   const gitSshEnv = process.env.GIT_SSH;
   if (gitSshEnv && gitSshEnv.trim()) {
-    return { sshBin: gitSshEnv.trim(), extraArgs: [] };
+    return { sshBin: gitSshEnv.trim(), extraArgs: [], envAssignments: {} };
   }
-  return { sshBin: "ssh", extraArgs: [] };
+  return { sshBin: "ssh", extraArgs: [], envAssignments: {} };
 }
 
 // For SCP-format (e.g. git@github.com:path) or ssh:// URLs that name a GitHub host directly,
@@ -398,6 +424,7 @@ async function checkOriginMatchesRemote(
     const expected = repoSlug.toLowerCase();
     const gitSshCfg = await getGitSshConfig(runner, repoPath, opts);
     const isCustomSsh = gitSshCfg.sshBin !== "ssh" || gitSshCfg.extraArgs.length > 0;
+    const sshRunOpts = mergeEnvAssignments(opts, gitSshCfg.envAssignments);
 
     const fetchR = await runner.run("git", ["-C", repoPath, "remote", "get-url", "origin"], opts);
     if (fetchR.code !== 0) {
@@ -423,11 +450,11 @@ async function checkOriginMatchesRemote(
             // actually use. Without -p, ssh -G uses the default-port block, which may differ when
             // the URL carries an explicit non-default port.
             const portArgs3 = directSsh.explicitPort ? ["-p", directSsh.explicitPort] : [];
-            const sshG3 = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgs3, "-G", directSsh.target], opts);
+            const sshG3 = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgs3, "-G", directSsh.target], sshRunOpts);
             if (sshG3.code === 0) {
               const lines3 = sshG3.stdout.split("\n");
               const hl3 = lines3.find((l) => l.toLowerCase().startsWith("hostname "));
-              const resolvedHost3 = hl3 ? hl3.slice("hostname ".length).trim().toLowerCase() : null;
+              const resolvedHost3 = hl3 ? hl3.slice("hostname ".length).trim().replace(/\.+$/, "").toLowerCase() : null;
               const pl3 = lines3.find((l) => l.toLowerCase().startsWith("port "));
               const resolvedPort3 = pl3 ? pl3.slice("port ".length).trim() : null;
               const ul3 = lines3.find((l) => l.toLowerCase().startsWith("user "));
@@ -513,11 +540,11 @@ async function checkOriginMatchesRemote(
             let fetchAliasToGitHub = false;
             try {
               const sshTarget = fetchUser ? `${fetchUser}@${rawFetchHost}` : rawFetchHost;
-              const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
+              const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], sshRunOpts);
               if (sshG.code === 0) {
                 const sshGLines = sshG.stdout.split("\n");
                 const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
-                const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                const resolvedHost = hl ? hl.slice("hostname ".length).trim().replace(/\.+$/, "").toLowerCase() : null;
                 const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                 const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                 const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
@@ -588,11 +615,11 @@ async function checkOriginMatchesRemote(
                 // command args, so OpenSSH reports the first -p as effective. Passing it here lets
                 // ssh -G select the correct Host block and report the true effective port.
                 const portArgsFetch = parsedFetch.port !== "" ? ["-p", parsedFetch.port] : [];
-                const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgsFetch, "-G", sshTarget], opts);
+                const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgsFetch, "-G", sshTarget], sshRunOpts);
                 if (sshG.code === 0) {
                   const sshGLines = sshG.stdout.split("\n");
                   const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
-                  const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                  const resolvedHost = hl ? hl.slice("hostname ".length).trim().replace(/\.+$/, "").toLowerCase() : null;
                   const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                   const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                   const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
@@ -682,7 +709,7 @@ async function checkOriginMatchesRemote(
                 if (pp.protocol === "ssh:" && pp.username === "" && GITHUB_HOSTS.has(pp.hostname.toLowerCase())) {
                   let sshUserOk = false;
                   try {
-                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", pp.hostname], opts);
+                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", pp.hostname], sshRunOpts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
                       sshUserOk = ul ? ul.slice("user ".length).trim() === "git" : false;
@@ -710,7 +737,7 @@ async function checkOriginMatchesRemote(
                 if (_pUlUser === undefined && GITHUB_HOSTS.has(_pUlHost) && _pUlHost !== "ssh.github.com") {
                   let sshUserOk = false;
                   try {
-                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", _pUlHost], opts);
+                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", _pUlHost], sshRunOpts);
                     if (sshG.code === 0) {
                       const ul = sshG.stdout.split("\n").find((l) => l.toLowerCase().startsWith("user "));
                       sshUserOk = ul ? ul.slice("user ".length).trim() === "git" : false;
@@ -734,11 +761,11 @@ async function checkOriginMatchesRemote(
                 try {
                   // Pass the URL's explicit port to ssh -G so the correct Host block is selected.
                   const portArgs3p = directPushSsh.explicitPort ? ["-p", directPushSsh.explicitPort] : [];
-                  const sshG3p = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgs3p, "-G", directPushSsh.target], opts);
+                  const sshG3p = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgs3p, "-G", directPushSsh.target], sshRunOpts);
                   if (sshG3p.code === 0) {
                     const lines3p = sshG3p.stdout.split("\n");
                     const hl3p = lines3p.find((l) => l.toLowerCase().startsWith("hostname "));
-                    const resolvedHost3p = hl3p ? hl3p.slice("hostname ".length).trim().toLowerCase() : null;
+                    const resolvedHost3p = hl3p ? hl3p.slice("hostname ".length).trim().replace(/\.+$/, "").toLowerCase() : null;
                     const pl3p = lines3p.find((l) => l.toLowerCase().startsWith("port "));
                     const resolvedPort3p = pl3p ? pl3p.slice("port ".length).trim() : null;
                     const ul3p = lines3p.find((l) => l.toLowerCase().startsWith("user "));
@@ -822,11 +849,11 @@ async function checkOriginMatchesRemote(
                   let pushAliasToGitHub = false;
                   try {
                     const sshTarget = pushUser ? `${pushUser}@${rawPushHost}` : rawPushHost;
-                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
+                    const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], sshRunOpts);
                     if (sshG.code === 0) {
                       const sshGLines = sshG.stdout.split("\n");
                       const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
-                      const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                      const resolvedHost = hl ? hl.slice("hostname ".length).trim().replace(/\.+$/, "").toLowerCase() : null;
                       const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                       const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                       const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
@@ -894,11 +921,11 @@ async function checkOriginMatchesRemote(
                       // Mirror Git's argument order: URL port (-p) is appended after the configured SSH
                       // command args, so OpenSSH reports the first -p as effective.
                       const portArgsPush = parsedPush.port !== "" ? ["-p", parsedPush.port] : [];
-                      const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgsPush, "-G", sshTarget], opts);
+                      const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgsPush, "-G", sshTarget], sshRunOpts);
                       if (sshG.code === 0) {
                         const sshGLines = sshG.stdout.split("\n");
                         const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
-                        const resolvedHost = hl ? hl.slice("hostname ".length).trim().toLowerCase() : null;
+                        const resolvedHost = hl ? hl.slice("hostname ".length).trim().replace(/\.+$/, "").toLowerCase() : null;
                         const pl = sshGLines.find((l) => l.toLowerCase().startsWith("port "));
                         const resolvedPort = pl ? pl.slice("port ".length).trim() : null;
                         const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));

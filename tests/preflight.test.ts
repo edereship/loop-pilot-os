@@ -1988,6 +1988,80 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
     expect(errors.every((e) => !e.includes("ghp_secret"))).toBe(true);
   });
+
+  // Finding 1 (iteration 12): ssh://git@github.com:443 with SSH-over-HTTPS remap must be accepted
+  it("ssh://git@github.com:443 fetch URL が SSH config で ssh.github.com:443 にリダイレクトされた場合はエラーなし（Finding 1 iteration 12）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@github.com:443/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@github.com:443/owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-p", "443", "-G", "git@github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 443\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ssh://git@github.com:443 fetch URL が SSH config リダイレクトなしの場合は NG（Finding 1 iteration 12）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@github.com:443/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@github.com:443/owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-p", "443", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 443\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 2 (iteration 12): leading shell assignments in GIT_SSH_COMMAND must be passed as env to SSH probes
+  it("GIT_SSH_COMMAND が KEY=VALUE 代入で始まる場合は代入を SSH probe の環境変数として渡す（Finding 2 iteration 12）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["/usr/local/bin/git-ssh-wrapper", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "WRAPPER_CONFIG=/cfg /usr/local/bin/git-ssh-wrapper";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+      const sshProbeCall = r.calls.find((c) => c.cmd === "/usr/local/bin/git-ssh-wrapper" && c.args.includes("-G"));
+      expect(sshProbeCall?.opts.env?.WRAPPER_CONFIG).toBe("/cfg");
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  it("core.sshCommand が KEY=VALUE 代入で始まる場合は代入を SSH probe の環境変数として渡す（Finding 2 iteration 12）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "WRAPPER_CONFIG=/cfg /usr/local/bin/git-ssh-wrapper\n", stderr: "" });
+    r.on(["/usr/local/bin/git-ssh-wrapper", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    const sshProbeCall = r.calls.find((c) => c.cmd === "/usr/local/bin/git-ssh-wrapper" && c.args.includes("-G"));
+    expect(sshProbeCall?.opts.env?.WRAPPER_CONFIG).toBe("/cfg");
+  });
+
+  // Finding 3 (iteration 12): FQDN absolute-DNS notation (trailing dot) from ssh -G must be normalized
+  it("ssh -G の hostname が FQDN 絶対表記 (github.com.) でも正常に一致する（Finding 3 iteration 12）", async () => {
+    const r = passingRunner();
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com.\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("SSH config alias の ssh -G で hostname が FQDN 絶対表記 (github.com.) でも一致する（Finding 3 iteration 12）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com.\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ssh -G の hostname が ssh.github.com. (FQDN) でも SSH-over-HTTPS として一致する（Finding 3 iteration 12）", async () => {
+    const r = passingRunner();
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname ssh.github.com.\nuser git\nport 443\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
 });
 
 describe("normalizeRemote", () => {
@@ -2180,5 +2254,10 @@ describe("normalizeRemote", () => {
 
   it("ユーザーのみ（パスワードなし）SSH URL は正規化する（Finding 1: no password ok）", () => {
     expect(normalizeRemote("ssh://git@github.com/owner/name.git")).toBe("owner/name");
+  });
+
+  // Finding 1 (iteration 12): ssh://git@github.com:443 must be accepted for SSH-over-HTTPS remap
+  it("ssh://git@github.com:443 は SSH-over-HTTPS リダイレクト用に正規化する（Finding 1 iteration 12）", () => {
+    expect(normalizeRemote("ssh://git@github.com:443/owner/name.git")).toBe("owner/name");
   });
 });
