@@ -126,8 +126,8 @@ export function normalizeRemote(url: string): string | null {
     // ssh.github.com is only valid as SSH-over-HTTPS at port 443 (ssh://...); SCP-style
     // URLs cannot express a port, so reject ssh.github.com in this context.
     if (host.toLowerCase() === "ssh.github.com") return null;
-    // GitHub SSH requires the 'git' user; explicit non-git users are rejected.
-    if (user !== undefined && user.toLowerCase() !== "git") return null;
+    // GitHub SSH requires the exact 'git' user (case-sensitive); reject any other username.
+    if (user !== undefined && user !== "git") return null;
     const path = rawPath.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
     return path.length > 0 ? path.toLowerCase() : null;
   }
@@ -163,8 +163,8 @@ export function normalizeRemote(url: string): string | null {
     // ssh.github.com is only valid with the ssh: protocol (SSH-over-HTTPS at port 443);
     // https://ssh.github.com/... is not a valid Git transport endpoint.
     if (parsed.protocol === "https:" && parsed.hostname.toLowerCase() === "ssh.github.com") return null;
-    // For SSH protocol, GitHub only accepts user 'git'; reject any explicit non-git user.
-    if (parsed.protocol === "ssh:" && parsed.username !== "" && parsed.username.toLowerCase() !== "git") {
+    // For SSH protocol, GitHub only accepts the exact 'git' user (case-sensitive).
+    if (parsed.protocol === "ssh:" && parsed.username !== "" && parsed.username !== "git") {
       return null;
     }
     // Reject SSH URLs with a password — embedded passwords in git remote URLs are never valid credentials.
@@ -454,7 +454,8 @@ async function checkOriginMatchesRemote(
       const fetchScpMatch = _fScpRaw && !_fScpRaw[3].startsWith("//") ? _fScpRaw : null;
       if (fetchScpMatch) {
         const fetchUser = fetchScpMatch[1];
-        const fetchHost = fetchScpMatch[2].toLowerCase();
+        const rawFetchHost = fetchScpMatch[2]; // preserve original case for ssh -G (OpenSSH Host matching is case-sensitive)
+        const fetchHost = rawFetchHost.toLowerCase();
         const rawFetchPath = fetchScpMatch[3];
         if (isIPv4Address(fetchHost)) {
           errors.push(
@@ -474,7 +475,7 @@ async function checkOriginMatchesRemote(
           } else {
             let fetchAliasToGitHub = false;
             try {
-              const sshTarget = fetchUser ? `${fetchUser}@${fetchHost}` : fetchHost;
+              const sshTarget = fetchUser ? `${fetchUser}@${rawFetchHost}` : rawFetchHost;
               const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
               if (sshG.code === 0) {
                 const sshGLines = sshG.stdout.split("\n");
@@ -544,9 +545,13 @@ async function checkOriginMatchesRemote(
             } else {
               let fetchAliasToGitHub = false;
               try {
-                const sshAlias = parsedFetch.hostname.toLowerCase();
+                const sshAlias = parsedFetch.hostname; // preserve case for OpenSSH Host matching
                 const sshTarget = urlUser ? `${urlUser}@${sshAlias}` : sshAlias;
-                const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
+                // Mirror Git's argument order: URL port (-p) is appended after the configured SSH
+                // command args, so OpenSSH reports the first -p as effective. Passing it here lets
+                // ssh -G select the correct Host block and report the true effective port.
+                const portArgsFetch = parsedFetch.port !== "" ? ["-p", parsedFetch.port] : [];
+                const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgsFetch, "-G", sshTarget], opts);
                 if (sshG.code === 0) {
                   const sshGLines = sshG.stdout.split("\n");
                   const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
@@ -556,12 +561,12 @@ async function checkOriginMatchesRemote(
                   const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
                   const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
                   const userOk = resolvedUser === "git";
-                  // An explicit port in the URL overrides the SSH config default port.
-                  const effectivePort = parsedFetch.port !== "" ? parsedFetch.port : resolvedPort;
+                  // Trust the port reported by ssh -G; the URL port was already passed via -p so
+                  // ssh selects the correct Host block and reports the effective port directly.
                   if (resolvedHost === "github.com") {
-                    fetchAliasToGitHub = (effectivePort === "22" || effectivePort === null) && userOk;
+                    fetchAliasToGitHub = (resolvedPort === "22" || resolvedPort === null) && userOk;
                   } else if (resolvedHost === "ssh.github.com") {
-                    fetchAliasToGitHub = effectivePort === "443" && userOk;
+                    fetchAliasToGitHub = resolvedPort === "443" && userOk;
                   }
                 }
               } catch {
@@ -742,7 +747,8 @@ async function checkOriginMatchesRemote(
             const pushScpMatch = _pScpRaw && !_pScpRaw[3].startsWith("//") ? _pScpRaw : null;
             if (pushScpMatch) {
               const pushUser = pushScpMatch[1];
-              const pushHost = pushScpMatch[2].toLowerCase();
+              const rawPushHost = pushScpMatch[2]; // preserve original case for ssh -G (OpenSSH Host matching is case-sensitive)
+              const pushHost = rawPushHost.toLowerCase();
               const rawPushPath = pushScpMatch[3];
               if (isIPv4Address(pushHost)) {
                 errors.push(
@@ -761,7 +767,7 @@ async function checkOriginMatchesRemote(
                 } else {
                   let pushAliasToGitHub = false;
                   try {
-                    const sshTarget = pushUser ? `${pushUser}@${pushHost}` : pushHost;
+                    const sshTarget = pushUser ? `${pushUser}@${rawPushHost}` : rawPushHost;
                     const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
                     if (sshG.code === 0) {
                       const sshGLines = sshG.stdout.split("\n");
@@ -829,9 +835,12 @@ async function checkOriginMatchesRemote(
                   } else {
                     let pushAliasToGitHub = false;
                     try {
-                      const sshAlias = parsedPush.hostname.toLowerCase();
+                      const sshAlias = parsedPush.hostname; // preserve case for OpenSSH Host matching
                       const sshTarget = purlUser ? `${purlUser}@${sshAlias}` : sshAlias;
-                      const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, "-G", sshTarget], opts);
+                      // Mirror Git's argument order: URL port (-p) is appended after the configured SSH
+                      // command args, so OpenSSH reports the first -p as effective.
+                      const portArgsPush = parsedPush.port !== "" ? ["-p", parsedPush.port] : [];
+                      const sshG = await runner.run(gitSshCfg.sshBin, [...gitSshCfg.extraArgs, ...portArgsPush, "-G", sshTarget], opts);
                       if (sshG.code === 0) {
                         const sshGLines = sshG.stdout.split("\n");
                         const hl = sshGLines.find((l) => l.toLowerCase().startsWith("hostname "));
@@ -841,12 +850,11 @@ async function checkOriginMatchesRemote(
                         const ul = sshGLines.find((l) => l.toLowerCase().startsWith("user "));
                         const resolvedUser = ul ? ul.slice("user ".length).trim().toLowerCase() : null;
                         const userOk = resolvedUser === "git";
-                        // An explicit port in the URL overrides the SSH config default port.
-                        const effectivePort = parsedPush.port !== "" ? parsedPush.port : resolvedPort;
+                        // Trust the port reported by ssh -G; the URL port was already passed via -p.
                         if (resolvedHost === "github.com") {
-                          pushAliasToGitHub = (effectivePort === "22" || effectivePort === null) && userOk;
+                          pushAliasToGitHub = (resolvedPort === "22" || resolvedPort === null) && userOk;
                         } else if (resolvedHost === "ssh.github.com") {
-                          pushAliasToGitHub = effectivePort === "443" && userOk;
+                          pushAliasToGitHub = resolvedPort === "443" && userOk;
                         }
                       }
                     } catch {

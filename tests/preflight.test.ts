@@ -1325,8 +1325,9 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
-    // ssh -G says github.com:22, but URL specifies port 2222 — must reject
-    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    // URL port 2222 is passed to ssh -G (-p 2222); OpenSSH overrides config Port 22 → reports 2222.
+    // github.com only accepts port 22, so must reject.
+    r.on(["ssh", "-p", "2222", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
   });
@@ -1335,8 +1336,8 @@ describe("runPreflight", () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
     r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
-    // ssh -G says github.com:22, but URL specifies port 2222 — must reject
-    r.on(["ssh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    // URL port 2222 is passed to ssh -G (-p 2222); OpenSSH overrides config Port 22 → reports 2222.
+    r.on(["ssh", "-p", "2222", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 2222\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
   });
@@ -1700,6 +1701,27 @@ describe("runPreflight", () => {
     }
   });
 
+  // Finding 2 (iteration 9): mixed-case SSH config alias hostname must be probed with original case
+  it("大文字 SSH config alias (git@GH:...) を元のケースで ssh -G に渡す（Finding 2 iteration 9: alias host case preserved）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@GH:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@GH:owner/name.git\n", stderr: "" });
+    // Must probe with original case 'GH', not lowercased 'gh', to match the Host GH ssh_config entry.
+    r.on(["ssh", "-G", "git@GH"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("大文字 SSH config alias で SSH config が非 GitHub ホストにリダイレクトしている場合は NG（Finding 2 iteration 9: mixed-case alias redirect detected）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@GH:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@GH:owner/name.git\n", stderr: "" });
+    // Host GH block redirects to evil server; detected only when probing with original 'GH' case.
+    r.on(["ssh", "-G", "git@GH"], { code: 0, stdout: "hostname evil.example.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
   // Finding 2 (iteration 8): mixed-case GitHub hostname must be probed with original case
   it("大文字 GitHub.com SCP URL を元のケースで ssh -G に渡す（Finding 2 iteration 8: host case preserved）", async () => {
     const r = passingRunner();
@@ -1740,6 +1762,26 @@ describe("runPreflight", () => {
     r.on(["ssh", "-p", "22", "-G", "git@github.com"], { code: 0, stdout: "hostname ssh.github.com\nuser git\nport 22\n", stderr: "" });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
+  });
+
+  // Finding 3 (iteration 9): GIT_SSH_COMMAND with -p takes precedence over URL port in ssh -G probe
+  it("GIT_SSH_COMMAND の -p 443 が ssh:// alias URL の port 2222 より優先される（Finding 3 iteration 9: first -p wins）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@gh:2222/owner/name.git\n", stderr: "" });
+    // Git runs: ssh -p 443 -p 2222 git@gh. OpenSSH uses the first -p 443.
+    // ssh -G mirrors this: ssh -p 443 -p 2222 -G git@gh → reports port 443.
+    // github.com:443 is not valid, so must reject.
+    r.on(["ssh", "-p", "443", "-p", "2222", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 443\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "ssh -p 443";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
   });
 
   // Finding 4 (iteration 8): SSH user override via GIT_SSH_COMMAND must be detected on direct URLs
@@ -1870,6 +1912,15 @@ describe("normalizeRemote", () => {
 
   it("ユーザーなし GitHub SCP は正規化する（Finding 1: userless ok）", () => {
     expect(normalizeRemote("github.com:owner/name.git")).toBe("owner/name");
+  });
+
+  // Finding 1 (iteration 9): SSH username must match 'git' exactly (case-sensitive)
+  it("大文字 Git ユーザー付き GitHub SCP は null を返す（Finding 9: exact SSH username SCP）", () => {
+    expect(normalizeRemote("Git@github.com:owner/name.git")).toBeNull();
+  });
+
+  it("大文字 Git ユーザー付き GitHub SSH URL は null を返す（Finding 9: exact SSH username url）", () => {
+    expect(normalizeRemote("ssh://Git@github.com/owner/name.git")).toBeNull();
   });
 
   // Finding 3: query string or fragment must be rejected in URL-parsed remotes
