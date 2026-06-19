@@ -265,6 +265,19 @@ function expandEnvVars(s: string): string {
   );
 }
 
+// Expand a single shell word: leading ~ / ~/ to HOME, then $VAR / ${VAR} references.
+// Git runs GIT_SSH_COMMAND and core.sshCommand through the shell, so both tilde and
+// variable expansion happen before the command reaches the SSH binary.
+function expandShellWord(s: string): string {
+  const home = process.env.HOME;
+  let result = s;
+  if (home) {
+    if (result === "~") result = home;
+    else if (result.startsWith("~/")) result = home + result.slice(1);
+  }
+  return expandEnvVars(result);
+}
+
 // Returns the SSH binary and extra args to pass when resolving aliases via ssh -G.
 // Git's SSH command selection order: GIT_SSH_COMMAND env var > core.sshCommand git config > GIT_SSH env var.
 // GIT_SSH names only a binary (no extra args); it is used as the SSH executable so that wrapper
@@ -278,30 +291,19 @@ async function getGitSshConfig(
   const envCmd = process.env.GIT_SSH_COMMAND;
   if (envCmd && envCmd.trim()) {
     const parts = splitShellArgs(envCmd.trim());
-    const bin = parts[0];
-    // When GIT_SSH_COMMAND names a wrapper binary (not literally ssh), use it directly for
-    // ssh -G alias resolution — the wrapper's own config handles extra options internally.
-    if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: bin, extraArgs: [] };
-    // Git executes GIT_SSH_COMMAND through the shell, so $HOME and ${VAR} references in
-    // the arguments are shell-expanded before the command reaches the SSH binary. We
-    // replicate that for simple variable references so paths like "$HOME/.ssh/config" resolve
-    // correctly when we invoke the binary directly for `ssh -G` alias checks.
-    return { sshBin: bin, extraArgs: parts.slice(1).map(expandEnvVars) };
+    // Git runs GIT_SSH_COMMAND through the shell, so ~ and $VAR in the executable path and
+    // arguments are expanded before the command runs. Replicate that here.
+    const bin = expandShellWord(parts[0]);
+    return { sshBin: bin, extraArgs: parts.slice(1).map(expandShellWord) };
   }
   try {
     const r = await runner.run("git", ["-C", repoPath, "config", "--get", "core.sshCommand"], opts);
     if (r.code === 0 && r.stdout.trim()) {
       const parts = splitShellArgs(r.stdout.trim());
-      const bin = parts[0];
-      // Git uses core.sshCommand as the SSH executable for fetch/push. When it is a wrapper
-      // binary (not literally `ssh`), invoke it directly for `ssh -G` alias resolution so
-      // that aliases it resolves are honoured. Extra args are only forwarded when the binary
-      // itself is ssh (or a path ending in /ssh) because wrapper binaries typically forward
-      // them internally already.
-      if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: bin, extraArgs: [] };
-      // core.sshCommand is executed through the shell by git, so $HOME and ${VAR} references
-      // in the arguments are shell-expanded. Replicate that for simple variable references.
-      return { sshBin: bin, extraArgs: parts.slice(1).map(expandEnvVars) };
+      // Git runs core.sshCommand through the shell, so ~ and $VAR in the executable path and
+      // arguments are expanded before the command runs. Replicate that here.
+      const bin = expandShellWord(parts[0]);
+      return { sshBin: bin, extraArgs: parts.slice(1).map(expandShellWord) };
     }
   } catch {
     // Fall through to GIT_SSH check.

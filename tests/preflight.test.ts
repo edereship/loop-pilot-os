@@ -1628,6 +1628,59 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("push URL") && e.includes("一致しません"))).toBe(true);
   });
+
+  // Finding 1 (iteration 7): tilde in GIT_SSH_COMMAND binary path must be expanded
+  it("GIT_SSH_COMMAND のバイナリパスに ~ がある場合 HOME に展開して alias を解決する（Finding 1 iteration 7: tilde in binary path）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    const homeDir = process.env.HOME ?? "/home/runner";
+    r.on([`${homeDir}/bin/ssh`, "-F", "/cfg", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "~/bin/ssh -F /cfg";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  // Finding 2 (iteration 7): GIT_SSH_COMMAND wrapper with required arguments must pass those args
+  it("GIT_SSH_COMMAND のラッパーバイナリに引数がある場合はその引数を ssh -G に渡す（Finding 2 iteration 7: wrapper args preserved）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["/usr/local/bin/git-ssh-wrapper", "--config", "gh", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "/usr/local/bin/git-ssh-wrapper --config gh";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  // Finding 3 (iteration 7): tilde in GIT_SSH_COMMAND arguments must be expanded
+  it("GIT_SSH_COMMAND の引数に ~ がある場合 HOME に展開して alias を解決する（Finding 3 iteration 7: tilde in args）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    const homeDir = process.env.HOME ?? "/home/runner";
+    r.on(["ssh", "-F", `${homeDir}/.ssh/config`, "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "ssh -F ~/.ssh/config";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
 });
 
 describe("normalizeRemote", () => {
