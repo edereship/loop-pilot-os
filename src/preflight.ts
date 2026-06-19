@@ -203,15 +203,27 @@ function redactUrl(url: string): string {
   }
 }
 
+// TLDs that are reserved for private/internal networks and are never registered in the IANA
+// root zone as public domains. Hosts under these TLDs are almost certainly SSH config aliases
+// (e.g. github.internal, repo.corp) and must not be rejected by isLikelyRealDomain so that
+// ssh -G alias resolution can verify them. See RFC 2606 (.test/.example/.invalid/.localhost),
+// RFC 6762 (.local), and common private-network conventions (.internal/.corp/.private/.lan).
+const PRIVATE_TLDS = new Set([
+  "internal", "local", "corp", "private", "lan", "intranet", "home",
+  "test", "example", "invalid", "localhost",
+]);
+
 // Returns true when the hostname looks like a real domain (e.g. "gitlab.com") rather than
 // an SSH config alias (e.g. "github.com-work", "github-work"). Real-domain TLDs are
-// letters-only; alias suffixes like "com-work" contain hyphens or digits.
-// Trailing dots (FQDN absolute notation, e.g. "gitlab.com.") are stripped before inspection.
+// letters-only and not in PRIVATE_TLDS; alias suffixes like "com-work" contain hyphens or
+// digits. Trailing dots (FQDN absolute notation, e.g. "gitlab.com.") are stripped first.
 function isLikelyRealDomain(host: string): boolean {
   const stripped = host.replace(/\.+$/, "");
   const lastDot = stripped.lastIndexOf(".");
   if (lastDot === -1) return false;
-  return /^[a-z]{2,}$/i.test(stripped.slice(lastDot + 1));
+  const tld = stripped.slice(lastDot + 1).toLowerCase();
+  if (PRIVATE_TLDS.has(tld)) return false; // private-network TLD — treat as SSH config alias
+  return /^[a-z]{2,}$/i.test(tld);
 }
 
 // Returns true for bare IPv4 addresses (e.g. "192.168.1.10"). These are never GitHub
@@ -306,8 +318,14 @@ async function getGitSshConfig(
     const parts = splitShellArgs(envCmd.trim());
     // Git runs GIT_SSH_COMMAND through the shell, so ~ and $VAR in the executable path and
     // arguments are expanded before the command runs. Replicate that here.
-    const bin = expandShellWord(parts[0]);
-    return { sshBin: bin, extraArgs: parts.slice(1).map(expandShellWord) };
+    // Skip any leading KEY=VALUE shell environment assignments — the shell sets them before
+    // exec, but our ssh -G probe does not go through a shell, so they are not the binary.
+    let binIdx = 0;
+    while (binIdx < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[binIdx])) binIdx++;
+    if (binIdx < parts.length) {
+      const bin = expandShellWord(parts[binIdx]);
+      return { sshBin: bin, extraArgs: parts.slice(binIdx + 1).map(expandShellWord) };
+    }
   }
   try {
     const r = await runner.run("git", ["-C", repoPath, "config", "--get", "core.sshCommand"], opts);
@@ -315,8 +333,13 @@ async function getGitSshConfig(
       const parts = splitShellArgs(r.stdout.trim());
       // Git runs core.sshCommand through the shell, so ~ and $VAR in the executable path and
       // arguments are expanded before the command runs. Replicate that here.
-      const bin = expandShellWord(parts[0]);
-      return { sshBin: bin, extraArgs: parts.slice(1).map(expandShellWord) };
+      // Skip any leading KEY=VALUE shell environment assignments (same reasoning as above).
+      let binIdx = 0;
+      while (binIdx < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[binIdx])) binIdx++;
+      if (binIdx < parts.length) {
+        const bin = expandShellWord(parts[binIdx]);
+        return { sshBin: bin, extraArgs: parts.slice(binIdx + 1).map(expandShellWord) };
+      }
     }
   } catch {
     // Fall through to GIT_SSH check.
@@ -610,8 +633,12 @@ async function checkOriginMatchesRemote(
             );
           }
         } catch {
-          // Malformed scheme URL (e.g., non-numeric port with embedded credentials) — skip to
-          // avoid exposing credentials through error messages.
+          // Malformed scheme URL (e.g., non-numeric port with embedded credentials) — the URL
+          // is unusable and the origin is not verified; emit a redacted mismatch error so that
+          // a valid push URL cannot mask an unverifiable fetch URL.
+          errors.push(
+            `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+          );
         }
       }
     }

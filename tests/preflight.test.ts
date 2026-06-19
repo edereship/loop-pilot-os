@@ -1885,6 +1885,109 @@ describe("runPreflight", () => {
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("一致しません"))).toBe(true);
   });
+
+  // Finding 1 (iteration 11): GIT_SSH_COMMAND with leading KEY=VALUE shell assignment
+  it("GIT_SSH_COMMAND が KEY=VALUE 代入で始まる場合は代入をスキップして SSH バイナリを特定する（Finding 1 iteration 11）", async () => {
+    const r = passingRunner();
+    // direct GitHub origin — the default passingRunner origin: git@github.com:owner/name.git
+    // With GIT_SSH_COMMAND='SSH_AUTH_SOCK=/tmp/agent.sock ssh', the effective binary is 'ssh'
+    // and isCustomSsh must be false (no non-standard binary or extra args).
+    r.on(["ssh", "-G", "git@github.com"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "SSH_AUTH_SOCK=/tmp/agent.sock ssh";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  it("core.sshCommand が KEY=VALUE 代入で始まる場合は代入をスキップして SSH バイナリを特定する（Finding 1 iteration 11: core.sshCommand）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "config", "--get", "core.sshCommand"], { code: 0, stdout: "SSH_AUTH_SOCK=/tmp/agent.sock ssh -F /cfg\n", stderr: "" });
+    // After skipping SSH_AUTH_SOCK=... the binary is 'ssh' and extra args are ['-F', '/cfg'].
+    r.on(["ssh", "-F", "/cfg", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("GIT_SSH_COMMAND が複数の KEY=VALUE 代入で始まる場合もスキップする（Finding 1 iteration 11: multiple assignments）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@gh:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-F", "/cfg", "-G", "git@gh"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const origEnv = process.env.GIT_SSH_COMMAND;
+    process.env.GIT_SSH_COMMAND = "A=1 B=2 ssh -F /cfg";
+    try {
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+    } finally {
+      if (origEnv === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = origEnv;
+    }
+  });
+
+  // Finding 2 (iteration 11): domain-like SSH aliases with private TLDs must be accepted via ssh -G
+  it("プライベート TLD の SSH config alias (git@github.internal:...) が github.com に解決されパスが一致すればエラーなし（Finding 2 iteration 11）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.internal:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.internal:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github.internal"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("プライベート TLD の SSH config alias でパスが不一致なら NG（Finding 2 iteration 11）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.internal:owner/other.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.internal:owner/other.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github.internal"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+  });
+
+  it("プライベート TLD (.corp) の SSH config alias が github.com に解決されパスが一致すればエラーなし（Finding 2 iteration 11: .corp TLD）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@git.corp:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@git.corp:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@git.corp"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("ssh:// alias にプライベート TLD がある場合も ssh -G で github.com に解決されパスが一致すればエラーなし（Finding 2 iteration 11: ssh:// alias）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "ssh://git@github.internal/owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "ssh://git@github.internal/owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github.internal"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("一致しません"))).toEqual([]);
+  });
+
+  it("push URL がプライベート TLD alias で github.com に解決されパスが一致すればエラーなし（Finding 2 iteration 11: push URL）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.internal:owner/name.git\n", stderr: "" });
+    r.on(["ssh", "-G", "git@github.internal"], { code: 0, stdout: "hostname github.com\nuser git\nport 22\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("push URL") && e.includes("一致しません"))).toEqual([]);
+  });
+
+  // Finding 3 (iteration 11): malformed fetch URL must emit error even when push URL is valid
+  it("不正な fetch URL はエラーを報告し push URL が正常でも検証をスキップしない（Finding 3 iteration 11）", async () => {
+    const r = passingRunner();
+    // Malformed fetch URL with embedded credential and non-numeric port
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "origin"], { code: 0, stdout: "https://ghp_secret@github.com:notaport/owner/name.git\n", stderr: "" });
+    // Valid push URL that matches repo.remote
+    r.on(["git", "-C", "/abs/repo", "remote", "get-url", "--push", "--all", "origin"], { code: 0, stdout: "git@github.com:owner/name.git\n", stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("origin") && e.includes("一致しません"))).toBe(true);
+    expect(errors.every((e) => !e.includes("ghp_secret"))).toBe(true);
+  });
 });
 
 describe("normalizeRemote", () => {
