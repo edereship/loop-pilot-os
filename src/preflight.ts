@@ -279,7 +279,9 @@ async function getGitSshConfig(
   if (envCmd && envCmd.trim()) {
     const parts = splitShellArgs(envCmd.trim());
     const bin = parts[0];
-    if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: "ssh", extraArgs: [] };
+    // When GIT_SSH_COMMAND names a wrapper binary (not literally ssh), use it directly for
+    // ssh -G alias resolution — the wrapper's own config handles extra options internally.
+    if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: bin, extraArgs: [] };
     // Git executes GIT_SSH_COMMAND through the shell, so $HOME and ${VAR} references in
     // the arguments are shell-expanded before the command reaches the SSH binary. We
     // replicate that for simple variable references so paths like "$HOME/.ssh/config" resolve
@@ -297,7 +299,9 @@ async function getGitSshConfig(
       // itself is ssh (or a path ending in /ssh) because wrapper binaries typically forward
       // them internally already.
       if (bin !== "ssh" && !bin.endsWith("/ssh")) return { sshBin: bin, extraArgs: [] };
-      return { sshBin: bin, extraArgs: parts.slice(1) };
+      // core.sshCommand is executed through the shell by git, so $HOME and ${VAR} references
+      // in the arguments are shell-expanded. Replicate that for simple variable references.
+      return { sshBin: bin, extraArgs: parts.slice(1).map(expandEnvVars) };
     }
   } catch {
     // Fall through to GIT_SSH check.
@@ -312,16 +316,19 @@ async function getGitSshConfig(
 }
 
 // For SCP-format (e.g. git@github.com:path) or ssh:// URLs that name a GitHub host directly,
-// return the ssh -G target string and expected hostname so callers can verify SSH config hasn't
-// redirected the host to a different server. Returns null for HTTPS or non-GitHub hosts.
-function extractDirectGitHubSshTarget(trimmed: string): { target: string; expectedHost: string } | null {
+// return the ssh -G target string, expected hostname, and the URL's explicit port (if any)
+// so callers can verify SSH config hasn't redirected the host to a different server.
+// Returns null for HTTPS or non-GitHub hosts.
+function extractDirectGitHubSshTarget(
+  trimmed: string,
+): { target: string; expectedHost: string; explicitPort: string | null } | null {
   // SCP format: [user@]host:path — ssh.github.com cannot be expressed without a port in SCP so reject it.
   const scpM = trimmed.match(/^(?:([^@/:]+)@)?([^/:]+):(.+)$/);
   if (scpM && !scpM[3].startsWith("//")) {
     const user = scpM[1];
     const host = scpM[2].toLowerCase();
     if (GITHUB_HOSTS.has(host) && host !== "ssh.github.com") {
-      return { target: user ? `${user}@${host}` : host, expectedHost: host };
+      return { target: user ? `${user}@${host}` : host, expectedHost: host, explicitPort: null };
     }
     return null;
   }
@@ -330,7 +337,9 @@ function extractDirectGitHubSshTarget(trimmed: string): { target: string; expect
     const p = new URL(trimmed);
     if (p.protocol === "ssh:" && GITHUB_HOSTS.has(p.hostname.toLowerCase())) {
       const host = p.hostname.toLowerCase();
-      return { target: p.username ? `${p.username}@${host}` : host, expectedHost: host };
+      // Preserve the URL's explicit port so callers can prefer it over the SSH-reported default
+      // (ssh -G without -p reports port 22 when there is no matching Host block in SSH config).
+      return { target: p.username ? `${p.username}@${host}` : host, expectedHost: host, explicitPort: p.port || null };
     }
   } catch {
     // ignore
@@ -376,13 +385,24 @@ async function checkOriginMatchesRemote(
               const pl3 = lines3.find((l) => l.toLowerCase().startsWith("port "));
               const resolvedPort3 = pl3 ? pl3.slice("port ".length).trim() : null;
               if (resolvedHost3 !== null && resolvedHost3 !== directSsh.expectedHost) {
-                errors.push(
-                  `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-                );
+                // Allow the documented GitHub SSH-over-HTTPS setup where github.com is mapped
+                // to ssh.github.com at port 443 via SSH config HostName/Port directives.
+                const isGitHubSshOverHttpsRemap =
+                  resolvedHost3 === "ssh.github.com" &&
+                  directSsh.expectedHost === "github.com" &&
+                  resolvedPort3 === "443";
+                if (!isGitHubSshOverHttpsRemap) {
+                  errors.push(
+                    `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                  );
+                }
               } else if (resolvedHost3 !== null && resolvedPort3 !== null) {
                 // github.com accepts only port 22; ssh.github.com accepts only port 443 (SSH-over-HTTPS).
                 const expectedPort3 = directSsh.expectedHost === "ssh.github.com" ? "443" : "22";
-                if (resolvedPort3 !== expectedPort3) {
+                // The URL's explicit port takes precedence over the SSH-config-reported port;
+                // ssh -G without -p reports port 22 when no Host block covers the target.
+                const effectivePort3 = directSsh.explicitPort ?? resolvedPort3;
+                if (effectivePort3 !== expectedPort3) {
                   errors.push(
                     `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                   );
@@ -407,6 +427,12 @@ async function checkOriginMatchesRemote(
         const fetchHost = fetchScpMatch[2].toLowerCase();
         const rawFetchPath = fetchScpMatch[3];
         if (isIPv4Address(fetchHost)) {
+          errors.push(
+            `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+          );
+        } else if (isLikelyRealDomain(fetchHost)) {
+          // Real non-GitHub domain (e.g. gitlab.com) — reject outright without ssh -G alias
+          // resolution; only alias-style hostnames (no letters-only TLD) qualify for lookup.
           errors.push(
             `git: ローカルリポの origin (${redactUrl(fetchUrl)}) が repo.remote (${repoSlug}) と一致しません`,
           );
@@ -468,9 +494,11 @@ async function checkOriginMatchesRemote(
             parsedFetch.protocol === "ssh:" &&
             !GITHUB_HOSTS.has(parsedFetch.hostname.toLowerCase()) &&
             parsedFetch.hostname !== "" &&
-            !isIPv4Address(parsedFetch.hostname)
+            !isIPv4Address(parsedFetch.hostname) &&
+            !isLikelyRealDomain(parsedFetch.hostname)
           ) {
-            // ssh:// URL with a non-GitHub, non-IP hostname — may be an SSH config alias.
+            // ssh:// URL with a non-GitHub, non-IP, alias-style hostname — may be an SSH config alias.
+            // Real domains (e.g. gitlab.com with a letters-only TLD) are rejected above by the else branch.
             const urlUser = parsedFetch.username;
             if (urlUser !== "" && urlUser.toLowerCase() !== "git") {
               // Explicit non-git user — reject outright.
@@ -635,13 +663,23 @@ async function checkOriginMatchesRemote(
                     const pl3p = lines3p.find((l) => l.toLowerCase().startsWith("port "));
                     const resolvedPort3p = pl3p ? pl3p.slice("port ".length).trim() : null;
                     if (resolvedHost3p !== null && resolvedHost3p !== directPushSsh.expectedHost) {
-                      errors.push(
-                        `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
-                      );
+                      // Allow the documented GitHub SSH-over-HTTPS setup where github.com is mapped
+                      // to ssh.github.com at port 443 via SSH config HostName/Port directives.
+                      const isGitHubSshOverHttpsRemapP =
+                        resolvedHost3p === "ssh.github.com" &&
+                        directPushSsh.expectedHost === "github.com" &&
+                        resolvedPort3p === "443";
+                      if (!isGitHubSshOverHttpsRemapP) {
+                        errors.push(
+                          `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                        );
+                      }
                     } else if (resolvedHost3p !== null && resolvedPort3p !== null) {
                       // github.com accepts only port 22; ssh.github.com accepts only port 443 (SSH-over-HTTPS).
                       const expectedPort3p = directPushSsh.expectedHost === "ssh.github.com" ? "443" : "22";
-                      if (resolvedPort3p !== expectedPort3p) {
+                      // The URL's explicit port takes precedence over the SSH-config-reported port.
+                      const effectivePort3p = directPushSsh.explicitPort ?? resolvedPort3p;
+                      if (effectivePort3p !== expectedPort3p) {
                         errors.push(
                           `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                         );
@@ -665,6 +703,11 @@ async function checkOriginMatchesRemote(
               const pushHost = pushScpMatch[2].toLowerCase();
               const rawPushPath = pushScpMatch[3];
               if (isIPv4Address(pushHost)) {
+                errors.push(
+                  `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
+                );
+              } else if (isLikelyRealDomain(pushHost)) {
+                // Real non-GitHub domain — reject outright without ssh -G alias resolution.
                 errors.push(
                   `git: origin の push URL (${redactUrl(pushUrl)}) が repo.remote (${repoSlug}) と一致しません`,
                 );
@@ -725,9 +768,11 @@ async function checkOriginMatchesRemote(
                   parsedPush.protocol === "ssh:" &&
                   !GITHUB_HOSTS.has(parsedPush.hostname.toLowerCase()) &&
                   parsedPush.hostname !== "" &&
-                  !isIPv4Address(parsedPush.hostname)
+                  !isIPv4Address(parsedPush.hostname) &&
+                  !isLikelyRealDomain(parsedPush.hostname)
                 ) {
-                  // ssh:// URL with a non-GitHub, non-IP hostname — may be an SSH config alias.
+                  // ssh:// URL with a non-GitHub, non-IP, alias-style hostname — may be an SSH config alias.
+                  // Real domains (e.g. gitlab.com) are rejected above by the else branch.
                   const purlUser = parsedPush.username;
                   if (purlUser !== "" && purlUser.toLowerCase() !== "git") {
                     errors.push(
