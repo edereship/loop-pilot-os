@@ -442,6 +442,36 @@ describe("classifyClaudeError", () => {
     expect(result.isRateLimit).toBe(false);
   });
 
+  it("detects 'hit your session limit' as rate limit (Finding 1 — documented Claude quota string)", () => {
+    const result = classifyClaudeError(
+      "You've hit your session limit",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("detects 'hit your weekly limit' in stderr as rate limit (Finding 1 — documented Claude quota string)", () => {
+    const result = classifyClaudeError(
+      "claude exited with code 1",
+      "You've hit your weekly limit. Resets Mon 12:00am",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("detects 'temporarily limiting requests' as rate limit (Finding 1 — documented Claude quota string)", () => {
+    const result = classifyClaudeError(
+      "Server is temporarily limiting requests",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
   it("does NOT match partial '429' inside longer numbers", () => {
     const result = classifyClaudeError(
       "processed 14290 tokens",
@@ -607,6 +637,37 @@ describe("parseResetsTime", () => {
     // NOW = 2026-06-20T10:00:00Z = 18:00 SGT.
     const result = parseResetsTime("resets 06:40pm (Asia/Singapore)", NOW);
     expect(result).toBe(Date.parse("2026-06-20T10:40:00.000Z"));
+  });
+
+  it("parses 'resets 3:45pm' without timezone as UTC future time (Finding 2 — documented no-timezone form)", () => {
+    // NOW = 2026-06-20T10:00:00Z. 3:45pm UTC = 15:45 UTC (future on same day).
+    const result = parseResetsTime("resets 3:45pm", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T15:45:00.000Z"));
+  });
+
+  it("parses 'resets 12:00am' without timezone and wraps to next day when past (Finding 2)", () => {
+    // NOW = 2026-06-20T10:00:00Z. midnight UTC = 00:00 UTC = past → next day.
+    const result = parseResetsTime("resets 12:00am", NOW);
+    expect(result).toBe(Date.parse("2026-06-21T00:00:00.000Z"));
+  });
+
+  it("parses 'resets Mon 12:00am' weekday form as next Monday midnight UTC (Finding 2 — documented weekly-limit form)", () => {
+    // NOW = 2026-06-20T10:00:00Z = Saturday. Next Monday = June 22 at 00:00 UTC.
+    const result = parseResetsTime("resets Mon 12:00am", NOW);
+    expect(result).toBe(Date.parse("2026-06-22T00:00:00.000Z"));
+  });
+
+  it("parses 'resets Mon 3:45pm' weekday form with non-midnight time (Finding 2)", () => {
+    // NOW = 2026-06-20T10:00:00Z = Saturday. Next Monday June 22 at 15:45 UTC.
+    const result = parseResetsTime("resets Mon 3:45pm", NOW);
+    expect(result).toBe(Date.parse("2026-06-22T15:45:00.000Z"));
+  });
+
+  it("weekday form wraps to next week when same weekday's time has already passed (Finding 2)", () => {
+    // NOW = 2026-06-20T10:00:00Z = Saturday. resets Sat 09:00am = today at 09:00 UTC — past.
+    // → wrap to next Saturday June 27 at 09:00 UTC.
+    const result = parseResetsTime("resets Sat 9:00am", NOW);
+    expect(result).toBe(Date.parse("2026-06-27T09:00:00.000Z"));
   });
 });
 
@@ -1093,6 +1154,43 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
 
     expect(outcome.kind).toBe("completed");
     expect(runner.calls).toHaveLength(2);
+  });
+
+  it("retries nonzero exit where result text matches broad pattern 'overloaded' (Finding 3 — broad patterns for API-level errors)", async () => {
+    const RESULT_OVERLOADED =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"result":"API is overloaded, please try again later","session_id":"s1"}';
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_OVERLOADED);
+        return { code: 1, stdout: "", stderr: "" }; // nonzero exit — API-level rejection
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
+  });
+
+  it("does NOT retry zero-exit result text with broad patterns — only narrow 429 applies to agent output (Finding 3)", async () => {
+    const RESULT_OVERLOADED_ZERO =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"result":"API is overloaded, please try again later","session_id":"s1"}';
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_OVERLOADED_ZERO], 0); // exit code 0
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    // Must NOT retry — zero exit means agent output, not an API-level rejection.
+    expect(outcome.kind).toBe("error");
+    expect(runner.calls).toHaveLength(1);
   });
 
   it("interrupts rate-limit sleep when isInterrupted fires (Finding 4)", async () => {

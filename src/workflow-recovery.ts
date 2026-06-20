@@ -107,25 +107,29 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
         { cwd: ctx.worktreePath },
       );
       if (logResult.stdout.trim() !== "") {
+        // Push the interrupted commits so the next attemptRecovery's
+        // syncBranchToOrigin does not silently discard them.
         try {
           await this.pushFix(ctx.branch, ctx.worktreePath);
-          // The LoopPilot workflow only fires on issue_comment / pull_request_review,
-          // not on push/synchronize. Post /restart-review so the pushed fix is
-          // reviewed without waiting for a human comment.
-          try {
-            await this.postRestartReview(ctx.prNumber);
-          } catch {
-            // best-effort; push succeeded — a human can /restart-review manually
-          }
-          // Push succeeded: return restarted so the orchestrator increments
-          // workflowFixAttempts, records workflowHandledErrorCount, and resets
-          // monitorStartedAt — preventing duplicate fix runs and false not-engaged
-          // guard triggers on the next poll.
-          return { kind: "restarted", costUsd: outcome.costUsd, newFix: true };
         } catch {
-          // Push failed — commits stay local-only. Nothing more we can do; the
-          // interrupted outcome is still returned so the caller can stop the session.
+          // Push failed — commits stay local-only. Best-effort; return interrupted
+          // so the caller stops the session without marking the error as handled.
+          return { kind: "interrupted", costUsd: outcome.costUsd };
         }
+        // Push succeeded; post /restart-review. Propagate comment failures so the
+        // orchestrator does not record workflowHandledErrorCount for an error that
+        // was never actually restarted (unlike a best-effort swallow, which would
+        // leave the PR silently stalled until the not-engaged guard fires).
+        try {
+          await this.postRestartReview(ctx.prNumber);
+        } catch (err) {
+          return {
+            kind: "unrecoverable",
+            costUsd: outcome.costUsd,
+            message: `restart review failed: ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+        return { kind: "restarted", costUsd: outcome.costUsd, newFix: true };
       }
       return { kind: "interrupted", costUsd: outcome.costUsd };
     }

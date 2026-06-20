@@ -407,6 +407,33 @@ describe("AgentWorkflowRecovery", () => {
     expect(pushCall).toBeUndefined();
   });
 
+  it("agent interrupted: restart-review comment failure after successful push → unrecoverable (Finding 4)", async () => {
+    // Push succeeds but /restart-review comment fails. The old code swallowed the
+    // comment failure and returned restarted(newFix:true), causing the orchestrator
+    // to record workflowHandledErrorCount even though the workflow was never restarted.
+    // The fix propagates the failure so the orchestrator surfaces it immediately.
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef fix commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    runner.on(["gh", "pr", "comment"], { code: 1, stderr: "not found" });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toMatchObject<Partial<RecoveryOutcome>>({
+      kind: "unrecoverable",
+      costUsd: 0.05,
+    });
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain(
+      "restart review failed",
+    );
+  });
+
   it("agent interrupted: push failure is silently swallowed, interrupted still returned (Finding 4)", async () => {
     const { recovery, agent, runner } = makeRecovery();
     runner.on(["git", "-C"], (args) => {

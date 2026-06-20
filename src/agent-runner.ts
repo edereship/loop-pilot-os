@@ -123,6 +123,8 @@ const DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS: RegExp[] = [
   /usage.?limit/i,
   /too many requests/i,
   /overloaded/i,
+  /\bhit your (session|weekly) limit\b/i,
+  /temporarily limiting\b/i,
 ];
 
 // Narrower pattern used only against resultText (agent output) to avoid
@@ -132,11 +134,17 @@ const RESULT_TEXT_429_PATTERN =
   /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\b429\b.*Too Many Requests/i;
 
 const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})/i;
-// Matches both:
-//   "reset at 7am (Asia/Singapore)"  — format without minutes (original CLI shape)
-//   "resets 6:40pm (America/New_York)" — format with minutes, no "at" (Finding 2)
-// Groups: (hour)(optional-minutes)(am|pm)(timezone)
-const RESETS_AT_AMPM_PATTERN = /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?(am|pm)\s*\(([^)]+)\)/i;
+// Matches timezone-qualified AM/PM resets ("resets 6:40pm (America/New_York)") and
+// bare no-timezone forms ("resets 3:45pm") — documented Claude quota message shapes.
+// Groups: (hour)(optional-minutes)(am|pm)(optional-timezone)
+const RESETS_AT_AMPM_PATTERN =
+  /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?(am|pm)(?:\s*\(([^)]+)\))?/i;
+
+// Weekday names indexed by JS Date.getUTCDay() (0=Sun … 6=Sat).
+const WEEKDAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+// Matches "resets Mon 12:00am" / "resets Sat 3:45pm" — documented weekly-limit form.
+const RESETS_WEEKDAY_PATTERN =
+  /resets?\s+(mon|tue|wed|thu|fri|sat|sun)\s+(\d{1,2})(?::(\d{2}))?(am|pm)/i;
 
 export interface RateLimitClassification {
   isRateLimit: boolean;
@@ -146,11 +154,11 @@ export interface RateLimitClassification {
 function parseResetsAtAmPm(text: string, nowMs: number): number | null {
   const match = RESETS_AT_AMPM_PATTERN.exec(text);
   if (!match) return null;
-  // Groups after extending pattern for optional minutes: (hour)(minutes?)(am|pm)(tz)
+  // Groups: (hour)(optional-minutes)(am|pm)(optional-timezone)
   let targetHour = parseInt(match[1]!, 10);
   const targetMinutes = match[2] !== undefined ? parseInt(match[2], 10) : 0;
   const ampm = match[3]!.toLowerCase();
-  const tz = match[4]!;
+  const tz = match[4]; // undefined when no parenthesized timezone
   if (targetHour < 1 || targetHour > 12) return null;
   if (targetMinutes > 59) return null;
   if (ampm === "am") {
@@ -158,31 +166,71 @@ function parseResetsAtAmPm(text: string, nowMs: number): number | null {
   } else {
     if (targetHour !== 12) targetHour += 12;
   }
-  try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).formatToParts(new Date(nowMs));
-    const hourPart = parts.find((p) => p.type === "hour");
-    const minutePart = parts.find((p) => p.type === "minute");
-    if (!hourPart || !minutePart) return null;
-    // hour12:false can yield "24" for midnight in some environments; normalise to 0-23.
-    const currentHour = parseInt(hourPart.value, 10) % 24;
-    const currentMinute = parseInt(minutePart.value, 10);
-    let deltaMs = (targetHour - currentHour) * 3_600_000 + (targetMinutes - currentMinute) * 60_000;
-    // Only wrap to next day if the target is more than 60s in the past (same
-    // semantics as the HH:MM parser: a near-past value means the reset is now).
-    if (deltaMs < -60_000) deltaMs += 24 * 3_600_000;
-    return nowMs + deltaMs;
-  } catch {
-    return null; // invalid timezone name
+  if (tz !== undefined) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).formatToParts(new Date(nowMs));
+      const hourPart = parts.find((p) => p.type === "hour");
+      const minutePart = parts.find((p) => p.type === "minute");
+      if (!hourPart || !minutePart) return null;
+      // hour12:false can yield "24" for midnight in some environments; normalise to 0-23.
+      const currentHour = parseInt(hourPart.value, 10) % 24;
+      const currentMinute = parseInt(minutePart.value, 10);
+      let deltaMs = (targetHour - currentHour) * 3_600_000 + (targetMinutes - currentMinute) * 60_000;
+      // Only wrap to next day if the target is more than 60s in the past (same
+      // semantics as the HH:MM parser: a near-past value means the reset is now).
+      if (deltaMs < -60_000) deltaMs += 24 * 3_600_000;
+      return nowMs + deltaMs;
+    } catch {
+      return null; // invalid timezone name
+    }
   }
+  // No timezone: treat as UTC, consistent with HH:MM parser behaviour.
+  const target = new Date(nowMs);
+  target.setUTCHours(targetHour, targetMinutes, 0, 0);
+  if (target.getTime() < nowMs - 60_000) {
+    target.setUTCDate(target.getUTCDate() + 1);
+  }
+  return target.getTime();
+}
+
+function parseResetsWeekday(text: string, nowMs: number): number | null {
+  const match = RESETS_WEEKDAY_PATTERN.exec(text);
+  if (!match) return null;
+  const weekdayName = match[1]!.toLowerCase();
+  let targetHour = parseInt(match[2]!, 10);
+  const targetMinutes = match[3] !== undefined ? parseInt(match[3], 10) : 0;
+  const ampm = match[4]!.toLowerCase();
+  if (targetHour < 1 || targetHour > 12) return null;
+  if (targetMinutes > 59) return null;
+  if (ampm === "am") {
+    if (targetHour === 12) targetHour = 0;
+  } else {
+    if (targetHour !== 12) targetHour += 12;
+  }
+  const targetDay = WEEKDAY_NAMES.indexOf(weekdayName);
+  const currentDay = new Date(nowMs).getUTCDay();
+  const daysAhead = (targetDay - currentDay + 7) % 7;
+  const target = new Date(nowMs);
+  target.setUTCDate(target.getUTCDate() + daysAhead);
+  target.setUTCHours(targetHour, targetMinutes, 0, 0);
+  // Same-weekday case: if target time has already passed (>60s ago), next week.
+  if (target.getTime() < nowMs - 60_000) {
+    target.setUTCDate(target.getUTCDate() + 7);
+  }
+  return target.getTime();
 }
 
 export function parseResetsTime(text: string, nowMs: number): number | null {
-  // Try AM/PM+timezone format first — a zero-padded 12-hour time like
+  // Try weekday form first — "resets Mon 12:00am" must not fall into the AM/PM
+  // branch which expects a digit immediately after "resets ".
+  const weekdayResult = parseResetsWeekday(text, nowMs);
+  if (weekdayResult !== null) return weekdayResult;
+  // Try AM/PM format next — a zero-padded 12-hour time like
   // "resets 06:40pm (Asia/Singapore)" would otherwise match the bare HH:MM
   // pattern and be misinterpreted as 06:40 UTC.
   const ampmResult = parseResetsAtAmPm(text, nowMs);
@@ -382,7 +430,15 @@ export class ClaudeAgentRunner implements AgentRunner {
       // arg would apply the broad /rate.?limit/ pattern to strings like
       // "GitHub API rate limit exceeded", masking the real failure as Claude quota.
       // Use an empty string so only the narrow HTTP-429 pattern fires via resultText.
-      const cliMessage = exitCode !== 0 ? outcome.message : "";
+      // For nonzero exits (API-level rejections from the CLI), include resultText in
+      // the combined message so broad patterns like /usage.?limit/ or /overloaded/
+      // are checked against the error payload emitted by the CLI.
+      const cliMessage =
+        exitCode !== 0
+          ? resultText
+            ? `${outcome.message}\n${resultText}`
+            : outcome.message
+          : "";
       const classification = classifyClaudeError(
         cliMessage,
         stderr,
