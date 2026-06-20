@@ -133,7 +133,7 @@ const DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS: RegExp[] = [
 const RESULT_TEXT_429_PATTERN =
   /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\b429\b.*Too Many Requests/i;
 
-const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})/i;
+const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})(?:\s*(utc))?/i;
 // Matches timezone-qualified AM/PM resets ("resets 6:40pm (America/New_York)") and
 // bare no-timezone forms ("resets 3:45pm") — documented Claude quota message shapes.
 // Groups: (hour)(optional-minutes)(am|pm)(optional-timezone)
@@ -247,14 +247,22 @@ export function parseResetsTime(text: string, nowMs: number): number | null {
   if (match) {
     const hours = parseInt(match[1]!, 10);
     const minutes = parseInt(match[2]!, 10);
+    const isUtc = match[3] !== undefined;
     if (hours <= 23 && minutes <= 59) {
       const target = new Date(nowMs);
-      target.setHours(hours, minutes, 0, 0);
-      // Only wrap to next day if the parsed time is more than 60s in the past.
-      // The reset time has minute precision; a near-past value (within the same
-      // minute) means the reset is happening now, not tomorrow.
-      if (target.getTime() < nowMs - 60_000) {
-        target.setDate(target.getDate() + 1);
+      if (isUtc) {
+        target.setUTCHours(hours, minutes, 0, 0);
+        if (target.getTime() < nowMs - 60_000) {
+          target.setUTCDate(target.getUTCDate() + 1);
+        }
+      } else {
+        target.setHours(hours, minutes, 0, 0);
+        // Only wrap to next day if the parsed time is more than 60s in the past.
+        // The reset time has minute precision; a near-past value (within the same
+        // minute) means the reset is happening now, not tomorrow.
+        if (target.getTime() < nowMs - 60_000) {
+          target.setDate(target.getDate() + 1);
+        }
       }
       return target.getTime();
     }
@@ -392,7 +400,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       resultText = resultText ? `${resultText}\nHTTP/429 Too Many Requests` : "HTTP/429 Too Many Requests";
     }
     const assistantText = assistantTextParts.join("\n");
-    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId, exitCode: cmdResult.code, assistantText };
+    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId ?? rl?.session_id ?? null, exitCode: cmdResult.code, assistantText };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
@@ -413,10 +421,20 @@ export class ClaudeAgentRunner implements AgentRunner {
       if (remainingBudget <= 0) {
         return { kind: "cost_exceeded", costUsd: totalCost };
       }
-      const { outcome, stderr, resultText, sessionId, exitCode, assistantText } = await this.runOnce(
-        { ...ctx, maxCostUsd: remainingBudget },
-        lastSessionId ?? undefined,
-      );
+      let runResult: Awaited<ReturnType<ClaudeAgentRunner["runOnce"]>>;
+      try {
+        runResult = await this.runOnce(
+          { ...ctx, maxCostUsd: remainingBudget },
+          lastSessionId ?? undefined,
+        );
+      } catch (err) {
+        return {
+          kind: "error",
+          costUsd: totalCost,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+      const { outcome, stderr, resultText, sessionId, exitCode, assistantText } = runResult;
       if (sessionId) lastSessionId = sessionId;
       totalCost += outcome.costUsd;
 

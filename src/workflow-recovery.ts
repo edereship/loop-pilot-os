@@ -136,6 +136,13 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
         ["-C", ctx.worktreePath, "log", `origin/${ctx.branch}..HEAD`, "--oneline"],
         { cwd: ctx.worktreePath },
       );
+      if (logResult.code !== 0) {
+        return {
+          kind: "unrecoverable",
+          costUsd: outcome.costUsd,
+          message: `git log failed in ${ctx.worktreePath}: ${logResult.stderr.trim() || `exit ${logResult.code}`}`,
+        };
+      }
       if (logResult.stdout.trim() !== "") {
         // Push the interrupted commits so the next attemptRecovery's
         // syncBranchToOrigin does not silently discard them.
