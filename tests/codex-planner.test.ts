@@ -728,7 +728,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
   });
 
-  it("CODEX_HOME 未設定時は子プロセスの env に CODEX_HOME を注入しない（model-run shell への漏えい防止）", async () => {
+  it("CODEX_HOME 未設定時は realCodexHome（~/.codex）を CODEX_HOME として注入する（/tmp シンボリックリンク経由の auth 漏えいを防ぐ）", async () => {
     const saved = { ...process.env };
     delete process.env["CODEX_HOME"];
     try {
@@ -738,13 +738,15 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
       await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
       const env = runner.calls[0]!.opts.env!;
-      // CODEX_HOME must NOT appear in the child env when the operator did not
-      // set it: Codex finds auth via $HOME/.codex (symlink to realCodexHome).
-      // Keeping CODEX_HOME out of the env prevents model-launched subshells
-      // from reading $CODEX_HOME/auth.json to leak refresh/API tokens.
-      expect(env["CODEX_HOME"]).toBeUndefined();
-      // HOME must still be set to the private per-run directory so that Codex
-      // resolves $HOME/.codex to the symlink pointing at the real auth dir.
+      // CODEX_HOME must be set to the real auth directory (~/.codex) so Codex
+      // can authenticate. The previous symlink approach put a .codex symlink
+      // inside the per-run /tmp dir (which the Codex sandbox workspace includes
+      // as readable), allowing prompt injection to read auth.json via the
+      // symlink. With an explicit CODEX_HOME pointing to ~/.codex (outside /tmp
+      // and outside the worktree), the sandbox cannot reach auth files.
+      const expectedCodexHome = path.join(os.homedir(), ".codex");
+      expect(env["CODEX_HOME"]).toBe(expectedCodexHome);
+      // HOME is still the private per-run directory for dotfile isolation.
       expect(env["HOME"]).toContain("codex-planner-");
       expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
     } finally {
@@ -781,9 +783,10 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     const authEnv = runner.calls[1]!.opts.env!;
     expect(authEnv["HOME"]).toContain("codex-planner-");
     expect(path.dirname(authEnv["HOME"]!)).toBe(os.tmpdir());
-    // CODEX_HOME is intentionally absent: Codex uses $HOME/.codex (symlink)
-    // to find auth, keeping the auth path out of model-launched subprocess envs.
-    expect(authEnv["CODEX_HOME"]).toBeUndefined();
+    // CODEX_HOME must be set to the real auth directory so Codex can
+    // authenticate during the login status check.
+    const expectedCodexHome = path.join(os.homedir(), ".codex");
+    expect(authEnv["CODEX_HOME"]).toBe(expectedCodexHome);
   });
 });
 
@@ -806,6 +809,36 @@ describe("CodexPlanner Windows .cmd shim (Finding 2)", () => {
     await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
     expect(runner.calls[0]!.cmd).toBe("codex");
+  });
+});
+
+describe("CodexPlanner Windows stdin prompt passthrough (Finding 3)", () => {
+  it("Windows ではプロンプトを stdin 経由で渡し、args の最終要素は '-' になる（cmd.exe コマンドライン長制限回避）", async () => {
+    if (process.platform !== "win32") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex.cmd"], { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    const prompt = "Do something important.";
+    await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt });
+
+    const call = runner.calls[0]!;
+    // The last positional arg must be the stdin sentinel, not the prompt text.
+    expect(call.args[call.args.length - 1]).toBe("-");
+    // The actual prompt must be piped via stdin.
+    expect(call.opts.stdin).toBe(prompt);
+  });
+
+  it("Windows では大きなプロンプトも stdin 経由で渡す（8191 文字 cmd.exe 制限を超えても失敗しない）", async () => {
+    if (process.platform !== "win32") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex.cmd"], { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    const largePrompt = "A".repeat(9000);
+    const outcome = await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: largePrompt });
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls[0]!.opts.stdin).toBe(largePrompt);
+    expect(runner.calls[0]!.args[runner.calls[0]!.args.length - 1]).toBe("-");
   });
 });
 

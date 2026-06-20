@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -189,45 +189,19 @@ function codexChildEnv(homeDir: string): Record<string, string> {
     }
   }
 
-  // Set up auth access for the Codex binary.
-  //
-  // When the operator did not set CODEX_HOME explicitly: create a symlink at
-  // homeDir/.codex pointing to the real auth directory. We do NOT inject
-  // CODEX_HOME into the child env — Codex finds auth via its HOME-relative
-  // default ($HOME/.codex = homeDir/.codex → realCodexHome). This keeps
-  // $CODEX_HOME unset in model-launched subprocesses, so a prompt cannot read
-  // $CODEX_HOME/auth.json to exfiltrate refresh/API tokens.
-  // The symlink is removed with homeDir in the caller's finally block.
-  //
-  // When the operator explicitly set CODEX_HOME, inject that path so their
-  // chosen auth directory is honoured. (Note: project-level .codex/config.toml
-  // and project-local hooks inside the worktree are not blocked by
-  // --ignore-user-config, which only skips $CODEX_HOME/config.toml. A Codex
-  // CLI flag to disable project-level config should be added via extraArgs
-  // once the appropriate flag is confirmed for the Codex CLI version in use.)
-  if (parentCodexHome !== undefined) {
-    out["CODEX_HOME"] = realCodexHome;
-  } else {
-    const isolatedCodexHome = path.join(homeDir, ".codex");
-    try {
-      symlinkSync(
-        realCodexHome,
-        isolatedCodexHome,
-        process.platform === "win32" ? "junction" : undefined,
-      );
-      // CODEX_HOME intentionally not set: Codex uses $HOME/.codex (the symlink).
-    } catch (err) {
-      // EEXIST: a prior codexChildEnv call with the same homeDir already
-      // created the symlink — auth is accessible via $HOME/.codex without an
-      // explicit CODEX_HOME env var.
-      // Any other error (e.g. junction target absent on Windows): fall back to
-      // the real path so authentication still works.
-      const code = (err as { code?: string }).code;
-      if (code !== "EEXIST") {
-        out["CODEX_HOME"] = realCodexHome;
-      }
-    }
-  }
+  // Always inject CODEX_HOME so Codex authenticates via its designated auth
+  // directory. The previous approach created a $HOME/.codex symlink inside the
+  // per-run temp dir instead of setting CODEX_HOME, but that symlink resided
+  // in /tmp — which the Codex sandbox workspace includes as readable — allowing
+  // a prompt-injected task to follow the symlink and read auth.json from within
+  // the sandbox. With CODEX_HOME set explicitly, the auth directory (typically
+  // ~/.codex) lies outside /tmp and outside the worktree, so the sandbox
+  // cannot reach it via /tmp traversal.
+  // (Note: project-level .codex/config.toml and project-local hooks inside
+  // the worktree are not blocked by --ignore-user-config, which only skips
+  // $CODEX_HOME/config.toml. A Codex CLI flag to disable project-level config
+  // should be added via extraArgs once the appropriate flag is confirmed.)
+  out["CODEX_HOME"] = realCodexHome;
   // Replace HOME and USERPROFILE with the caller-supplied private per-run
   // directory so that prompts cannot reach host dotfiles via "~" or
   // %USERPROFILE%. USERPROFILE is the Windows equivalent of HOME; tools
@@ -320,6 +294,14 @@ export class CodexPlanner {
     const hasIgnoreRules = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-rules" || a.startsWith("--ignore-rules="),
     );
+    // On Windows the prompt is passed to codex.cmd, which routes through
+    // cmd.exe's 8191-character command-line limit. Large ticket descriptions
+    // or digest-heavy prompts can exceed that limit after quoteCmdExeToken
+    // escaping doubles '%' and '"' characters. Codex accepts "-" as the prompt
+    // argument to read the prompt from stdin instead, which has no size limit.
+    const useStdinPrompt = process.platform === "win32";
+    const promptArg = useStdinPrompt ? "-" : ctx.prompt;
+
     const args: string[] = [
       "exec",
       "--ephemeral",
@@ -332,7 +314,7 @@ export class CodexPlanner {
       // (including the literal '-' which codex reads as stdin) is never
       // misinterpreted as a CLI flag.
       "--",
-      ctx.prompt,
+      promptArg,
     ];
 
     const timeoutMs = ctx.timeoutMs ?? this.opts.defaultTimeoutMs;
@@ -345,7 +327,9 @@ export class CodexPlanner {
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
       env: codexChildEnv(privateHome),
-      stdin: "ignore",
+      // On Windows the prompt goes through stdin (see useStdinPrompt above).
+      // On other platforms stdin is closed immediately to prevent hangs.
+      stdin: useStdinPrompt ? ctx.prompt : "ignore",
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
 

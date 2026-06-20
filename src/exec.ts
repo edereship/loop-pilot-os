@@ -1,6 +1,30 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { CommandResult, CommandRunner, RunOptions } from "./types.js";
+
+// Searches absolute PATH entries for a Windows .cmd shim and returns its
+// absolute path. Using an absolute path prevents cmd.exe from searching the
+// current working directory first, which would allow a repo-supplied codex.cmd
+// in the ticket worktree to shadow the npm shim.
+function resolveWindowsCmdShim(cmd: string, env: Record<string, string> | undefined): string {
+  // Find PATH case-insensitively (Windows may report "Path", "PATH", etc.)
+  let pathValue = "";
+  if (env !== undefined) {
+    for (const [k, v] of Object.entries(env)) {
+      if (k.toUpperCase() === "PATH") { pathValue = v; break; }
+    }
+  }
+  if (!pathValue) pathValue = process.env["PATH"] ?? process.env["Path"] ?? "";
+
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir || !path.isAbsolute(dir)) continue;
+    const candidate = path.join(dir, cmd);
+    if (existsSync(candidate)) return candidate;
+  }
+  return cmd;
+}
 
 // Wraps a single token for use inside a cmd.exe /s /c "..." command string.
 // Interior double-quotes are doubled ("") per cmd.exe convention, then the
@@ -30,8 +54,12 @@ export class RealCommandRunner implements CommandRunner {
       let spawnArgs = args;
       let windowsVerbatimArguments = false;
       if (process.platform === "win32" && cmd.endsWith(".cmd")) {
+        // Resolve to absolute path before building the cmd string so that
+        // cmd.exe does not fall back to searching the current directory
+        // (which is the ticket worktree and may contain a shadowing .cmd).
+        const resolvedCmd = resolveWindowsCmdShim(cmd, opts.env);
         spawnCmd = "cmd.exe";
-        const innerTokens = [cmd, ...args].map(quoteCmdExeToken).join(" ");
+        const innerTokens = [resolvedCmd, ...args].map(quoteCmdExeToken).join(" ");
         spawnArgs = ["/d", "/s", "/c", `"${innerTokens}"`];
         windowsVerbatimArguments = true;
       }
@@ -43,6 +71,10 @@ export class RealCommandRunner implements CommandRunner {
       });
 
       if (opts.stdin === "ignore") {
+        child.stdin?.end();
+      } else if (opts.stdin !== undefined) {
+        // String content: write to stdin then close so the child reads it.
+        child.stdin?.write(opts.stdin);
         child.stdin?.end();
       }
 
