@@ -78,7 +78,7 @@ export class RealCommandRunner implements CommandRunner {
       });
 
       child.stdin?.on("error", () => {});
-      if (opts.stdin === "ignore") {
+      if (opts.closeStdin) {
         child.stdin?.end();
       } else if (opts.stdin !== undefined) {
         child.stdin?.write(opts.stdin);
@@ -89,6 +89,7 @@ export class RealCommandRunner implements CommandRunner {
       let stderr = "";
       let lineBuffer = "";
       let settled = false;
+      let timedOut = false;
       const stdoutDecoder = new StringDecoder("utf8");
       const stderrDecoder = new StringDecoder("utf8");
 
@@ -113,9 +114,11 @@ export class RealCommandRunner implements CommandRunner {
             // On Windows the tracked child is cmd.exe, not the Codex process
             // started by the .cmd shim. child.kill() only kills cmd.exe; the
             // real subprocess keeps running. Use taskkill /T to terminate the
-            // entire process tree rooted at cmd.exe. Wait for taskkill to
-            // finish before settling so the caller cannot clean up while the
-            // Codex process tree is still running.
+            // entire process tree rooted at cmd.exe.
+            // Mark timed out before spawning taskkill so the normal close handler
+            // cannot win the race and resolve successfully between now and when
+            // taskkill's own close/error fires.
+            timedOut = true;
             const killer = spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });
             const settleTimeout = (): void => { settle(() => reject(timeoutErr)); };
             killer.on("close", settleTimeout);
@@ -168,7 +171,11 @@ export class RealCommandRunner implements CommandRunner {
         }
         stderr += stderrDecoder.end();
         flushLines();
-        settle(() => resolve({ code: code ?? -1, stdout, stderr }));
+        // Guard against the Windows race where the process exits between the
+        // timeout firing and taskkill completing: timedOut is set synchronously
+        // before taskkill is spawned, so this check prevents a successful
+        // resolve from winning over the pending timeout rejection.
+        if (!timedOut) settle(() => resolve({ code: code ?? -1, stdout, stderr }));
       });
     });
   }

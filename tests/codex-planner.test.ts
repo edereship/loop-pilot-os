@@ -52,9 +52,10 @@ describe("CodexPlanner.run", () => {
       "--ignore-user-config",
       "--ignore-rules",
       "--",
-      "Pick the next task from the list.",
+      "-",
     ]);
     expect(call.opts.cwd).toBe("/wt/issue-42");
+    expect(call.opts.stdin).toBe("Pick the next task from the list.");
   });
 
   it("extraArgs がある場合はプロンプトの前に挿入される", async () => {
@@ -76,8 +77,9 @@ describe("CodexPlanner.run", () => {
       "--sandbox",
       "read-only",
       "--",
-      "Enrich this ticket.",
+      "-",
     ]);
+    expect(runner.calls[0]!.opts.stdin).toBe("Enrich this ticket.");
   });
 
   it("timeoutMs 指定時は opts.timeoutMs に渡す（hung codex の hard backstop）", async () => {
@@ -131,7 +133,7 @@ describe("CodexPlanner.run", () => {
     expect(runner.calls[0]!.opts.timeoutMs).toBe(600_000);
   });
 
-  it("codex exec は opts.stdin を 'ignore' に設定して起動する（stdin ハング防止）", async () => {
+  it("codex exec はプロンプトを opts.stdin 経由で渡す（OS arg-length 制限回避）", async () => {
     const runner = new FakeCommandRunner();
     codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
     const logs: string[] = [];
@@ -140,7 +142,7 @@ describe("CodexPlanner.run", () => {
       prompt: "Do something.",
     });
 
-    expect(runner.calls[0]!.opts.stdin).toBe("ignore");
+    expect(runner.calls[0]!.opts.stdin).toBe("Do something.");
   });
 
   it("codex 子プロセスに機密 env を渡さない（IPI 漏えい防止）", async () => {
@@ -280,7 +282,7 @@ describe("CodexPlanner.run", () => {
 
   it("タイムアウト（CommandRunner が reject）→ kind=error", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex"], () => {
+    runner.on([CODEX_CMD], () => {
       throw new Error('command "codex" timed out after 1800000ms');
     });
     const logs: string[] = [];
@@ -296,7 +298,7 @@ describe("CodexPlanner.run", () => {
 
   it("CommandRunner が非 Error 値で reject → String(err) にフォールバック", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex"], () => {
+    runner.on([CODEX_CMD], () => {
       throw "connection reset";  // eslint-disable-line no-throw-literal
     });
     const logs: string[] = [];
@@ -339,7 +341,7 @@ describe("CodexPlanner.run", () => {
 
   it("タイムアウト時に started + failed ログを出力する", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex"], () => {
+    runner.on([CODEX_CMD], () => {
       throw new Error("timed out");
     });
     const logs: string[] = [];

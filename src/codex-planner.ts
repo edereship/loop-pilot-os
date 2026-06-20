@@ -251,8 +251,9 @@ export class CodexPlanner {
 
   async run(ctx: CodexPlannerContext): Promise<CodexOutcome> {
     // A lone "-" is Codex's stdin sentinel: even after "--", Codex interprets
-    // "-" as "read prompt from stdin". Since stdin is always "ignore", the
-    // invocation would silently receive an empty prompt instead of the dash.
+    // "-" as "read prompt from stdin". Reject it early to avoid ambiguity —
+    // callers that intend to pass a literal dash should use something more
+    // descriptive, and a bare dash is almost certainly a mis-invocation.
     if (ctx.prompt === "-") {
       return {
         kind: "error",
@@ -264,7 +265,7 @@ export class CodexPlanner {
     // read the worktree) cannot mutate files before implementation starts.
     // Callers that need write access must pass "--sandbox"/"-s" in extraArgs.
     const hasCustomSandbox = hasFlagOrAlias(this.opts.extraArgs ?? [], "--sandbox", "-s");
-    // stdin is always "ignore" so there is no user path to approve commands;
+    // stdin carries the prompt, so there is no user path to approve commands;
     // add --ask-for-approval never unless the caller already specified it.
     const hasCustomApproval = hasFlagOrAlias(this.opts.extraArgs ?? [], "--ask-for-approval", "-a");
     // Ignore operator's interactive Codex config (config.toml, project rules,
@@ -276,17 +277,17 @@ export class CodexPlanner {
     );
     // --ignore-rules skips project/.rules files separately from --ignore-user-config.
     // Without it a repo-supplied rule can deny planner-generated shell commands even
-    // when stdin is ignored and approvals are set to never.
+    // when approvals are set to never.
     const hasIgnoreRules = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-rules" || a.startsWith("--ignore-rules="),
     );
-    // On Windows the prompt is passed to codex.cmd, which routes through
-    // cmd.exe's 8191-character command-line limit. Large ticket descriptions
-    // or digest-heavy prompts can exceed that limit after quoteCmdExeToken
-    // escaping doubles '%' and '"' characters. Codex accepts "-" as the prompt
-    // argument to read the prompt from stdin instead, which has no size limit.
-    const useStdinPrompt = process.platform === "win32";
-    const promptArg = useStdinPrompt ? "-" : ctx.prompt;
+    // Always pass the prompt via stdin rather than as a positional argument.
+    // On Windows, cmd.exe imposes an 8191-character command-line limit; large
+    // ticket descriptions or digest-heavy prompts can exceed it after
+    // quoteCmdExeToken escaping. On POSIX, the kernel ARG_MAX can be exceeded
+    // by very large prompts, causing spawn to fail with E2BIG. Codex accepts
+    // "-" as the prompt argument to read from stdin, which has no size limit.
+    const promptArg = "-";
 
     const args: string[] = [
       "exec",
@@ -315,9 +316,8 @@ export class CodexPlanner {
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
       env: codexChildEnv(privateHome),
-      // On Windows the prompt goes through stdin (see useStdinPrompt above).
-      // On other platforms stdin is closed immediately to prevent hangs.
-      stdin: useStdinPrompt ? ctx.prompt : "ignore",
+      // Prompt is always piped via stdin (promptArg is always "-").
+      stdin: ctx.prompt,
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
 

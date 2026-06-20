@@ -182,7 +182,8 @@ export interface RunOptions {
   env?: Record<string, string>;
   onStdoutLine?: (line: string) => void;  // stream-json 進捗用
   timeoutMs?: number;                      // 超過時 kill して reject
-  stdin?: "ignore" | string;               // "ignore": stdin を即 EOF; string: その内容を書き込んでから EOF
+  stdin?: string;                           // pipe this content then EOF
+  closeStdin?: boolean;                    // if true, close stdin immediately without writing
 }
 export interface CommandRunner {
   run(cmd: string, args: string[], opts: RunOptions): Promise<CommandResult>;
