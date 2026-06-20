@@ -501,6 +501,35 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
     expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
   });
+
+  it("implementing + no PR + dirty worktree (uncommitted edits) → manual cleanup, not discarded (Finding 4)", async () => {
+    // Scenario: SIGINT fires during the rate-limit sleep after Claude has edited files
+    // but before the final commit.  hasCommitsWithDiff returns false, but the worktree
+    // is dirty.  The recovery path must treat dirty files as work and fall through to
+    // manual cleanup rather than destroying the partial implementation.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-dt-x", worktreePath: "/wt/ty-dt", linearIssueId: "issue-DT", linearIdentifier: "TY-DT" },
+    );
+    h.git.commitsWithDiff.set("/wt/ty-dt", false);  // no committed work yet
+    h.git.uncommitted.set("/wt/ty-dt", true);        // but there are edited files
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("manual cleanup");
+    expect(s.stopDetail).toContain("looppilot/ty-dt-x");
+    expect(s.stopDetail).toContain("TY-DT");
+    // Dirty worktree must NOT be discarded; partial edits must survive
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
+    expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
 });
 
 describe("回復 — 孤児チケット（In Progress だがセッション行なし → Todo 復帰・ベストエフォート）（仕様 §9 / カーネル §8）", () => {

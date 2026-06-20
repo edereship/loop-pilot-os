@@ -250,13 +250,18 @@ export class Orchestrator {
     // exists yet. If the agent already committed changes (crash between runSession
     // completing and handoff() recording "handing_off"), fall through to manual cleanup
     // to avoid destroying committed implementation work.
+    // Also treat uncommitted file edits as "work" — if SIGINT fires during the
+    // rate-limit sleep after Claude has edited files but before it commits, the
+    // worktree is dirty but hasCommitsWithDiff returns false.  Discarding that
+    // worktree would silently destroy the partial implementation.
     if (session.state === "implementing") {
       let hasWork = false;
       if (session.worktreePath) {
         try {
-          hasWork = await this.git.hasCommitsWithDiff(session.worktreePath);
+          hasWork = await this.git.hasCommitsWithDiff(session.worktreePath) ||
+            await this.git.hasUncommittedChanges(session.worktreePath);
         } catch {
-          hasWork = true; // assume commits exist if check fails; prefer manual cleanup
+          hasWork = true; // assume work exists if check fails; prefer manual cleanup
         }
       }
       if (!hasWork) {

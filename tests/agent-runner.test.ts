@@ -549,6 +549,34 @@ describe("parseResetsTime", () => {
     const result = parseResetsTime("resets 14:30", nowLater);
     expect(result).toBe(Date.parse("2026-06-21T14:30:00.000Z"));
   });
+
+  // Finding 3 (Codex): real CLI emits "reset at 7am (Asia/Singapore)" / "5pm (Europe/Kyiv)"
+  // Asia/Singapore is always UTC+8 (no DST), making assertions deterministic.
+  it("parses 'reset at Xam (Timezone)' form — future same-day in that TZ (Finding 3)", () => {
+    // NOW = 2026-06-20T10:00:00Z = 18:00 SGT (6pm). Next 7am SGT = 2026-06-20T23:00:00Z.
+    const result = parseResetsTime("Your limit will reset at 7am (Asia/Singapore)", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T23:00:00.000Z"));
+  });
+
+  it("parses 'reset at Xpm (Timezone)' form — future same-day in that TZ (Finding 3)", () => {
+    // NOW = 2026-06-20T10:00:00Z = 18:00 SGT. 7pm SGT = 19:00 SGT = 11:00 UTC same day.
+    const result = parseResetsTime("Your limit will reset at 7pm (Asia/Singapore)", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T11:00:00.000Z"));
+  });
+
+  it("falls back to am/pm parser when HH:MM pattern is absent (Finding 3)", () => {
+    // Confirm that "reset at" without colon-time goes to the am/pm branch, not null.
+    const result = parseResetsTime("reset at 12pm (Asia/Singapore)", NOW);
+    // 12pm SGT = noon SGT = 04:00 UTC (still future from 10:00 UTC? no — 04:00 is past)
+    // noon SGT on 2026-06-20 = 2026-06-20T04:00Z — that's in the past vs NOW(10:00Z)
+    // so wrap to next day: 2026-06-21T04:00Z
+    expect(result).toBe(Date.parse("2026-06-21T04:00:00.000Z"));
+  });
+
+  it("returns null for unknown timezone in am/pm pattern (Finding 3)", () => {
+    const result = parseResetsTime("reset at 7am (Invalid/Zone)", NOW);
+    expect(result).toBeNull();
+  });
 });
 
 // --- Rate limit retry loop tests ---
@@ -887,6 +915,32 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     );
     expect(result.isRateLimit).toBe(true);
     expect(result.resetsAtMs).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
+  });
+
+  it("retries when result line has api_error_status:429 but empty result text (Finding 2)", async () => {
+    // Real quota rejections can arrive as a result line with api_error_status:429 and no
+    // result text.  The classifier must detect this even when stderr is also empty.
+    const RESULT_API_ERROR_429 =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"api_error_status":429,"session_id":"s1"}';
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_API_ERROR_429);
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
   });
 
   it("retry uses -p '' --resume <sessionId> to maintain print mode (Finding 1)", async () => {

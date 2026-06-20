@@ -86,6 +86,9 @@ interface ResultLine {
   total_cost_usd?: number;
   result?: string;
   session_id?: string;
+  // Structured HTTP error status emitted when quota is rejected at the API layer
+  // with no accompanying result text (e.g. stream-json rate_limit_event scenario).
+  api_error_status?: number;
 }
 
 function isResultLine(value: unknown): value is ResultLine {
@@ -129,27 +132,68 @@ const RESULT_TEXT_429_PATTERN =
   /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\b429\b.*Too Many Requests/i;
 
 const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})/i;
+// Matches "reset at 7am (Asia/Singapore)" / "reset at 5pm (Europe/Kyiv)" — the
+// format emitted by the real Claude Code CLI in quota messages (HH:MM not used).
+const RESETS_AT_AMPM_PATTERN = /reset\s+at\s+(\d{1,2})(am|pm)\s*\(([^)]+)\)/i;
 
 export interface RateLimitClassification {
   isRateLimit: boolean;
   resetsAtMs: number | null;
 }
 
-export function parseResetsTime(stderr: string, nowMs: number): number | null {
-  const match = RESETS_PATTERN.exec(stderr);
+function parseResetsAtAmPm(text: string, nowMs: number): number | null {
+  const match = RESETS_AT_AMPM_PATTERN.exec(text);
   if (!match) return null;
-  const hours = parseInt(match[1]!, 10);
-  const minutes = parseInt(match[2]!, 10);
-  if (hours > 23 || minutes > 59) return null;
-  const target = new Date(nowMs);
-  target.setUTCHours(hours, minutes, 0, 0);
-  // Only wrap to next day if the parsed time is more than 60s in the past.
-  // The reset time has minute precision; a near-past value (within the same
-  // minute) means the reset is happening now, not tomorrow.
-  if (target.getTime() < nowMs - 60_000) {
-    target.setUTCDate(target.getUTCDate() + 1);
+  let targetHour = parseInt(match[1]!, 10);
+  const ampm = match[2]!.toLowerCase();
+  const tz = match[3]!;
+  if (targetHour < 1 || targetHour > 12) return null;
+  if (ampm === "am") {
+    if (targetHour === 12) targetHour = 0;
+  } else {
+    if (targetHour !== 12) targetHour += 12;
   }
-  return target.getTime();
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date(nowMs));
+    const hourPart = parts.find((p) => p.type === "hour");
+    const minutePart = parts.find((p) => p.type === "minute");
+    if (!hourPart || !minutePart) return null;
+    // hour12:false can yield "24" for midnight in some environments; normalise to 0-23.
+    const currentHour = parseInt(hourPart.value, 10) % 24;
+    const currentMinute = parseInt(minutePart.value, 10);
+    let deltaMs = (targetHour - currentHour) * 3_600_000 - currentMinute * 60_000;
+    // Only wrap to next day if the target is more than 60s in the past (same
+    // semantics as the HH:MM parser: a near-past value means the reset is now).
+    if (deltaMs < -60_000) deltaMs += 24 * 3_600_000;
+    return nowMs + deltaMs;
+  } catch {
+    return null; // invalid timezone name
+  }
+}
+
+export function parseResetsTime(text: string, nowMs: number): number | null {
+  const match = RESETS_PATTERN.exec(text);
+  if (match) {
+    const hours = parseInt(match[1]!, 10);
+    const minutes = parseInt(match[2]!, 10);
+    if (hours <= 23 && minutes <= 59) {
+      const target = new Date(nowMs);
+      target.setUTCHours(hours, minutes, 0, 0);
+      // Only wrap to next day if the parsed time is more than 60s in the past.
+      // The reset time has minute precision; a near-past value (within the same
+      // minute) means the reset is happening now, not tomorrow.
+      if (target.getTime() < nowMs - 60_000) {
+        target.setUTCDate(target.getUTCDate() + 1);
+      }
+      return target.getTime();
+    }
+  }
+  return parseResetsAtAmPm(text, nowMs);
 }
 
 export function classifyClaudeError(
@@ -270,7 +314,14 @@ export class ClaudeAgentRunner implements AgentRunner {
     const cmdResult = await this.runner.run("claude", args, opts);
     const rl = resultLine as ResultLine | null;
     const outcome = this.toOutcome(rl, cmdResult.code, cmdResult.stderr);
-    return { outcome, stderr: cmdResult.stderr, resultText: rl?.result ?? "", sessionId: capturedSessionId, exitCode: cmdResult.code };
+    // Prefer the agent's result text; when it is absent but the result line
+    // carries api_error_status: 429, synthesise an HTTP/429 token so the
+    // rate-limit classifier can detect the failure even with empty stderr.
+    let resultText = rl?.result ?? "";
+    if (!resultText && rl?.api_error_status === 429) {
+      resultText = "HTTP/429 Too Many Requests";
+    }
+    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId, exitCode: cmdResult.code };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
