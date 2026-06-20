@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -19,17 +19,14 @@ const CODEX_COMMAND = process.platform === "win32" ? "codex.cmd" : "codex";
 //
 // Auth credentials (CODEX_API_KEY, CODEX_ACCESS_TOKEN, OPENAI_API_KEY) are
 // intentionally absent: Codex is authenticated via its auth cache directory
-// ($CODEX_HOME, defaulting to ~/.codex). When the operator has not set
-// CODEX_HOME explicitly, codexChildEnv() creates a symlink at homeDir/.codex
-// pointing to the real auth directory, then sets HOME=homeDir so Codex finds
-// auth via its default $HOME/.codex path — without an explicit CODEX_HOME env
-// var. This keeps the auth path out of model-launched subprocess environments:
-// a prompt cannot read $CODEX_HOME/auth.json because $CODEX_HOME is unset.
-// When the operator has explicitly set CODEX_HOME, that path is forwarded so
-// their chosen auth directory is honoured.
-//
-// CODEX_HOME is intentionally absent from this allowlist: it is conditionally
-// injected at the end of codexChildEnv() only when the operator set it.
+// ($CODEX_HOME, defaulting to ~/.codex). CODEX_HOME is never included in the
+// child environment because an env var is trivially readable by model-launched
+// commands (e.g. `cat "$CODEX_HOME/auth.json"`). Instead, run() creates a
+// symlink at privateHome/.codex -> realCodexHome and sets HOME=privateHome,
+// so Codex finds auth via its default $HOME/.codex path without the auth
+// directory being named in the environment. When the operator has explicitly
+// set CODEX_HOME, the symlink points to their chosen auth directory but the
+// env var itself is never forwarded.
 //
 // XDG base dirs (XDG_CONFIG_HOME etc.) are excluded: since HOME is redirected
 // to a fresh private temp dir, Codex will derive isolated XDG paths from that
@@ -92,10 +89,12 @@ const CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT = new Set([
   "SystemDrive",
 ]);
 
-// Proxy env keys that may carry embedded URL credentials (user:pass@host).
-// Checked case-insensitively so both HTTPS_PROXY and https_proxy are covered.
+// Env keys whose values are URLs that may carry embedded credentials
+// (user:pass@host). Includes OPENAI_BASE_URL because an operator may point
+// Codex at a basic-auth gateway (https://user:pass@proxy/v1). Checked
+// case-insensitively so both HTTPS_PROXY and https_proxy are covered.
 // NO_PROXY/no_proxy hold host lists, not URLs, so they need no scrubbing.
-const PROXY_CREDENTIAL_KEYS_UPPER = new Set(["HTTPS_PROXY", "HTTP_PROXY"]);
+const CREDENTIAL_URL_KEYS_UPPER = new Set(["HTTPS_PROXY", "HTTP_PROXY", "OPENAI_BASE_URL"]);
 
 // Env keys whose values are filesystem paths that must be resolved to absolute
 // before being forwarded. This prevents cwd-relative paths from resolving to
@@ -141,15 +140,14 @@ function scrubProxyUrl(rawUrl: string): string | undefined {
   return rawUrl;
 }
 
-function codexChildEnv(homeDir: string): Record<string, string> {
-  // Resolve the auth cache directory from the *parent* environment before we
-  // build the sanitised child env. We need this to inject CODEX_HOME into the
-  // child so the Codex binary can authenticate even after we redirect HOME.
+function resolveCodexAuthDir(): string {
   const parentCodexHome = process.env["CODEX_HOME"];
-  const realCodexHome = parentCodexHome
+  return parentCodexHome
     ? (path.isAbsolute(parentCodexHome) ? parentCodexHome : path.resolve(parentCodexHome))
     : path.join(os.homedir(), ".codex");
+}
 
+function codexChildEnv(homeDir: string): Record<string, string> {
   const out: Record<string, string> = {};
   const isWindows = process.platform === "win32";
   // On Windows, env keys are case-insensitive (e.g. "Path" instead of "PATH").
@@ -170,7 +168,7 @@ function codexChildEnv(homeDir: string): Record<string, string> {
 
     const keyUpper = key.toUpperCase();
     // Strip embedded credentials from proxy URL values before forwarding.
-    if (PROXY_CREDENTIAL_KEYS_UPPER.has(keyUpper)) {
+    if (CREDENTIAL_URL_KEYS_UPPER.has(keyUpper)) {
       const scrubbed = scrubProxyUrl(value);
       if (scrubbed !== undefined) {
         out[key] = scrubbed;
@@ -189,27 +187,16 @@ function codexChildEnv(homeDir: string): Record<string, string> {
     }
   }
 
-  // Always inject CODEX_HOME so Codex authenticates via its designated auth
-  // directory. The previous approach created a $HOME/.codex symlink inside the
-  // per-run temp dir instead of setting CODEX_HOME, but that symlink resided
-  // in /tmp — which the Codex sandbox workspace includes as readable — allowing
-  // a prompt-injected task to follow the symlink and read auth.json from within
-  // the sandbox. With CODEX_HOME set explicitly, the auth directory (typically
-  // ~/.codex) lies outside /tmp and outside the worktree, so the sandbox
-  // cannot reach it via /tmp traversal.
-  // (Note: project-level .codex/config.toml and project-local hooks inside
-  // the worktree are not blocked by --ignore-user-config, which only skips
-  // $CODEX_HOME/config.toml. A Codex CLI flag to disable project-level config
-  // should be added via extraArgs once the appropriate flag is confirmed.)
-  out["CODEX_HOME"] = realCodexHome;
+  // CODEX_HOME is NOT exported: exposing the path as an env var lets
+  // model-launched commands discover and read the auth cache. Auth is provided
+  // via a symlink at privateHome/.codex -> realCodexHome created by the caller
+  // (run/checkAvailability). Project-level .codex inside the worktree is
+  // removed before the run to prevent ticket-branch hooks from executing.
+  //
   // Replace HOME and USERPROFILE with the caller-supplied private per-run
   // directory so that prompts cannot reach host dotfiles via "~" or
-  // %USERPROFILE%. USERPROFILE is the Windows equivalent of HOME; tools
-  // that expand it would otherwise still point at the operator's real profile
-  // (including AppData and .codex) despite the HOME redirect.
-  // Codex authenticates via the explicit CODEX_HOME set above, not HOME.
-  // XDG paths (XDG_CONFIG_HOME etc.) are not forwarded; Codex derives them
-  // from this isolated HOME, keeping all per-run state within homeDir.
+  // %USERPROFILE%. XDG paths (XDG_CONFIG_HOME etc.) are not forwarded;
+  // Codex derives them from this isolated HOME.
   out["HOME"] = homeDir;
   out["USERPROFILE"] = homeDir;
 
@@ -323,6 +310,12 @@ export class CodexPlanner {
     // share state and so dotfiles in the global temp root cannot affect the run.
     const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
     if (process.platform !== "win32") chmodSync(privateHome, 0o700);
+    symlinkSync(
+      resolveCodexAuthDir(),
+      path.join(privateHome, ".codex"),
+      process.platform === "win32" ? "junction" : undefined,
+    );
+    rmSync(path.join(ctx.worktreePath, ".codex"), { recursive: true, force: true });
 
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
@@ -367,6 +360,11 @@ export class CodexPlanner {
     // codexChildEnv strips before runtime.
     const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
     if (process.platform !== "win32") chmodSync(privateHome, 0o700);
+    symlinkSync(
+      resolveCodexAuthDir(),
+      path.join(privateHome, ".codex"),
+      process.platform === "win32" ? "junction" : undefined,
+    );
     try {
       let result;
       try {

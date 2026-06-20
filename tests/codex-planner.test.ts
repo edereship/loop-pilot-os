@@ -638,6 +638,47 @@ describe("CodexPlanner scheme-less proxy scrubbing (Finding 1 extension)", () =>
   });
 });
 
+describe("CodexPlanner OPENAI_BASE_URL credential scrubbing (Finding 4)", () => {
+  it("OPENAI_BASE_URL に認証情報が含まれる場合はそれを除去してから転送する", async () => {
+    const urlWithCreds = "https://user:pass@proxy.example.com/v1";
+    const saved = { ...process.env };
+    process.env.OPENAI_BASE_URL = urlWithCreds;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["OPENAI_BASE_URL"]).toBeDefined();
+      expect(env["OPENAI_BASE_URL"]).not.toContain("user");
+      expect(env["OPENAI_BASE_URL"]).not.toContain("pass");
+      expect(env["OPENAI_BASE_URL"]).toMatch(/^https:\/\/proxy\.example\.com\/v1/);
+    } finally {
+      if (saved["OPENAI_BASE_URL"] === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = saved["OPENAI_BASE_URL"];
+    }
+  });
+
+  it("認証情報がない OPENAI_BASE_URL はそのまま転送する", async () => {
+    const url = "https://api.openai.com/v1";
+    const saved = { ...process.env };
+    process.env.OPENAI_BASE_URL = url;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["OPENAI_BASE_URL"]).toBe(url);
+    } finally {
+      if (saved["OPENAI_BASE_URL"] === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = saved["OPENAI_BASE_URL"];
+    }
+  });
+});
+
 describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
   it("Linux で extraArgs に --sandbox danger-full-access がある場合は bubblewrap チェックをスキップする", async () => {
     if (process.platform !== "linux") return;
@@ -728,7 +769,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
   });
 
-  it("CODEX_HOME 未設定時は realCodexHome（~/.codex）を CODEX_HOME として注入する（/tmp シンボリックリンク経由の auth 漏えいを防ぐ）", async () => {
+  it("CODEX_HOME 未設定時でも CODEX_HOME を子 env に含めない（$HOME/.codex symlink で auth を提供）", async () => {
     const saved = { ...process.env };
     delete process.env["CODEX_HOME"];
     try {
@@ -738,14 +779,10 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
       await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
       const env = runner.calls[0]!.opts.env!;
-      // CODEX_HOME must be set to the real auth directory (~/.codex) so Codex
-      // can authenticate. The previous symlink approach put a .codex symlink
-      // inside the per-run /tmp dir (which the Codex sandbox workspace includes
-      // as readable), allowing prompt injection to read auth.json via the
-      // symlink. With an explicit CODEX_HOME pointing to ~/.codex (outside /tmp
-      // and outside the worktree), the sandbox cannot reach auth files.
-      const expectedCodexHome = path.join(os.homedir(), ".codex");
-      expect(env["CODEX_HOME"]).toBe(expectedCodexHome);
+      // CODEX_HOME must NOT be in the child env: exposing the path lets
+      // model-launched commands read the auth cache. Auth is provided via
+      // a symlink at privateHome/.codex -> realCodexHome.
+      expect(env["CODEX_HOME"]).toBeUndefined();
       // HOME is still the private per-run directory for dotfile isolation.
       expect(env["HOME"]).toContain("codex-planner-");
       expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
@@ -755,7 +792,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     }
   });
 
-  it("CODEX_HOME が既に設定されている場合はその絶対パスを注入する", async () => {
+  it("CODEX_HOME が既に設定されている場合でも子 env には含めない（symlink で auth を提供）", async () => {
     const saved = { ...process.env };
     process.env["CODEX_HOME"] = "/custom/codex/home";
     try {
@@ -765,7 +802,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
       await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
       const env = runner.calls[0]!.opts.env!;
-      expect(env["CODEX_HOME"]).toBe("/custom/codex/home");
+      expect(env["CODEX_HOME"]).toBeUndefined();
     } finally {
       if (saved["CODEX_HOME"] === undefined) delete process.env["CODEX_HOME"];
       else process.env["CODEX_HOME"] = saved["CODEX_HOME"];
@@ -783,10 +820,9 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     const authEnv = runner.calls[1]!.opts.env!;
     expect(authEnv["HOME"]).toContain("codex-planner-");
     expect(path.dirname(authEnv["HOME"]!)).toBe(os.tmpdir());
-    // CODEX_HOME must be set to the real auth directory so Codex can
-    // authenticate during the login status check.
-    const expectedCodexHome = path.join(os.homedir(), ".codex");
-    expect(authEnv["CODEX_HOME"]).toBe(expectedCodexHome);
+    // CODEX_HOME must NOT be in the child env; auth is discovered via
+    // the $HOME/.codex symlink.
+    expect(authEnv["CODEX_HOME"]).toBeUndefined();
   });
 });
 

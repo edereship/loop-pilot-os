@@ -23,7 +23,7 @@ function resolveWindowsCmdShim(cmd: string, env: Record<string, string> | undefi
     const candidate = path.join(dir, cmd);
     if (existsSync(candidate)) return candidate;
   }
-  return cmd;
+  throw new Error(`${cmd} not found in any absolute PATH entry`);
 }
 
 // Wraps a single token for use inside a cmd.exe /s /c "..." command string.
@@ -70,10 +70,10 @@ export class RealCommandRunner implements CommandRunner {
         ...(windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       });
 
+      child.stdin?.on("error", () => {});
       if (opts.stdin === "ignore") {
         child.stdin?.end();
       } else if (opts.stdin !== undefined) {
-        // String content: write to stdin then close so the child reads it.
         child.stdin?.write(opts.stdin);
         child.stdin?.end();
       }
@@ -99,22 +99,24 @@ export class RealCommandRunner implements CommandRunner {
 
       if (opts.timeoutMs !== undefined) {
         timeoutHandle = setTimeout(() => {
+          const timeoutErr = new Error(
+            `command "${cmd}" timed out after ${String(opts.timeoutMs)}ms`,
+          );
           if (process.platform === "win32" && windowsVerbatimArguments && child.pid !== undefined) {
             // On Windows the tracked child is cmd.exe, not the Codex process
             // started by the .cmd shim. child.kill() only kills cmd.exe; the
             // real subprocess keeps running. Use taskkill /T to terminate the
-            // entire process tree rooted at cmd.exe.
-            spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });
+            // entire process tree rooted at cmd.exe. Wait for taskkill to
+            // finish before settling so the caller cannot clean up while the
+            // Codex process tree is still running.
+            const killer = spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });
+            const settleTimeout = (): void => { settle(() => reject(timeoutErr)); };
+            killer.on("close", settleTimeout);
+            killer.on("error", settleTimeout);
           } else {
             child.kill("SIGKILL");
+            settle(() => reject(timeoutErr));
           }
-          settle(() =>
-            reject(
-              new Error(
-                `command "${cmd}" timed out after ${String(opts.timeoutMs)}ms`,
-              ),
-            ),
-          );
         }, opts.timeoutMs);
       }
 
