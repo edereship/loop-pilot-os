@@ -10,6 +10,8 @@ import type {
 const SUMMARY_MAX = 2000;
 const PROGRESS_TEXT_MAX = 80;
 const STDERR_TAIL_MAX = 1000;
+const RATE_LIMIT_MIN_WAIT_MS = 30_000;
+const RATE_LIMIT_BUFFER_MS = 60_000;
 
 // claude 子プロセスへ渡さない機密環境変数（IPI でチケット由来プロンプトに操作された
 // agent が Bash 等で読み出し外部送信・権限昇格するのを防ぐ防御の多層化）。
@@ -249,7 +251,6 @@ export class ClaudeAgentRunner implements AgentRunner {
     const rl = this.opts.rateLimit;
     const capMs = rl.capHours * 3_600_000;
     const reprobeMs = rl.reprobeMinutes * 60_000;
-    const BUFFER_MS = 60_000;
     const startMs = rl.clock();
     let totalCost = 0;
 
@@ -261,17 +262,18 @@ export class ClaudeAgentRunner implements AgentRunner {
         return { ...outcome, costUsd: totalCost };
       }
 
+      const nowMs = rl.clock();
       const classification = classifyClaudeError(
         outcome.message,
         stderr,
         rl.claudePatterns,
-        rl.clock(),
+        nowMs,
       );
       if (!classification.isRateLimit) {
         return { ...outcome, costUsd: totalCost };
       }
 
-      const elapsed = rl.clock() - startMs;
+      const elapsed = nowMs - startMs;
       if (elapsed >= capMs) {
         this.opts.log(`rate limit cap exceeded (${rl.capHours}h); halting`);
         return {
@@ -283,10 +285,12 @@ export class ClaudeAgentRunner implements AgentRunner {
 
       let waitMs: number;
       if (classification.resetsAtMs !== null) {
-        waitMs = Math.max(0, classification.resetsAtMs - rl.clock() + BUFFER_MS);
+        waitMs = Math.max(0, classification.resetsAtMs - nowMs + RATE_LIMIT_BUFFER_MS);
       } else {
         waitMs = reprobeMs;
       }
+
+      waitMs = Math.max(waitMs, RATE_LIMIT_MIN_WAIT_MS);
 
       const remainingMs = capMs - elapsed;
       waitMs = Math.min(waitMs, remainingMs);

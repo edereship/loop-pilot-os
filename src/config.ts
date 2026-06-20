@@ -526,6 +526,18 @@ export function loadConfig(
           `takes precedence over --effort flags in extra_args)`,
       );
     }
+
+    if (result.data.rate_limit?.claude_patterns) {
+      for (const pattern of result.data.rate_limit.claude_patterns) {
+        try {
+          new RegExp(pattern, "i");
+        } catch {
+          errors.push(
+            `rate_limit.claude_patterns: invalid regex "${pattern}"`,
+          );
+        }
+      }
+    }
   }
 
   if (!result.success || errors.length > 0) {
