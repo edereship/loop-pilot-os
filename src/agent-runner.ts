@@ -195,13 +195,15 @@ export class ClaudeAgentRunner implements AgentRunner {
   private async runOnce(
     ctx: SessionContext,
     resumeSessionId?: string,
-  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null }> {
+  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
-    // When resuming a rate-limited session, use --resume instead of -p to
-    // continue from the rate-limit stop rather than rerunning the task.
+    // When resuming a rate-limited session, prefix with -p "" so the CLI stays in
+    // print/headless mode (same as a normal run). Without -p, --output-format and
+    // --max-budget-usd are rejected or the CLI enters an interactive session instead
+    // of emitting stream-json, causing the retry loop to hang or return "no result line".
     const args: string[] = [
-      ...(resumeSessionId ? ["--resume", resumeSessionId] : ["-p", ctx.prompt]),
+      ...(resumeSessionId ? ["-p", "", "--resume", resumeSessionId] : ["-p", ctx.prompt]),
       "--output-format",
       "stream-json",
       "--verbose",
@@ -268,7 +270,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     const cmdResult = await this.runner.run("claude", args, opts);
     const rl = resultLine as ResultLine | null;
     const outcome = this.toOutcome(rl, cmdResult.code, cmdResult.stderr);
-    return { outcome, stderr: cmdResult.stderr, resultText: rl?.result ?? "", sessionId: capturedSessionId };
+    return { outcome, stderr: cmdResult.stderr, resultText: rl?.result ?? "", sessionId: capturedSessionId, exitCode: cmdResult.code };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
@@ -289,7 +291,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       if (remainingBudget <= 0) {
         return { kind: "cost_exceeded", costUsd: totalCost };
       }
-      const { outcome, stderr, resultText, sessionId } = await this.runOnce(
+      const { outcome, stderr, resultText, sessionId, exitCode } = await this.runOnce(
         { ...ctx, maxCostUsd: remainingBudget },
         lastSessionId ?? undefined,
       );
@@ -309,8 +311,14 @@ export class ClaudeAgentRunner implements AgentRunner {
       }
 
       const nowMs = rl.clock();
+      // When the CLI exits cleanly (exitCode=0) the error message comes from the
+      // agent's own result text, not from CLI output. Passing it as the "message"
+      // arg would apply the broad /rate.?limit/ pattern to strings like
+      // "GitHub API rate limit exceeded", masking the real failure as Claude quota.
+      // Use an empty string so only the narrow HTTP-429 pattern fires via resultText.
+      const cliMessage = exitCode !== 0 ? outcome.message : "";
       const classification = classifyClaudeError(
-        outcome.message,
+        cliMessage,
         stderr,
         rl.claudePatterns,
         nowMs,

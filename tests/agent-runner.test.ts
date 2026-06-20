@@ -889,6 +889,63 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     expect(result.resetsAtMs).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
   });
 
+  it("retry uses -p '' --resume <sessionId> to maintain print mode (Finding 1)", async () => {
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE); // session_id "s1"
+        opts.onStdoutLine?.(RESULT_429_LINE);
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    await agent.runSession(ctx);
+
+    expect(runner.calls).toHaveLength(2);
+    // First call must use -p <prompt> (normal headless invocation)
+    expect(runner.calls[0]!.args[0]).toBe("-p");
+    expect(runner.calls[0]!.args[1]).toBe(ctx.prompt);
+    // Second call must have -p "" then --resume <sessionId> to stay in print mode
+    const secondArgs = runner.calls[1]!.args;
+    const resumeIdx = secondArgs.indexOf("--resume");
+    expect(resumeIdx).toBeGreaterThan(-1);
+    expect(secondArgs[resumeIdx - 2]).toBe("-p");
+    expect(secondArgs[resumeIdx - 1]).toBe("");
+    expect(secondArgs[resumeIdx + 1]).toBe("s1");
+  });
+
+  it("does NOT retry when agent result text says 'rate limit' without HTTP 429 (Finding 2)", async () => {
+    const RESULT_GITHUB_RATE_LIMIT =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"result":"GitHub API rate limit exceeded","session_id":"s1"}';
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_GITHUB_RATE_LIMIT], 0);
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    // Must NOT retry — this is not Claude quota, it is an agent-reported product error
+    expect(outcome.kind).toBe("error");
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("classifyClaudeError with empty message does NOT classify 'rate limit' result text (Finding 2)", () => {
+    const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+    // runSession passes "" for message when exitCode=0 (agent result text goes via resultText only)
+    const result = classifyClaudeError(
+      "",
+      "",
+      [],
+      NOW,
+      "GitHub API rate limit exceeded",
+    );
+    expect(result.isRateLimit).toBe(false);
+  });
+
   it("interrupts rate-limit sleep when isInterrupted fires (Finding 4)", async () => {
     let callCount = 0;
     const runner = new FakeCommandRunner();

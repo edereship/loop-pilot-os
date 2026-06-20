@@ -245,19 +245,32 @@ export class Orchestrator {
       });
       return await this.adoptAndMonitor(session, prNumber, monitorStartedAt);
     }
-    // IMPLEMENT interrupted before PR creation (e.g. SIGINT during rate-limit
-    // sleep): revert the ticket to Todo and discard the worktree so the task
-    // can be re-processed in a future run, rather than stranding it.
+    // IMPLEMENT interrupted before PR creation (e.g. SIGINT during rate-limit sleep):
+    // revert the ticket to Todo and discard the worktree only when no committed work
+    // exists yet. If the agent already committed changes (crash between runSession
+    // completing and handoff() recording "handing_off"), fall through to manual cleanup
+    // to avoid destroying committed implementation work.
     if (session.state === "implementing") {
+      let hasWork = false;
       if (session.worktreePath) {
-        await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+        try {
+          hasWork = await this.git.hasCommitsWithDiff(session.worktreePath);
+        } catch {
+          hasWork = true; // assume commits exist if check fails; prefer manual cleanup
+        }
       }
-      await bestEffort(() => this.source.transition(session.linearIssueId, "todo"));
-      this.store.updateSession(session.id, { runId: this.runId });
-      const detail =
-        `crash recovery: no open PR; ticket reverted to Todo: ` +
-        `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
-      return await this.stopSession(session, "exception", detail);
+      if (!hasWork) {
+        if (session.worktreePath) {
+          await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+        }
+        await bestEffort(() => this.source.transition(session.linearIssueId, "todo"));
+        this.store.updateSession(session.id, { runId: this.runId });
+        const detail =
+          `crash recovery: no open PR; ticket reverted to Todo: ` +
+          `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+        return await this.stopSession(session, "exception", detail);
+      }
+      // Has committed work → fall through to manual cleanup below
     }
     // オープン PR なし → 手動掃除を促して HALT（タスク内自動再開は v1 スコープ外）。
     this.store.updateSession(session.id, { runId: this.runId });

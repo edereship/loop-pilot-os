@@ -447,6 +447,62 @@ describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 /
   });
 });
 
+describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", () => {
+  it("implementing + no PR + no commits → discard worktree + ticket reverted to Todo + HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-rl-x", worktreePath: "/wt/ty-rl", linearIssueId: "issue-RL", linearIdentifier: "TY-RL" },
+    );
+    // Explicitly mark no committed work (e.g. SIGINT during rate-limit sleep before first commit)
+    h.git.commitsWithDiff.set("/wt/ty-rl", false);
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("ticket reverted to Todo");
+    expect(s.stopDetail).toContain("looppilot/ty-rl-x");
+    expect(s.stopDetail).toContain("TY-RL");
+    expect(s.runId).toBe(newRun.id);
+    // Worktree discarded and ticket reverted
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(true);
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-RL", state: "todo" });
+    // HALT — loop not entered
+    expect(newRun.state).toBe("halted");
+    expect(h.source.eligibleCalls).toHaveLength(0);
+  });
+
+  it("implementing + no PR + has commits → manual cleanup (no discard, no todo revert) + HALT (Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-wk-x", worktreePath: "/wt/ty-wk", linearIssueId: "issue-WK", linearIdentifier: "TY-WK" },
+    );
+    // Agent committed work but orchestrator crashed before handoff; default FakeGitPr returns true
+    h.git.commitsWithDiff.set("/wt/ty-wk", true);
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    // Falls through to the existing manual-cleanup path — no discard, no todo transition
+    expect(s.stopDetail).toContain("manual cleanup");
+    expect(s.stopDetail).toContain("looppilot/ty-wk-x");
+    expect(s.stopDetail).toContain("TY-WK");
+    // Committed work must NOT be destroyed
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
+    expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
+  });
+});
+
 describe("回復 — 孤児チケット（In Progress だがセッション行なし → Todo 復帰・ベストエフォート）（仕様 §9 / カーネル §8）", () => {
   it("findOrphanedInProgress が 2 件返す → 各々 transition(todo) + 警告ログ。HALT しない", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
