@@ -49,6 +49,14 @@ function agentChildEnv(effortEnvOverride: string | undefined): Record<string, st
   return out;
 }
 
+export interface RateLimitOpts {
+  reprobeMinutes: number;
+  capHours: number;
+  claudePatterns: string[];
+  sleep: (ms: number) => Promise<void>;
+  clock: () => number;
+}
+
 interface AgentRunnerOptions {
   model: string;
   /** undefined → omit --effort flag */
@@ -64,6 +72,7 @@ interface AgentRunnerOptions {
   allowedTools: string;
   extraArgs: string[];
   log: (line: string) => void;
+  rateLimit?: RateLimitOpts;
 }
 
 // claude stream-json の result 行（カーネル §5.1）。未知フィールドは無視する。
@@ -157,7 +166,9 @@ export class ClaudeAgentRunner implements AgentRunner {
     private readonly opts: AgentRunnerOptions,
   ) {}
 
-  async runSession(ctx: SessionContext): Promise<AgentOutcome> {
+  private async runOnce(
+    ctx: SessionContext,
+  ): Promise<{ outcome: AgentOutcome; stderr: string }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
     const args: string[] = [
@@ -225,8 +236,66 @@ export class ClaudeAgentRunner implements AgentRunner {
       ...(ctx.hardTimeoutMs !== undefined ? { timeoutMs: ctx.hardTimeoutMs } : {}),
     };
     const cmdResult = await this.runner.run("claude", args, opts);
+    const outcome = this.toOutcome(resultLine, cmdResult.code, cmdResult.stderr);
+    return { outcome, stderr: cmdResult.stderr };
+  }
 
-    return this.toOutcome(resultLine, cmdResult.code, cmdResult.stderr);
+  async runSession(ctx: SessionContext): Promise<AgentOutcome> {
+    if (!this.opts.rateLimit) {
+      const { outcome } = await this.runOnce(ctx);
+      return outcome;
+    }
+
+    const rl = this.opts.rateLimit;
+    const capMs = rl.capHours * 3_600_000;
+    const reprobeMs = rl.reprobeMinutes * 60_000;
+    const BUFFER_MS = 60_000;
+    const startMs = rl.clock();
+    let totalCost = 0;
+
+    while (true) {
+      const { outcome, stderr } = await this.runOnce(ctx);
+      totalCost += outcome.costUsd;
+
+      if (outcome.kind !== "error") {
+        return { ...outcome, costUsd: totalCost };
+      }
+
+      const classification = classifyClaudeError(
+        outcome.message,
+        stderr,
+        rl.claudePatterns,
+        rl.clock(),
+      );
+      if (!classification.isRateLimit) {
+        return { ...outcome, costUsd: totalCost };
+      }
+
+      const elapsed = rl.clock() - startMs;
+      if (elapsed >= capMs) {
+        this.opts.log(`rate limit cap exceeded (${rl.capHours}h); halting`);
+        return {
+          kind: "error",
+          costUsd: totalCost,
+          message: `rate limit cap exceeded (${rl.capHours}h): ${outcome.message}`,
+        };
+      }
+
+      let waitMs: number;
+      if (classification.resetsAtMs !== null) {
+        waitMs = Math.max(0, classification.resetsAtMs - rl.clock() + BUFFER_MS);
+      } else {
+        waitMs = reprobeMs;
+      }
+
+      const remainingMs = capMs - elapsed;
+      waitMs = Math.min(waitMs, remainingMs);
+
+      this.opts.log(
+        `rate limit detected; waiting ${Math.ceil(waitMs / 60_000)}m before re-probe`,
+      );
+      await rl.sleep(waitMs);
+    }
   }
 
   private toOutcome(

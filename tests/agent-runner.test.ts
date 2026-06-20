@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { ClaudeAgentRunner, classifyClaudeError, parseResetsTime } from "../src/agent-runner.js";
-import { FakeCommandRunner } from "./fakes.js";
+import { FakeCommandRunner, instantSleep } from "./fakes.js";
 import type { RunOptions, CommandResult, SessionContext } from "../src/types.js";
 
 // 仕様§5.3 / カーネル§5.1: claude headless の stream-json NDJSON 行（実出力スナップショット相当）
@@ -526,5 +526,214 @@ describe("parseResetsTime", () => {
   it("handles 'reset' (singular) variant", () => {
     const result = parseResetsTime("limit reset 14:30 UTC", NOW);
     expect(result).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
+  });
+});
+
+// --- Rate limit retry loop tests ---
+
+const RESULT_429_LINE =
+  '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"result":"429 Too Many Requests","session_id":"s1"}';
+
+function makeRunnerWithRateLimit(
+  runner: FakeCommandRunner,
+  logs: string[],
+  overrides?: {
+    reprobeMinutes?: number;
+    capHours?: number;
+    claudePatterns?: string[];
+    clockMs?: number[];
+  },
+): { agent: ClaudeAgentRunner; sleep: ReturnType<typeof instantSleep>; } {
+  const sleep = instantSleep();
+  let clockIndex = 0;
+  const clockValues = overrides?.clockMs ?? [0];
+  const clock = (): number => {
+    const v = clockValues[Math.min(clockIndex, clockValues.length - 1)]!;
+    clockIndex++;
+    return v;
+  };
+  const agent = new ClaudeAgentRunner(runner, {
+    model: "opus",
+    effort: "max",
+    effortEnvOverride: "max",
+    permissionMode: "acceptEdits",
+    allowedTools: "Edit,Write,Read,Glob,Grep,Bash",
+    extraArgs: [],
+    log: (line: string) => logs.push(line),
+    rateLimit: {
+      reprobeMinutes: overrides?.reprobeMinutes ?? 15,
+      capHours: overrides?.capHours ?? 6,
+      claudePatterns: overrides?.claudePatterns ?? [],
+      sleep,
+      clock,
+    },
+  });
+  return { agent, sleep };
+}
+
+describe("ClaudeAgentRunner rate limit retry loop", () => {
+  it("retries on rate-limit error and succeeds on second attempt", async () => {
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_429_LINE);
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent, sleep } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
+    expect(sleep.calls).toHaveLength(1);
+    expect(sleep.calls[0]).toBe(15 * 60_000);
+  });
+
+  it("accumulates cost across retries", async () => {
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_429_LINE);
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    if (outcome.kind === "completed") {
+      expect(outcome.costUsd).toBeCloseTo(0.01 + 1.2345);
+    }
+  });
+
+  it("does NOT retry non-rate-limit errors", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_GENERIC_ERROR_LINE]);
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("error");
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("does NOT retry cost_exceeded", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_BUDGET_LINE], 1);
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("cost_exceeded");
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("HALTs when cap is exceeded", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_429_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const capMs = 1 * 3_600_000;
+    const { agent } = makeRunnerWithRateLimit(runner, logs, {
+      capHours: 1,
+      clockMs: [0, 0, capMs + 1],
+    });
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain("rate limit cap exceeded");
+    }
+  });
+
+  it("uses resets time when available in stderr (waits until reset + 1min buffer)", async () => {
+    let callCount = 0;
+    const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+    const RESET_TARGET = Date.parse("2026-06-20T14:30:00.000Z");
+    const BUFFER = 60_000;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_429_LINE);
+        return { code: 0, stdout: "", stderr: "Your limit resets 14:30" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent, sleep } = makeRunnerWithRateLimit(runner, logs, {
+      clockMs: [NOW, NOW, NOW, NOW],
+    });
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(sleep.calls[0]).toBe(RESET_TARGET - NOW + BUFFER);
+  });
+
+  it("clamps wait time to remaining cap", async () => {
+    let callCount = 0;
+    const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_429_LINE);
+        return { code: 0, stdout: "", stderr: "Your limit resets 14:30" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const capHours = 1;
+    const capMs = capHours * 3_600_000;
+    const { agent, sleep } = makeRunnerWithRateLimit(runner, logs, {
+      capHours,
+      clockMs: [NOW, NOW, NOW, NOW],
+    });
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(sleep.calls[0]).toBe(capMs);
+  });
+
+  it("logs rate-limit detection with wait time", async () => {
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_429_LINE);
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    await agent.runSession(ctx);
+
+    expect(logs.some((l) => l.includes("rate limit detected"))).toBe(true);
   });
 });

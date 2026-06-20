@@ -155,6 +155,13 @@ async function runLoop(configPath: string): Promise<number> {
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,
+      rateLimit: {
+        reprobeMinutes: config.rateLimit.reprobeMinutes,
+        capHours: config.rateLimit.capHours,
+        claudePatterns: config.rateLimit.claudePatterns,
+        sleep,
+        clock: Date.now,
+      },
     });
     const git = new GitPrManager(runner, {
       repoPath: config.repo.path,
