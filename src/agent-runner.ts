@@ -140,9 +140,10 @@ const DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS: RegExp[] = [
 
 // Narrower pattern used only against resultText (agent output) to avoid
 // misclassifying product-level rate-limit text (e.g. GitHub API limits)
-// as Claude quota exhaustion. Matches only HTTP 429 indicators.
-const RESULT_TEXT_429_PATTERN =
-  /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\b429\b.*Too Many Requests/i;
+// as Claude quota exhaustion. Matches HTTP 429 and HTTP 529 indicators
+// injected by the api_error_status handler below.
+const RESULT_TEXT_API_RATE_LIMIT_PATTERN =
+  /\bHTTP[/ ]\s*(?:429|529)\b|\bstatus\s*(?:code\s*)?:?\s*(?:429|529)\b|\b429\b.*Too Many Requests|\b529\b.*Overloaded/i;
 
 const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})(?:\s*(utc))?/i;
 // Matches timezone-qualified AM/PM resets ("resets 6:40pm (America/New_York)") and
@@ -302,7 +303,7 @@ export function classifyClaudeError(
     // misclassifying product-level rate-limit text as Claude quota exhaustion.
     const cliOutput = `${message}\n${stderr}`;
     isRateLimit = patterns.some((p) => p.test(cliOutput)) ||
-      RESULT_TEXT_429_PATTERN.test(resultText);
+      RESULT_TEXT_API_RATE_LIMIT_PATTERN.test(resultText);
   }
   if (!isRateLimit) return { isRateLimit: false, resetsAtMs: null };
   return {
@@ -324,7 +325,7 @@ export class ClaudeAgentRunner implements AgentRunner {
   private async runOnce(
     ctx: SessionContext,
     resumeSessionId?: string,
-  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number; assistantText: string; rateLimitResetsAtMs: number | null }> {
+  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number; assistantText: string; rateLimitResetsAtMs: number | null; rateLimitEventSeen: boolean }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
     // When resuming a rate-limited session, use a non-empty -p so the CLI stays
@@ -353,6 +354,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     let capturedSessionId: string | null = null;
     const assistantTextParts: string[] = [];
     let capturedRateLimitResetsAtMs: number | null = null;
+    let rateLimitEventSeen = false;
 
     const onStdoutLine = (line: string): void => {
       let parsed: unknown;
@@ -387,9 +389,12 @@ export class ClaudeAgentRunner implements AgentRunner {
 
       if (type === "rate_limit_event") {
         const info = (parsed as RateLimitEventLine).rate_limit_info;
-        if (info?.status === "rejected" && typeof info.resets_at === "string") {
-          const ts = Date.parse(info.resets_at);
-          if (!isNaN(ts)) capturedRateLimitResetsAtMs = ts;
+        if (info?.status === "rejected") {
+          rateLimitEventSeen = true;
+          if (typeof info.resets_at === "string") {
+            const ts = Date.parse(info.resets_at);
+            if (!isNaN(ts)) capturedRateLimitResetsAtMs = ts;
+          }
         }
         return;
       }
@@ -421,10 +426,10 @@ export class ClaudeAgentRunner implements AgentRunner {
       resultText = resultText ? `${resultText}\nHTTP/429 Too Many Requests` : "HTTP/429 Too Many Requests";
     }
     if (rl?.api_error_status === 529) {
-      resultText = resultText ? `${resultText}\noverloaded` : "overloaded";
+      resultText = resultText ? `${resultText}\nHTTP/529 Overloaded` : "HTTP/529 Overloaded";
     }
     const assistantText = assistantTextParts.join("\n");
-    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId ?? rl?.session_id ?? null, exitCode: cmdResult.code, assistantText, rateLimitResetsAtMs: capturedRateLimitResetsAtMs };
+    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId ?? rl?.session_id ?? null, exitCode: cmdResult.code, assistantText, rateLimitResetsAtMs: capturedRateLimitResetsAtMs, rateLimitEventSeen };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
@@ -458,7 +463,7 @@ export class ClaudeAgentRunner implements AgentRunner {
           message: err instanceof Error ? err.message : String(err),
         };
       }
-      const { outcome, stderr, resultText, sessionId, exitCode, assistantText, rateLimitResetsAtMs } = runResult;
+      const { outcome, stderr, resultText, sessionId, exitCode, assistantText, rateLimitResetsAtMs, rateLimitEventSeen } = runResult;
       if (sessionId) lastSessionId = sessionId;
       totalCost += outcome.costUsd;
 
@@ -496,7 +501,7 @@ export class ClaudeAgentRunner implements AgentRunner {
         nowMs,
         resultText,
       );
-      if (!classification.isRateLimit) {
+      if (!classification.isRateLimit && !rateLimitEventSeen) {
         return { ...outcome, costUsd: totalCost };
       }
 
