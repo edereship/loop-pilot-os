@@ -40,7 +40,6 @@ describe("CodexPlanner.run", () => {
     expect(call.args).toEqual([
       "exec",
       "--ephemeral",
-      "--output-last-message",
       "--sandbox",
       "read-only",
       "--ask-for-approval",
@@ -63,7 +62,6 @@ describe("CodexPlanner.run", () => {
     expect(runner.calls[0]!.args).toEqual([
       "exec",
       "--ephemeral",
-      "--output-last-message",
       "--ask-for-approval",
       "never",
       "--sandbox",
@@ -446,32 +444,26 @@ describe("CodexPlanner.checkAvailability", () => {
     );
   });
 
-  it("Linux で bubblewrap が spawn 失敗 → サンドボックスエラーで throw（Finding 4）", async () => {
+  it("Linux で bwrap がなくても checkAvailability は成功する（Codex が自前の sandbox helper にフォールバックするため）", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
     runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
     runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["bwrap", "--version"], () => {
-      throw new Error("spawn bwrap ENOENT");
-    });
+    // bwrap is intentionally not stubbed: if the code calls it, FakeCommandRunner throws.
     const logs: string[] = [];
 
-    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
-      /sandbox.*bubblewrap|bubblewrap.*unavailable/i,
-    );
+    await expect(makePlanner(runner, logs).checkAvailability()).resolves.toBe("codex-cli 0.137.0");
   });
 
-  it("Linux で bwrap が非0終了 → サンドボックスエラーで throw（Finding 4）", async () => {
+  it("Linux で bwrap が非0終了でも checkAvailability は成功する（Codex sandbox probe を呼ばないため）", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
     runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
     runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["bwrap", "--version"], { code: 1, stdout: "", stderr: "error" });
+    // bwrap is intentionally not stubbed: if the code calls it, FakeCommandRunner throws.
     const logs: string[] = [];
 
-    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
-      /sandbox.*bubblewrap|bubblewrap.*unavailable/i,
-    );
+    await expect(makePlanner(runner, logs).checkAvailability()).resolves.toBe("codex-cli 0.137.0");
   });
 });
 

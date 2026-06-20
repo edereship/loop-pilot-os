@@ -1,3 +1,4 @@
+import path from "node:path";
 import process from "node:process";
 import type { CommandRunner, RunOptions } from "./types.js";
 
@@ -80,6 +81,12 @@ const CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT = new Set([
 // NO_PROXY/no_proxy hold host lists, not URLs, so they need no scrubbing.
 const PROXY_CREDENTIAL_KEYS_UPPER = new Set(["HTTPS_PROXY", "HTTP_PROXY"]);
 
+// Env keys whose values are filesystem paths that must be resolved to absolute
+// before being forwarded. This prevents cwd-relative paths from resolving to
+// different locations when the auth check (cwd=".") and exec (cwd=worktreePath)
+// run from different directories.
+const PATH_ENV_KEYS_UPPER = new Set(["CODEX_HOME"]);
+
 // Returns the scrubbed proxy URL, or undefined if the value should be dropped.
 // Only attempt URL parsing for http/https-schemed values: the WHATWG URL parser
 // accepts scheme-less strings like "user:pass@host:8080" as valid opaque URLs
@@ -127,12 +134,17 @@ function codexChildEnv(): Record<string, string> {
       : CODEX_CHILD_ENV_ALLOWLIST.has(key);
     if (!isAllowed) continue;
 
+    const keyUpper = key.toUpperCase();
     // Strip embedded credentials from proxy URL values before forwarding.
-    if (PROXY_CREDENTIAL_KEYS_UPPER.has(key.toUpperCase())) {
+    if (PROXY_CREDENTIAL_KEYS_UPPER.has(keyUpper)) {
       const scrubbed = scrubProxyUrl(value);
       if (scrubbed !== undefined) {
         out[key] = scrubbed;
       }
+    } else if (PATH_ENV_KEYS_UPPER.has(keyUpper) && !path.isAbsolute(value)) {
+      // Resolve relative paths to absolute so the same directory is used
+      // regardless of which cwd the child process inherits.
+      out[key] = path.resolve(value);
     } else {
       out[key] = value;
     }
@@ -169,18 +181,6 @@ function hasFlagOrAlias(args: string[], longFlag: string, shortAlias: string): b
   );
 }
 
-// Returns true when extraArgs selects a Codex sandbox mode that does not
-// require the bubblewrap backend on Linux (danger-full-access or full bypass).
-function hasSandboxBypassMode(extraArgs: string[]): boolean {
-  for (let i = 0; i < extraArgs.length; i++) {
-    const a = extraArgs[i]!;
-    if (a === "--sandbox=danger-full-access" || a === "-s=danger-full-access") return true;
-    if ((a === "--sandbox" || a === "-s") && extraArgs[i + 1] === "danger-full-access") return true;
-    if (a === "--dangerously-bypass-approvals-and-sandbox" || a === "--yolo") return true;
-  }
-  return false;
-}
-
 export class CodexPlanner {
   constructor(
     private readonly runner: CommandRunner,
@@ -198,9 +198,6 @@ export class CodexPlanner {
     const args: string[] = [
       "exec",
       "--ephemeral",
-      // Request only the final assistant message on stdout so callers that
-      // parse the returned text see the answer rather than tool/progress output.
-      "--output-last-message",
       ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
       ...(hasCustomApproval ? [] : ["--ask-for-approval", "never"]),
       ...(this.opts.extraArgs ?? []),
@@ -268,27 +265,6 @@ export class CodexPlanner {
     }
     if (authResult.code !== 0) {
       throw new Error("codex: 認証されていません（codex login を実行してください）");
-    }
-
-    // On Linux/WSL, the default sandbox (--sandbox read-only) requires bubblewrap.
-    // Skip this probe when extraArgs select a mode that bypasses the sandbox entirely
-    // (e.g. --sandbox danger-full-access on an externally isolated runner).
-    // Probe it now so a missing sandbox backend surfaces at preflight rather than
-    // failing at the first run() call with an opaque non-zero exit.
-    if (process.platform === "linux" && !hasSandboxBypassMode(this.opts.extraArgs ?? [])) {
-      let bwrapResult;
-      try {
-        bwrapResult = await this.runner.run("bwrap", ["--version"], { cwd: "." });
-      } catch (err) {
-        throw new Error(
-          `codex: sandbox backend (bubblewrap) unavailable on this Linux host — install bubblewrap or run in a container with sandbox support (${err instanceof Error ? err.message : String(err)})`,
-        );
-      }
-      if (bwrapResult.code !== 0) {
-        throw new Error(
-          "codex: sandbox backend (bubblewrap) unavailable on this Linux host — install bubblewrap or run in a container with sandbox support",
-        );
-      }
     }
 
     return version;
