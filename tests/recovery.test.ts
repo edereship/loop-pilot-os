@@ -37,6 +37,7 @@ function makeConfig(over: Partial<{
       sessionHardTimeoutMinutes: 120,
       maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2,
+      codexTimeoutMinutes: 30,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,

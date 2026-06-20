@@ -60,6 +60,7 @@ describe("loadConfig", () => {
     expect(config.safety.sessionHardTimeoutMinutes).toBe(120); // 既定（hung claude 用 hard backstop）
     expect(config.safety.maxWorkflowFixAttempts).toBe(2); // default (not in config-valid.toml)
     expect(config.safety.maxCostUsdPerFix).toBe(2); // default (not in config-valid.toml)
+    expect(config.safety.codexTimeoutMinutes).toBe(30); // default (not in config-valid.toml)
 
     expect(config.loop.monitorPollSeconds).toBe(60);
     expect(config.loop.idleRecheckSeconds).toBe(300);

@@ -53,6 +53,7 @@ const rawSchema = z.object({
     session_hard_timeout_minutes: z.number().positive().default(120),
     max_workflow_fix_attempts: z.number().int().positive().default(2),
     max_cost_usd_per_fix: z.number().positive().default(2),
+    codex_timeout_minutes: z.number().positive().default(30),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -116,6 +117,7 @@ export interface Config {
     sessionHardTimeoutMinutes: number;
     maxWorkflowFixAttempts: number;
     maxCostUsdPerFix: number;
+    codexTimeoutMinutes: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -601,6 +603,7 @@ export function loadConfig(
       sessionHardTimeoutMinutes: raw.safety.session_hard_timeout_minutes,
       maxWorkflowFixAttempts: raw.safety.max_workflow_fix_attempts,
       maxCostUsdPerFix: raw.safety.max_cost_usd_per_fix,
+      codexTimeoutMinutes: raw.safety.codex_timeout_minutes,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,

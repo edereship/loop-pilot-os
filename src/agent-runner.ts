@@ -21,6 +21,7 @@ const RATE_LIMIT_BUFFER_MS = 60_000;
 // 注（残存リスク）: gh が `gh auth login`（~/.config/gh/hosts.yml）で認証済みかつ agent に
 //   Bash を許可している場合、env 除外だけでは ambient 認証経由の濫用は防げない。運用側で
 //   agent.allowed_tools を最小化（Bash/ネットワークを絞る）こと。
+// Keep in sync with codex-planner.ts SENSITIVE_ENV_KEYS
 const SENSITIVE_ENV_KEYS = [
   "LINEAR_API_KEY",
   "SLACK_WEBHOOK_URL",
