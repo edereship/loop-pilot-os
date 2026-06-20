@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
+import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { CodexPlanner } from "../src/codex-planner.js";
 import { FakeCommandRunner } from "./fakes.js";
 import type { RunOptions, CommandResult } from "../src/types.js";
 
 const STDERR_TAIL = "Error: something broke in codex";
+
+// Mirror the production platform check so stubs match the actual command used.
+const CODEX_CMD = process.platform === "win32" ? "codex.cmd" : "codex";
 
 function makePlanner(
   runner: FakeCommandRunner,
@@ -21,7 +26,7 @@ function codexStub(
   runner: FakeCommandRunner,
   result: Partial<CommandResult> | ((args: string[], opts: RunOptions) => Partial<CommandResult>),
 ): void {
-  runner.on(["codex"], result);
+  runner.on([CODEX_CMD], result);
 }
 
 describe("CodexPlanner.run", () => {
@@ -347,15 +352,15 @@ describe("CodexPlanner.run", () => {
 describe("CodexPlanner.checkAvailability", () => {
   it("codex --version が成功かつ認証済み → バージョン文字列を返す", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
     // bubblewrap probe is performed on Linux; stub it so the test is portable.
     runner.on(["bwrap", "--version"], { code: 0, stdout: "bwrap 0.8.0\n", stderr: "" });
     const logs: string[] = [];
     const version = await makePlanner(runner, logs).checkAvailability();
 
     expect(version).toBe("codex-cli 0.137.0");
-    expect(runner.calls[0]!.cmd).toBe("codex");
+    expect(runner.calls[0]!.cmd).toBe(CODEX_CMD);
     expect(runner.calls[0]!.args).toEqual(["--version"]);
     expect(runner.calls[0]!.opts.cwd).toBe(".");
     expect(runner.calls[1]!.args).toEqual(["login", "status"]);
@@ -372,8 +377,8 @@ describe("CodexPlanner.checkAvailability", () => {
     Object.assign(process.env, SECRETS);
     try {
       const runner = new FakeCommandRunner();
-      runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-      runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+      runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+      runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
       // bubblewrap probe is performed on Linux; stub it so the test is portable.
       runner.on(["bwrap", "--version"], { code: 0, stdout: "bwrap 0.8.0\n", stderr: "" });
       const logs: string[] = [];
@@ -397,7 +402,7 @@ describe("CodexPlanner.checkAvailability", () => {
 
   it("codex --version が非0終了 → throw", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 127, stdout: "", stderr: "command not found" });
+    runner.on([CODEX_CMD, "--version"], { code: 127, stdout: "", stderr: "command not found" });
     const logs: string[] = [];
 
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
@@ -407,7 +412,7 @@ describe("CodexPlanner.checkAvailability", () => {
 
   it("codex --version が spawn 失敗（ENOENT）→ 診断メッセージ付き throw", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], () => {
+    runner.on([CODEX_CMD, "--version"], () => {
       throw new Error("spawn codex ENOENT");
     });
     const logs: string[] = [];
@@ -422,8 +427,8 @@ describe("CodexPlanner.checkAvailability", () => {
 
   it("codex login status が非0終了（未認証）→ 認証エラーで throw", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 1, stdout: "", stderr: "not logged in" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 1, stdout: "", stderr: "not logged in" });
     const logs: string[] = [];
 
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
@@ -433,8 +438,8 @@ describe("CodexPlanner.checkAvailability", () => {
 
   it("codex login status が spawn 失敗 → 認証確認エラーで throw", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], () => {
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], () => {
       throw new Error("spawn codex ENOENT");
     });
     const logs: string[] = [];
@@ -447,8 +452,8 @@ describe("CodexPlanner.checkAvailability", () => {
   it("Linux で bwrap がなくても checkAvailability は成功する（Codex が自前の sandbox helper にフォールバックするため）", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
     // bwrap is intentionally not stubbed: if the code calls it, FakeCommandRunner throws.
     const logs: string[] = [];
 
@@ -458,8 +463,8 @@ describe("CodexPlanner.checkAvailability", () => {
   it("Linux で bwrap が非0終了でも checkAvailability は成功する（Codex sandbox probe を呼ばないため）", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
     // bwrap is intentionally not stubbed: if the code calls it, FakeCommandRunner throws.
     const logs: string[] = [];
 
@@ -633,8 +638,8 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
   it("Linux で extraArgs に --sandbox danger-full-access がある場合は bubblewrap チェックをスキップする", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
     // bwrap is intentionally NOT stubbed: if the code calls it, FakeCommandRunner throws.
     const planner = new CodexPlanner(runner, {
       log: () => {},
@@ -647,8 +652,8 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
   it("Linux で extraArgs に --sandbox=danger-full-access がある場合は bubblewrap チェックをスキップする", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
     const planner = new CodexPlanner(runner, {
       log: () => {},
       extraArgs: ["--sandbox=danger-full-access"],
@@ -660,8 +665,8 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
   it("Linux で extraArgs に --yolo がある場合は bubblewrap チェックをスキップする", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
     const planner = new CodexPlanner(runner, {
       log: () => {},
       extraArgs: ["--yolo"],
@@ -673,8 +678,8 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
   it("Linux で extraArgs に --dangerously-bypass-approvals-and-sandbox がある場合は bubblewrap チェックをスキップする", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
-    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
-    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
     const planner = new CodexPlanner(runner, {
       log: () => {},
       extraArgs: ["--dangerously-bypass-approvals-and-sandbox"],
@@ -702,5 +707,117 @@ describe("CodexPlanner Windows supplement key casing (Finding 4)", () => {
       if (saved["ComSpec"] === undefined) delete process.env["ComSpec"];
       else process.env["ComSpec"] = saved["ComSpec"];
     }
+  });
+});
+
+describe("CodexPlanner auth file isolation (Finding 1)", () => {
+  it("子プロセスの HOME は os.tmpdir() に差し替えられる（~/.codex auth ファイルを sandbox から隠す）", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+    const env = runner.calls[0]!.opts.env!;
+    expect(env["HOME"]).toBe(os.tmpdir());
+  });
+
+  it("子プロセスに CODEX_HOME が常に注入される（HOME 差し替え後も auth を解決できる）", async () => {
+    const saved = { ...process.env };
+    delete process.env["CODEX_HOME"];
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["CODEX_HOME"]).toBeDefined();
+      expect(path.isAbsolute(env["CODEX_HOME"]!)).toBe(true);
+      // Default CODEX_HOME resolves to the .codex directory under the real home.
+      expect(env["CODEX_HOME"]).toMatch(/\.codex$/);
+    } finally {
+      if (saved["CODEX_HOME"] === undefined) delete process.env["CODEX_HOME"];
+      else process.env["CODEX_HOME"] = saved["CODEX_HOME"];
+    }
+  });
+
+  it("CODEX_HOME が既に設定されている場合はその絶対パスを注入する", async () => {
+    const saved = { ...process.env };
+    process.env["CODEX_HOME"] = "/custom/codex/home";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["CODEX_HOME"]).toBe("/custom/codex/home");
+    } finally {
+      if (saved["CODEX_HOME"] === undefined) delete process.env["CODEX_HOME"];
+      else process.env["CODEX_HOME"] = saved["CODEX_HOME"];
+    }
+  });
+
+  it("checkAvailability の auth 確認でも HOME は tmpdir に差し替えられる", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs).checkAvailability();
+
+    // The auth check (calls[1]) must use the isolated env.
+    const authEnv = runner.calls[1]!.opts.env!;
+    expect(authEnv["HOME"]).toBe(os.tmpdir());
+    expect(authEnv["CODEX_HOME"]).toBeDefined();
+  });
+});
+
+describe("CodexPlanner Windows .cmd shim (Finding 2)", () => {
+  it("Windows では codex.cmd として起動される（npm shim は shell:false では直接実行できないため）", async () => {
+    if (process.platform !== "win32") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex.cmd"], { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+    expect(runner.calls[0]!.cmd).toBe("codex.cmd");
+  });
+
+  it("Windows 以外では codex として起動される", async () => {
+    if (process.platform === "win32") return;
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+    expect(runner.calls[0]!.cmd).toBe("codex");
+  });
+});
+
+describe("CodexPlanner lone-dash prompt guard (Finding 3)", () => {
+  it('prompt が "-" 単独の場合は kind=error を即返しサブプロセスを起動しない', async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    const outcome = await makePlanner(runner, logs).run({
+      worktreePath: "/wt",
+      prompt: "-",
+    });
+
+    expect(outcome.kind).toBe("error");
+    expect((outcome as { kind: "error"; message: string }).message).toMatch(/stdin/i);
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  it('prompt が "-" で始まるが単独でない場合は通常通り起動する（"--help" 等）', async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    const outcome = await makePlanner(runner, logs).run({
+      worktreePath: "/wt",
+      prompt: "--help",
+    });
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(1);
   });
 });

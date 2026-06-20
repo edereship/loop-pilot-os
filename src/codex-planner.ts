@@ -1,8 +1,13 @@
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import type { CommandRunner, RunOptions } from "./types.js";
 
 const STDERR_TAIL_MAX = 1000;
+
+// On Windows, npm-installed CLI tools are wrapped in .cmd shims that cannot
+// be resolved by Node's spawn() with shell:false. Use the explicit .cmd form.
+const CODEX_COMMAND = process.platform === "win32" ? "codex.cmd" : "codex";
 
 // Allowlist of environment variables forwarded to the Codex child process.
 // An allowlist (rather than a denylist) is used because Codex exec can run
@@ -12,9 +17,10 @@ const STDERR_TAIL_MAX = 1000;
 // NPM_TOKEN, and other CI secrets — is excluded automatically.
 //
 // Auth credentials (CODEX_API_KEY, CODEX_ACCESS_TOKEN, OPENAI_API_KEY) are
-// intentionally absent: the only supported authentication method is a cached
-// auth file (~/.codex/auth.json), which checkAvailability() verifies under
-// the same filtered environment before any exec run.
+// intentionally absent: Codex is authenticated via its auth cache directory
+// ($CODEX_HOME, defaulting to ~/.codex). codexChildEnv() always injects an
+// explicit CODEX_HOME so the Codex binary can locate its auth even after HOME
+// has been replaced with os.tmpdir() (see below).
 const CODEX_CHILD_ENV_ALLOWLIST = new Set([
   // Shell essentials
   "PATH",
@@ -116,6 +122,14 @@ function scrubProxyUrl(rawUrl: string): string | undefined {
 }
 
 function codexChildEnv(): Record<string, string> {
+  // Resolve the auth cache directory from the *parent* environment before we
+  // build the sanitised child env. We need this to inject CODEX_HOME into the
+  // child so the Codex binary can authenticate even after we redirect HOME.
+  const parentCodexHome = process.env["CODEX_HOME"];
+  const realCodexHome = parentCodexHome
+    ? (path.isAbsolute(parentCodexHome) ? parentCodexHome : path.resolve(parentCodexHome))
+    : path.join(os.homedir(), ".codex");
+
   const out: Record<string, string> = {};
   const isWindows = process.platform === "win32";
   // On Windows, env keys are case-insensitive (e.g. "Path" instead of "PATH").
@@ -149,6 +163,16 @@ function codexChildEnv(): Record<string, string> {
       out[key] = value;
     }
   }
+
+  // Always inject CODEX_HOME (absolute) so the Codex binary can locate its
+  // auth cache regardless of the HOME value below. This overrides any value
+  // the loop may have already written for CODEX_HOME (they are the same).
+  out["CODEX_HOME"] = realCodexHome;
+  // Replace HOME with the system temp directory so that a malicious planning
+  // prompt cannot reach ~/.codex/auth.json by navigating via "~". Codex itself
+  // authenticates via the explicit CODEX_HOME set above, not via HOME.
+  out["HOME"] = os.tmpdir();
+
   return out;
 }
 
@@ -188,6 +212,16 @@ export class CodexPlanner {
   ) {}
 
   async run(ctx: CodexPlannerContext): Promise<CodexOutcome> {
+    // A lone "-" is Codex's stdin sentinel: even after "--", Codex interprets
+    // "-" as "read prompt from stdin". Since stdin is always "ignore", the
+    // invocation would silently receive an empty prompt instead of the dash.
+    if (ctx.prompt === "-") {
+      return {
+        kind: "error",
+        message: 'invalid prompt: a lone "-" would switch Codex to stdin mode',
+      };
+    }
+
     // Default to read-only sandbox so planning prompts (which only need to
     // read the worktree) cannot mutate files before implementation starts.
     // Callers that need write access must pass "--sandbox"/"-s" in extraArgs.
@@ -220,7 +254,7 @@ export class CodexPlanner {
 
     let result;
     try {
-      result = await this.runner.run("codex", args, runOpts);
+      result = await this.runner.run(CODEX_COMMAND, args, runOpts);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.opts.log(`codex session failed: ${message}`);
@@ -241,7 +275,7 @@ export class CodexPlanner {
   async checkAvailability(): Promise<string> {
     let result;
     try {
-      result = await this.runner.run("codex", ["--version"], { cwd: "." });
+      result = await this.runner.run(CODEX_COMMAND, ["--version"], { cwd: "." });
     } catch (err) {
       throw new Error(
         `codex CLI not found or not available: ${err instanceof Error ? err.message : String(err)}`,
@@ -257,7 +291,7 @@ export class CodexPlanner {
       // Run the auth check with the same filtered environment as run() so that
       // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
       // fail here at preflight rather than silently at exec time.
-      authResult = await this.runner.run("codex", ["login", "status"], { cwd: ".", env: codexChildEnv() });
+      authResult = await this.runner.run(CODEX_COMMAND, ["login", "status"], { cwd: ".", env: codexChildEnv() });
     } catch (err) {
       throw new Error(
         `codex: 認証状態を確認できません（${err instanceof Error ? err.message : String(err)}）`,
