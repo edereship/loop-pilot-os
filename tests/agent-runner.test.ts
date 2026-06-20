@@ -640,6 +640,48 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     expect(runner.calls).toHaveLength(1);
   });
 
+  it("reduces --max-budget-usd on retries by accumulated cost", async () => {
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_429_LINE);
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    await agent.runSession(ctx);
+
+    const firstBudget = runner.calls[0]!.args[runner.calls[0]!.args.indexOf("--max-budget-usd") + 1];
+    const secondBudget = runner.calls[1]!.args[runner.calls[1]!.args.indexOf("--max-budget-usd") + 1];
+    expect(firstBudget).toBe("10.00");
+    expect(secondBudget).toBe("9.99");
+  });
+
+  it("returns cost_exceeded when retry budget is exhausted", async () => {
+    const RESULT_EXPENSIVE_429 =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":10.00,"result":"429 Too Many Requests","session_id":"s1"}';
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_EXPENSIVE_429);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("cost_exceeded");
+    expect(outcome.costUsd).toBe(10);
+    expect(runner.calls).toHaveLength(1);
+  });
+
   it("HALTs when cap is exceeded", async () => {
     const runner = new FakeCommandRunner();
     runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {

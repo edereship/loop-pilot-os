@@ -255,7 +255,13 @@ export class ClaudeAgentRunner implements AgentRunner {
     let totalCost = 0;
 
     while (true) {
-      const { outcome, stderr } = await this.runOnce(ctx);
+      const remainingBudget = ctx.maxCostUsd - totalCost;
+      if (remainingBudget <= 0) {
+        return { kind: "cost_exceeded", costUsd: totalCost };
+      }
+      const { outcome, stderr } = await this.runOnce(
+        { ...ctx, maxCostUsd: remainingBudget },
+      );
       totalCost += outcome.costUsd;
 
       if (outcome.kind !== "error") {
