@@ -195,7 +195,14 @@ function codexChildEnv(homeDir: string): Record<string, string> {
   // directory so that prompts cannot reach host dotfiles via "~" or
   // %USERPROFILE%. XDG paths (XDG_CONFIG_HOME etc.) are not forwarded;
   // Codex derives them from this isolated HOME.
+  //
+  // CODEX_SQLITE_HOME is set to homeDir (the private per-run directory) so
+  // that writable Codex state (SQLite databases, session files) is isolated
+  // per-run. Without this override CODEX_SQLITE_HOME defaults to CODEX_HOME,
+  // meaning concurrent planner runs share and can lock or corrupt the same
+  // database even though HOME was made per-run.
   out["CODEX_HOME"] = resolveCodexAuthDir();
+  out["CODEX_SQLITE_HOME"] = homeDir;
   out["HOME"] = homeDir;
   out["USERPROFILE"] = homeDir;
 
@@ -397,7 +404,11 @@ export class CodexPlanner {
       // fall back to its own sandbox helper on some configurations.
       if (process.platform === "linux" && !isSandboxBypassed(this.opts.extraArgs ?? [])) {
         try {
-          await this.runner.run("bwrap", ["--version"], { cwd: "." });
+          // Use the same sanitized env as all other child invocations so that
+          // relative PATH entries (e.g. "." or "node_modules/.bin") cannot
+          // shadow the system bwrap binary when LoopPilot is started from a
+          // repository or config directory.
+          await this.runner.run("bwrap", ["--version"], { cwd: ".", env: codexChildEnv(privateHome) });
         } catch {
           // bwrap unavailable; Codex may use a fallback — proceed and let
           // runtime surface the failure if sandboxing truly cannot start.

@@ -119,7 +119,15 @@ export class RealCommandRunner implements CommandRunner {
             // cannot win the race and resolve successfully between now and when
             // taskkill's own close/error fires.
             timedOut = true;
-            const killer = spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });
+            // Resolve taskkill to an absolute path so that CreateProcess does
+            // not search the current directory (which may be a repo worktree
+            // containing an attacker-controlled taskkill.exe) before system32.
+            const taskkillPath = path.join(
+              process.env["SystemRoot"] ?? "C:\\Windows",
+              "System32",
+              "taskkill.exe",
+            );
+            const killer = spawn(taskkillPath, ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });
             const settleTimeout = (): void => { settle(() => reject(timeoutErr)); };
             killer.on("close", settleTimeout);
             killer.on("error", settleTimeout);

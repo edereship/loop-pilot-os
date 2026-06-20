@@ -1004,6 +1004,66 @@ describe("CodexPlanner XDG isolation (Finding 4)", () => {
   });
 });
 
+describe("CodexPlanner CODEX_SQLITE_HOME isolation (Finding 6)", () => {
+  it("CODEX_SQLITE_HOME はプライベート一時ディレクトリに設定される（並行実行の SQLite ロック競合を防ぐ）", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+    const env = runner.calls[0]!.opts.env!;
+    // CODEX_SQLITE_HOME must be the per-run private directory, not the shared CODEX_HOME.
+    expect(env["CODEX_SQLITE_HOME"]).toBeDefined();
+    expect(env["CODEX_SQLITE_HOME"]).toContain("codex-planner-");
+    expect(path.dirname(env["CODEX_SQLITE_HOME"]!)).toBe(os.tmpdir());
+    // It must be co-located with HOME so all per-run state lives in one place.
+    expect(env["CODEX_SQLITE_HOME"]).toBe(env["HOME"]);
+  });
+
+  it("CODEX_SQLITE_HOME は CODEX_HOME（共有 auth ディレクトリ）と異なる", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+    const env = runner.calls[0]!.opts.env!;
+    expect(env["CODEX_SQLITE_HOME"]).not.toBe(env["CODEX_HOME"]);
+  });
+});
+
+describe("CodexPlanner bwrap probe sanitized env (Finding 7a)", () => {
+  it("Linux で bwrap プローブはサニタイズ済み env を使う（相対 PATH による shadowing を防ぐ）", async () => {
+    if (process.platform !== "linux") return;
+    const SECRETS = {
+      LINEAR_API_KEY: "lin_xxx",
+      GH_TOKEN: "ghp_xxx",
+    };
+    const saved = { ...process.env };
+    Object.assign(process.env, SECRETS);
+    try {
+      const runner = new FakeCommandRunner();
+      runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+      runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
+      runner.on(["bwrap", "--version"], { code: 0, stdout: "bwrap 0.8.0\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).checkAvailability();
+
+      const bwrapCall = runner.calls.find((c) => c.cmd === "bwrap");
+      expect(bwrapCall).toBeDefined();
+      const env = bwrapCall!.opts.env!;
+      expect(env).toBeDefined();
+      for (const key of Object.keys(SECRETS)) {
+        expect(env).not.toHaveProperty(key);
+      }
+    } finally {
+      for (const key of Object.keys(SECRETS)) {
+        if (saved[key] === undefined) delete process.env[key as keyof typeof process.env];
+        else process.env[key] = saved[key];
+      }
+    }
+  });
+});
+
 describe("CodexPlanner SSH agent exclusion (Finding 5)", () => {
   it("SSH_AUTH_SOCK は転送しない（shell-capable モードで SSH agent 経由の認証を防ぐ）", async () => {
     const saved = { ...process.env };
