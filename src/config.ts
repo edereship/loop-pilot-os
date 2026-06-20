@@ -64,6 +64,11 @@ const rawSchema = z.object({
   notify: z.object({
     progress: z.boolean().default(false),
   }).strict().optional(),
+  rate_limit: z.object({
+    reprobe_minutes: z.number().positive().default(15),
+    cap_hours: z.number().positive().default(6),
+    claude_patterns: z.array(z.string()).default([]),
+  }).strict().optional(),
 }).strict();
 
 type RawConfig = z.infer<typeof rawSchema>;
@@ -121,6 +126,11 @@ export interface Config {
   };
   notify: {
     progress: boolean;
+  };
+  rateLimit: {
+    reprobeMinutes: number;
+    capHours: number;
+    claudePatterns: string[];
   };
   linearApiKey: string;
   slackWebhookUrl: string | undefined;
@@ -589,6 +599,11 @@ export function loadConfig(
     },
     notify: {
       progress: raw.notify?.progress ?? false,
+    },
+    rateLimit: {
+      reprobeMinutes: raw.rate_limit?.reprobe_minutes ?? 15,
+      capHours: raw.rate_limit?.cap_hours ?? 6,
+      claudePatterns: raw.rate_limit?.claude_patterns ?? [],
     },
     linearApiKey: linearApiKey as string,
     slackWebhookUrl,
