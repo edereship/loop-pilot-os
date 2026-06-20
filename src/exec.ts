@@ -6,8 +6,12 @@ import type { CommandResult, CommandRunner, RunOptions } from "./types.js";
 // Interior double-quotes are doubled ("") per cmd.exe convention, then the
 // token is wrapped in double-quotes to neutralise metacharacters (&, |, >,
 // <, ^, etc.) that cmd.exe would otherwise interpret as shell operators.
+// Percent signs are doubled (%%) before quoting: cmd.exe expands %VAR% during
+// a pre-processing pass that runs even inside double-quoted strings, so a
+// ticket-derived prompt containing %PATH% or %TEMP% would be rewritten before
+// Codex receives it. Doubling prevents that expansion.
 function quoteCmdExeToken(token: string): string {
-  return `"${token.replace(/"/g, '""')}"`;
+  return `"${token.replace(/%/g, "%%").replace(/"/g, '""')}"`;
 }
 
 export class RealCommandRunner implements CommandRunner {
@@ -63,7 +67,15 @@ export class RealCommandRunner implements CommandRunner {
 
       if (opts.timeoutMs !== undefined) {
         timeoutHandle = setTimeout(() => {
-          child.kill("SIGKILL");
+          if (process.platform === "win32" && windowsVerbatimArguments && child.pid !== undefined) {
+            // On Windows the tracked child is cmd.exe, not the Codex process
+            // started by the .cmd shim. child.kill() only kills cmd.exe; the
+            // real subprocess keeps running. Use taskkill /T to terminate the
+            // entire process tree rooted at cmd.exe.
+            spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" });
+          } else {
+            child.kill("SIGKILL");
+          }
           settle(() =>
             reject(
               new Error(

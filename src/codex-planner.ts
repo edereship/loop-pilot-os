@@ -19,13 +19,17 @@ const CODEX_COMMAND = process.platform === "win32" ? "codex.cmd" : "codex";
 //
 // Auth credentials (CODEX_API_KEY, CODEX_ACCESS_TOKEN, OPENAI_API_KEY) are
 // intentionally absent: Codex is authenticated via its auth cache directory
-// ($CODEX_HOME, defaulting to ~/.codex). codexChildEnv() always injects an
-// explicit CODEX_HOME so the Codex binary can locate its auth even after HOME
-// has been replaced with a private per-run temp directory (see below).
+// ($CODEX_HOME, defaulting to ~/.codex). When the operator has not set
+// CODEX_HOME explicitly, codexChildEnv() creates a symlink at homeDir/.codex
+// pointing to the real auth directory, then sets HOME=homeDir so Codex finds
+// auth via its default $HOME/.codex path — without an explicit CODEX_HOME env
+// var. This keeps the auth path out of model-launched subprocess environments:
+// a prompt cannot read $CODEX_HOME/auth.json because $CODEX_HOME is unset.
+// When the operator has explicitly set CODEX_HOME, that path is forwarded so
+// their chosen auth directory is honoured.
 //
-// CODEX_HOME is intentionally absent from this allowlist: it is injected
-// explicitly at the end of codexChildEnv() so the absolute value derived from
-// the parent environment (or the default) is always used, bypassing the loop.
+// CODEX_HOME is intentionally absent from this allowlist: it is conditionally
+// injected at the end of codexChildEnv() only when the operator set it.
 //
 // XDG base dirs (XDG_CONFIG_HOME etc.) are excluded: since HOME is redirected
 // to a fresh private temp dir, Codex will derive isolated XDG paths from that
@@ -185,15 +189,22 @@ function codexChildEnv(homeDir: string): Record<string, string> {
     }
   }
 
-  // Inject CODEX_HOME so the Codex binary can locate its auth cache after the
-  // HOME override below. When the operator did not set CODEX_HOME explicitly,
-  // create a symlink inside homeDir pointing at the real auth directory rather
-  // than forwarding the real ~/.codex absolute path. This keeps the operator's
-  // home directory path out of the child environment, reducing the information
-  // available to model-driven file reads (the real path is not in $CODEX_HOME).
+  // Set up auth access for the Codex binary.
+  //
+  // When the operator did not set CODEX_HOME explicitly: create a symlink at
+  // homeDir/.codex pointing to the real auth directory. We do NOT inject
+  // CODEX_HOME into the child env — Codex finds auth via its HOME-relative
+  // default ($HOME/.codex = homeDir/.codex → realCodexHome). This keeps
+  // $CODEX_HOME unset in model-launched subprocesses, so a prompt cannot read
+  // $CODEX_HOME/auth.json to exfiltrate refresh/API tokens.
   // The symlink is removed with homeDir in the caller's finally block.
-  // When the operator explicitly set CODEX_HOME, forward that exact path so
-  // their chosen auth directory is honoured.
+  //
+  // When the operator explicitly set CODEX_HOME, inject that path so their
+  // chosen auth directory is honoured. (Note: project-level .codex/config.toml
+  // and project-local hooks inside the worktree are not blocked by
+  // --ignore-user-config, which only skips $CODEX_HOME/config.toml. A Codex
+  // CLI flag to disable project-level config should be added via extraArgs
+  // once the appropriate flag is confirmed for the Codex CLI version in use.)
   if (parentCodexHome !== undefined) {
     out["CODEX_HOME"] = realCodexHome;
   } else {
@@ -204,14 +215,17 @@ function codexChildEnv(homeDir: string): Record<string, string> {
         isolatedCodexHome,
         process.platform === "win32" ? "junction" : undefined,
       );
-      out["CODEX_HOME"] = isolatedCodexHome;
+      // CODEX_HOME intentionally not set: Codex uses $HOME/.codex (the symlink).
     } catch (err) {
       // EEXIST: a prior codexChildEnv call with the same homeDir already
-      // created the symlink — the isolated path is already in place, reuse it.
+      // created the symlink — auth is accessible via $HOME/.codex without an
+      // explicit CODEX_HOME env var.
       // Any other error (e.g. junction target absent on Windows): fall back to
       // the real path so authentication still works.
       const code = (err as { code?: string }).code;
-      out["CODEX_HOME"] = code === "EEXIST" ? isolatedCodexHome : realCodexHome;
+      if (code !== "EEXIST") {
+        out["CODEX_HOME"] = realCodexHome;
+      }
     }
   }
   // Replace HOME and USERPROFILE with the caller-supplied private per-run

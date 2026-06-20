@@ -41,7 +41,7 @@ describe("CodexPlanner.run", () => {
 
     expect(runner.calls).toHaveLength(1);
     const call = runner.calls[0]!;
-    expect(call.cmd).toBe("codex");
+    expect(call.cmd).toBe(CODEX_CMD);
     expect(call.args).toEqual([
       "exec",
       "--ephemeral",
@@ -728,7 +728,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
   });
 
-  it("子プロセスに CODEX_HOME が常に注入される（HOME 差し替え後も auth を解決できる）", async () => {
+  it("CODEX_HOME 未設定時は子プロセスの env に CODEX_HOME を注入しない（model-run shell への漏えい防止）", async () => {
     const saved = { ...process.env };
     delete process.env["CODEX_HOME"];
     try {
@@ -738,10 +738,15 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
       await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
       const env = runner.calls[0]!.opts.env!;
-      expect(env["CODEX_HOME"]).toBeDefined();
-      expect(path.isAbsolute(env["CODEX_HOME"]!)).toBe(true);
-      // Default CODEX_HOME resolves to the .codex directory under the real home.
-      expect(env["CODEX_HOME"]).toMatch(/\.codex$/);
+      // CODEX_HOME must NOT appear in the child env when the operator did not
+      // set it: Codex finds auth via $HOME/.codex (symlink to realCodexHome).
+      // Keeping CODEX_HOME out of the env prevents model-launched subshells
+      // from reading $CODEX_HOME/auth.json to leak refresh/API tokens.
+      expect(env["CODEX_HOME"]).toBeUndefined();
+      // HOME must still be set to the private per-run directory so that Codex
+      // resolves $HOME/.codex to the symlink pointing at the real auth dir.
+      expect(env["HOME"]).toContain("codex-planner-");
+      expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
     } finally {
       if (saved["CODEX_HOME"] === undefined) delete process.env["CODEX_HOME"];
       else process.env["CODEX_HOME"] = saved["CODEX_HOME"];
@@ -776,7 +781,9 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     const authEnv = runner.calls[1]!.opts.env!;
     expect(authEnv["HOME"]).toContain("codex-planner-");
     expect(path.dirname(authEnv["HOME"]!)).toBe(os.tmpdir());
-    expect(authEnv["CODEX_HOME"]).toBeDefined();
+    // CODEX_HOME is intentionally absent: Codex uses $HOME/.codex (symlink)
+    // to find auth, keeping the auth path out of model-launched subprocess envs.
+    expect(authEnv["CODEX_HOME"]).toBeUndefined();
   });
 });
 
