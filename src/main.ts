@@ -142,6 +142,7 @@ async function runLoop(configPath: string): Promise<number> {
     const effortSupported = effortAlwaysEnabled ||
       modelHasEffortCapabilityEnvVar(config.agent.model, process.env) ||
       modelSupportsEffort(config.agent.model);
+    let stopRequested = false;
     const effort = config.agent.effort;
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,
@@ -155,6 +156,14 @@ async function runLoop(configPath: string): Promise<number> {
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,
+      rateLimit: {
+        reprobeMinutes: config.rateLimit.reprobeMinutes,
+        capHours: config.rateLimit.capHours,
+        claudePatterns: config.rateLimit.claudePatterns,
+        sleep,
+        clock: Date.now,
+        isInterrupted: () => stopRequested,
+      },
     });
     const git = new GitPrManager(runner, {
       repoPath: config.repo.path,
@@ -200,7 +209,6 @@ async function runLoop(configPath: string): Promise<number> {
     // 2 回目の停止シグナルは強制終了（安全点まで待てない運用者向けのエスケープハッチ）。
     // run_started 通知は orchestrator.run() が内部で送る（カーネル §7）。
     const STOP_SIGNALS: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
-    let stopRequested = false;
     const onStopSignal = (signal: NodeJS.Signals): void => {
       if (stopRequested) {
         process.stderr.write(`\n${signal} again: forcing exit.\n`);

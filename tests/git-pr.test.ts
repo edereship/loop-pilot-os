@@ -204,6 +204,22 @@ describe("GitPrManager.hasCommitsWithDiff", () => {
     const mgr = new GitPrManager(runner, OPTS);
     expect(await mgr.hasCommitsWithDiff("/wt/x")).toBe(false);
   });
+
+  // Finding 1: when the worktree path is missing or inaccessible, git rev-list returns
+  // non-zero. The method must throw so the orchestrator's catch block can treat the
+  // situation as "has work" and take the safe manual-cleanup path instead of discarding
+  // the worktree and reverting the ticket.
+  it("throws when rev-list fails (e.g. worktree missing or inaccessible)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "rev-list"], {
+      code: 128,
+      stdout: "",
+      stderr: "fatal: not a git repository",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.hasCommitsWithDiff("/wt/x")).rejects.toThrow(/git rev-list failed/);
+  });
 });
 
 describe("GitPrManager.hasUncommittedChanges", () => {
@@ -231,6 +247,21 @@ describe("GitPrManager.hasUncommittedChanges", () => {
 
     const mgr = new GitPrManager(runner, OPTS);
     expect(await mgr.hasUncommittedChanges("/wt/x")).toBe(false);
+  });
+
+  // Finding 1: when the worktree path is missing or inaccessible, git status returns
+  // non-zero. The method must throw so the orchestrator's catch block can treat the
+  // situation as "has work" and avoid destroying the worktree prematurely.
+  it("throws when status --porcelain fails (e.g. worktree missing or inaccessible)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/x", "status"], {
+      code: 128,
+      stdout: "",
+      stderr: "fatal: not a git repository",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.hasUncommittedChanges("/wt/x")).rejects.toThrow(/git status failed/);
   });
 });
 

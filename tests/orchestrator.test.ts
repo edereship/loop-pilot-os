@@ -530,6 +530,50 @@ describe("Orchestrator 失敗系 — IMPLEMENT（仕様 §5.3 / カーネル §7
     expect(s.failureReason).toBe("exception");
     expect(s.stopDetail).toContain("no outcome queued");
   });
+
+  it("hasUncommittedChanges throws after completed outcome → stopped(exception) with cost, not daemon crash", async () => {
+    // If git status fails after the agent completes (e.g. worktree disappeared or index
+    // lock), the throw must be caught so the daemon can record stopSession(exception)
+    // and send a halt notification, rather than crashing with the session stuck in
+    // "implementing".
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "done" }];
+    h.git.failNext("hasUncommittedChanges", new Error("git status failed: index lock"));
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("git status failed");
+    expect(s.costUsd).toBe(0.5);
+  });
+
+  it("agent interrupted outcome → haltForInterrupt (session stays in implementing, run halts as user_interrupt)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "interrupted", costUsd: 0.5 }];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must NOT be marked stopped(exception) — it stays in implementing so
+    // a process restart can recover it via recoverByOpenPr.
+    expect(sessions[0]?.state).toBe("implementing");
+    expect(sessions[0]?.failureReason).toBeNull();
+    // Cost is recorded before halting.
+    expect(sessions[0]?.costUsd).toBeCloseTo(0.5);
+    // Run halts cleanly as user_interrupt, not exception.
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "user_interrupt" });
+  });
 });
 
 describe("Orchestrator 失敗系 — HANDOFF（仕様 §5.4 / カーネル §7.5）", () => {

@@ -78,6 +78,7 @@ export interface SessionContext {
 export type AgentOutcome =
   | { kind: "completed"; costUsd: number; summary: string }
   | { kind: "cost_exceeded"; costUsd: number }
+  | { kind: "interrupted"; costUsd: number }
   | { kind: "error"; costUsd: number; message: string };
 export interface AgentRunner {
   runSession(ctx: SessionContext): Promise<AgentOutcome>;
@@ -159,6 +160,7 @@ export type RecoveryOutcome =
   // run may legitimately report costUsd: 0.
   | { kind: "restarted"; costUsd: number; newFix: boolean }
   | { kind: "exhausted"; costUsd: number }
+  | { kind: "interrupted"; costUsd: number }
   | { kind: "unrecoverable"; costUsd: number; message: string };
 export interface WorkflowRecovery {
   attemptRecovery(ctx: RecoveryContext): Promise<RecoveryOutcome>;

@@ -245,6 +245,46 @@ export class Orchestrator {
       });
       return await this.adoptAndMonitor(session, prNumber, monitorStartedAt);
     }
+    // IMPLEMENT interrupted before PR creation (e.g. SIGINT during rate-limit sleep):
+    // revert the ticket to Todo and discard the worktree only when no committed work
+    // exists yet. If the agent already committed changes (crash between runSession
+    // completing and handoff() recording "handing_off"), fall through to manual cleanup
+    // to avoid destroying committed implementation work.
+    // Also treat uncommitted file edits as "work" — if SIGINT fires during the
+    // rate-limit sleep after Claude has edited files but before it commits, the
+    // worktree is dirty but hasCommitsWithDiff returns false.  Discarding that
+    // worktree would silently destroy the partial implementation.
+    if (session.state === "implementing") {
+      let hasWork = false;
+      if (session.worktreePath) {
+        try {
+          hasWork = await this.git.hasCommitsWithDiff(session.worktreePath) ||
+            await this.git.hasUncommittedChanges(session.worktreePath);
+        } catch {
+          hasWork = true; // assume work exists if check fails; prefer manual cleanup
+        }
+      }
+      if (!hasWork) {
+        if (session.worktreePath) {
+          await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+        }
+        let revertedToTodo = true;
+        try {
+          await this.source.transition(session.linearIssueId, "todo");
+        } catch {
+          revertedToTodo = false;
+        }
+        this.store.updateSession(session.id, { runId: this.runId });
+        const revertStatus = revertedToTodo
+          ? "ticket reverted to Todo"
+          : "ticket revert to Todo FAILED — may be stuck In Progress";
+        const detail =
+          `crash recovery: no open PR; ${revertStatus}: ` +
+          `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+        return await this.stopSession(session, "exception", detail);
+      }
+      // Has committed work → fall through to manual cleanup below
+    }
     // オープン PR なし → 手動掃除を促して HALT（タスク内自動再開は v1 スコープ外）。
     this.store.updateSession(session.id, { runId: this.runId });
     const detail =
@@ -481,6 +521,11 @@ export class Orchestrator {
       return await this.stopSession(session, "exception", errMsg(err));
     }
 
+    if (outcome.kind === "interrupted") {
+      this.store.updateSession(session.id, { costUsd: outcome.costUsd });
+      await this.haltForInterrupt();
+      return HALT;
+    }
     if (outcome.kind === "cost_exceeded") {
       this.store.updateSession(session.id, { costUsd: outcome.costUsd });
       await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
@@ -492,11 +537,18 @@ export class Orchestrator {
     }
     // completed: まず cost と summary を永続化（仕様 §7 IMPLEMENT 後条件）
     this.store.updateSession(session.id, { costUsd: outcome.costUsd, agentSummary: outcome.summary });
-    if (await this.git.hasUncommittedChanges(worktreePath)) {
-      return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: outcome.costUsd });
-    }
-    if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
-      return await this.stopSession(session, "agent_no_change", null, { costUsd: outcome.costUsd });
+    // Wrap post-agent git checks: if git status/log fails (e.g. worktree disappeared or
+    // index lock), the throw must not escape uncaught — it would crash the daemon without
+    // calling stopSession and leave the session stuck in "implementing".
+    try {
+      if (await this.git.hasUncommittedChanges(worktreePath)) {
+        return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: outcome.costUsd });
+      }
+      if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
+        return await this.stopSession(session, "agent_no_change", null, { costUsd: outcome.costUsd });
+      }
+    } catch (err) {
+      return await this.stopSession(session, "exception", errMsg(err), { costUsd: outcome.costUsd });
     }
     return CONTINUE;
   }
@@ -874,6 +926,16 @@ export class Orchestrator {
               "workflow_setup_failed",
               `workflow recovery error: ${errMsg(err)}`,
             );
+          }
+          if (recoveryResult.kind === "interrupted") {
+            if (recoveryResult.costUsd > 0) {
+              const refreshed = this.store.getSession(session.id);
+              this.store.updateSession(session.id, {
+                costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd,
+              });
+            }
+            await this.haltForInterrupt();
+            return HALT;
           }
           if (recoveryResult.kind === "restarted") {
             if (recoveryResult.newFix) {

@@ -561,6 +561,33 @@ describe("loadConfig", () => {
     ).toThrow(/agent\.permission_mode/);
   });
 
+  // ES-383: rate_limit セクション省略時の既定値
+  it("defaults rateLimit when [rate_limit] section is omitted", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.rateLimit).toEqual({
+      reprobeMinutes: 15,
+      capHours: 6,
+      claudePatterns: [],
+    });
+  });
+
+  it("reads explicit [rate_limit] values", () => {
+    const config = loadConfig(fixture("config-rate-limit.toml"), fullEnv);
+    expect(config.rateLimit).toEqual({
+      reprobeMinutes: 5,
+      capHours: 2,
+      claudePatterns: [],
+    });
+  });
+
+  it("reads claude_patterns from [rate_limit]", () => {
+    const config = loadConfig(fixture("config-rate-limit-custom.toml"), fullEnv);
+    expect(config.rateLimit.claudePatterns).toEqual([
+      "custom_429",
+      "my_rate_limit_pattern",
+    ]);
+  });
+
   // notify.progress: 既定 false（未設定 or empty [notify]）
   it("defaults notify.progress to false when [notify] section is empty", () => {
     const config = loadConfig(fixture("config-valid.toml"), fullEnv);

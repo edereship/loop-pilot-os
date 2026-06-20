@@ -36,6 +36,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
     digest: { recentMergedCount: 5 },
     notify: { progress: false },
+    rateLimit: { reprobeMinutes: 15, capHours: 6, claudePatterns: [] },
     linearApiKey: "lin_api_test",
     slackWebhookUrl: undefined,
     stateDbPath: "/abs/repo/looppilot-os.db",

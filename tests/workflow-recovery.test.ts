@@ -302,6 +302,212 @@ describe("AgentWorkflowRecovery", () => {
     expect(r3).toEqual<RecoveryOutcome>({ kind: "exhausted", costUsd: 0.7 });
   });
 
+  it("agent interrupted: pushes local commits and returns restarted when push succeeds (Finding 4)", async () => {
+    // If the fix agent made commits then was interrupted (e.g. during rate-limit sleep),
+    // those commits must be pushed immediately. Otherwise, the next attemptRecovery call
+    // starts with syncBranchToOrigin which does `git reset --hard origin/<branch>` and
+    // silently discards the local-only commits. After a successful push the outcome must
+    // be restarted(newFix: true) so the orchestrator increments workflowFixAttempts,
+    // records workflowHandledErrorCount, and resets monitorStartedAt — preventing duplicate
+    // fix runs and false not-engaged guard triggers on the next poll.
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef fix commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    runner.on(["gh", "pr", "comment"], { code: 0 });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.05, newFix: true });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeDefined();
+    expect(pushCall!.args).toEqual(["push", "origin", "HEAD:looppilot/ty-1-fix"]);
+    // After pushing interrupted commits, /restart-review must be posted so
+    // LoopPilot re-runs (the workflow triggers only on issue_comment, not push).
+    const commentCall = runner.calls.find((c) => c.cmd === "gh" && c.args[0] === "pr");
+    expect(commentCall).toBeDefined();
+    expect(commentCall!.args).toEqual(["pr", "comment", "42", "-R", REMOTE, "-b", "/restart-review"]);
+  });
+
+  it("agent interrupted with no local commits: does not push (Finding 4)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "" }; // no commits ahead
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.0 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.0 });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
+  it("agent interrupted with dirty worktree: commits WIP then pushes and returns restarted (Finding 3)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "M src/fix.ts\n" };
+      if (args.includes("add")) return { code: 0 };
+      if (args.includes("commit")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef WIP commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    runner.on(["gh", "pr", "comment"], { code: 0 });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    // Push succeeded after the WIP commit, so return restarted(newFix: true) to keep
+    // orchestrator bookkeeping (workflowFixAttempts, monitorStartedAt) in sync.
+    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.05, newFix: true });
+    // WIP commit was created: git add -A and git commit were called
+    const addCall = runner.calls.find((c) =>
+      c.cmd === "git" && c.args.includes("-C") && c.args.includes("add"),
+    );
+    expect(addCall).toBeDefined();
+    const commitCall = runner.calls.find((c) =>
+      c.cmd === "git" && c.args.includes("-C") && c.args.includes("commit"),
+    );
+    expect(commitCall).toBeDefined();
+    expect(commitCall!.args).toContain("WIP: interrupted fix-agent edits");
+    // Push happened after the WIP commit
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeDefined();
+  });
+
+  it("agent interrupted with dirty worktree but commit fails: returns unrecoverable to prevent data loss (Finding 3)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "M src/fix.ts\n" };
+      if (args.includes("add")) return { code: 0 };
+      if (args.includes("commit")) return { code: 1, stderr: "nothing to commit" };
+      if (args.includes("log")) return { code: 0, stdout: "" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.02 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    // WIP commit failed — must return unrecoverable, not interrupted.
+    // Returning interrupted would allow the next retry to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), silently discarding the uncommitted edits.
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.02);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("WIP commit failed");
+    // No push should occur — unrecoverable is returned early
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
+  it("agent interrupted with dirty worktree but staging fails: returns unrecoverable to prevent data loss (Finding 2)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "M src/fix.ts\n" };
+      if (args.includes("add")) return { code: 1, stderr: "error: Unable to create '.git/index.lock': File exists." };
+      if (args.includes("log")) return { code: 0, stdout: "" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.02 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    // git add failed — must return unrecoverable, not interrupted.
+    // Returning interrupted would allow the next retry to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), silently discarding the uncommitted edits.
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.02);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("git add failed");
+    // No push should occur — unrecoverable is returned early
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
+  it("agent interrupted: git status failure → unrecoverable to prevent silent discard of uncommitted edits", async () => {
+    // If git status --porcelain exits non-zero (e.g. index lock, inaccessible worktree),
+    // we cannot tell whether the worktree is dirty. Falling through and treating empty
+    // stdout as "clean" would allow the next attemptRecovery to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), which silently discards uncommitted edits.
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 128, stderr: "fatal: not a git repository", stdout: "" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.03 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.03);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("git status failed");
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
+  it("agent interrupted: restart-review comment failure after successful push → unrecoverable (Finding 4)", async () => {
+    // Push succeeds but /restart-review comment fails. The old code swallowed the
+    // comment failure and returned restarted(newFix:true), causing the orchestrator
+    // to record workflowHandledErrorCount even though the workflow was never restarted.
+    // The fix propagates the failure so the orchestrator surfaces it immediately.
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef fix commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    runner.on(["gh", "pr", "comment"], { code: 1, stderr: "not found" });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toMatchObject<Partial<RecoveryOutcome>>({
+      kind: "unrecoverable",
+      costUsd: 0.05,
+    });
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain(
+      "restart review failed",
+    );
+  });
+
+  it("agent interrupted: push failure returns unrecoverable to prevent silent commit loss (Finding 2)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef fix commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 1, stderr: "rejected: not fast-forward" });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    // Push failed with local commits ahead — must return unrecoverable, not interrupted.
+    // Returning interrupted would allow the next retry to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), silently discarding the local commits.
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.05);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("interrupted push failed");
+  });
+
   it("buildFixPrompt includes the error body", async () => {
     const { recovery, agent, runner } = makeRecovery();
     agent.outcomes = [{ kind: "completed", costUsd: 0.1, summary: "ok" }];

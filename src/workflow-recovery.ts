@@ -71,6 +71,110 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
       ...(ctx.hardTimeoutMs !== undefined ? { hardTimeoutMs: ctx.hardTimeoutMs } : {}),
     });
 
+    if (outcome.kind === "interrupted") {
+      this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
+      // If the fix agent left uncommitted edits (e.g. SIGINT during rate-limit
+      // sleep after editing files but before committing), commit them as a WIP
+      // so that the next attemptRecovery's syncBranchToOrigin (`git reset --hard`)
+      // doesn't silently destroy the partial work.
+      const statusResult = await this.runner.run(
+        "git",
+        ["-C", ctx.worktreePath, "status", "--porcelain"],
+        { cwd: ctx.worktreePath },
+      );
+      // A non-zero exit (e.g. index lock, inaccessible worktree) means we cannot
+      // determine whether there are uncommitted edits. Treating empty stdout as
+      // "clean" would allow the next attemptRecovery to call syncBranchToOrigin
+      // (git reset --hard), silently discarding any dirty files.
+      if (statusResult.code !== 0) {
+        return {
+          kind: "unrecoverable",
+          costUsd: outcome.costUsd,
+          message: `git status failed in ${ctx.worktreePath}: ${statusResult.stderr.trim() || `exit ${statusResult.code}`}`,
+        };
+      }
+      if (statusResult.stdout.trim() !== "") {
+        const addResult = await this.runner.run(
+          "git",
+          ["-C", ctx.worktreePath, "add", "-A"],
+          { cwd: ctx.worktreePath },
+        );
+        if (addResult.code === 0) {
+          const commitResult = await this.runner.run(
+            "git",
+            ["-C", ctx.worktreePath, "commit", "-m", "WIP: interrupted fix-agent edits"],
+            { cwd: ctx.worktreePath },
+          );
+          if (commitResult.code !== 0) {
+            // WIP commit failed; uncommitted edits remain. The next attemptRecovery
+            // would call syncBranchToOrigin (git reset --hard) and silently discard
+            // them. Surface as unrecoverable so the orchestrator stops retrying.
+            return {
+              kind: "unrecoverable",
+              costUsd: outcome.costUsd,
+              message: `WIP commit failed: ${commitResult.stderr.trim() || `exit ${commitResult.code}`}`,
+            };
+          }
+        } else {
+          // git add failed (e.g. index lock, permissions); uncommitted edits remain.
+          // The next attemptRecovery would call syncBranchToOrigin (git reset --hard)
+          // and silently discard them. Surface as unrecoverable so the orchestrator
+          // stops retrying.
+          return {
+            kind: "unrecoverable",
+            costUsd: outcome.costUsd,
+            message: `git add failed: ${addResult.stderr.trim() || `exit ${addResult.code}`}`,
+          };
+        }
+      }
+      // If the fix agent committed work before being interrupted (e.g. during a
+      // rate-limit sleep), push those commits now. Without this, the next call to
+      // attemptRecovery would run syncBranchToOrigin which does
+      // `git reset --hard origin/<branch>` and silently discards the local commits.
+      const logResult = await this.runner.run(
+        "git",
+        ["-C", ctx.worktreePath, "log", `origin/${ctx.branch}..HEAD`, "--oneline"],
+        { cwd: ctx.worktreePath },
+      );
+      if (logResult.code !== 0) {
+        return {
+          kind: "unrecoverable",
+          costUsd: outcome.costUsd,
+          message: `git log failed in ${ctx.worktreePath}: ${logResult.stderr.trim() || `exit ${logResult.code}`}`,
+        };
+      }
+      if (logResult.stdout.trim() !== "") {
+        // Push the interrupted commits so the next attemptRecovery's
+        // syncBranchToOrigin does not silently discard them.
+        try {
+          await this.pushFix(ctx.branch, ctx.worktreePath);
+        } catch (err) {
+          // Push failed — local commits cannot be preserved. Return unrecoverable
+          // so the orchestrator stops retrying: the next attemptRecovery would call
+          // syncBranchToOrigin (git reset --hard), silently discarding those commits.
+          return {
+            kind: "unrecoverable",
+            costUsd: outcome.costUsd,
+            message: `interrupted push failed: ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+        // Push succeeded; post /restart-review. Propagate comment failures so the
+        // orchestrator does not record workflowHandledErrorCount for an error that
+        // was never actually restarted (unlike a best-effort swallow, which would
+        // leave the PR silently stalled until the not-engaged guard fires).
+        try {
+          await this.postRestartReview(ctx.prNumber);
+        } catch (err) {
+          return {
+            kind: "unrecoverable",
+            costUsd: outcome.costUsd,
+            message: `restart review failed: ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+        return { kind: "restarted", costUsd: outcome.costUsd, newFix: true };
+      }
+      return { kind: "interrupted", costUsd: outcome.costUsd };
+    }
     if (outcome.kind === "cost_exceeded") {
       this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
       return {
