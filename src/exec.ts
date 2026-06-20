@@ -5,12 +5,20 @@ import type { CommandResult, CommandRunner, RunOptions } from "./types.js";
 export class RealCommandRunner implements CommandRunner {
   run(cmd: string, args: string[], opts: RunOptions): Promise<CommandResult> {
     return new Promise<CommandResult>((resolve, reject) => {
-      // On Windows, npm-installed CLI tools are wrapped in .cmd shims that
-      // cannot be launched by spawn() with shell:false; enable shell for them.
-      const child = spawn(cmd, args, {
+      // On Windows, .cmd shims require cmd.exe. Invoke it directly with
+      // shell:false so individual args are passed as separate elements rather
+      // than concatenated into a single command string, which would let shell
+      // metacharacters in any arg (e.g. '&' in a prompt) run host commands.
+      let spawnCmd = cmd;
+      let spawnArgs = args;
+      if (process.platform === "win32" && cmd.endsWith(".cmd")) {
+        spawnCmd = "cmd.exe";
+        spawnArgs = ["/d", "/s", "/c", cmd, ...args];
+      }
+      const child = spawn(spawnCmd, spawnArgs, {
         cwd: opts.cwd,
         env: opts.env ?? process.env,
-        shell: cmd.endsWith(".cmd"),
+        shell: false,
       });
 
       if (opts.stdin === "ignore") {

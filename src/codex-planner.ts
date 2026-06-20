@@ -77,14 +77,15 @@ const CODEX_CHILD_ENV_ALLOWLIST = new Set([
 
 // Windows-only supplemental keys not present in the POSIX allowlist above.
 // Windows exposes PATHEXT and COMSPEC for executable/shim resolution (codex.cmd),
-// SystemRoot and SystemDrive for system binary paths, and USERPROFILE as the
-// Windows equivalent of HOME. These are safe system keys, not credentials.
+// SystemRoot and SystemDrive for system binary paths.
+// USERPROFILE is intentionally absent: like HOME it is overridden with the
+// private per-run directory at the end of codexChildEnv() so that tools
+// expanding %USERPROFILE% see the isolated directory, not the operator's profile.
 const CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT = new Set([
   "PATHEXT",
   "COMSPEC",
   "SystemRoot",
   "SystemDrive",
-  "USERPROFILE",
 ]);
 
 // Proxy env keys that may carry embedded URL credentials (user:pass@host).
@@ -189,12 +190,16 @@ function codexChildEnv(homeDir: string): Record<string, string> {
   // the allowlist above; it is injected here so the resolved absolute value
   // from the parent environment (or the ~/.codex default) is always used.
   out["CODEX_HOME"] = realCodexHome;
-  // Replace HOME with a caller-supplied private per-run directory so that a
-  // malicious planning prompt cannot reach ~/.codex/auth.json via "~". Codex
-  // authenticates via the explicit CODEX_HOME set above, not via HOME.
-  // XDG paths (XDG_CONFIG_HOME etc.) are not forwarded; Codex will derive
-  // them from this isolated HOME, keeping all per-run state within homeDir.
+  // Replace HOME and USERPROFILE with the caller-supplied private per-run
+  // directory so that prompts cannot reach host dotfiles via "~" or
+  // %USERPROFILE%. USERPROFILE is the Windows equivalent of HOME; tools
+  // that expand it would otherwise still point at the operator's real profile
+  // (including AppData and .codex) despite the HOME redirect.
+  // Codex authenticates via the explicit CODEX_HOME set above, not HOME.
+  // XDG paths (XDG_CONFIG_HOME etc.) are not forwarded; Codex derives them
+  // from this isolated HOME, keeping all per-run state within homeDir.
   out["HOME"] = homeDir;
+  out["USERPROFILE"] = homeDir;
 
   return out;
 }
@@ -228,6 +233,18 @@ function hasFlagOrAlias(args: string[], longFlag: string, shortAlias: string): b
   );
 }
 
+// Returns true when extraArgs opt out of the default bwrap-backed sandbox,
+// meaning bwrap availability is not a prerequisite for Codex to succeed.
+function isSandboxBypassed(extraArgs: string[]): boolean {
+  for (let i = 0; i < extraArgs.length; i++) {
+    const a = extraArgs[i]!;
+    if (a === "--yolo" || a === "--dangerously-bypass-approvals-and-sandbox") return true;
+    if (a === "--sandbox=danger-full-access") return true;
+    if (a === "--sandbox" && extraArgs[i + 1] === "danger-full-access") return true;
+  }
+  return false;
+}
+
 export class CodexPlanner {
   constructor(
     private readonly runner: CommandRunner,
@@ -252,11 +269,19 @@ export class CodexPlanner {
     // stdin is always "ignore" so there is no user path to approve commands;
     // add --ask-for-approval never unless the caller already specified it.
     const hasCustomApproval = hasFlagOrAlias(this.opts.extraArgs ?? [], "--ask-for-approval", "-a");
+    // Ignore operator's interactive Codex config (config.toml, project rules,
+    // hooks) so planner runs don't inherit unexpected MCP servers or custom
+    // instructions that are unrelated to LoopPilot. Authentication still works
+    // because CODEX_HOME is forwarded explicitly in codexChildEnv().
+    const hasIgnoreUserConfig = (this.opts.extraArgs ?? []).some(
+      (a) => a === "--ignore-user-config" || a.startsWith("--ignore-user-config="),
+    );
     const args: string[] = [
       "exec",
       "--ephemeral",
       ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
       ...(hasCustomApproval ? [] : ["--ask-for-approval", "never"]),
+      ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
       ...(this.opts.extraArgs ?? []),
       // Terminate options before the prompt so that a prompt starting with '-'
       // (including the literal '-' which codex reads as stdin) is never
@@ -339,9 +364,24 @@ export class CodexPlanner {
       if (authResult.code !== 0) {
         throw new Error("codex: 認証されていません（codex login を実行してください）");
       }
-      return version;
     } finally {
       rmSync(privateHome, { recursive: true, force: true });
     }
+
+    // On Linux, Codex uses bwrap + seccomp for sandboxing. Probe bwrap so
+    // preflight can surface a missing helper early rather than at exec time.
+    // Skip the probe when extraArgs bypass sandboxing (e.g. --yolo), and
+    // treat a missing or failing bwrap as a non-fatal warning: Codex may
+    // fall back to its own sandbox helper on some configurations.
+    if (process.platform === "linux" && !isSandboxBypassed(this.opts.extraArgs ?? [])) {
+      try {
+        await this.runner.run("bwrap", ["--version"], { cwd: "." });
+      } catch {
+        // bwrap unavailable; Codex may use a fallback — proceed and let
+        // runtime surface the failure if sandboxing truly cannot start.
+      }
+    }
+
+    return version;
   }
 }
