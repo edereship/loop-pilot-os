@@ -118,7 +118,7 @@ function firstTextBlock(parsed: unknown): string | null {
 }
 
 const DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS: RegExp[] = [
-  /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b/i,
+  /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\(429\)/i,
   /rate.?limit/i,
   /usage.?limit/i,
   /too many requests/i,
@@ -250,7 +250,7 @@ export class ClaudeAgentRunner implements AgentRunner {
   private async runOnce(
     ctx: SessionContext,
     resumeSessionId?: string,
-  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number }> {
+  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number; assistantText: string }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
     // When resuming a rate-limited session, prefix with -p "" so the CLI stays in
@@ -276,6 +276,7 @@ export class ClaudeAgentRunner implements AgentRunner {
 
     let resultLine: ResultLine | null = null;
     let capturedSessionId: string | null = null;
+    const assistantTextParts: string[] = [];
 
     const onStdoutLine = (line: string): void => {
       let parsed: unknown;
@@ -303,6 +304,7 @@ export class ClaudeAgentRunner implements AgentRunner {
         const text = firstTextBlock(parsed);
         if (text !== null) {
           this.opts.log(`agent: ${text.slice(0, PROGRESS_TEXT_MAX)}`);
+          assistantTextParts.push(text);
         }
         return;
       }
@@ -333,7 +335,8 @@ export class ClaudeAgentRunner implements AgentRunner {
     if (rl?.api_error_status === 429) {
       resultText = resultText ? `${resultText}\nHTTP/429 Too Many Requests` : "HTTP/429 Too Many Requests";
     }
-    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId, exitCode: cmdResult.code };
+    const assistantText = assistantTextParts.join("\n");
+    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId, exitCode: cmdResult.code, assistantText };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
@@ -354,7 +357,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       if (remainingBudget <= 0) {
         return { kind: "cost_exceeded", costUsd: totalCost };
       }
-      const { outcome, stderr, resultText, sessionId, exitCode } = await this.runOnce(
+      const { outcome, stderr, resultText, sessionId, exitCode, assistantText } = await this.runOnce(
         { ...ctx, maxCostUsd: remainingBudget },
         lastSessionId ?? undefined,
       );
@@ -401,9 +404,10 @@ export class ClaudeAgentRunner implements AgentRunner {
         };
       }
 
+      const resetsAtMs = classification.resetsAtMs ?? parseResetsTime(assistantText, nowMs);
       let waitMs: number;
-      if (classification.resetsAtMs !== null) {
-        waitMs = Math.max(0, classification.resetsAtMs - nowMs + RATE_LIMIT_BUFFER_MS);
+      if (resetsAtMs !== null) {
+        waitMs = Math.max(0, resetsAtMs - nowMs + RATE_LIMIT_BUFFER_MS);
       } else {
         waitMs = reprobeMs;
       }

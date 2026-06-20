@@ -452,6 +452,16 @@ describe("classifyClaudeError", () => {
     expect(result.isRateLimit).toBe(false);
   });
 
+  it("detects parenthesized '(429)' in stderr as rate limit (Finding 1 — Claude CLI 'Request rejected (429)' form)", () => {
+    const result = classifyClaudeError(
+      "claude exited with code 1",
+      "Request rejected (429)",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
   it("does NOT match '429' in ticket-like identifiers (e.g. TY-429) without HTTP context", () => {
     const result = classifyClaudeError(
       "claude exited with code 1: TY-429 is stuck in review",
@@ -1019,6 +1029,43 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
       "GitHub API rate limit exceeded",
     );
     expect(result.isRateLimit).toBe(false);
+  });
+
+  it("uses reset hint from assistant event text when not in stderr or result (Finding 2)", async () => {
+    // The result line has api_error_status:429 and no resets hint; the reset
+    // time appears only in an assistant text event emitted before the result.
+    const RESULT_API_ERROR_429_NO_RESET =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"api_error_status":429,"session_id":"s1"}';
+    const ASSISTANT_RESETS_LINE =
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Claude usage limit reached. Your quota resets 6:40pm (Asia/Singapore)"}]},"session_id":"s1"}';
+    // Asia/Singapore = UTC+8 (no DST). 6:40pm SGT = 10:40 UTC.
+    const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+    const RESET_TARGET = Date.parse("2026-06-20T10:40:00.000Z");
+    const BUFFER = 60_000;
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(ASSISTANT_RESETS_LINE);
+        opts.onStdoutLine?.(RESULT_API_ERROR_429_NO_RESET);
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent, sleep } = makeRunnerWithRateLimit(runner, logs, {
+      clockMs: [NOW, NOW, NOW, NOW],
+    });
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
+    // Wait must be derived from the assistant-event reset hint, not the reprobe interval.
+    expect(sleep.calls[0]).toBe(RESET_TARGET - NOW + BUFFER);
   });
 
   it("retries when api_error_status:429 with non-empty result text like 'Claude usage limit reached' (Finding 3)", async () => {

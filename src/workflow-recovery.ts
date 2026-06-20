@@ -110,6 +110,14 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
       if (logResult.stdout.trim() !== "") {
         try {
           await this.pushFix(ctx.branch, ctx.worktreePath);
+          // The LoopPilot workflow only fires on issue_comment / pull_request_review,
+          // not on push/synchronize. Post /restart-review so the pushed fix is
+          // reviewed without waiting for a human comment.
+          try {
+            await this.postRestartReview(ctx.prNumber);
+          } catch {
+            // best-effort; push succeeded — a human can /restart-review manually
+          }
         } catch {
           // Push failed — commits stay local-only. Nothing more we can do; the
           // interrupted outcome is still returned so the caller can stop the session.

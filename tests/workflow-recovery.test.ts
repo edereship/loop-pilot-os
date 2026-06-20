@@ -315,6 +315,7 @@ describe("AgentWorkflowRecovery", () => {
       return { code: 0 };
     });
     runner.on(["git", "push"], { code: 0 });
+    runner.on(["gh", "pr", "comment"], { code: 0 });
     agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
 
     const result = await recovery.attemptRecovery(ctx());
@@ -323,6 +324,11 @@ describe("AgentWorkflowRecovery", () => {
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeDefined();
     expect(pushCall!.args).toEqual(["push", "origin", "HEAD:looppilot/ty-1-fix"]);
+    // After pushing interrupted commits, /restart-review must be posted so
+    // LoopPilot re-runs (the workflow triggers only on issue_comment, not push).
+    const commentCall = runner.calls.find((c) => c.cmd === "gh" && c.args[0] === "pr");
+    expect(commentCall).toBeDefined();
+    expect(commentCall!.args).toEqual(["pr", "comment", "42", "-R", REMOTE, "-b", "/restart-review"]);
   });
 
   it("agent interrupted with no local commits: does not push (Finding 4)", async () => {
@@ -354,6 +360,7 @@ describe("AgentWorkflowRecovery", () => {
       return { code: 0 };
     });
     runner.on(["git", "push"], { code: 0 });
+    runner.on(["gh", "pr", "comment"], { code: 0 });
     agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
 
     const result = await recovery.attemptRecovery(ctx());
