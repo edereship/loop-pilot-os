@@ -122,6 +122,12 @@ const DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS: RegExp[] = [
   /overloaded/i,
 ];
 
+// Narrower pattern used only against resultText (agent output) to avoid
+// misclassifying product-level rate-limit text (e.g. GitHub API limits)
+// as Claude quota exhaustion. Matches only HTTP 429 indicators.
+const RESULT_TEXT_429_PATTERN =
+  /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\b429\b.*Too Many Requests/i;
+
 const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})/i;
 
 export interface RateLimitClassification {
@@ -157,8 +163,18 @@ export function classifyClaudeError(
     configPatterns.length > 0
       ? configPatterns.map((p) => new RegExp(p, "i"))
       : DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS;
-  const combined = `${message}\n${stderr}\n${resultText}`;
-  const isRateLimit = patterns.some((p) => p.test(combined));
+  let isRateLimit: boolean;
+  if (configPatterns.length > 0) {
+    const combined = `${message}\n${stderr}\n${resultText}`;
+    isRateLimit = patterns.some((p) => p.test(combined));
+  } else {
+    // Default patterns: check CLI output (message + stderr) with all patterns,
+    // but only check resultText for the specific HTTP 429 pattern to avoid
+    // misclassifying product-level rate-limit text as Claude quota exhaustion.
+    const cliOutput = `${message}\n${stderr}`;
+    isRateLimit = patterns.some((p) => p.test(cliOutput)) ||
+      RESULT_TEXT_429_PATTERN.test(resultText);
+  }
   if (!isRateLimit) return { isRateLimit: false, resetsAtMs: null };
   return {
     isRateLimit: true,
@@ -178,12 +194,14 @@ export class ClaudeAgentRunner implements AgentRunner {
 
   private async runOnce(
     ctx: SessionContext,
-  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string }> {
+    resumeSessionId?: string,
+  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
+    // When resuming a rate-limited session, use --resume instead of -p to
+    // continue from the rate-limit stop rather than rerunning the task.
     const args: string[] = [
-      "-p",
-      ctx.prompt,
+      ...(resumeSessionId ? ["--resume", resumeSessionId] : ["-p", ctx.prompt]),
       "--output-format",
       "stream-json",
       "--verbose",
@@ -200,6 +218,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     ];
 
     let resultLine: ResultLine | null = null;
+    let capturedSessionId: string | null = null;
 
     const onStdoutLine = (line: string): void => {
       let parsed: unknown;
@@ -215,6 +234,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       if (type === "system") {
         if ((parsed as { subtype?: unknown }).subtype === "init") {
           const sessionId = (parsed as { session_id?: unknown }).session_id;
+          if (typeof sessionId === "string") capturedSessionId = sessionId;
           this.opts.log(
             `agent session started${typeof sessionId === "string" ? ` (session ${sessionId})` : ""}`,
           );
@@ -248,7 +268,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     const cmdResult = await this.runner.run("claude", args, opts);
     const rl = resultLine as ResultLine | null;
     const outcome = this.toOutcome(rl, cmdResult.code, cmdResult.stderr);
-    return { outcome, stderr: cmdResult.stderr, resultText: rl?.result ?? "" };
+    return { outcome, stderr: cmdResult.stderr, resultText: rl?.result ?? "", sessionId: capturedSessionId };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
@@ -262,15 +282,18 @@ export class ClaudeAgentRunner implements AgentRunner {
     const reprobeMs = rl.reprobeMinutes * 60_000;
     const startMs = rl.clock();
     let totalCost = 0;
+    let lastSessionId: string | null = null;
 
     while (true) {
       const remainingBudget = ctx.maxCostUsd - totalCost;
       if (remainingBudget <= 0) {
         return { kind: "cost_exceeded", costUsd: totalCost };
       }
-      const { outcome, stderr, resultText } = await this.runOnce(
+      const { outcome, stderr, resultText, sessionId } = await this.runOnce(
         { ...ctx, maxCostUsd: remainingBudget },
+        lastSessionId ?? undefined,
       );
+      if (sessionId) lastSessionId = sessionId;
       totalCost += outcome.costUsd;
 
       // Non-error outcomes (completed, cost_exceeded from the agent itself) are returned
@@ -336,6 +359,18 @@ export class ClaudeAgentRunner implements AgentRunner {
         }
       } else {
         await rl.sleep(waitMs);
+      }
+
+      // Re-check cap after sleep to prevent an extra probe when sleep
+      // was clamped to the remaining cap time.
+      const postSleepElapsed = rl.clock() - startMs;
+      if (postSleepElapsed >= capMs) {
+        this.opts.log(`rate limit cap exceeded (${rl.capHours}h); halting`);
+        return {
+          kind: "error",
+          costUsd: totalCost,
+          message: `rate limit cap exceeded (${rl.capHours}h): ${outcome.message}`,
+        };
       }
     }
   }

@@ -245,6 +245,20 @@ export class Orchestrator {
       });
       return await this.adoptAndMonitor(session, prNumber, monitorStartedAt);
     }
+    // IMPLEMENT interrupted before PR creation (e.g. SIGINT during rate-limit
+    // sleep): revert the ticket to Todo and discard the worktree so the task
+    // can be re-processed in a future run, rather than stranding it.
+    if (session.state === "implementing") {
+      if (session.worktreePath) {
+        await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+      }
+      await bestEffort(() => this.source.transition(session.linearIssueId, "todo"));
+      this.store.updateSession(session.id, { runId: this.runId });
+      const detail =
+        `crash recovery: no open PR; ticket reverted to Todo: ` +
+        `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+      return await this.stopSession(session, "exception", detail);
+    }
     // オープン PR なし → 手動掃除を促して HALT（タスク内自動再開は v1 スコープ外）。
     this.store.updateSession(session.id, { runId: this.runId });
     const detail =
@@ -879,6 +893,16 @@ export class Orchestrator {
               "workflow_setup_failed",
               `workflow recovery error: ${errMsg(err)}`,
             );
+          }
+          if (recoveryResult.kind === "interrupted") {
+            if (recoveryResult.costUsd > 0) {
+              const refreshed = this.store.getSession(session.id);
+              this.store.updateSession(session.id, {
+                costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd,
+              });
+            }
+            await this.haltForInterrupt();
+            return HALT;
           }
           if (recoveryResult.kind === "restarted") {
             if (recoveryResult.newFix) {

@@ -73,11 +73,7 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
 
     if (outcome.kind === "interrupted") {
       this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
-      return {
-        kind: "unrecoverable",
-        costUsd: outcome.costUsd,
-        message: "fix agent interrupted",
-      };
+      return { kind: "interrupted", costUsd: outcome.costUsd };
     }
     if (outcome.kind === "cost_exceeded") {
       this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
