@@ -437,6 +437,29 @@ describe("AgentWorkflowRecovery", () => {
     expect(pushCall).toBeUndefined();
   });
 
+  it("agent interrupted: git status failure → unrecoverable to prevent silent discard of uncommitted edits", async () => {
+    // If git status --porcelain exits non-zero (e.g. index lock, inaccessible worktree),
+    // we cannot tell whether the worktree is dirty. Falling through and treating empty
+    // stdout as "clean" would allow the next attemptRecovery to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), which silently discards uncommitted edits.
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 128, stderr: "fatal: not a git repository", stdout: "" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.03 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.03);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("git status failed");
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
   it("agent interrupted: restart-review comment failure after successful push → unrecoverable (Finding 4)", async () => {
     // Push succeeds but /restart-review comment fails. The old code swallowed the
     // comment failure and returned restarted(newFix:true), causing the orchestrator

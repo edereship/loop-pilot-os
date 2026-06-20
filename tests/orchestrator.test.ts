@@ -531,6 +531,27 @@ describe("Orchestrator 失敗系 — IMPLEMENT（仕様 §5.3 / カーネル §7
     expect(s.stopDetail).toContain("no outcome queued");
   });
 
+  it("hasUncommittedChanges throws after completed outcome → stopped(exception) with cost, not daemon crash", async () => {
+    // If git status fails after the agent completes (e.g. worktree disappeared or index
+    // lock), the throw must be caught so the daemon can record stopSession(exception)
+    // and send a halt notification, rather than crashing with the session stuck in
+    // "implementing".
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "done" }];
+    h.git.failNext("hasUncommittedChanges", new Error("git status failed: index lock"));
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("git status failed");
+    expect(s.costUsd).toBe(0.5);
+  });
+
   it("agent interrupted outcome → haltForInterrupt (session stays in implementing, run halts as user_interrupt)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);

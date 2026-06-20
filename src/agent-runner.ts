@@ -216,14 +216,18 @@ function parseResetsWeekday(text: string, nowMs: number): number | null {
     if (targetHour !== 12) targetHour += 12;
   }
   const targetDay = WEEKDAY_NAMES.indexOf(weekdayName);
-  const currentDay = new Date(nowMs).getUTCDay();
+  // Use local time to match the process-local interpretation used by the other
+  // no-timezone parsers (RESETS_PATTERN and the no-tz branch of RESETS_AT_AMPM_PATTERN).
+  // Claude displays weekday reset times in the user's local timezone; using UTC methods
+  // on a non-UTC host shifts the target by the UTC offset.
+  const currentDay = new Date(nowMs).getDay();
   const daysAhead = (targetDay - currentDay + 7) % 7;
   const target = new Date(nowMs);
-  target.setUTCDate(target.getUTCDate() + daysAhead);
-  target.setUTCHours(targetHour, targetMinutes, 0, 0);
+  target.setDate(target.getDate() + daysAhead);
+  target.setHours(targetHour, targetMinutes, 0, 0);
   // Same-weekday case: if target time has already passed (>60s ago), next week.
   if (target.getTime() < nowMs - 60_000) {
-    target.setUTCDate(target.getUTCDate() + 7);
+    target.setDate(target.getDate() + 7);
   }
   return target.getTime();
 }

@@ -537,11 +537,18 @@ export class Orchestrator {
     }
     // completed: まず cost と summary を永続化（仕様 §7 IMPLEMENT 後条件）
     this.store.updateSession(session.id, { costUsd: outcome.costUsd, agentSummary: outcome.summary });
-    if (await this.git.hasUncommittedChanges(worktreePath)) {
-      return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: outcome.costUsd });
-    }
-    if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
-      return await this.stopSession(session, "agent_no_change", null, { costUsd: outcome.costUsd });
+    // Wrap post-agent git checks: if git status/log fails (e.g. worktree disappeared or
+    // index lock), the throw must not escape uncaught — it would crash the daemon without
+    // calling stopSession and leave the session stuck in "implementing".
+    try {
+      if (await this.git.hasUncommittedChanges(worktreePath)) {
+        return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: outcome.costUsd });
+      }
+      if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
+        return await this.stopSession(session, "agent_no_change", null, { costUsd: outcome.costUsd });
+      }
+    } catch (err) {
+      return await this.stopSession(session, "exception", errMsg(err), { costUsd: outcome.costUsd });
     }
     return CONTINUE;
   }

@@ -82,6 +82,17 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
         ["-C", ctx.worktreePath, "status", "--porcelain"],
         { cwd: ctx.worktreePath },
       );
+      // A non-zero exit (e.g. index lock, inaccessible worktree) means we cannot
+      // determine whether there are uncommitted edits. Treating empty stdout as
+      // "clean" would allow the next attemptRecovery to call syncBranchToOrigin
+      // (git reset --hard), silently discarding any dirty files.
+      if (statusResult.code !== 0) {
+        return {
+          kind: "unrecoverable",
+          costUsd: outcome.costUsd,
+          message: `git status failed in ${ctx.worktreePath}: ${statusResult.stderr.trim() || `exit ${statusResult.code}`}`,
+        };
+      }
       if (statusResult.stdout.trim() !== "") {
         const addResult = await this.runner.run(
           "git",
