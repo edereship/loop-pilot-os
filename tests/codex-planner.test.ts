@@ -42,6 +42,8 @@ describe("CodexPlanner.run", () => {
       "--ephemeral",
       "--sandbox",
       "read-only",
+      "--ask-for-approval",
+      "never",
       "Pick the next task from the list.",
     ]);
     expect(call.opts.cwd).toBe("/wt/issue-42");
@@ -59,6 +61,8 @@ describe("CodexPlanner.run", () => {
     expect(runner.calls[0]!.args).toEqual([
       "exec",
       "--ephemeral",
+      "--ask-for-approval",
+      "never",
       "--sandbox",
       "read-only",
       "Enrich this ticket.",
@@ -88,6 +92,32 @@ describe("CodexPlanner.run", () => {
     });
 
     expect(runner.calls[0]!.opts.timeoutMs).toBeUndefined();
+  });
+
+  it("opts.defaultTimeoutMs を ctx.timeoutMs のフォールバックとして使う（config タイムアウトの配線）", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    const planner = new CodexPlanner(runner, {
+      log: (line: string) => logs.push(line),
+      defaultTimeoutMs: 1_800_000,
+    });
+    await planner.run({ worktreePath: "/wt", prompt: "Do something." });
+
+    expect(runner.calls[0]!.opts.timeoutMs).toBe(1_800_000);
+  });
+
+  it("ctx.timeoutMs は opts.defaultTimeoutMs より優先される", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    const planner = new CodexPlanner(runner, {
+      log: (line: string) => logs.push(line),
+      defaultTimeoutMs: 1_800_000,
+    });
+    await planner.run({ worktreePath: "/wt", prompt: "Do something.", timeoutMs: 600_000 });
+
+    expect(runner.calls[0]!.opts.timeoutMs).toBe(600_000);
   });
 
   it("codex exec は opts.stdin を 'ignore' に設定して起動する（stdin ハング防止）", async () => {

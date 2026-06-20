@@ -44,6 +44,11 @@ const CODEX_CHILD_ENV_ALLOWLIST = new Set([
   "no_proxy",
   // Custom OpenAI API base URL (not a credential)
   "OPENAI_BASE_URL",
+  // Codex home directory (overrides default ~/.codex for config and auth state)
+  "CODEX_HOME",
+  // TLS certificate bundles (for corporate/private CA environments)
+  "CODEX_CA_CERTIFICATE",
+  "SSL_CERT_FILE",
   // XDG base directories (for Codex config and cache)
   "XDG_CONFIG_HOME",
   "XDG_DATA_HOME",
@@ -81,6 +86,8 @@ export type CodexOutcome =
 export interface CodexPlannerOptions {
   log: (line: string) => void;
   extraArgs?: string[];
+  /** Fallback timeout for run() when ctx.timeoutMs is not set (e.g. config.safety.codexTimeoutMinutes * 60_000). */
+  defaultTimeoutMs?: number;
 }
 
 export class CodexPlanner {
@@ -94,19 +101,24 @@ export class CodexPlanner {
     // read the worktree) cannot mutate files before implementation starts.
     // Callers that need write access must pass "--sandbox" in extraArgs.
     const hasCustomSandbox = this.opts.extraArgs?.some((a) => a === "--sandbox") ?? false;
+    // stdin is always "ignore" so there is no user path to approve commands;
+    // add --ask-for-approval never unless the caller already specified it.
+    const hasCustomApproval = this.opts.extraArgs?.some((a) => a === "--ask-for-approval") ?? false;
     const args: string[] = [
       "exec",
       "--ephemeral",
       ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
+      ...(hasCustomApproval ? [] : ["--ask-for-approval", "never"]),
       ...(this.opts.extraArgs ?? []),
       ctx.prompt,
     ];
 
+    const timeoutMs = ctx.timeoutMs ?? this.opts.defaultTimeoutMs;
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
       env: codexChildEnv(),
       stdin: "ignore",
-      ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
 
     this.opts.log("codex session started");
