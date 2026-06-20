@@ -245,12 +245,12 @@ export function parseResetsTime(text: string, nowMs: number): number | null {
     const minutes = parseInt(match[2]!, 10);
     if (hours <= 23 && minutes <= 59) {
       const target = new Date(nowMs);
-      target.setUTCHours(hours, minutes, 0, 0);
+      target.setHours(hours, minutes, 0, 0);
       // Only wrap to next day if the parsed time is more than 60s in the past.
       // The reset time has minute precision; a near-past value (within the same
       // minute) means the reset is happening now, not tomorrow.
       if (target.getTime() < nowMs - 60_000) {
-        target.setUTCDate(target.getUTCDate() + 1);
+        target.setDate(target.getDate() + 1);
       }
       return target.getTime();
     }

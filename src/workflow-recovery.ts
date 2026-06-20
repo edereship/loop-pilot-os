@@ -104,6 +104,16 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
               message: `WIP commit failed: ${commitResult.stderr.trim() || `exit ${commitResult.code}`}`,
             };
           }
+        } else {
+          // git add failed (e.g. index lock, permissions); uncommitted edits remain.
+          // The next attemptRecovery would call syncBranchToOrigin (git reset --hard)
+          // and silently discard them. Surface as unrecoverable so the orchestrator
+          // stops retrying.
+          return {
+            kind: "unrecoverable",
+            costUsd: outcome.costUsd,
+            message: `git add failed: ${addResult.stderr.trim() || `exit ${addResult.code}`}`,
+          };
         }
       }
       // If the fix agent committed work before being interrupted (e.g. during a

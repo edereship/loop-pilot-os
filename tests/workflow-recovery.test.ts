@@ -412,6 +412,31 @@ describe("AgentWorkflowRecovery", () => {
     expect(pushCall).toBeUndefined();
   });
 
+  it("agent interrupted with dirty worktree but staging fails: returns unrecoverable to prevent data loss (Finding 2)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "M src/fix.ts\n" };
+      if (args.includes("add")) return { code: 1, stderr: "error: Unable to create '.git/index.lock': File exists." };
+      if (args.includes("log")) return { code: 0, stdout: "" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.02 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    // git add failed — must return unrecoverable, not interrupted.
+    // Returning interrupted would allow the next retry to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), silently discarding the uncommitted edits.
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.02);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("git add failed");
+    // No push should occur — unrecoverable is returned early
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
   it("agent interrupted: restart-review comment failure after successful push → unrecoverable (Finding 4)", async () => {
     // Push succeeds but /restart-review comment fails. The old code swallowed the
     // comment failure and returned restarted(newFix:true), causing the orchestrator
