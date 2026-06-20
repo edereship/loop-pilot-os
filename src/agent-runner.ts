@@ -189,11 +189,14 @@ function parseResetsAtAmPm(text: string, nowMs: number): number | null {
       return null; // invalid timezone name
     }
   }
-  // No timezone: treat as UTC, consistent with HH:MM parser behaviour.
+  // No timezone: treat as process-local time so "resets 7pm" is interpreted in
+  // the same timezone as the host running the agent (Claude displays times in the
+  // user's local TZ).  Using setUTCHours on a non-UTC host would shift the target
+  // by the UTC offset and could cause the runner to wait an extra day.
   const target = new Date(nowMs);
-  target.setUTCHours(targetHour, targetMinutes, 0, 0);
+  target.setHours(targetHour, targetMinutes, 0, 0);
   if (target.getTime() < nowMs - 60_000) {
-    target.setUTCDate(target.getUTCDate() + 1);
+    target.setDate(target.getDate() + 1);
   }
   return target.getTime();
 }
@@ -301,12 +304,13 @@ export class ClaudeAgentRunner implements AgentRunner {
   ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number; assistantText: string }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
-    // When resuming a rate-limited session, prefix with -p "" so the CLI stays in
-    // print/headless mode (same as a normal run). Without -p, --output-format and
-    // --max-budget-usd are rejected or the CLI enters an interactive session instead
-    // of emitting stream-json, causing the retry loop to hang or return "no result line".
+    // When resuming a rate-limited session, use a non-empty -p so the CLI stays
+    // in print/headless mode and has a message to act on.  A bare -p "" with
+    // --resume can hang with "No messages returned" (upstream #15918).
+    // Without -p at all, --output-format and --max-budget-usd are rejected or the
+    // CLI enters an interactive session instead of emitting stream-json.
     const args: string[] = [
-      ...(resumeSessionId ? ["-p", "", "--resume", resumeSessionId] : ["-p", ctx.prompt]),
+      ...(resumeSessionId ? ["-p", "Continue.", "--resume", resumeSessionId] : ["-p", ctx.prompt]),
       "--output-format",
       "stream-json",
       "--verbose",

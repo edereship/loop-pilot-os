@@ -1035,7 +1035,7 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     expect(runner.calls).toHaveLength(2);
   });
 
-  it("retry uses -p '' --resume <sessionId> to maintain print mode (Finding 1)", async () => {
+  it("retry uses -p 'Continue.' --resume <sessionId> to maintain print mode (Finding 1)", async () => {
     let callCount = 0;
     const runner = new FakeCommandRunner();
     runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
@@ -1057,12 +1057,13 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     // First call must use -p <prompt> (normal headless invocation)
     expect(runner.calls[0]!.args[0]).toBe("-p");
     expect(runner.calls[0]!.args[1]).toBe(ctx.prompt);
-    // Second call must have -p "" then --resume <sessionId> to stay in print mode
+    // Second call must have -p "Continue." then --resume <sessionId> to stay in print mode.
+    // A bare -p "" with --resume can hang with "No messages returned" (upstream #15918).
     const secondArgs = runner.calls[1]!.args;
     const resumeIdx = secondArgs.indexOf("--resume");
     expect(resumeIdx).toBeGreaterThan(-1);
     expect(secondArgs[resumeIdx - 2]).toBe("-p");
-    expect(secondArgs[resumeIdx - 1]).toBe("");
+    expect(secondArgs[resumeIdx - 1]).toBe("Continue.");
     expect(secondArgs[resumeIdx + 1]).toBe("s1");
   });
 

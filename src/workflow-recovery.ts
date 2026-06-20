@@ -89,12 +89,21 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
           { cwd: ctx.worktreePath },
         );
         if (addResult.code === 0) {
-          await this.runner.run(
+          const commitResult = await this.runner.run(
             "git",
             ["-C", ctx.worktreePath, "commit", "-m", "WIP: interrupted fix-agent edits"],
             { cwd: ctx.worktreePath },
           );
-          // If commit fails (code !== 0), edits stay uncommitted; nothing more we can do.
+          if (commitResult.code !== 0) {
+            // WIP commit failed; uncommitted edits remain. The next attemptRecovery
+            // would call syncBranchToOrigin (git reset --hard) and silently discard
+            // them. Surface as unrecoverable so the orchestrator stops retrying.
+            return {
+              kind: "unrecoverable",
+              costUsd: outcome.costUsd,
+              message: `WIP commit failed: ${commitResult.stderr.trim() || `exit ${commitResult.code}`}`,
+            };
+          }
         }
       }
       // If the fix agent committed work before being interrupted (e.g. during a
@@ -111,10 +120,15 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
         // syncBranchToOrigin does not silently discard them.
         try {
           await this.pushFix(ctx.branch, ctx.worktreePath);
-        } catch {
-          // Push failed — commits stay local-only. Best-effort; return interrupted
-          // so the caller stops the session without marking the error as handled.
-          return { kind: "interrupted", costUsd: outcome.costUsd };
+        } catch (err) {
+          // Push failed — local commits cannot be preserved. Return unrecoverable
+          // so the orchestrator stops retrying: the next attemptRecovery would call
+          // syncBranchToOrigin (git reset --hard), silently discarding those commits.
+          return {
+            kind: "unrecoverable",
+            costUsd: outcome.costUsd,
+            message: `interrupted push failed: ${err instanceof Error ? err.message : String(err)}`,
+          };
         }
         // Push succeeded; post /restart-review. Propagate comment failures so the
         // orchestrator does not record workflowHandledErrorCount for an error that

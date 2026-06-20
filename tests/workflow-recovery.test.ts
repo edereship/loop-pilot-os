@@ -386,7 +386,7 @@ describe("AgentWorkflowRecovery", () => {
     expect(pushCall).toBeDefined();
   });
 
-  it("agent interrupted with dirty worktree but commit fails: still returns interrupted (Finding 3)", async () => {
+  it("agent interrupted with dirty worktree but commit fails: returns unrecoverable to prevent data loss (Finding 3)", async () => {
     const { recovery, agent, runner } = makeRecovery();
     runner.on(["git", "-C"], (args) => {
       if (args.includes("fetch")) return { code: 0 };
@@ -401,8 +401,13 @@ describe("AgentWorkflowRecovery", () => {
 
     const result = await recovery.attemptRecovery(ctx());
 
-    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.02 });
-    // No push because commit failed and log shows no commits ahead
+    // WIP commit failed — must return unrecoverable, not interrupted.
+    // Returning interrupted would allow the next retry to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), silently discarding the uncommitted edits.
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.02);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("WIP commit failed");
+    // No push should occur — unrecoverable is returned early
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeUndefined();
   });
@@ -434,7 +439,7 @@ describe("AgentWorkflowRecovery", () => {
     );
   });
 
-  it("agent interrupted: push failure is silently swallowed, interrupted still returned (Finding 4)", async () => {
+  it("agent interrupted: push failure returns unrecoverable to prevent silent commit loss (Finding 2)", async () => {
     const { recovery, agent, runner } = makeRecovery();
     runner.on(["git", "-C"], (args) => {
       if (args.includes("fetch")) return { code: 0 };
@@ -447,8 +452,12 @@ describe("AgentWorkflowRecovery", () => {
 
     const result = await recovery.attemptRecovery(ctx());
 
-    // Push failed, but we still return interrupted (not unrecoverable) — best-effort.
-    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.05 });
+    // Push failed with local commits ahead — must return unrecoverable, not interrupted.
+    // Returning interrupted would allow the next retry to call syncBranchToOrigin
+    // (git reset --hard origin/<branch>), silently discarding the local commits.
+    expect(result.kind).toBe("unrecoverable");
+    expect(result.costUsd).toBe(0.05);
+    expect((result as { kind: "unrecoverable"; message: string }).message).toContain("interrupted push failed");
   });
 
   it("buildFixPrompt includes the error body", async () => {
