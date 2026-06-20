@@ -57,6 +57,7 @@ export interface RateLimitOpts {
   claudePatterns: string[];
   sleep: (ms: number) => Promise<void>;
   clock: () => number;
+  isInterrupted?: () => boolean;
 }
 
 interface AgentRunnerOptions {
@@ -136,7 +137,10 @@ export function parseResetsTime(stderr: string, nowMs: number): number | null {
   if (hours > 23 || minutes > 59) return null;
   const target = new Date(nowMs);
   target.setUTCHours(hours, minutes, 0, 0);
-  if (target.getTime() <= nowMs) {
+  // Only wrap to next day if the parsed time is more than 60s in the past.
+  // The reset time has minute precision; a near-past value (within the same
+  // minute) means the reset is happening now, not tomorrow.
+  if (target.getTime() < nowMs - 60_000) {
     target.setUTCDate(target.getUTCDate() + 1);
   }
   return target.getTime();
@@ -147,15 +151,19 @@ export function classifyClaudeError(
   stderr: string,
   configPatterns: string[],
   nowMs: number,
+  resultText = "",
 ): RateLimitClassification {
   const patterns =
     configPatterns.length > 0
       ? configPatterns.map((p) => new RegExp(p, "i"))
       : DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS;
-  const combined = `${message}\n${stderr}`;
+  const combined = `${message}\n${stderr}\n${resultText}`;
   const isRateLimit = patterns.some((p) => p.test(combined));
   if (!isRateLimit) return { isRateLimit: false, resetsAtMs: null };
-  return { isRateLimit: true, resetsAtMs: parseResetsTime(stderr, nowMs) };
+  return {
+    isRateLimit: true,
+    resetsAtMs: parseResetsTime(stderr, nowMs) ?? parseResetsTime(resultText, nowMs),
+  };
 }
 
 /**
@@ -170,7 +178,7 @@ export class ClaudeAgentRunner implements AgentRunner {
 
   private async runOnce(
     ctx: SessionContext,
-  ): Promise<{ outcome: AgentOutcome; stderr: string }> {
+  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
     const args: string[] = [
@@ -238,8 +246,9 @@ export class ClaudeAgentRunner implements AgentRunner {
       ...(ctx.hardTimeoutMs !== undefined ? { timeoutMs: ctx.hardTimeoutMs } : {}),
     };
     const cmdResult = await this.runner.run("claude", args, opts);
-    const outcome = this.toOutcome(resultLine, cmdResult.code, cmdResult.stderr);
-    return { outcome, stderr: cmdResult.stderr };
+    const rl = resultLine as ResultLine | null;
+    const outcome = this.toOutcome(rl, cmdResult.code, cmdResult.stderr);
+    return { outcome, stderr: cmdResult.stderr, resultText: rl?.result ?? "" };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
@@ -259,10 +268,14 @@ export class ClaudeAgentRunner implements AgentRunner {
       if (remainingBudget <= 0) {
         return { kind: "cost_exceeded", costUsd: totalCost };
       }
-      const { outcome, stderr } = await this.runOnce(
+      const { outcome, stderr, resultText } = await this.runOnce(
         { ...ctx, maxCostUsd: remainingBudget },
       );
       totalCost += outcome.costUsd;
+
+      if (ctx.maxCostUsd - totalCost <= 0) {
+        return { kind: "cost_exceeded", costUsd: totalCost };
+      }
 
       if (outcome.kind !== "error") {
         return { ...outcome, costUsd: totalCost };
@@ -274,6 +287,7 @@ export class ClaudeAgentRunner implements AgentRunner {
         stderr,
         rl.claudePatterns,
         nowMs,
+        resultText,
       );
       if (!classification.isRateLimit) {
         return { ...outcome, costUsd: totalCost };
@@ -304,7 +318,29 @@ export class ClaudeAgentRunner implements AgentRunner {
       this.opts.log(
         `rate limit detected; waiting ${Math.ceil(waitMs / 60_000)}m before re-probe`,
       );
-      await rl.sleep(waitMs);
+
+      if (rl.isInterrupted) {
+        const SLEEP_CHUNK_MS = 10_000;
+        for (let slept = 0; slept < waitMs; slept += SLEEP_CHUNK_MS) {
+          if (rl.isInterrupted()) {
+            return {
+              kind: "error",
+              costUsd: totalCost,
+              message: "interrupted during rate-limit backoff",
+            };
+          }
+          await rl.sleep(Math.min(SLEEP_CHUNK_MS, waitMs - slept));
+        }
+        if (rl.isInterrupted()) {
+          return {
+            kind: "error",
+            costUsd: totalCost,
+            message: "interrupted during rate-limit backoff",
+          };
+        }
+      } else {
+        await rl.sleep(waitMs);
+      }
     }
   }
 

@@ -527,6 +527,18 @@ describe("parseResetsTime", () => {
     const result = parseResetsTime("limit reset 14:30 UTC", NOW);
     expect(result).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
   });
+
+  it("treats near-past time (within same minute) as current, not tomorrow", () => {
+    const nowSameMinute = Date.parse("2026-06-20T14:30:05.000Z");
+    const result = parseResetsTime("resets 14:30", nowSameMinute);
+    expect(result).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
+  });
+
+  it("still wraps to next day when parsed time is more than 60s in the past", () => {
+    const nowLater = Date.parse("2026-06-20T14:32:00.000Z");
+    const result = parseResetsTime("resets 14:30", nowLater);
+    expect(result).toBe(Date.parse("2026-06-21T14:30:00.000Z"));
+  });
 });
 
 // --- Rate limit retry loop tests ---
@@ -777,5 +789,121 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     await agent.runSession(ctx);
 
     expect(logs.some((l) => l.includes("rate limit detected"))).toBe(true);
+  });
+
+  it("does not sleep when rate-limit attempt exhausts the budget (Finding 2)", async () => {
+    const RESULT_EXPENSIVE_429 =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":10.00,"result":"429 Too Many Requests","session_id":"s1"}';
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_EXPENSIVE_429);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent, sleep } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("cost_exceeded");
+    expect(outcome.costUsd).toBe(10);
+    expect(runner.calls).toHaveLength(1);
+    expect(sleep.calls).toHaveLength(0);
+  });
+
+  it("retries nonzero exit with rate-limit text in result (Finding 3)", async () => {
+    const RESULT_429_NONZERO =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"result":"429 Too Many Requests","session_id":"s1"}';
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_429_NONZERO);
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
+  });
+
+  it("classifyClaudeError detects rate limit from resultText (Finding 3)", () => {
+    const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+    const result = classifyClaudeError(
+      "claude exited with code 1",
+      "",
+      [],
+      NOW,
+      "429 Too Many Requests",
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("classifyClaudeError parses resets time from resultText when not in stderr (Finding 3)", () => {
+    const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+    const result = classifyClaudeError(
+      "429 rate limit",
+      "",
+      [],
+      NOW,
+      "Your limit resets 14:30",
+    );
+    expect(result.isRateLimit).toBe(true);
+    expect(result.resetsAtMs).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
+  });
+
+  it("interrupts rate-limit sleep when isInterrupted fires (Finding 4)", async () => {
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_429_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const sleep = instantSleep();
+    let interrupted = false;
+    let clockIndex = 0;
+    const clockValues = [0, 0, 0];
+    const clock = (): number => {
+      const v = clockValues[Math.min(clockIndex, clockValues.length - 1)]!;
+      clockIndex++;
+      return v;
+    };
+    const agent = new ClaudeAgentRunner(runner, {
+      model: "opus",
+      effort: "max",
+      effortEnvOverride: "max",
+      permissionMode: "acceptEdits",
+      allowedTools: "Edit,Write,Read,Glob,Grep,Bash",
+      extraArgs: [],
+      log: (line: string) => logs.push(line),
+      rateLimit: {
+        reprobeMinutes: 15,
+        capHours: 6,
+        claudePatterns: [],
+        sleep: (ms: number) => {
+          interrupted = true;
+          return sleep(ms);
+        },
+        clock,
+        isInterrupted: () => interrupted,
+      },
+    });
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toBe("interrupted during rate-limit backoff");
+    }
+    expect(runner.calls).toHaveLength(1);
   });
 });
