@@ -302,11 +302,14 @@ describe("AgentWorkflowRecovery", () => {
     expect(r3).toEqual<RecoveryOutcome>({ kind: "exhausted", costUsd: 0.7 });
   });
 
-  it("agent interrupted: pushes local commits before returning interrupted (Finding 4)", async () => {
+  it("agent interrupted: pushes local commits and returns restarted when push succeeds (Finding 4)", async () => {
     // If the fix agent made commits then was interrupted (e.g. during rate-limit sleep),
     // those commits must be pushed immediately. Otherwise, the next attemptRecovery call
     // starts with syncBranchToOrigin which does `git reset --hard origin/<branch>` and
-    // silently discards the local-only commits.
+    // silently discards the local-only commits. After a successful push the outcome must
+    // be restarted(newFix: true) so the orchestrator increments workflowFixAttempts,
+    // records workflowHandledErrorCount, and resets monitorStartedAt — preventing duplicate
+    // fix runs and false not-engaged guard triggers on the next poll.
     const { recovery, agent, runner } = makeRecovery();
     runner.on(["git", "-C"], (args) => {
       if (args.includes("fetch")) return { code: 0 };
@@ -320,7 +323,7 @@ describe("AgentWorkflowRecovery", () => {
 
     const result = await recovery.attemptRecovery(ctx());
 
-    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.05 });
+    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.05, newFix: true });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeDefined();
     expect(pushCall!.args).toEqual(["push", "origin", "HEAD:looppilot/ty-1-fix"]);
@@ -348,7 +351,7 @@ describe("AgentWorkflowRecovery", () => {
     expect(pushCall).toBeUndefined();
   });
 
-  it("agent interrupted with dirty worktree: commits WIP then pushes (Finding 3)", async () => {
+  it("agent interrupted with dirty worktree: commits WIP then pushes and returns restarted (Finding 3)", async () => {
     const { recovery, agent, runner } = makeRecovery();
     runner.on(["git", "-C"], (args) => {
       if (args.includes("fetch")) return { code: 0 };
@@ -365,7 +368,9 @@ describe("AgentWorkflowRecovery", () => {
 
     const result = await recovery.attemptRecovery(ctx());
 
-    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.05 });
+    // Push succeeded after the WIP commit, so return restarted(newFix: true) to keep
+    // orchestrator bookkeeping (workflowFixAttempts, monitorStartedAt) in sync.
+    expect(result).toEqual<RecoveryOutcome>({ kind: "restarted", costUsd: 0.05, newFix: true });
     // WIP commit was created: git add -A and git commit were called
     const addCall = runner.calls.find((c) =>
       c.cmd === "git" && c.args.includes("-C") && c.args.includes("add"),

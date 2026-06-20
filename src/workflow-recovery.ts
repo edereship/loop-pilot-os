@@ -83,19 +83,18 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
         { cwd: ctx.worktreePath },
       );
       if (statusResult.stdout.trim() !== "") {
-        try {
-          await this.runner.run(
-            "git",
-            ["-C", ctx.worktreePath, "add", "-A"],
-            { cwd: ctx.worktreePath },
-          );
+        const addResult = await this.runner.run(
+          "git",
+          ["-C", ctx.worktreePath, "add", "-A"],
+          { cwd: ctx.worktreePath },
+        );
+        if (addResult.code === 0) {
           await this.runner.run(
             "git",
             ["-C", ctx.worktreePath, "commit", "-m", "WIP: interrupted fix-agent edits"],
             { cwd: ctx.worktreePath },
           );
-        } catch {
-          // Commit failed — edits stay uncommitted; nothing more we can do.
+          // If commit fails (code !== 0), edits stay uncommitted; nothing more we can do.
         }
       }
       // If the fix agent committed work before being interrupted (e.g. during a
@@ -118,6 +117,11 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
           } catch {
             // best-effort; push succeeded — a human can /restart-review manually
           }
+          // Push succeeded: return restarted so the orchestrator increments
+          // workflowFixAttempts, records workflowHandledErrorCount, and resets
+          // monitorStartedAt — preventing duplicate fix runs and false not-engaged
+          // guard triggers on the next poll.
+          return { kind: "restarted", costUsd: outcome.costUsd, newFix: true };
         } catch {
           // Push failed — commits stay local-only. Nothing more we can do; the
           // interrupted outcome is still returned so the caller can stop the session.

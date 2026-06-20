@@ -98,6 +98,11 @@ export class GitPrManager implements GitPrManagerInterface {
       ["-C", worktreePath, "rev-list", "--count", range],
       { cwd: worktreePath },
     );
+    if (count.code !== 0) {
+      throw new Error(
+        `git rev-list failed in ${worktreePath}: ${count.stderr.trim() || `exit ${count.code}`}`,
+      );
+    }
     const ahead = Number.parseInt(count.stdout.trim(), 10);
     if (!Number.isFinite(ahead) || ahead <= 0) {
       return false;
@@ -118,6 +123,11 @@ export class GitPrManager implements GitPrManagerInterface {
       ["-C", worktreePath, "status", "--porcelain"],
       { cwd: worktreePath },
     );
+    if (res.code !== 0) {
+      throw new Error(
+        `git status failed in ${worktreePath}: ${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
     return res.stdout.trim().length > 0;
   }
 
