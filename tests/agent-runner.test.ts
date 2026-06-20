@@ -1194,6 +1194,66 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     expect(runner.calls).toHaveLength(1);
   });
 
+  it("uses resets_at from rate_limit_event frame when present (Finding 1 — structured reset timestamp)", async () => {
+    // rate_limit_event with status:"rejected" and a structured resets_at ISO timestamp
+    // must be captured and used for the wait calculation, not the reprobe interval.
+    const RATE_LIMIT_EVENT_LINE =
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resets_at":"2026-06-20T14:30:00.000Z"}}';
+    const RESULT_API_ERROR_429_NO_RESET =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"api_error_status":429,"session_id":"s1"}';
+    const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+    const RESET_TARGET = Date.parse("2026-06-20T14:30:00.000Z");
+    const BUFFER = 60_000;
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RATE_LIMIT_EVENT_LINE);
+        opts.onStdoutLine?.(RESULT_API_ERROR_429_NO_RESET);
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent, sleep } = makeRunnerWithRateLimit(runner, logs, {
+      clockMs: [NOW, NOW, NOW, NOW],
+    });
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
+    // Wait must be derived from the structured rate_limit_event resets_at, not reprobe interval.
+    expect(sleep.calls[0]).toBe(RESET_TARGET - NOW + BUFFER);
+  });
+
+  it("retries when api_error_status:529 (overloaded) with empty result text (Finding 2 — structured overload)", async () => {
+    const RESULT_API_ERROR_529 =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"api_error_status":529,"session_id":"s1"}';
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_API_ERROR_529);
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
+  });
+
   it("interrupts rate-limit sleep when isInterrupted fires (Finding 4)", async () => {
     let callCount = 0;
     const runner = new FakeCommandRunner();

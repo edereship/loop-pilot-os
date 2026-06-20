@@ -100,6 +100,17 @@ function isResultLine(value: unknown): value is ResultLine {
   );
 }
 
+// rate_limit_event frame emitted by the Claude Code SDK when a request is
+// rejected at the API quota layer. The resets_at field carries the structured
+// reset timestamp (ISO-8601 string) that is more reliable than parsing prose.
+interface RateLimitEventLine {
+  type: "rate_limit_event";
+  rate_limit_info?: {
+    status?: string;
+    resets_at?: string;
+  };
+}
+
 // assistant メッセージ content から最初の text ブロックを取り出す。
 function firstTextBlock(parsed: unknown): string | null {
   const content = (parsed as { message?: { content?: unknown } }).message?.content;
@@ -313,7 +324,7 @@ export class ClaudeAgentRunner implements AgentRunner {
   private async runOnce(
     ctx: SessionContext,
     resumeSessionId?: string,
-  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number; assistantText: string }> {
+  ): Promise<{ outcome: AgentOutcome; stderr: string; resultText: string; sessionId: string | null; exitCode: number; assistantText: string; rateLimitResetsAtMs: number | null }> {
     // カーネル §5.1: argv は一字一句この順。max-budget-usd は toFixed(2)。
     // effort が undefined（config で "auto" 指定 or 非対応モデル向け）のとき --effort を省く。
     // When resuming a rate-limited session, use a non-empty -p so the CLI stays
@@ -341,6 +352,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     let resultLine: ResultLine | null = null;
     let capturedSessionId: string | null = null;
     const assistantTextParts: string[] = [];
+    let capturedRateLimitResetsAtMs: number | null = null;
 
     const onStdoutLine = (line: string): void => {
       let parsed: unknown;
@@ -373,6 +385,15 @@ export class ClaudeAgentRunner implements AgentRunner {
         return;
       }
 
+      if (type === "rate_limit_event") {
+        const info = (parsed as RateLimitEventLine).rate_limit_info;
+        if (info?.status === "rejected" && typeof info.resets_at === "string") {
+          const ts = Date.parse(info.resets_at);
+          if (!isNaN(ts)) capturedRateLimitResetsAtMs = ts;
+        }
+        return;
+      }
+
       if (isResultLine(parsed)) {
         resultLine = parsed;
       }
@@ -399,8 +420,11 @@ export class ClaudeAgentRunner implements AgentRunner {
     if (rl?.api_error_status === 429) {
       resultText = resultText ? `${resultText}\nHTTP/429 Too Many Requests` : "HTTP/429 Too Many Requests";
     }
+    if (rl?.api_error_status === 529) {
+      resultText = resultText ? `${resultText}\noverloaded` : "overloaded";
+    }
     const assistantText = assistantTextParts.join("\n");
-    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId ?? rl?.session_id ?? null, exitCode: cmdResult.code, assistantText };
+    return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId ?? rl?.session_id ?? null, exitCode: cmdResult.code, assistantText, rateLimitResetsAtMs: capturedRateLimitResetsAtMs };
   }
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
@@ -434,7 +458,7 @@ export class ClaudeAgentRunner implements AgentRunner {
           message: err instanceof Error ? err.message : String(err),
         };
       }
-      const { outcome, stderr, resultText, sessionId, exitCode, assistantText } = runResult;
+      const { outcome, stderr, resultText, sessionId, exitCode, assistantText, rateLimitResetsAtMs } = runResult;
       if (sessionId) lastSessionId = sessionId;
       totalCost += outcome.costUsd;
 
@@ -486,7 +510,7 @@ export class ClaudeAgentRunner implements AgentRunner {
         };
       }
 
-      const resetsAtMs = classification.resetsAtMs ?? parseResetsTime(assistantText, nowMs);
+      const resetsAtMs = rateLimitResetsAtMs ?? classification.resetsAtMs ?? parseResetsTime(assistantText, nowMs);
       let waitMs: number;
       if (resetsAtMs !== null) {
         waitMs = Math.max(0, resetsAtMs - nowMs + RATE_LIMIT_BUFFER_MS);
