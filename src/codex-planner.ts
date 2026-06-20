@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -19,14 +19,11 @@ const CODEX_COMMAND = process.platform === "win32" ? "codex.cmd" : "codex";
 //
 // Auth credentials (CODEX_API_KEY, CODEX_ACCESS_TOKEN, OPENAI_API_KEY) are
 // intentionally absent: Codex is authenticated via its auth cache directory
-// ($CODEX_HOME, defaulting to ~/.codex). CODEX_HOME is never included in the
-// child environment because an env var is trivially readable by model-launched
-// commands (e.g. `cat "$CODEX_HOME/auth.json"`). Instead, run() creates a
-// symlink at privateHome/.codex -> realCodexHome and sets HOME=privateHome,
-// so Codex finds auth via its default $HOME/.codex path without the auth
-// directory being named in the environment. When the operator has explicitly
-// set CODEX_HOME, the symlink points to their chosen auth directory but the
-// env var itself is never forwarded.
+// ($CODEX_HOME, defaulting to ~/.codex). CODEX_HOME is exported explicitly
+// by codexChildEnv() so Codex locates auth without relying on $HOME/.codex.
+// Keeping auth outside HOME reduces automatic discovery via HOME traversal;
+// the path is still readable via the environment in full-access sandbox
+// modes, but that is equivalent to $HOME/.codex being shell-readable.
 //
 // XDG base dirs (XDG_CONFIG_HOME etc.) are excluded: since HOME is redirected
 // to a fresh private temp dir, Codex will derive isolated XDG paths from that
@@ -187,16 +184,18 @@ function codexChildEnv(homeDir: string): Record<string, string> {
     }
   }
 
-  // CODEX_HOME is NOT exported: exposing the path as an env var lets
-  // model-launched commands discover and read the auth cache. Auth is provided
-  // via a symlink at privateHome/.codex -> realCodexHome created by the caller
-  // (run/checkAvailability). Project-level .codex inside the worktree is
-  // removed before the run to prevent ticket-branch hooks from executing.
+  // CODEX_HOME is exported explicitly so Codex locates auth without relying
+  // on $HOME/.codex. Keeping auth outside HOME reduces discovery via HOME
+  // traversal; in full-access sandbox mode the path remains readable via the
+  // environment, but that is equivalent to $HOME/.codex being shell-readable.
+  // Project-level .codex inside the worktree is NOT removed; --ignore-rules
+  // and --ignore-user-config prevent hooks and project config from running.
   //
   // Replace HOME and USERPROFILE with the caller-supplied private per-run
   // directory so that prompts cannot reach host dotfiles via "~" or
   // %USERPROFILE%. XDG paths (XDG_CONFIG_HOME etc.) are not forwarded;
   // Codex derives them from this isolated HOME.
+  out["CODEX_HOME"] = resolveCodexAuthDir();
   out["HOME"] = homeDir;
   out["USERPROFILE"] = homeDir;
 
@@ -308,14 +307,10 @@ export class CodexPlanner {
 
     // Create a private per-run home directory so concurrent planner runs don't
     // share state and so dotfiles in the global temp root cannot affect the run.
+    // CODEX_HOME is set to the real auth directory in codexChildEnv(); HOME
+    // itself does not contain a .codex entry so auth files are outside HOME.
     const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
     if (process.platform !== "win32") chmodSync(privateHome, 0o700);
-    symlinkSync(
-      resolveCodexAuthDir(),
-      path.join(privateHome, ".codex"),
-      process.platform === "win32" ? "junction" : undefined,
-    );
-    rmSync(path.join(ctx.worktreePath, ".codex"), { recursive: true, force: true });
 
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
@@ -360,11 +355,6 @@ export class CodexPlanner {
     // codexChildEnv strips before runtime.
     const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
     if (process.platform !== "win32") chmodSync(privateHome, 0o700);
-    symlinkSync(
-      resolveCodexAuthDir(),
-      path.join(privateHome, ".codex"),
-      process.platform === "win32" ? "junction" : undefined,
-    );
     try {
       let result;
       try {

@@ -58,7 +58,14 @@ export class RealCommandRunner implements CommandRunner {
         // cmd.exe does not fall back to searching the current directory
         // (which is the ticket worktree and may contain a shadowing .cmd).
         const resolvedCmd = resolveWindowsCmdShim(cmd, opts.env);
-        spawnCmd = "cmd.exe";
+        // Resolve cmd.exe to an absolute path: CreateProcess searches cwd
+        // before system directories when given a bare name, so a repo-supplied
+        // cmd.exe at the worktree root would shadow the real shell. Prefer
+        // COMSPEC when it is already absolute; fall back to %SystemRoot%.
+        const comspec = process.env["COMSPEC"];
+        spawnCmd = (comspec && path.isAbsolute(comspec))
+          ? comspec
+          : path.join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "cmd.exe");
         const innerTokens = [resolvedCmd, ...args].map(quoteCmdExeToken).join(" ");
         spawnArgs = ["/d", "/s", "/c", `"${innerTokens}"`];
         windowsVerbatimArguments = true;

@@ -769,7 +769,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
   });
 
-  it("CODEX_HOME 未設定時でも CODEX_HOME を子 env に含めない（$HOME/.codex symlink で auth を提供）", async () => {
+  it("CODEX_HOME 未設定時はデフォルト (~/.codex) を CODEX_HOME として子 env に設定する（auth を HOME の外に置く）", async () => {
     const saved = { ...process.env };
     delete process.env["CODEX_HOME"];
     try {
@@ -779,10 +779,11 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
       await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
       const env = runner.calls[0]!.opts.env!;
-      // CODEX_HOME must NOT be in the child env: exposing the path lets
-      // model-launched commands read the auth cache. Auth is provided via
-      // a symlink at privateHome/.codex -> realCodexHome.
-      expect(env["CODEX_HOME"]).toBeUndefined();
+      // CODEX_HOME must be set so Codex locates auth without relying on
+      // $HOME/.codex; auth is kept outside HOME to reduce discovery via
+      // automatic HOME traversal.
+      expect(env["CODEX_HOME"]).toBeDefined();
+      expect(env["CODEX_HOME"]).toContain(".codex");
       // HOME is still the private per-run directory for dotfile isolation.
       expect(env["HOME"]).toContain("codex-planner-");
       expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
@@ -792,7 +793,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     }
   });
 
-  it("CODEX_HOME が既に設定されている場合でも子 env には含めない（symlink で auth を提供）", async () => {
+  it("CODEX_HOME が親 env に設定されている場合はその値を子 env の CODEX_HOME として転送する", async () => {
     const saved = { ...process.env };
     process.env["CODEX_HOME"] = "/custom/codex/home";
     try {
@@ -802,7 +803,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
       await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
       const env = runner.calls[0]!.opts.env!;
-      expect(env["CODEX_HOME"]).toBeUndefined();
+      expect(env["CODEX_HOME"]).toBe("/custom/codex/home");
     } finally {
       if (saved["CODEX_HOME"] === undefined) delete process.env["CODEX_HOME"];
       else process.env["CODEX_HOME"] = saved["CODEX_HOME"];
@@ -820,9 +821,9 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     const authEnv = runner.calls[1]!.opts.env!;
     expect(authEnv["HOME"]).toContain("codex-planner-");
     expect(path.dirname(authEnv["HOME"]!)).toBe(os.tmpdir());
-    // CODEX_HOME must NOT be in the child env; auth is discovered via
-    // the $HOME/.codex symlink.
-    expect(authEnv["CODEX_HOME"]).toBeUndefined();
+    // CODEX_HOME must be set in the child env so Codex locates auth
+    // without relying on $HOME/.codex.
+    expect(authEnv["CODEX_HOME"]).toBeDefined();
   });
 });
 
