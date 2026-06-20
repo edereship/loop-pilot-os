@@ -40,10 +40,12 @@ describe("CodexPlanner.run", () => {
     expect(call.args).toEqual([
       "exec",
       "--ephemeral",
+      "--output-last-message",
       "--sandbox",
       "read-only",
       "--ask-for-approval",
       "never",
+      "--",
       "Pick the next task from the list.",
     ]);
     expect(call.opts.cwd).toBe("/wt/issue-42");
@@ -61,10 +63,12 @@ describe("CodexPlanner.run", () => {
     expect(runner.calls[0]!.args).toEqual([
       "exec",
       "--ephemeral",
+      "--output-last-message",
       "--ask-for-approval",
       "never",
       "--sandbox",
       "read-only",
+      "--",
       "Enrich this ticket.",
     ]);
   });
@@ -592,5 +596,119 @@ describe("CodexPlanner flag alias detection (Finding 3)", () => {
     const args = runner.calls[0]!.args;
     expect(args).not.toContain("--ask-for-approval");
     expect(args).toContain("--ask-for-approval=on-request");
+  });
+});
+
+describe("CodexPlanner scheme-less proxy scrubbing (Finding 1 extension)", () => {
+  it("スキームなし proxy に '@' が含まれる（認証情報あり）場合は env 変数を除去する", async () => {
+    const schemelessWithCreds = "user:pass@proxy.internal:8080";
+    const saved = { ...process.env };
+    process.env.HTTP_PROXY = schemelessWithCreds;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["HTTP_PROXY"]).toBeUndefined();
+    } finally {
+      if (saved["HTTP_PROXY"] === undefined) delete process.env.HTTP_PROXY;
+      else process.env.HTTP_PROXY = saved["HTTP_PROXY"];
+    }
+  });
+
+  it("スキームなし proxy に '@' がない（認証情報なし）場合はそのまま転送する", async () => {
+    const schemelessNoCreds = "proxy.internal:8080";
+    const saved = { ...process.env };
+    process.env.HTTP_PROXY = schemelessNoCreds;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["HTTP_PROXY"]).toBe(schemelessNoCreds);
+    } finally {
+      if (saved["HTTP_PROXY"] === undefined) delete process.env.HTTP_PROXY;
+      else process.env.HTTP_PROXY = saved["HTTP_PROXY"];
+    }
+  });
+});
+
+describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
+  it("Linux で extraArgs に --sandbox danger-full-access がある場合は bubblewrap チェックをスキップする", async () => {
+    if (process.platform !== "linux") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    // bwrap is intentionally NOT stubbed: if the code calls it, FakeCommandRunner throws.
+    const planner = new CodexPlanner(runner, {
+      log: () => {},
+      extraArgs: ["--sandbox", "danger-full-access"],
+    });
+
+    await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+  });
+
+  it("Linux で extraArgs に --sandbox=danger-full-access がある場合は bubblewrap チェックをスキップする", async () => {
+    if (process.platform !== "linux") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    const planner = new CodexPlanner(runner, {
+      log: () => {},
+      extraArgs: ["--sandbox=danger-full-access"],
+    });
+
+    await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+  });
+
+  it("Linux で extraArgs に --yolo がある場合は bubblewrap チェックをスキップする", async () => {
+    if (process.platform !== "linux") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    const planner = new CodexPlanner(runner, {
+      log: () => {},
+      extraArgs: ["--yolo"],
+    });
+
+    await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+  });
+
+  it("Linux で extraArgs に --dangerously-bypass-approvals-and-sandbox がある場合は bubblewrap チェックをスキップする", async () => {
+    if (process.platform !== "linux") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    const planner = new CodexPlanner(runner, {
+      log: () => {},
+      extraArgs: ["--dangerously-bypass-approvals-and-sandbox"],
+    });
+
+    await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+  });
+});
+
+describe("CodexPlanner Windows supplement key casing (Finding 4)", () => {
+  it("Windows で大文字小文字が異なる補助キー（ComSpec）も子 env に含める", async () => {
+    if (process.platform !== "win32") return;
+    const saved = { ...process.env };
+    // Simulate Windows reporting supplement key with non-canonical casing.
+    process.env["ComSpec"] = "C:\\Windows\\System32\\cmd.exe";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["ComSpec"]).toBe("C:\\Windows\\System32\\cmd.exe");
+    } finally {
+      if (saved["ComSpec"] === undefined) delete process.env["ComSpec"];
+      else process.env["ComSpec"] = saved["ComSpec"];
+    }
   });
 });

@@ -80,17 +80,31 @@ const CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT = new Set([
 // NO_PROXY/no_proxy hold host lists, not URLs, so they need no scrubbing.
 const PROXY_CREDENTIAL_KEYS_UPPER = new Set(["HTTPS_PROXY", "HTTP_PROXY"]);
 
-function scrubProxyUrl(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    if (u.username || u.password) {
-      u.username = "";
-      u.password = "";
-      return u.toString();
+// Returns the scrubbed proxy URL, or undefined if the value should be dropped.
+// Only attempt URL parsing for http/https-schemed values: the WHATWG URL parser
+// accepts scheme-less strings like "user:pass@host:8080" as valid opaque URLs
+// (treating "user" as the scheme), so parsed .username/.password are always
+// empty and credentials would pass through undetected.
+// For non-http/https or scheme-less values, rely on '@' as a credential signal.
+function scrubProxyUrl(rawUrl: string): string | undefined {
+  const lower = rawUrl.toLowerCase();
+  if (lower.startsWith("http://") || lower.startsWith("https://")) {
+    try {
+      const u = new URL(rawUrl);
+      if (u.username || u.password) {
+        u.username = "";
+        u.password = "";
+        return u.toString();
+      }
+    } catch {
+      // A value starting with http/https that still fails to parse — drop if
+      // it contains '@' (embedded credentials), otherwise forward as-is.
+      if (rawUrl.includes("@")) return undefined;
     }
-  } catch {
-    // Scheme-less or otherwise unparseable proxy value — forward as-is.
+    return rawUrl;
   }
+  // Scheme-less or non-HTTP scheme: '@' indicates embedded credentials — drop.
+  if (rawUrl.includes("@")) return undefined;
   return rawUrl;
 }
 
@@ -98,21 +112,27 @@ function codexChildEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   const isWindows = process.platform === "win32";
   // On Windows, env keys are case-insensitive (e.g. "Path" instead of "PATH").
-  // Build an uppercase lookup set so allowlist matching works regardless of casing.
+  // Build uppercase lookup sets so allowlist matching works regardless of casing.
   const allowlistUppercase = isWindows
     ? new Set([...CODEX_CHILD_ENV_ALLOWLIST].map((k) => k.toUpperCase()))
+    : null;
+  const windowsSupplementUpper = isWindows
+    ? new Set([...CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT].map((k) => k.toUpperCase()))
     : null;
 
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
     const isAllowed = isWindows
-      ? (allowlistUppercase!.has(key.toUpperCase()) || CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT.has(key))
+      ? (allowlistUppercase!.has(key.toUpperCase()) || windowsSupplementUpper!.has(key.toUpperCase()))
       : CODEX_CHILD_ENV_ALLOWLIST.has(key);
     if (!isAllowed) continue;
 
     // Strip embedded credentials from proxy URL values before forwarding.
     if (PROXY_CREDENTIAL_KEYS_UPPER.has(key.toUpperCase())) {
-      out[key] = scrubProxyUrl(value);
+      const scrubbed = scrubProxyUrl(value);
+      if (scrubbed !== undefined) {
+        out[key] = scrubbed;
+      }
     } else {
       out[key] = value;
     }
@@ -149,6 +169,18 @@ function hasFlagOrAlias(args: string[], longFlag: string, shortAlias: string): b
   );
 }
 
+// Returns true when extraArgs selects a Codex sandbox mode that does not
+// require the bubblewrap backend on Linux (danger-full-access or full bypass).
+function hasSandboxBypassMode(extraArgs: string[]): boolean {
+  for (let i = 0; i < extraArgs.length; i++) {
+    const a = extraArgs[i]!;
+    if (a === "--sandbox=danger-full-access" || a === "-s=danger-full-access") return true;
+    if ((a === "--sandbox" || a === "-s") && extraArgs[i + 1] === "danger-full-access") return true;
+    if (a === "--dangerously-bypass-approvals-and-sandbox" || a === "--yolo") return true;
+  }
+  return false;
+}
+
 export class CodexPlanner {
   constructor(
     private readonly runner: CommandRunner,
@@ -166,9 +198,16 @@ export class CodexPlanner {
     const args: string[] = [
       "exec",
       "--ephemeral",
+      // Request only the final assistant message on stdout so callers that
+      // parse the returned text see the answer rather than tool/progress output.
+      "--output-last-message",
       ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
       ...(hasCustomApproval ? [] : ["--ask-for-approval", "never"]),
       ...(this.opts.extraArgs ?? []),
+      // Terminate options before the prompt so that a prompt starting with '-'
+      // (including the literal '-' which codex reads as stdin) is never
+      // misinterpreted as a CLI flag.
+      "--",
       ctx.prompt,
     ];
 
@@ -232,9 +271,11 @@ export class CodexPlanner {
     }
 
     // On Linux/WSL, the default sandbox (--sandbox read-only) requires bubblewrap.
+    // Skip this probe when extraArgs select a mode that bypasses the sandbox entirely
+    // (e.g. --sandbox danger-full-access on an externally isolated runner).
     // Probe it now so a missing sandbox backend surfaces at preflight rather than
     // failing at the first run() call with an opaque non-zero exit.
-    if (process.platform === "linux") {
+    if (process.platform === "linux" && !hasSandboxBypassMode(this.opts.extraArgs ?? [])) {
       let bwrapResult;
       try {
         bwrapResult = await this.runner.run("bwrap", ["--version"], { cwd: "." });
