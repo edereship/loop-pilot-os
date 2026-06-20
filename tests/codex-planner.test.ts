@@ -711,14 +711,17 @@ describe("CodexPlanner Windows supplement key casing (Finding 4)", () => {
 });
 
 describe("CodexPlanner auth file isolation (Finding 1)", () => {
-  it("子プロセスの HOME は os.tmpdir() に差し替えられる（~/.codex auth ファイルを sandbox から隠す）", async () => {
+  it("子プロセスの HOME はシステム一時ディレクトリ配下の専用ディレクトリに差し替えられる（~/.codex auth ファイルを sandbox から隠す）", async () => {
     const runner = new FakeCommandRunner();
     codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
     const logs: string[] = [];
     await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
 
     const env = runner.calls[0]!.opts.env!;
-    expect(env["HOME"]).toBe(os.tmpdir());
+    // HOME must be a private per-run subdirectory under os.tmpdir(), not the
+    // shared temp root itself, to prevent concurrent runs from sharing state.
+    expect(env["HOME"]).toContain("codex-planner-");
+    expect(path.dirname(env["HOME"]!)).toBe(os.tmpdir());
   });
 
   it("子プロセスに CODEX_HOME が常に注入される（HOME 差し替え後も auth を解決できる）", async () => {
@@ -758,7 +761,7 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
     }
   });
 
-  it("checkAvailability の auth 確認でも HOME は tmpdir に差し替えられる", async () => {
+  it("checkAvailability の auth 確認でも HOME は専用の一時ディレクトリに差し替えられる", async () => {
     const runner = new FakeCommandRunner();
     runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
     runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
@@ -767,7 +770,8 @@ describe("CodexPlanner auth file isolation (Finding 1)", () => {
 
     // The auth check (calls[1]) must use the isolated env.
     const authEnv = runner.calls[1]!.opts.env!;
-    expect(authEnv["HOME"]).toBe(os.tmpdir());
+    expect(authEnv["HOME"]).toContain("codex-planner-");
+    expect(path.dirname(authEnv["HOME"]!)).toBe(os.tmpdir());
     expect(authEnv["CODEX_HOME"]).toBeDefined();
   });
 });
@@ -819,5 +823,196 @@ describe("CodexPlanner lone-dash prompt guard (Finding 3)", () => {
 
     expect(outcome.kind).toBe("completed");
     expect(runner.calls).toHaveLength(1);
+  });
+});
+
+describe("CodexPlanner certificate path absolutization (Finding 3)", () => {
+  it("CODEX_CA_CERTIFICATE が相対パスの場合は絶対パスに解決して転送する", async () => {
+    const saved = { ...process.env };
+    process.env.CODEX_CA_CERTIFICATE = "certs/ca.pem";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["CODEX_CA_CERTIFICATE"]).toBeDefined();
+      expect(path.isAbsolute(env["CODEX_CA_CERTIFICATE"]!)).toBe(true);
+    } finally {
+      if (saved["CODEX_CA_CERTIFICATE"] === undefined) delete process.env.CODEX_CA_CERTIFICATE;
+      else process.env.CODEX_CA_CERTIFICATE = saved["CODEX_CA_CERTIFICATE"];
+    }
+  });
+
+  it("SSL_CERT_FILE が相対パスの場合は絶対パスに解決して転送する", async () => {
+    const saved = { ...process.env };
+    process.env.SSL_CERT_FILE = "certs/bundle.pem";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["SSL_CERT_FILE"]).toBeDefined();
+      expect(path.isAbsolute(env["SSL_CERT_FILE"]!)).toBe(true);
+    } finally {
+      if (saved["SSL_CERT_FILE"] === undefined) delete process.env.SSL_CERT_FILE;
+      else process.env.SSL_CERT_FILE = saved["SSL_CERT_FILE"];
+    }
+  });
+
+  it("CODEX_CA_CERTIFICATE が絶対パスの場合はそのまま転送する", async () => {
+    const saved = { ...process.env };
+    process.env.CODEX_CA_CERTIFICATE = "/etc/ssl/certs/ca.pem";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["CODEX_CA_CERTIFICATE"]).toBe("/etc/ssl/certs/ca.pem");
+    } finally {
+      if (saved["CODEX_CA_CERTIFICATE"] === undefined) delete process.env.CODEX_CA_CERTIFICATE;
+      else process.env.CODEX_CA_CERTIFICATE = saved["CODEX_CA_CERTIFICATE"];
+    }
+  });
+});
+
+describe("CodexPlanner XDG isolation (Finding 4)", () => {
+  it("XDG_CONFIG_HOME はホスト値を転送しない（HOME 隔離を無効化するため）", async () => {
+    const saved = { ...process.env };
+    process.env.XDG_CONFIG_HOME = "/home/user/.config";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["XDG_CONFIG_HOME"]).toBeUndefined();
+    } finally {
+      if (saved["XDG_CONFIG_HOME"] === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = saved["XDG_CONFIG_HOME"];
+    }
+  });
+
+  it("XDG_DATA_HOME と XDG_CACHE_HOME もホスト値を転送しない", async () => {
+    const saved = { ...process.env };
+    process.env.XDG_DATA_HOME = "/home/user/.local/share";
+    process.env.XDG_CACHE_HOME = "/home/user/.cache";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["XDG_DATA_HOME"]).toBeUndefined();
+      expect(env["XDG_CACHE_HOME"]).toBeUndefined();
+    } finally {
+      if (saved["XDG_DATA_HOME"] === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = saved["XDG_DATA_HOME"];
+      if (saved["XDG_CACHE_HOME"] === undefined) delete process.env.XDG_CACHE_HOME;
+      else process.env.XDG_CACHE_HOME = saved["XDG_CACHE_HOME"];
+    }
+  });
+});
+
+describe("CodexPlanner SSH agent exclusion (Finding 5)", () => {
+  it("SSH_AUTH_SOCK は転送しない（shell-capable モードで SSH agent 経由の認証を防ぐ）", async () => {
+    const saved = { ...process.env };
+    process.env.SSH_AUTH_SOCK = "/tmp/ssh-XXXX/agent.123";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["SSH_AUTH_SOCK"]).toBeUndefined();
+    } finally {
+      if (saved["SSH_AUTH_SOCK"] === undefined) delete process.env.SSH_AUTH_SOCK;
+      else process.env.SSH_AUTH_SOCK = saved["SSH_AUTH_SOCK"];
+    }
+  });
+
+  it("SSH_AGENT_PID は転送しない", async () => {
+    const saved = { ...process.env };
+    process.env.SSH_AGENT_PID = "12345";
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["SSH_AGENT_PID"]).toBeUndefined();
+    } finally {
+      if (saved["SSH_AGENT_PID"] === undefined) delete process.env.SSH_AGENT_PID;
+      else process.env.SSH_AGENT_PID = saved["SSH_AGENT_PID"];
+    }
+  });
+});
+
+describe("CodexPlanner PATH sanitization (Finding 7)", () => {
+  it("PATH の相対エントリ（'.'）を除去してバイナリ shadowing を防ぐ", async () => {
+    const saved = { ...process.env };
+    process.env.PATH = `.${path.delimiter}/usr/local/bin${path.delimiter}/usr/bin`;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      const entries = (env["PATH"] ?? "").split(path.delimiter);
+      expect(entries).not.toContain(".");
+      expect(entries).toContain("/usr/local/bin");
+      expect(entries).toContain("/usr/bin");
+    } finally {
+      if (saved["PATH"] === undefined) delete process.env.PATH;
+      else process.env.PATH = saved["PATH"];
+    }
+  });
+
+  it("PATH の相対エントリ（'node_modules/.bin'）を除去する", async () => {
+    const saved = { ...process.env };
+    process.env.PATH = `node_modules/.bin${path.delimiter}/usr/bin`;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      const entries = (env["PATH"] ?? "").split(path.delimiter);
+      expect(entries).not.toContain("node_modules/.bin");
+      expect(entries).toContain("/usr/bin");
+    } finally {
+      if (saved["PATH"] === undefined) delete process.env.PATH;
+      else process.env.PATH = saved["PATH"];
+    }
+  });
+
+  it("PATH の絶対エントリはそのまま保持する", async () => {
+    const saved = { ...process.env };
+    process.env.PATH = `/usr/local/bin${path.delimiter}/usr/bin`;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      const entries = (env["PATH"] ?? "").split(path.delimiter);
+      expect(entries).toContain("/usr/local/bin");
+      expect(entries).toContain("/usr/bin");
+    } finally {
+      if (saved["PATH"] === undefined) delete process.env.PATH;
+      else process.env.PATH = saved["PATH"];
+    }
   });
 });

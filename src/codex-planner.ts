@@ -1,3 +1,4 @@
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -20,7 +21,20 @@ const CODEX_COMMAND = process.platform === "win32" ? "codex.cmd" : "codex";
 // intentionally absent: Codex is authenticated via its auth cache directory
 // ($CODEX_HOME, defaulting to ~/.codex). codexChildEnv() always injects an
 // explicit CODEX_HOME so the Codex binary can locate its auth even after HOME
-// has been replaced with os.tmpdir() (see below).
+// has been replaced with a private per-run temp directory (see below).
+//
+// CODEX_HOME is intentionally absent from this allowlist: it is injected
+// explicitly at the end of codexChildEnv() so the absolute value derived from
+// the parent environment (or the default) is always used, bypassing the loop.
+//
+// XDG base dirs (XDG_CONFIG_HOME etc.) are excluded: since HOME is redirected
+// to a fresh private temp dir, Codex will derive isolated XDG paths from that
+// HOME. Forwarding the host XDG paths would undo the HOME isolation and expose
+// config files such as gh/hosts.yml to prompts running in shell-capable modes.
+//
+// SSH_AUTH_SOCK / SSH_AGENT_PID are excluded: a prompt running in a
+// shell-capable sandbox could use the host SSH agent socket to authenticate to
+// GitHub or other private hosts even though GH_TOKEN was scrubbed.
 const CODEX_CHILD_ENV_ALLOWLIST = new Set([
   // Shell essentials
   "PATH",
@@ -51,18 +65,9 @@ const CODEX_CHILD_ENV_ALLOWLIST = new Set([
   "no_proxy",
   // Custom OpenAI API base URL (not a credential)
   "OPENAI_BASE_URL",
-  // Codex home directory (overrides default ~/.codex for config and auth state)
-  "CODEX_HOME",
   // TLS certificate bundles (for corporate/private CA environments)
   "CODEX_CA_CERTIFICATE",
   "SSL_CERT_FILE",
-  // XDG base directories (for Codex config and cache)
-  "XDG_CONFIG_HOME",
-  "XDG_DATA_HOME",
-  "XDG_CACHE_HOME",
-  // SSH agent (for git operations inside the Codex sandbox)
-  "SSH_AUTH_SOCK",
-  "SSH_AGENT_PID",
   // Git identity (for commits made within the Codex sandbox)
   "GIT_AUTHOR_NAME",
   "GIT_AUTHOR_EMAIL",
@@ -91,7 +96,17 @@ const PROXY_CREDENTIAL_KEYS_UPPER = new Set(["HTTPS_PROXY", "HTTP_PROXY"]);
 // before being forwarded. This prevents cwd-relative paths from resolving to
 // different locations when the auth check (cwd=".") and exec (cwd=worktreePath)
 // run from different directories.
-const PATH_ENV_KEYS_UPPER = new Set(["CODEX_HOME"]);
+const PATH_ENV_KEYS_UPPER = new Set(["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"]);
+
+// Removes relative entries from a PATH-style string. Prevents a checked-out
+// repository from shadowing the Codex binary via entries like "." or
+// "node_modules/.bin" when cwd changes to the worktree.
+function sanitizePath(pathStr: string): string {
+  return pathStr
+    .split(path.delimiter)
+    .filter((entry) => path.isAbsolute(entry))
+    .join(path.delimiter);
+}
 
 // Returns the scrubbed proxy URL, or undefined if the value should be dropped.
 // Only attempt URL parsing for http/https-schemed values: the WHATWG URL parser
@@ -121,7 +136,7 @@ function scrubProxyUrl(rawUrl: string): string | undefined {
   return rawUrl;
 }
 
-function codexChildEnv(): Record<string, string> {
+function codexChildEnv(homeDir: string): Record<string, string> {
   // Resolve the auth cache directory from the *parent* environment before we
   // build the sanitised child env. We need this to inject CODEX_HOME into the
   // child so the Codex binary can authenticate even after we redirect HOME.
@@ -159,19 +174,27 @@ function codexChildEnv(): Record<string, string> {
       // Resolve relative paths to absolute so the same directory is used
       // regardless of which cwd the child process inherits.
       out[key] = path.resolve(value);
+    } else if (keyUpper === "PATH") {
+      // Remove relative entries (e.g. "." or "node_modules/.bin") so a
+      // repo checked out at worktreePath cannot shadow the Codex binary.
+      const sanitized = sanitizePath(value);
+      if (sanitized.length > 0) out[key] = sanitized;
     } else {
       out[key] = value;
     }
   }
 
   // Always inject CODEX_HOME (absolute) so the Codex binary can locate its
-  // auth cache regardless of the HOME value below. This overrides any value
-  // the loop may have already written for CODEX_HOME (they are the same).
+  // auth cache regardless of the HOME override below. CODEX_HOME is not in
+  // the allowlist above; it is injected here so the resolved absolute value
+  // from the parent environment (or the ~/.codex default) is always used.
   out["CODEX_HOME"] = realCodexHome;
-  // Replace HOME with the system temp directory so that a malicious planning
-  // prompt cannot reach ~/.codex/auth.json by navigating via "~". Codex itself
+  // Replace HOME with a caller-supplied private per-run directory so that a
+  // malicious planning prompt cannot reach ~/.codex/auth.json via "~". Codex
   // authenticates via the explicit CODEX_HOME set above, not via HOME.
-  out["HOME"] = os.tmpdir();
+  // XDG paths (XDG_CONFIG_HOME etc.) are not forwarded; Codex will derive
+  // them from this isolated HOME, keeping all per-run state within homeDir.
+  out["HOME"] = homeDir;
 
   return out;
 }
@@ -243,33 +266,43 @@ export class CodexPlanner {
     ];
 
     const timeoutMs = ctx.timeoutMs ?? this.opts.defaultTimeoutMs;
+
+    // Create a private per-run home directory so concurrent planner runs don't
+    // share state and so dotfiles in the global temp root cannot affect the run.
+    const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
+    if (process.platform !== "win32") chmodSync(privateHome, 0o700);
+
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
-      env: codexChildEnv(),
+      env: codexChildEnv(privateHome),
       stdin: "ignore",
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
 
     this.opts.log("codex session started");
 
-    let result;
     try {
-      result = await this.runner.run(CODEX_COMMAND, args, runOpts);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.opts.log(`codex session failed: ${message}`);
-      return { kind: "error", message };
-    }
+      let result;
+      try {
+        result = await this.runner.run(CODEX_COMMAND, args, runOpts);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.opts.log(`codex session failed: ${message}`);
+        return { kind: "error", message };
+      }
 
-    if (result.code !== 0) {
-      const tail = result.stderr.trim().slice(-STDERR_TAIL_MAX);
-      const msg = `codex exited with code ${result.code}`;
-      this.opts.log(`codex session error: ${msg}`);
-      return { kind: "error", message: tail ? `${msg}: ${tail}` : msg };
-    }
+      if (result.code !== 0) {
+        const tail = result.stderr.trim().slice(-STDERR_TAIL_MAX);
+        const msg = `codex exited with code ${result.code}`;
+        this.opts.log(`codex session error: ${msg}`);
+        return { kind: "error", message: tail ? `${msg}: ${tail}` : msg };
+      }
 
-    this.opts.log("codex session completed");
-    return { kind: "completed", text: result.stdout.trim() };
+      this.opts.log("codex session completed");
+      return { kind: "completed", text: result.stdout.trim() };
+    } finally {
+      rmSync(privateHome, { recursive: true, force: true });
+    }
   }
 
   async checkAvailability(): Promise<string> {
@@ -286,21 +319,29 @@ export class CodexPlanner {
     }
     const version = result.stdout.trim();
 
-    let authResult;
+    // Run the auth check with the same filtered environment as run() so that
+    // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
+    // fail here at preflight rather than silently at exec time.
+    const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
+    if (process.platform !== "win32") chmodSync(privateHome, 0o700);
     try {
-      // Run the auth check with the same filtered environment as run() so that
-      // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
-      // fail here at preflight rather than silently at exec time.
-      authResult = await this.runner.run(CODEX_COMMAND, ["login", "status"], { cwd: ".", env: codexChildEnv() });
-    } catch (err) {
-      throw new Error(
-        `codex: 認証状態を確認できません（${err instanceof Error ? err.message : String(err)}）`,
-      );
+      let authResult;
+      try {
+        authResult = await this.runner.run(CODEX_COMMAND, ["login", "status"], {
+          cwd: ".",
+          env: codexChildEnv(privateHome),
+        });
+      } catch (err) {
+        throw new Error(
+          `codex: 認証状態を確認できません（${err instanceof Error ? err.message : String(err)}）`,
+        );
+      }
+      if (authResult.code !== 0) {
+        throw new Error("codex: 認証されていません（codex login を実行してください）");
+      }
+      return version;
+    } finally {
+      rmSync(privateHome, { recursive: true, force: true });
     }
-    if (authResult.code !== 0) {
-      throw new Error("codex: 認証されていません（codex login を実行してください）");
-    }
-
-    return version;
   }
 }
