@@ -102,6 +102,51 @@ function firstTextBlock(parsed: unknown): string | null {
   return null;
 }
 
+const DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS: RegExp[] = [
+  /\b429\b/,
+  /rate.?limit/i,
+  /usage.?limit/i,
+  /too many requests/i,
+  /overloaded/i,
+];
+
+const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})/i;
+
+export interface RateLimitClassification {
+  isRateLimit: boolean;
+  resetsAtMs: number | null;
+}
+
+export function parseResetsTime(stderr: string, nowMs: number): number | null {
+  const match = RESETS_PATTERN.exec(stderr);
+  if (!match) return null;
+  const hours = parseInt(match[1]!, 10);
+  const minutes = parseInt(match[2]!, 10);
+  if (hours > 23 || minutes > 59) return null;
+  const target = new Date(nowMs);
+  target.setUTCHours(hours, minutes, 0, 0);
+  if (target.getTime() <= nowMs) {
+    target.setUTCDate(target.getUTCDate() + 1);
+  }
+  return target.getTime();
+}
+
+export function classifyClaudeError(
+  message: string,
+  stderr: string,
+  configPatterns: string[],
+  nowMs: number,
+): RateLimitClassification {
+  const patterns =
+    configPatterns.length > 0
+      ? configPatterns.map((p) => new RegExp(p, "i"))
+      : DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS;
+  const combined = `${message}\n${stderr}`;
+  const isRateLimit = patterns.some((p) => p.test(combined));
+  if (!isRateLimit) return { isRateLimit: false, resetsAtMs: null };
+  return { isRateLimit: true, resetsAtMs: parseResetsTime(stderr, nowMs) };
+}
+
 /**
  * Claude Code ヘッドレス（`claude -p --output-format stream-json`）を worktree 内で
  * コスト上限付きに起動する AgentRunner。仕様§5.3 IMPLEMENT / §11 コスト一本化。

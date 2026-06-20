@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ClaudeAgentRunner } from "../src/agent-runner.js";
+import { ClaudeAgentRunner, classifyClaudeError, parseResetsTime } from "../src/agent-runner.js";
 import { FakeCommandRunner } from "./fakes.js";
 import type { RunOptions, CommandResult, SessionContext } from "../src/types.js";
 
@@ -376,5 +376,155 @@ describe("ClaudeAgentRunner.runSession", () => {
       );
     expect(logs[1]).toContain(expectedText);
     expect(logs[1]).not.toContain("right now"); // 81字目以降は落ちる
+  });
+});
+
+describe("classifyClaudeError", () => {
+  const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+
+  it("detects 429 in error message as rate limit", () => {
+    const result = classifyClaudeError(
+      "claude exited with code 1: 429 Too Many Requests",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("detects 'rate limit' (case-insensitive) as rate limit", () => {
+    const result = classifyClaudeError(
+      "Rate Limit exceeded",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("detects 'usage limit' in stderr as rate limit", () => {
+    const result = classifyClaudeError(
+      "claude exited with code 1",
+      "Error: usage limit reached for this billing period",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("detects 'too many requests' as rate limit", () => {
+    const result = classifyClaudeError(
+      "too many requests, please slow down",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("detects 'overloaded' as rate limit", () => {
+    const result = classifyClaudeError(
+      "API is overloaded",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("does NOT classify non-rate-limit errors", () => {
+    const result = classifyClaudeError(
+      "claude exited with code 1: Error: credentials expired; run /login",
+      "fatal: authentication failed",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(false);
+  });
+
+  it("does NOT match partial '429' inside longer numbers", () => {
+    const result = classifyClaudeError(
+      "processed 14290 tokens",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(false);
+  });
+
+  it("uses config patterns instead of defaults when provided", () => {
+    const result = classifyClaudeError(
+      "CUSTOM_QUOTA_HIT",
+      "",
+      ["CUSTOM_QUOTA"],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+  });
+
+  it("config patterns replace defaults (default '429' no longer matches)", () => {
+    const result = classifyClaudeError(
+      "429 Too Many Requests",
+      "",
+      ["CUSTOM_ONLY"],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(false);
+  });
+
+  it("parses 'resets HH:MM' from stderr and returns resetsAtMs", () => {
+    const result = classifyClaudeError(
+      "429 rate limit",
+      "Your limit resets 14:30",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+    expect(result.resetsAtMs).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
+  });
+
+  it("returns resetsAtMs=null when no resets time is found", () => {
+    const result = classifyClaudeError(
+      "429 rate limit",
+      "some other error details",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(true);
+    expect(result.resetsAtMs).toBeNull();
+  });
+});
+
+describe("parseResetsTime", () => {
+  const NOW = Date.parse("2026-06-20T10:00:00.000Z");
+
+  it("parses 'resets HH:MM' and returns epoch ms for same-day future time", () => {
+    const result = parseResetsTime("Your limit resets 14:30", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
+  });
+
+  it("wraps to next day when parsed time is in the past", () => {
+    const result = parseResetsTime("resets 08:00", NOW);
+    expect(result).toBe(Date.parse("2026-06-21T08:00:00.000Z"));
+  });
+
+  it("returns null when no resets pattern is found", () => {
+    const result = parseResetsTime("no reset info here", NOW);
+    expect(result).toBeNull();
+  });
+
+  it("returns null for invalid hours (>23)", () => {
+    const result = parseResetsTime("resets 25:00", NOW);
+    expect(result).toBeNull();
+  });
+
+  it("returns null for invalid minutes (>59)", () => {
+    const result = parseResetsTime("resets 14:61", NOW);
+    expect(result).toBeNull();
+  });
+
+  it("handles 'reset' (singular) variant", () => {
+    const result = parseResetsTime("limit reset 14:30 UTC", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T14:30:00.000Z"));
   });
 });
