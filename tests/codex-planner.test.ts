@@ -347,6 +347,8 @@ describe("CodexPlanner.checkAvailability", () => {
     const runner = new FakeCommandRunner();
     runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
     runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    // bubblewrap probe is performed on Linux; stub it so the test is portable.
+    runner.on(["bwrap", "--version"], { code: 0, stdout: "bwrap 0.8.0\n", stderr: "" });
     const logs: string[] = [];
     const version = await makePlanner(runner, logs).checkAvailability();
 
@@ -370,6 +372,8 @@ describe("CodexPlanner.checkAvailability", () => {
       const runner = new FakeCommandRunner();
       runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
       runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+      // bubblewrap probe is performed on Linux; stub it so the test is portable.
+      runner.on(["bwrap", "--version"], { code: 0, stdout: "bwrap 0.8.0\n", stderr: "" });
       const logs: string[] = [];
       await makePlanner(runner, logs).checkAvailability();
 
@@ -436,5 +440,157 @@ describe("CodexPlanner.checkAvailability", () => {
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
       /認証状態を確認できません/,
     );
+  });
+
+  it("Linux で bubblewrap が spawn 失敗 → サンドボックスエラーで throw（Finding 4）", async () => {
+    if (process.platform !== "linux") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["bwrap", "--version"], () => {
+      throw new Error("spawn bwrap ENOENT");
+    });
+    const logs: string[] = [];
+
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
+      /sandbox.*bubblewrap|bubblewrap.*unavailable/i,
+    );
+  });
+
+  it("Linux で bwrap が非0終了 → サンドボックスエラーで throw（Finding 4）", async () => {
+    if (process.platform !== "linux") return;
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["bwrap", "--version"], { code: 1, stdout: "", stderr: "error" });
+    const logs: string[] = [];
+
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
+      /sandbox.*bubblewrap|bubblewrap.*unavailable/i,
+    );
+  });
+});
+
+describe("CodexPlanner proxy credential scrubbing (Finding 1)", () => {
+  it("HTTPS_PROXY に認証情報が含まれる場合はそれを除去してから転送する", async () => {
+    const proxyWithCreds = "https://user:secret@proxy.example.com:8080";
+    const saved = { ...process.env };
+    process.env.HTTPS_PROXY = proxyWithCreds;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["HTTPS_PROXY"]).toBeDefined();
+      expect(env["HTTPS_PROXY"]).not.toContain("user");
+      expect(env["HTTPS_PROXY"]).not.toContain("secret");
+      expect(env["HTTPS_PROXY"]).toMatch(/^https:\/\/proxy\.example\.com:8080/);
+    } finally {
+      if (saved["HTTPS_PROXY"] === undefined) delete process.env.HTTPS_PROXY;
+      else process.env.HTTPS_PROXY = saved["HTTPS_PROXY"];
+    }
+  });
+
+  it("HTTP_PROXY の小文字バリアント（http_proxy）も認証情報を除去する", async () => {
+    const proxyWithCreds = "http://admin:pass@corp-proxy.internal:3128";
+    const saved = { ...process.env };
+    process.env.http_proxy = proxyWithCreds;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["http_proxy"]).toBeDefined();
+      expect(env["http_proxy"]).not.toContain("admin");
+      expect(env["http_proxy"]).not.toContain("pass");
+      expect(env["http_proxy"]).toMatch(/^http:\/\/corp-proxy\.internal:3128/);
+    } finally {
+      if (saved["http_proxy"] === undefined) delete process.env.http_proxy;
+      else process.env.http_proxy = saved["http_proxy"];
+    }
+  });
+
+  it("認証情報がない proxy URL はそのまま転送する", async () => {
+    const proxyNoCreds = "http://proxy.example.com:8080";
+    const saved = { ...process.env };
+    process.env.HTTP_PROXY = proxyNoCreds;
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({ worktreePath: "/wt", prompt: "task" });
+
+      const env = runner.calls[0]!.opts.env!;
+      expect(env["HTTP_PROXY"]).toBe(proxyNoCreds);
+    } finally {
+      if (saved["HTTP_PROXY"] === undefined) delete process.env.HTTP_PROXY;
+      else process.env.HTTP_PROXY = saved["HTTP_PROXY"];
+    }
+  });
+});
+
+describe("CodexPlanner flag alias detection (Finding 3)", () => {
+  it("-s 短縮エイリアスで sandbox が指定された場合はデフォルトの --sandbox read-only を追加しない", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs, ["-s", "workspace-write"]).run({
+      worktreePath: "/wt",
+      prompt: "task",
+    });
+
+    const args = runner.calls[0]!.args;
+    // Default --sandbox read-only must not be prepended
+    const sandboxDefaultIdx = args.indexOf("--sandbox");
+    expect(sandboxDefaultIdx).toBe(-1);
+    expect(args).toContain("-s");
+    expect(args).toContain("workspace-write");
+  });
+
+  it("--sandbox=value 形式で sandbox が指定された場合はデフォルトの --sandbox read-only を追加しない", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs, ["--sandbox=workspace-write"]).run({
+      worktreePath: "/wt",
+      prompt: "task",
+    });
+
+    const args = runner.calls[0]!.args;
+    expect(args).not.toContain("--sandbox");
+    expect(args).toContain("--sandbox=workspace-write");
+  });
+
+  it("-a 短縮エイリアスで ask-for-approval が指定された場合はデフォルトを追加しない", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs, ["-a", "on-request"]).run({
+      worktreePath: "/wt",
+      prompt: "task",
+    });
+
+    const args = runner.calls[0]!.args;
+    expect(args).not.toContain("--ask-for-approval");
+    expect(args).toContain("-a");
+    expect(args).toContain("on-request");
+  });
+
+  it("--ask-for-approval=value 形式で approval が指定された場合はデフォルトを追加しない", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs, ["--ask-for-approval=on-request"]).run({
+      worktreePath: "/wt",
+      prompt: "task",
+    });
+
+    const args = runner.calls[0]!.args;
+    expect(args).not.toContain("--ask-for-approval");
+    expect(args).toContain("--ask-for-approval=on-request");
   });
 });

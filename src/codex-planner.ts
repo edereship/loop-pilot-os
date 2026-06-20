@@ -63,12 +63,59 @@ const CODEX_CHILD_ENV_ALLOWLIST = new Set([
   "GIT_COMMITTER_EMAIL",
 ]);
 
+// Windows-only supplemental keys not present in the POSIX allowlist above.
+// Windows exposes PATHEXT and COMSPEC for executable/shim resolution (codex.cmd),
+// SystemRoot and SystemDrive for system binary paths, and USERPROFILE as the
+// Windows equivalent of HOME. These are safe system keys, not credentials.
+const CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT = new Set([
+  "PATHEXT",
+  "COMSPEC",
+  "SystemRoot",
+  "SystemDrive",
+  "USERPROFILE",
+]);
+
+// Proxy env keys that may carry embedded URL credentials (user:pass@host).
+// Checked case-insensitively so both HTTPS_PROXY and https_proxy are covered.
+// NO_PROXY/no_proxy hold host lists, not URLs, so they need no scrubbing.
+const PROXY_CREDENTIAL_KEYS_UPPER = new Set(["HTTPS_PROXY", "HTTP_PROXY"]);
+
+function scrubProxyUrl(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    if (u.username || u.password) {
+      u.username = "";
+      u.password = "";
+      return u.toString();
+    }
+  } catch {
+    // Scheme-less or otherwise unparseable proxy value — forward as-is.
+  }
+  return rawUrl;
+}
+
 function codexChildEnv(): Record<string, string> {
   const out: Record<string, string> = {};
+  const isWindows = process.platform === "win32";
+  // On Windows, env keys are case-insensitive (e.g. "Path" instead of "PATH").
+  // Build an uppercase lookup set so allowlist matching works regardless of casing.
+  const allowlistUppercase = isWindows
+    ? new Set([...CODEX_CHILD_ENV_ALLOWLIST].map((k) => k.toUpperCase()))
+    : null;
+
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
-    if (!CODEX_CHILD_ENV_ALLOWLIST.has(key)) continue;
-    out[key] = value;
+    const isAllowed = isWindows
+      ? (allowlistUppercase!.has(key.toUpperCase()) || CODEX_CHILD_ENV_WINDOWS_SUPPLEMENT.has(key))
+      : CODEX_CHILD_ENV_ALLOWLIST.has(key);
+    if (!isAllowed) continue;
+
+    // Strip embedded credentials from proxy URL values before forwarding.
+    if (PROXY_CREDENTIAL_KEYS_UPPER.has(key.toUpperCase())) {
+      out[key] = scrubProxyUrl(value);
+    } else {
+      out[key] = value;
+    }
   }
   return out;
 }
@@ -90,6 +137,18 @@ export interface CodexPlannerOptions {
   defaultTimeoutMs?: number;
 }
 
+// Detect a flag by its long form, short alias, or --flag=value / -f=value forms.
+// Used to avoid prepending defaults when the caller has already supplied the flag.
+function hasFlagOrAlias(args: string[], longFlag: string, shortAlias: string): boolean {
+  return args.some(
+    (a) =>
+      a === longFlag ||
+      a === shortAlias ||
+      a.startsWith(`${longFlag}=`) ||
+      a.startsWith(`${shortAlias}=`),
+  );
+}
+
 export class CodexPlanner {
   constructor(
     private readonly runner: CommandRunner,
@@ -99,11 +158,11 @@ export class CodexPlanner {
   async run(ctx: CodexPlannerContext): Promise<CodexOutcome> {
     // Default to read-only sandbox so planning prompts (which only need to
     // read the worktree) cannot mutate files before implementation starts.
-    // Callers that need write access must pass "--sandbox" in extraArgs.
-    const hasCustomSandbox = this.opts.extraArgs?.some((a) => a === "--sandbox") ?? false;
+    // Callers that need write access must pass "--sandbox"/"-s" in extraArgs.
+    const hasCustomSandbox = hasFlagOrAlias(this.opts.extraArgs ?? [], "--sandbox", "-s");
     // stdin is always "ignore" so there is no user path to approve commands;
     // add --ask-for-approval never unless the caller already specified it.
-    const hasCustomApproval = this.opts.extraArgs?.some((a) => a === "--ask-for-approval") ?? false;
+    const hasCustomApproval = hasFlagOrAlias(this.opts.extraArgs ?? [], "--ask-for-approval", "-a");
     const args: string[] = [
       "exec",
       "--ephemeral",
@@ -170,6 +229,25 @@ export class CodexPlanner {
     }
     if (authResult.code !== 0) {
       throw new Error("codex: 認証されていません（codex login を実行してください）");
+    }
+
+    // On Linux/WSL, the default sandbox (--sandbox read-only) requires bubblewrap.
+    // Probe it now so a missing sandbox backend surfaces at preflight rather than
+    // failing at the first run() call with an opaque non-zero exit.
+    if (process.platform === "linux") {
+      let bwrapResult;
+      try {
+        bwrapResult = await this.runner.run("bwrap", ["--version"], { cwd: "." });
+      } catch (err) {
+        throw new Error(
+          `codex: sandbox backend (bubblewrap) unavailable on this Linux host — install bubblewrap or run in a container with sandbox support (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+      if (bwrapResult.code !== 0) {
+        throw new Error(
+          "codex: sandbox backend (bubblewrap) unavailable on this Linux host — install bubblewrap or run in a container with sandbox support",
+        );
+      }
     }
 
     return version;
