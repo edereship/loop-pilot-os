@@ -342,6 +342,59 @@ describe("AgentWorkflowRecovery", () => {
     expect(pushCall).toBeUndefined();
   });
 
+  it("agent interrupted with dirty worktree: commits WIP then pushes (Finding 3)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "M src/fix.ts\n" };
+      if (args.includes("add")) return { code: 0 };
+      if (args.includes("commit")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef WIP commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.05 });
+    // WIP commit was created: git add -A and git commit were called
+    const addCall = runner.calls.find((c) =>
+      c.cmd === "git" && c.args.includes("-C") && c.args.includes("add"),
+    );
+    expect(addCall).toBeDefined();
+    const commitCall = runner.calls.find((c) =>
+      c.cmd === "git" && c.args.includes("-C") && c.args.includes("commit"),
+    );
+    expect(commitCall).toBeDefined();
+    expect(commitCall!.args).toContain("WIP: interrupted fix-agent edits");
+    // Push happened after the WIP commit
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeDefined();
+  });
+
+  it("agent interrupted with dirty worktree but commit fails: still returns interrupted (Finding 3)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "M src/fix.ts\n" };
+      if (args.includes("add")) return { code: 0 };
+      if (args.includes("commit")) return { code: 1, stderr: "nothing to commit" };
+      if (args.includes("log")) return { code: 0, stdout: "" };
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.02 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.02 });
+    // No push because commit failed and log shows no commits ahead
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
   it("agent interrupted: push failure is silently swallowed, interrupted still returned (Finding 4)", async () => {
     const { recovery, agent, runner } = makeRecovery();
     runner.on(["git", "-C"], (args) => {

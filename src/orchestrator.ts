@@ -268,10 +268,18 @@ export class Orchestrator {
         if (session.worktreePath) {
           await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
         }
-        await bestEffort(() => this.source.transition(session.linearIssueId, "todo"));
+        let revertedToTodo = true;
+        try {
+          await this.source.transition(session.linearIssueId, "todo");
+        } catch {
+          revertedToTodo = false;
+        }
         this.store.updateSession(session.id, { runId: this.runId });
+        const revertStatus = revertedToTodo
+          ? "ticket reverted to Todo"
+          : "ticket revert to Todo FAILED — may be stuck In Progress";
         const detail =
-          `crash recovery: no open PR; ticket reverted to Todo: ` +
+          `crash recovery: no open PR; ${revertStatus}: ` +
           `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
         return await this.stopSession(session, "exception", detail);
       }

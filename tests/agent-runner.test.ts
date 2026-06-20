@@ -590,6 +590,14 @@ describe("parseResetsTime", () => {
     const result = parseResetsTime("resets 6:40am (Asia/Singapore)", NOW);
     expect(result).toBe(Date.parse("2026-06-20T22:40:00.000Z"));
   });
+
+  it("zero-padded 12-hour time with am/pm+tz is parsed as local, not bare UTC (Finding 1)", () => {
+    // "resets 06:40pm (Asia/Singapore)" must be parsed as 6:40pm SGT, not 06:40 UTC.
+    // 6:40pm SGT = 18:40 SGT = 10:40 UTC.
+    // NOW = 2026-06-20T10:00:00Z = 18:00 SGT.
+    const result = parseResetsTime("resets 06:40pm (Asia/Singapore)", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T10:40:00.000Z"));
+  });
 });
 
 // --- Rate limit retry loop tests ---

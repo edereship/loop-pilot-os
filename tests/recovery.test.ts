@@ -502,6 +502,30 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
   });
 
+  it("implementing + no PR + no commits + transition(todo) fails → detail says revert FAILED (Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-rf-x", worktreePath: "/wt/ty-rf", linearIssueId: "issue-RF", linearIdentifier: "TY-RF" },
+    );
+    h.git.commitsWithDiff.set("/wt/ty-rf", false);
+    // Make the Todo transition fail
+    h.source.failNext("transition", new Error("Linear 5xx"));
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("ticket revert to Todo FAILED");
+    expect(s.stopDetail).toContain("may be stuck In Progress");
+    expect(s.stopDetail).toContain("TY-RF");
+    // Worktree was still discarded (best-effort, before transition)
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(true);
+  });
+
   it("implementing + no PR + dirty worktree (uncommitted edits) → manual cleanup, not discarded (Finding 4)", async () => {
     // Scenario: SIGINT fires during the rate-limit sleep after Claude has edited files
     // but before the final commit.  hasCommitsWithDiff returns false, but the worktree

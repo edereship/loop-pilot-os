@@ -73,6 +73,31 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
 
     if (outcome.kind === "interrupted") {
       this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
+      // If the fix agent left uncommitted edits (e.g. SIGINT during rate-limit
+      // sleep after editing files but before committing), commit them as a WIP
+      // so that the next attemptRecovery's syncBranchToOrigin (`git reset --hard`)
+      // doesn't silently destroy the partial work.
+      const statusResult = await this.runner.run(
+        "git",
+        ["-C", ctx.worktreePath, "status", "--porcelain"],
+        { cwd: ctx.worktreePath },
+      );
+      if (statusResult.stdout.trim() !== "") {
+        try {
+          await this.runner.run(
+            "git",
+            ["-C", ctx.worktreePath, "add", "-A"],
+            { cwd: ctx.worktreePath },
+          );
+          await this.runner.run(
+            "git",
+            ["-C", ctx.worktreePath, "commit", "-m", "WIP: interrupted fix-agent edits"],
+            { cwd: ctx.worktreePath },
+          );
+        } catch {
+          // Commit failed — edits stay uncommitted; nothing more we can do.
+        }
+      }
       // If the fix agent committed work before being interrupted (e.g. during a
       // rate-limit sleep), push those commits now. Without this, the next call to
       // attemptRecovery would run syncBranchToOrigin which does

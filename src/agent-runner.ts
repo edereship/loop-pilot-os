@@ -182,6 +182,12 @@ function parseResetsAtAmPm(text: string, nowMs: number): number | null {
 }
 
 export function parseResetsTime(text: string, nowMs: number): number | null {
+  // Try AM/PM+timezone format first — a zero-padded 12-hour time like
+  // "resets 06:40pm (Asia/Singapore)" would otherwise match the bare HH:MM
+  // pattern and be misinterpreted as 06:40 UTC.
+  const ampmResult = parseResetsAtAmPm(text, nowMs);
+  if (ampmResult !== null) return ampmResult;
+
   const match = RESETS_PATTERN.exec(text);
   if (match) {
     const hours = parseInt(match[1]!, 10);
@@ -198,7 +204,7 @@ export function parseResetsTime(text: string, nowMs: number): number | null {
       return target.getTime();
     }
   }
-  return parseResetsAtAmPm(text, nowMs);
+  return null;
 }
 
 export function classifyClaudeError(
