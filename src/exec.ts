@@ -2,23 +2,40 @@ import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { CommandResult, CommandRunner, RunOptions } from "./types.js";
 
+// Wraps a single token for use inside a cmd.exe /s /c "..." command string.
+// Interior double-quotes are doubled ("") per cmd.exe convention, then the
+// token is wrapped in double-quotes to neutralise metacharacters (&, |, >,
+// <, ^, etc.) that cmd.exe would otherwise interpret as shell operators.
+function quoteCmdExeToken(token: string): string {
+  return `"${token.replace(/"/g, '""')}"`;
+}
+
 export class RealCommandRunner implements CommandRunner {
   run(cmd: string, args: string[], opts: RunOptions): Promise<CommandResult> {
     return new Promise<CommandResult>((resolve, reject) => {
-      // On Windows, .cmd shims require cmd.exe. Invoke it directly with
-      // shell:false so individual args are passed as separate elements rather
-      // than concatenated into a single command string, which would let shell
-      // metacharacters in any arg (e.g. '&' in a prompt) run host commands.
+      // On Windows, .cmd shims must go through cmd.exe. Passing individual
+      // args as separate spawn elements lets Node.js build the CreateProcess
+      // command line, but Node.js does not escape cmd.exe metacharacters
+      // (& | > < ^) so an arg like "x&whoami" would be split by cmd.exe and
+      // run as two commands. Instead, build a fully-quoted command string
+      // ourselves and use windowsVerbatimArguments to pass it verbatim.
+      // Format: cmd.exe /d /s /c "<tok1> <tok2> ..." where /s strips the
+      // outermost quotes and executes the inner quoted-token string, keeping
+      // metacharacters inside the per-token quotes inert.
       let spawnCmd = cmd;
       let spawnArgs = args;
+      let windowsVerbatimArguments = false;
       if (process.platform === "win32" && cmd.endsWith(".cmd")) {
         spawnCmd = "cmd.exe";
-        spawnArgs = ["/d", "/s", "/c", cmd, ...args];
+        const innerTokens = [cmd, ...args].map(quoteCmdExeToken).join(" ");
+        spawnArgs = ["/d", "/s", "/c", `"${innerTokens}"`];
+        windowsVerbatimArguments = true;
       }
       const child = spawn(spawnCmd, spawnArgs, {
         cwd: opts.cwd,
         env: opts.env ?? process.env,
         shell: false,
+        ...(windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       });
 
       if (opts.stdin === "ignore") {

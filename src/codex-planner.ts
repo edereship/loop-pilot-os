@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -185,11 +185,35 @@ function codexChildEnv(homeDir: string): Record<string, string> {
     }
   }
 
-  // Always inject CODEX_HOME (absolute) so the Codex binary can locate its
-  // auth cache regardless of the HOME override below. CODEX_HOME is not in
-  // the allowlist above; it is injected here so the resolved absolute value
-  // from the parent environment (or the ~/.codex default) is always used.
-  out["CODEX_HOME"] = realCodexHome;
+  // Inject CODEX_HOME so the Codex binary can locate its auth cache after the
+  // HOME override below. When the operator did not set CODEX_HOME explicitly,
+  // create a symlink inside homeDir pointing at the real auth directory rather
+  // than forwarding the real ~/.codex absolute path. This keeps the operator's
+  // home directory path out of the child environment, reducing the information
+  // available to model-driven file reads (the real path is not in $CODEX_HOME).
+  // The symlink is removed with homeDir in the caller's finally block.
+  // When the operator explicitly set CODEX_HOME, forward that exact path so
+  // their chosen auth directory is honoured.
+  if (parentCodexHome !== undefined) {
+    out["CODEX_HOME"] = realCodexHome;
+  } else {
+    const isolatedCodexHome = path.join(homeDir, ".codex");
+    try {
+      symlinkSync(
+        realCodexHome,
+        isolatedCodexHome,
+        process.platform === "win32" ? "junction" : undefined,
+      );
+      out["CODEX_HOME"] = isolatedCodexHome;
+    } catch (err) {
+      // EEXIST: a prior codexChildEnv call with the same homeDir already
+      // created the symlink — the isolated path is already in place, reuse it.
+      // Any other error (e.g. junction target absent on Windows): fall back to
+      // the real path so authentication still works.
+      const code = (err as { code?: string }).code;
+      out["CODEX_HOME"] = code === "EEXIST" ? isolatedCodexHome : realCodexHome;
+    }
+  }
   // Replace HOME and USERPROFILE with the caller-supplied private per-run
   // directory so that prompts cannot reach host dotfiles via "~" or
   // %USERPROFILE%. USERPROFILE is the Windows equivalent of HOME; tools
@@ -276,12 +300,19 @@ export class CodexPlanner {
     const hasIgnoreUserConfig = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-user-config" || a.startsWith("--ignore-user-config="),
     );
+    // --ignore-rules skips project/.rules files separately from --ignore-user-config.
+    // Without it a repo-supplied rule can deny planner-generated shell commands even
+    // when stdin is ignored and approvals are set to never.
+    const hasIgnoreRules = (this.opts.extraArgs ?? []).some(
+      (a) => a === "--ignore-rules" || a.startsWith("--ignore-rules="),
+    );
     const args: string[] = [
       "exec",
       "--ephemeral",
       ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
       ...(hasCustomApproval ? [] : ["--ask-for-approval", "never"]),
       ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
+      ...(hasIgnoreRules ? [] : ["--ignore-rules"]),
       ...(this.opts.extraArgs ?? []),
       // Terminate options before the prompt so that a prompt starting with '-'
       // (including the literal '-' which codex reads as stdin) is never
@@ -331,25 +362,33 @@ export class CodexPlanner {
   }
 
   async checkAvailability(): Promise<string> {
-    let result;
-    try {
-      result = await this.runner.run(CODEX_COMMAND, ["--version"], { cwd: "." });
-    } catch (err) {
-      throw new Error(
-        `codex CLI not found or not available: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    if (result.code !== 0) {
-      throw new Error("codex CLI not found or not available");
-    }
-    const version = result.stdout.trim();
-
-    // Run the auth check with the same filtered environment as run() so that
-    // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
-    // fail here at preflight rather than silently at exec time.
+    // Create the private home early so the same sanitized env (including the
+    // PATH-stripped version) is used for both the --version probe and the auth
+    // check. This prevents a false-positive availability report when Codex is
+    // reachable only via a relative PATH entry (e.g. node_modules/.bin) that
+    // codexChildEnv strips before runtime.
     const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
     if (process.platform !== "win32") chmodSync(privateHome, 0o700);
     try {
+      let result;
+      try {
+        result = await this.runner.run(CODEX_COMMAND, ["--version"], {
+          cwd: ".",
+          env: codexChildEnv(privateHome),
+        });
+      } catch (err) {
+        throw new Error(
+          `codex CLI not found or not available: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (result.code !== 0) {
+        throw new Error("codex CLI not found or not available");
+      }
+      const version = result.stdout.trim();
+
+      // Run the auth check with the same filtered environment as run() so that
+      // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
+      // fail here at preflight rather than silently at exec time.
       let authResult;
       try {
         authResult = await this.runner.run(CODEX_COMMAND, ["login", "status"], {
@@ -364,24 +403,24 @@ export class CodexPlanner {
       if (authResult.code !== 0) {
         throw new Error("codex: 認証されていません（codex login を実行してください）");
       }
+
+      // On Linux, Codex uses bwrap + seccomp for sandboxing. Probe bwrap so
+      // preflight can surface a missing helper early rather than at exec time.
+      // Skip the probe when extraArgs bypass sandboxing (e.g. --yolo), and
+      // treat a missing or failing bwrap as a non-fatal warning: Codex may
+      // fall back to its own sandbox helper on some configurations.
+      if (process.platform === "linux" && !isSandboxBypassed(this.opts.extraArgs ?? [])) {
+        try {
+          await this.runner.run("bwrap", ["--version"], { cwd: "." });
+        } catch {
+          // bwrap unavailable; Codex may use a fallback — proceed and let
+          // runtime surface the failure if sandboxing truly cannot start.
+        }
+      }
+
+      return version;
     } finally {
       rmSync(privateHome, { recursive: true, force: true });
     }
-
-    // On Linux, Codex uses bwrap + seccomp for sandboxing. Probe bwrap so
-    // preflight can surface a missing helper early rather than at exec time.
-    // Skip the probe when extraArgs bypass sandboxing (e.g. --yolo), and
-    // treat a missing or failing bwrap as a non-fatal warning: Codex may
-    // fall back to its own sandbox helper on some configurations.
-    if (process.platform === "linux" && !isSandboxBypassed(this.opts.extraArgs ?? [])) {
-      try {
-        await this.runner.run("bwrap", ["--version"], { cwd: "." });
-      } catch {
-        // bwrap unavailable; Codex may use a fallback — proceed and let
-        // runtime surface the failure if sandboxing truly cannot start.
-      }
-    }
-
-    return version;
   }
 }

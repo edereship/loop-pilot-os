@@ -50,6 +50,7 @@ describe("CodexPlanner.run", () => {
       "--ask-for-approval",
       "never",
       "--ignore-user-config",
+      "--ignore-rules",
       "--",
       "Pick the next task from the list.",
     ]);
@@ -71,6 +72,7 @@ describe("CodexPlanner.run", () => {
       "--ask-for-approval",
       "never",
       "--ignore-user-config",
+      "--ignore-rules",
       "--sandbox",
       "read-only",
       "--",
