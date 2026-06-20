@@ -40,6 +40,8 @@ describe("CodexPlanner.run", () => {
     expect(call.args).toEqual([
       "exec",
       "--ephemeral",
+      "--sandbox",
+      "read-only",
       "Pick the next task from the list.",
     ]);
     expect(call.opts.cwd).toBe("/wt/issue-42");
@@ -130,6 +132,36 @@ describe("CodexPlanner.run", () => {
       expect(env).toHaveProperty("PATH");
     } finally {
       for (const key of Object.keys(SECRETS)) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
+  });
+
+  it("allowlist 外の env 変数（AWS_SECRET_ACCESS_KEY 等）を渡さない（最小権限）", async () => {
+    const NON_ALLOWLISTED = {
+      AWS_SECRET_ACCESS_KEY: "aws_secret",
+      NPM_TOKEN: "npm_token_xxx",
+      DATABASE_URL: "postgres://user:pass@host/db",
+      MY_CUSTOM_SECRET: "s3cr3t",
+    };
+    const saved = { ...process.env };
+    Object.assign(process.env, NON_ALLOWLISTED);
+    try {
+      const runner = new FakeCommandRunner();
+      codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).run({
+        worktreePath: "/wt",
+        prompt: "task",
+      });
+
+      const env = runner.calls[0]!.opts.env!;
+      for (const key of Object.keys(NON_ALLOWLISTED)) {
+        expect(env).not.toHaveProperty(key);
+      }
+    } finally {
+      for (const key of Object.keys(NON_ALLOWLISTED)) {
         if (saved[key] === undefined) delete process.env[key];
         else process.env[key] = saved[key];
       }
@@ -293,6 +325,38 @@ describe("CodexPlanner.checkAvailability", () => {
     expect(runner.calls[0]!.args).toEqual(["--version"]);
     expect(runner.calls[0]!.opts.cwd).toBe(".");
     expect(runner.calls[1]!.args).toEqual(["login", "status"]);
+  });
+
+  it("checkAvailability の認証確認は run() と同じフィルタ済み env を使う（env-only 認証の早期検出）", async () => {
+    const SECRETS = {
+      CODEX_API_KEY: "cdx_xxx",
+      CODEX_ACCESS_TOKEN: "cat_xxx",
+      OPENAI_API_KEY: "sk-xxx",
+      GH_TOKEN: "ghp_xxx",
+    };
+    const saved = { ...process.env };
+    Object.assign(process.env, SECRETS);
+    try {
+      const runner = new FakeCommandRunner();
+      runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+      runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
+      const logs: string[] = [];
+      await makePlanner(runner, logs).checkAvailability();
+
+      // login status (calls[1]) must use the filtered env — not the parent env — so that
+      // hosts relying on env-var-only auth fail here at preflight rather than silently during run().
+      const authEnv = runner.calls[1]!.opts.env;
+      expect(authEnv).toBeDefined();
+      for (const key of Object.keys(SECRETS)) {
+        expect(authEnv).not.toHaveProperty(key);
+      }
+      expect(authEnv).toHaveProperty("HOME");
+    } finally {
+      for (const key of Object.keys(SECRETS)) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
   });
 
   it("codex --version が非0終了 → throw", async () => {

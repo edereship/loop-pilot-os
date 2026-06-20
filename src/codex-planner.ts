@@ -3,28 +3,66 @@ import type { CommandRunner, RunOptions } from "./types.js";
 
 const STDERR_TAIL_MAX = 1000;
 
-// Keep in sync with agent-runner.ts SENSITIVE_ENV_KEYS
-// CLAUDE_CODE_EFFORT_LEVEL is intentionally not filtered: Codex CLI does not
-// consume this env var (it is Claude Code specific).
-const SENSITIVE_ENV_KEYS = [
-  "LINEAR_API_KEY",
-  "SLACK_WEBHOOK_URL",
-  "GH_TOKEN",
-  "GITHUB_TOKEN",
-  "GH_ENTERPRISE_TOKEN",
-  "GITHUB_ENTERPRISE_TOKEN",
-  // Codex/OpenAI auth credentials: must not be exposed to the Codex child process
-  // because ticket-derived prompts run inside it and could exfiltrate them via shell.
-  "CODEX_API_KEY",
-  "OPENAI_API_KEY",
-  "CODEX_ACCESS_TOKEN",
-];
+// Allowlist of environment variables forwarded to the Codex child process.
+// An allowlist (rather than a denylist) is used because Codex exec can run
+// arbitrary shell commands inside its sandbox, so any credential present in
+// the environment can be exfiltrated. Only variables that Codex legitimately
+// needs are permitted; everything else — including AWS_SECRET_ACCESS_KEY,
+// NPM_TOKEN, and other CI secrets — is excluded automatically.
+//
+// Auth credentials (CODEX_API_KEY, CODEX_ACCESS_TOKEN, OPENAI_API_KEY) are
+// intentionally absent: the only supported authentication method is a cached
+// auth file (~/.codex/auth.json), which checkAvailability() verifies under
+// the same filtered environment before any exec run.
+const CODEX_CHILD_ENV_ALLOWLIST = new Set([
+  // Shell essentials
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  // Temporary directory
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  // Terminal and locale (output formatting)
+  "TERM",
+  "COLORTERM",
+  "TERM_PROGRAM",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "NO_COLOR",
+  "FORCE_COLOR",
+  // HTTP proxy (Codex needs to reach the OpenAI API)
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "NO_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "no_proxy",
+  // Custom OpenAI API base URL (not a credential)
+  "OPENAI_BASE_URL",
+  // XDG base directories (for Codex config and cache)
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  // SSH agent (for git operations inside the Codex sandbox)
+  "SSH_AUTH_SOCK",
+  "SSH_AGENT_PID",
+  // Git identity (for commits made within the Codex sandbox)
+  "GIT_AUTHOR_NAME",
+  "GIT_AUTHOR_EMAIL",
+  "GIT_COMMITTER_NAME",
+  "GIT_COMMITTER_EMAIL",
+]);
 
 function codexChildEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
-    if (SENSITIVE_ENV_KEYS.includes(key)) continue;
+    if (!CODEX_CHILD_ENV_ALLOWLIST.has(key)) continue;
     out[key] = value;
   }
   return out;
@@ -52,9 +90,14 @@ export class CodexPlanner {
   ) {}
 
   async run(ctx: CodexPlannerContext): Promise<CodexOutcome> {
+    // Default to read-only sandbox so planning prompts (which only need to
+    // read the worktree) cannot mutate files before implementation starts.
+    // Callers that need write access must pass "--sandbox" in extraArgs.
+    const hasCustomSandbox = this.opts.extraArgs?.some((a) => a === "--sandbox") ?? false;
     const args: string[] = [
       "exec",
       "--ephemeral",
+      ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
       ...(this.opts.extraArgs ?? []),
       ctx.prompt,
     ];
@@ -104,7 +147,10 @@ export class CodexPlanner {
 
     let authResult;
     try {
-      authResult = await this.runner.run("codex", ["login", "status"], { cwd: "." });
+      // Run the auth check with the same filtered environment as run() so that
+      // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
+      // fail here at preflight rather than silently at exec time.
+      authResult = await this.runner.run("codex", ["login", "status"], { cwd: ".", env: codexChildEnv() });
     } catch (err) {
       throw new Error(
         `codex: 認証状態を確認できません（${err instanceof Error ? err.message : String(err)}）`,
