@@ -481,6 +481,11 @@ export class Orchestrator {
       return await this.stopSession(session, "exception", errMsg(err));
     }
 
+    if (outcome.kind === "interrupted") {
+      this.store.updateSession(session.id, { costUsd: outcome.costUsd });
+      await this.haltForInterrupt();
+      return HALT;
+    }
     if (outcome.kind === "cost_exceeded") {
       this.store.updateSession(session.id, { costUsd: outcome.costUsd });
       await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));

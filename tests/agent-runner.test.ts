@@ -452,6 +452,16 @@ describe("classifyClaudeError", () => {
     expect(result.isRateLimit).toBe(false);
   });
 
+  it("does NOT match '429' in ticket-like identifiers (e.g. TY-429) without HTTP context", () => {
+    const result = classifyClaudeError(
+      "claude exited with code 1: TY-429 is stuck in review",
+      "",
+      [],
+      NOW,
+    );
+    expect(result.isRateLimit).toBe(false);
+  });
+
   it("uses config patterns instead of defaults when provided", () => {
     const result = classifyClaudeError(
       "CUSTOM_QUOTA_HIT",
@@ -791,6 +801,26 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     expect(logs.some((l) => l.includes("rate limit detected"))).toBe(true);
   });
 
+  it("returns completed when a successful run costs exactly the remaining budget (not cost_exceeded)", async () => {
+    const RESULT_SUCCESS_FULL_BUDGET =
+      '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":10.00,"result":"Completed the task","session_id":"s1"}';
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_FULL_BUDGET);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx); // ctx.maxCostUsd = 10
+
+    expect(outcome.kind).toBe("completed");
+    if (outcome.kind === "completed") {
+      expect(outcome.costUsd).toBeCloseTo(10.0);
+      expect(outcome.summary).toBe("Completed the task");
+    }
+  });
+
   it("does not sleep when rate-limit attempt exhausts the budget (Finding 2)", async () => {
     const RESULT_EXPENSIVE_429 =
       '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":10.00,"result":"429 Too Many Requests","session_id":"s1"}';
@@ -900,10 +930,7 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
     });
     const outcome = await agent.runSession(ctx);
 
-    expect(outcome.kind).toBe("error");
-    if (outcome.kind === "error") {
-      expect(outcome.message).toBe("interrupted during rate-limit backoff");
-    }
+    expect(outcome.kind).toBe("interrupted");
     expect(runner.calls).toHaveLength(1);
   });
 });

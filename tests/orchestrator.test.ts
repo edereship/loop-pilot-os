@@ -530,6 +530,29 @@ describe("Orchestrator 失敗系 — IMPLEMENT（仕様 §5.3 / カーネル §7
     expect(s.failureReason).toBe("exception");
     expect(s.stopDetail).toContain("no outcome queued");
   });
+
+  it("agent interrupted outcome → haltForInterrupt (session stays in implementing, run halts as user_interrupt)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "interrupted", costUsd: 0.5 }];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must NOT be marked stopped(exception) — it stays in implementing so
+    // a process restart can recover it via recoverByOpenPr.
+    expect(sessions[0]?.state).toBe("implementing");
+    expect(sessions[0]?.failureReason).toBeNull();
+    // Cost is recorded before halting.
+    expect(sessions[0]?.costUsd).toBeCloseTo(0.5);
+    // Run halts cleanly as user_interrupt, not exception.
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "user_interrupt" });
+  });
 });
 
 describe("Orchestrator 失敗系 — HANDOFF（仕様 §5.4 / カーネル §7.5）", () => {

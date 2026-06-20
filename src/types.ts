@@ -78,6 +78,7 @@ export interface SessionContext {
 export type AgentOutcome =
   | { kind: "completed"; costUsd: number; summary: string }
   | { kind: "cost_exceeded"; costUsd: number }
+  | { kind: "interrupted"; costUsd: number }
   | { kind: "error"; costUsd: number; message: string };
 export interface AgentRunner {
   runSession(ctx: SessionContext): Promise<AgentOutcome>;

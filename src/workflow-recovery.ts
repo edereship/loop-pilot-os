@@ -71,6 +71,14 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
       ...(ctx.hardTimeoutMs !== undefined ? { hardTimeoutMs: ctx.hardTimeoutMs } : {}),
     });
 
+    if (outcome.kind === "interrupted") {
+      this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
+      return {
+        kind: "unrecoverable",
+        costUsd: outcome.costUsd,
+        message: "fix agent interrupted",
+      };
+    }
     if (outcome.kind === "cost_exceeded") {
       this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
       return {

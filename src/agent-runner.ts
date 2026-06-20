@@ -115,7 +115,7 @@ function firstTextBlock(parsed: unknown): string | null {
 }
 
 const DEFAULT_CLAUDE_RATE_LIMIT_PATTERNS: RegExp[] = [
-  /\b429\b/,
+  /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b/i,
   /rate.?limit/i,
   /usage.?limit/i,
   /too many requests/i,
@@ -273,12 +273,16 @@ export class ClaudeAgentRunner implements AgentRunner {
       );
       totalCost += outcome.costUsd;
 
-      if (ctx.maxCostUsd - totalCost <= 0) {
-        return { kind: "cost_exceeded", costUsd: totalCost };
-      }
-
+      // Non-error outcomes (completed, cost_exceeded from the agent itself) are returned
+      // immediately. The budget guard only applies to error outcomes that may trigger a
+      // retry — a successful run that happens to exhaust the remaining budget must not
+      // be misreported as cost_exceeded.
       if (outcome.kind !== "error") {
         return { ...outcome, costUsd: totalCost };
+      }
+
+      if (ctx.maxCostUsd - totalCost <= 0) {
+        return { kind: "cost_exceeded", costUsd: totalCost };
       }
 
       const nowMs = rl.clock();
@@ -323,20 +327,12 @@ export class ClaudeAgentRunner implements AgentRunner {
         const SLEEP_CHUNK_MS = 10_000;
         for (let slept = 0; slept < waitMs; slept += SLEEP_CHUNK_MS) {
           if (rl.isInterrupted()) {
-            return {
-              kind: "error",
-              costUsd: totalCost,
-              message: "interrupted during rate-limit backoff",
-            };
+            return { kind: "interrupted", costUsd: totalCost };
           }
           await rl.sleep(Math.min(SLEEP_CHUNK_MS, waitMs - slept));
         }
         if (rl.isInterrupted()) {
-          return {
-            kind: "error",
-            costUsd: totalCost,
-            message: "interrupted during rate-limit backoff",
-          };
+          return { kind: "interrupted", costUsd: totalCost };
         }
       } else {
         await rl.sleep(waitMs);
