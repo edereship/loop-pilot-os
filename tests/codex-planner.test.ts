@@ -88,6 +88,18 @@ describe("CodexPlanner.run", () => {
     expect(runner.calls[0]!.opts.timeoutMs).toBeUndefined();
   });
 
+  it("codex exec は opts.stdin を 'ignore' に設定して起動する（stdin ハング防止）", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 0, stdout: "ok\n", stderr: "" });
+    const logs: string[] = [];
+    await makePlanner(runner, logs).run({
+      worktreePath: "/wt",
+      prompt: "Do something.",
+    });
+
+    expect(runner.calls[0]!.opts.stdin).toBe("ignore");
+  });
+
   it("codex 子プロセスに機密 env を渡さない（IPI 漏えい防止）", async () => {
     const SECRETS = {
       LINEAR_API_KEY: "lin_xxx",
@@ -96,6 +108,9 @@ describe("CodexPlanner.run", () => {
       GITHUB_TOKEN: "gho_xxx",
       GH_ENTERPRISE_TOKEN: "ghp_ent",
       GITHUB_ENTERPRISE_TOKEN: "gho_ent",
+      CODEX_API_KEY: "cdx_xxx",
+      OPENAI_API_KEY: "sk-xxx",
+      CODEX_ACCESS_TOKEN: "cat_xxx",
     };
     const saved = { ...process.env };
     Object.assign(process.env, SECRETS);
@@ -266,9 +281,10 @@ describe("CodexPlanner.run", () => {
 });
 
 describe("CodexPlanner.checkAvailability", () => {
-  it("codex --version が成功 → バージョン文字列を返す", async () => {
+  it("codex --version が成功かつ認証済み → バージョン文字列を返す", async () => {
     const runner = new FakeCommandRunner();
     runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 0, stdout: "", stderr: "" });
     const logs: string[] = [];
     const version = await makePlanner(runner, logs).checkAvailability();
 
@@ -276,6 +292,7 @@ describe("CodexPlanner.checkAvailability", () => {
     expect(runner.calls[0]!.cmd).toBe("codex");
     expect(runner.calls[0]!.args).toEqual(["--version"]);
     expect(runner.calls[0]!.opts.cwd).toBe(".");
+    expect(runner.calls[1]!.args).toEqual(["login", "status"]);
   });
 
   it("codex --version が非0終了 → throw", async () => {
@@ -300,6 +317,30 @@ describe("CodexPlanner.checkAvailability", () => {
     );
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
       /ENOENT/,
+    );
+  });
+
+  it("codex login status が非0終了（未認証）→ 認証エラーで throw", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], { code: 1, stdout: "", stderr: "not logged in" });
+    const logs: string[] = [];
+
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
+      /認証されていません|codex login/,
+    );
+  });
+
+  it("codex login status が spawn 失敗 → 認証確認エラーで throw", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["codex", "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+    runner.on(["codex", "login", "status"], () => {
+      throw new Error("spawn codex ENOENT");
+    });
+    const logs: string[] = [];
+
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
+      /認証状態を確認できません/,
     );
   });
 });

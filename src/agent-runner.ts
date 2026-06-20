@@ -29,6 +29,11 @@ const SENSITIVE_ENV_KEYS = [
   "GITHUB_TOKEN",
   "GH_ENTERPRISE_TOKEN",
   "GITHUB_ENTERPRISE_TOKEN",
+  // Codex/OpenAI auth credentials: must not be exposed to the claude child process
+  // because ticket-derived prompts run inside it and could exfiltrate them via Bash.
+  "CODEX_API_KEY",
+  "OPENAI_API_KEY",
+  "CODEX_ACCESS_TOKEN",
 ];
 
 /** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。

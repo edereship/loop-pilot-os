@@ -11,6 +11,10 @@ export class RealCommandRunner implements CommandRunner {
         shell: false,
       });
 
+      if (opts.stdin === "ignore") {
+        child.stdin?.end();
+      }
+
       let stdout = "";
       let stderr = "";
       let lineBuffer = "";

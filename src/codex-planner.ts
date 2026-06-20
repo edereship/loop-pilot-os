@@ -13,6 +13,11 @@ const SENSITIVE_ENV_KEYS = [
   "GITHUB_TOKEN",
   "GH_ENTERPRISE_TOKEN",
   "GITHUB_ENTERPRISE_TOKEN",
+  // Codex/OpenAI auth credentials: must not be exposed to the Codex child process
+  // because ticket-derived prompts run inside it and could exfiltrate them via shell.
+  "CODEX_API_KEY",
+  "OPENAI_API_KEY",
+  "CODEX_ACCESS_TOKEN",
 ];
 
 function codexChildEnv(): Record<string, string> {
@@ -57,6 +62,7 @@ export class CodexPlanner {
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
       env: codexChildEnv(),
+      stdin: "ignore",
       ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
     };
 
@@ -94,6 +100,20 @@ export class CodexPlanner {
     if (result.code !== 0) {
       throw new Error("codex CLI not found or not available");
     }
-    return result.stdout.trim();
+    const version = result.stdout.trim();
+
+    let authResult;
+    try {
+      authResult = await this.runner.run("codex", ["login", "status"], { cwd: "." });
+    } catch (err) {
+      throw new Error(
+        `codex: 認証状態を確認できません（${err instanceof Error ? err.message : String(err)}）`,
+      );
+    }
+    if (authResult.code !== 0) {
+      throw new Error("codex: 認証されていません（codex login を実行してください）");
+    }
+
+    return version;
   }
 }
