@@ -577,6 +577,19 @@ describe("parseResetsTime", () => {
     const result = parseResetsTime("reset at 7am (Invalid/Zone)", NOW);
     expect(result).toBeNull();
   });
+
+  it("parses 'resets H:MMpm (Timezone)' with minutes and no 'at' (Finding 2)", () => {
+    // NOW = 2026-06-20T10:00:00Z = 18:00 SGT (+8). 6:40pm SGT = 10:40 UTC same day.
+    const result = parseResetsTime("resets 6:40pm (Asia/Singapore)", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T10:40:00.000Z"));
+  });
+
+  it("parses 'resets H:MMam (Timezone)' with minutes that wraps to next day (Finding 2)", () => {
+    // NOW = 2026-06-20T10:00:00Z = 18:00 SGT (+8). 6:40am SGT = 22:40 UTC previous day
+    // → wraps to 2026-06-20T22:40:00Z (next occurrence, i.e. tonight SGT).
+    const result = parseResetsTime("resets 6:40am (Asia/Singapore)", NOW);
+    expect(result).toBe(Date.parse("2026-06-20T22:40:00.000Z"));
+  });
 });
 
 // --- Rate limit retry loop tests ---
@@ -998,6 +1011,33 @@ describe("ClaudeAgentRunner rate limit retry loop", () => {
       "GitHub API rate limit exceeded",
     );
     expect(result.isRateLimit).toBe(false);
+  });
+
+  it("retries when api_error_status:429 with non-empty result text like 'Claude usage limit reached' (Finding 3)", async () => {
+    // Claude can emit api_error_status:429 together with a human-readable message.
+    // The rate-limit classifier must detect this even when the result text does not
+    // contain a literal HTTP/429 token.
+    const RESULT_API_ERROR_429_WITH_TEXT =
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.01,"api_error_status":429,"result":"Claude usage limit reached for this billing period","session_id":"s1"}';
+    let callCount = 0;
+    const runner = new FakeCommandRunner();
+    runner.on(["claude"], (_args: string[], opts: RunOptions): Partial<CommandResult> => {
+      callCount++;
+      if (callCount === 1) {
+        opts.onStdoutLine?.(INIT_LINE);
+        opts.onStdoutLine?.(RESULT_API_ERROR_429_WITH_TEXT);
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      opts.onStdoutLine?.(INIT_LINE);
+      opts.onStdoutLine?.(RESULT_SUCCESS_LINE);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const logs: string[] = [];
+    const { agent } = makeRunnerWithRateLimit(runner, logs);
+    const outcome = await agent.runSession(ctx);
+
+    expect(outcome.kind).toBe("completed");
+    expect(runner.calls).toHaveLength(2);
   });
 
   it("interrupts rate-limit sleep when isInterrupted fires (Finding 4)", async () => {

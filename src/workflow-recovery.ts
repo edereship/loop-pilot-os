@@ -73,6 +73,23 @@ export class AgentWorkflowRecovery implements WorkflowRecovery {
 
     if (outcome.kind === "interrupted") {
       this.totalCostUsdByPr.set(prNumber, totalCostUsd + outcome.costUsd);
+      // If the fix agent committed work before being interrupted (e.g. during a
+      // rate-limit sleep), push those commits now. Without this, the next call to
+      // attemptRecovery would run syncBranchToOrigin which does
+      // `git reset --hard origin/<branch>` and silently discards the local commits.
+      const logResult = await this.runner.run(
+        "git",
+        ["-C", ctx.worktreePath, "log", `origin/${ctx.branch}..HEAD`, "--oneline"],
+        { cwd: ctx.worktreePath },
+      );
+      if (logResult.stdout.trim() !== "") {
+        try {
+          await this.pushFix(ctx.branch, ctx.worktreePath);
+        } catch {
+          // Push failed — commits stay local-only. Nothing more we can do; the
+          // interrupted outcome is still returned so the caller can stop the session.
+        }
+      }
       return { kind: "interrupted", costUsd: outcome.costUsd };
     }
     if (outcome.kind === "cost_exceeded") {

@@ -132,9 +132,11 @@ const RESULT_TEXT_429_PATTERN =
   /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\b429\b.*Too Many Requests/i;
 
 const RESETS_PATTERN = /resets?\s+(\d{2}):(\d{2})/i;
-// Matches "reset at 7am (Asia/Singapore)" / "reset at 5pm (Europe/Kyiv)" — the
-// format emitted by the real Claude Code CLI in quota messages (HH:MM not used).
-const RESETS_AT_AMPM_PATTERN = /reset\s+at\s+(\d{1,2})(am|pm)\s*\(([^)]+)\)/i;
+// Matches both:
+//   "reset at 7am (Asia/Singapore)"  — format without minutes (original CLI shape)
+//   "resets 6:40pm (America/New_York)" — format with minutes, no "at" (Finding 2)
+// Groups: (hour)(optional-minutes)(am|pm)(timezone)
+const RESETS_AT_AMPM_PATTERN = /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?(am|pm)\s*\(([^)]+)\)/i;
 
 export interface RateLimitClassification {
   isRateLimit: boolean;
@@ -144,10 +146,13 @@ export interface RateLimitClassification {
 function parseResetsAtAmPm(text: string, nowMs: number): number | null {
   const match = RESETS_AT_AMPM_PATTERN.exec(text);
   if (!match) return null;
+  // Groups after extending pattern for optional minutes: (hour)(minutes?)(am|pm)(tz)
   let targetHour = parseInt(match[1]!, 10);
-  const ampm = match[2]!.toLowerCase();
-  const tz = match[3]!;
+  const targetMinutes = match[2] !== undefined ? parseInt(match[2], 10) : 0;
+  const ampm = match[3]!.toLowerCase();
+  const tz = match[4]!;
   if (targetHour < 1 || targetHour > 12) return null;
+  if (targetMinutes > 59) return null;
   if (ampm === "am") {
     if (targetHour === 12) targetHour = 0;
   } else {
@@ -166,7 +171,7 @@ function parseResetsAtAmPm(text: string, nowMs: number): number | null {
     // hour12:false can yield "24" for midnight in some environments; normalise to 0-23.
     const currentHour = parseInt(hourPart.value, 10) % 24;
     const currentMinute = parseInt(minutePart.value, 10);
-    let deltaMs = (targetHour - currentHour) * 3_600_000 - currentMinute * 60_000;
+    let deltaMs = (targetHour - currentHour) * 3_600_000 + (targetMinutes - currentMinute) * 60_000;
     // Only wrap to next day if the target is more than 60s in the past (same
     // semantics as the HH:MM parser: a near-past value means the reset is now).
     if (deltaMs < -60_000) deltaMs += 24 * 3_600_000;
@@ -314,12 +319,13 @@ export class ClaudeAgentRunner implements AgentRunner {
     const cmdResult = await this.runner.run("claude", args, opts);
     const rl = resultLine as ResultLine | null;
     const outcome = this.toOutcome(rl, cmdResult.code, cmdResult.stderr);
-    // Prefer the agent's result text; when it is absent but the result line
-    // carries api_error_status: 429, synthesise an HTTP/429 token so the
-    // rate-limit classifier can detect the failure even with empty stderr.
+    // When the result line carries api_error_status: 429, synthesise an HTTP/429
+    // token so the rate-limit classifier can detect the failure regardless of
+    // whether the result text is empty or contains a human-readable message like
+    // "Claude usage limit reached" that would not match RESULT_TEXT_429_PATTERN.
     let resultText = rl?.result ?? "";
-    if (!resultText && rl?.api_error_status === 429) {
-      resultText = "HTTP/429 Too Many Requests";
+    if (rl?.api_error_status === 429) {
+      resultText = resultText ? `${resultText}\nHTTP/429 Too Many Requests` : "HTTP/429 Too Many Requests";
     }
     return { outcome, stderr: cmdResult.stderr, resultText, sessionId: capturedSessionId, exitCode: cmdResult.code };
   }

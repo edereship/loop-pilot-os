@@ -302,6 +302,63 @@ describe("AgentWorkflowRecovery", () => {
     expect(r3).toEqual<RecoveryOutcome>({ kind: "exhausted", costUsd: 0.7 });
   });
 
+  it("agent interrupted: pushes local commits before returning interrupted (Finding 4)", async () => {
+    // If the fix agent made commits then was interrupted (e.g. during rate-limit sleep),
+    // those commits must be pushed immediately. Otherwise, the next attemptRecovery call
+    // starts with syncBranchToOrigin which does `git reset --hard origin/<branch>` and
+    // silently discards the local-only commits.
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef fix commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.05 });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeDefined();
+    expect(pushCall!.args).toEqual(["push", "origin", "HEAD:looppilot/ty-1-fix"]);
+  });
+
+  it("agent interrupted with no local commits: does not push (Finding 4)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "" }; // no commits ahead
+      return { code: 0 };
+    });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.0 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.0 });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
+  it("agent interrupted: push failure is silently swallowed, interrupted still returned (Finding 4)", async () => {
+    const { recovery, agent, runner } = makeRecovery();
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "deadbeef fix commit\n" };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 1, stderr: "rejected: not fast-forward" });
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.05 }];
+
+    const result = await recovery.attemptRecovery(ctx());
+
+    // Push failed, but we still return interrupted (not unrecoverable) — best-effort.
+    expect(result).toEqual<RecoveryOutcome>({ kind: "interrupted", costUsd: 0.05 });
+  });
+
   it("buildFixPrompt includes the error body", async () => {
     const { recovery, agent, runner } = makeRecovery();
     agent.outcomes = [{ kind: "completed", costUsd: 0.1, summary: "ok" }];
