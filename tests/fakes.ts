@@ -129,7 +129,7 @@ export class FakeTaskSource implements TaskSource {
   /** メソッド名 → 次の1回だけ throw させるエラー */
   private failOnce = new Map<string, Error>();
 
-  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment", error?: Error): void {
+  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment" | "getAllEligible", error?: Error): void {
     this.failOnce.set(method, error ?? new Error(`FakeTaskSource.${method} injected failure`));
   }
 
@@ -166,6 +166,7 @@ export class FakeTaskSource implements TaskSource {
   }
 
   async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
+    this.eligibleCalls.push([...excludeIds]);
     this.takeFailure("getAllEligible");
     const exclude = new Set(excludeIds);
     return this.queue.filter((i) => !exclude.has(i.id));
@@ -272,9 +273,13 @@ export class FakeGitPr implements GitPrManager {
     this.takeFailure("discardWorktree");
   }
 
+  prDiffSummaries = new Map<number, import("../src/types.js").PrDiffSummary>();
+
   async getPrDiffSummary(prNumber: number): Promise<import("../src/types.js").PrDiffSummary> {
     this.calls.push({ method: "getPrDiffSummary", args: [prNumber] });
     this.takeFailure("getPrDiffSummary");
+    const preset = this.prDiffSummaries.get(prNumber);
+    if (preset) return preset;
     return { title: `PR #${prNumber}`, body: "", diff: "" };
   }
 }

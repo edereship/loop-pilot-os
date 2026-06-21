@@ -479,6 +479,66 @@ describe("GitPrManager.mergePr", () => {
   });
 });
 
+describe("GitPrManager.getPrDiffSummary", () => {
+  // カーネル §ES-382: gh pr view --json title,body + gh pr diff でサマリを返す。
+  it("returns title, body, and diff from gh commands", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view", "42"], (args) => {
+      if (args.includes("--json")) {
+        return { code: 0, stdout: JSON.stringify({ title: "TY-1: Fix bug", body: "Fixes the login bug" }), stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    runner.on(["gh", "pr", "diff", "42"], {
+      code: 0,
+      stdout: "diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1,2 @@\n line\n+added\n",
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.getPrDiffSummary(42);
+    expect(result.title).toBe("TY-1: Fix bug");
+    expect(result.body).toBe("Fixes the login bug");
+    expect(result.diff).toContain("diff --git");
+  });
+
+  // GitHub API は body が null を返し得る。null は空文字に正規化する。
+  it("coerces a null body to an empty string", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view", "42"], {
+      code: 0,
+      stdout: JSON.stringify({ title: "TY-2: Add feature", body: null }),
+      stderr: "",
+    });
+    runner.on(["gh", "pr", "diff", "42"], { code: 0, stdout: "diff --git a/x b/x\n", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.getPrDiffSummary(42);
+    expect(result.body).toBe("");
+  });
+
+  it("throws when gh pr view exits non-zero", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view", "99"], { code: 1, stdout: "", stderr: "not found" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.getPrDiffSummary(99)).rejects.toThrow(/gh pr view failed/);
+  });
+
+  it("throws when gh pr diff exits non-zero", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view", "99"], {
+      code: 0,
+      stdout: JSON.stringify({ title: "TY-3: Some fix", body: "body" }),
+      stderr: "",
+    });
+    runner.on(["gh", "pr", "diff", "99"], { code: 1, stdout: "", stderr: "diff failed" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.getPrDiffSummary(99)).rejects.toThrow(/gh pr diff failed/);
+  });
+});
+
 describe("GitPrManager.discardWorktree", () => {
   // カーネル §5.2: worktree remove --force <wt> → branch -D <branch>（この順）
   it("removes the worktree first then deletes the branch, in that order", async () => {

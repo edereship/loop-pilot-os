@@ -280,10 +280,11 @@ export class GitPrManager implements GitPrManagerInterface {
         `gh pr view failed for #${prNumber}: ${viewRes.stderr.trim() || `exit ${viewRes.code}`}`,
       );
     }
-    const { title, body } = JSON.parse(viewRes.stdout) as {
+    const { title, body: rawBody } = JSON.parse(viewRes.stdout) as {
       title: string;
-      body: string;
+      body: string | null;
     };
+    const body = rawBody ?? "";
 
     const diffRes = await this.runner.run(
       "gh",

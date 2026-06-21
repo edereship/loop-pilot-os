@@ -433,3 +433,68 @@ describe("LinearTaskSource.postComment", () => {
     ).rejects.toThrow(/Linear GraphQL error/i);
   });
 });
+
+describe("LinearTaskSource.getAllEligible", () => {
+  // getAllEligible は全適格チケットを決定的順序（①意味的優先度 ②sortOrder ③id）で返す。
+  // linear-eligible.json は Medium/Urgent/None/Low/High の順で格納。
+  it("returns all eligible issues sorted by priority→sortOrder→id, excluding excludeIds", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-eligible.json") },
+    ]);
+    // "b" は i-high に対応しないが、実際の id で excludeIds を渡す。
+    // i-high (priority=2, sortOrder=50) を除外して残りの 4 件が返ることを確認する。
+    const result = await makeSource(fetchFn).getAllEligible(["i-high"]);
+    expect(result).toHaveLength(4);
+    // 先頭は Urgent (priority=1)。
+    expect(result[0].id).toBe("i-urgent");
+    expect(result[0].identifier).toBe("TY-1");
+    // 2番目は Medium (priority=3)。i-high は除外済み。
+    expect(result[1].id).toBe("i-medium");
+    expect(result[1].identifier).toBe("TY-3");
+    // 末尾は No priority (priority=0 → rank=4)。
+    expect(result[3].id).toBe("i-none");
+  });
+
+  it("returns all issues when excludeIds is empty", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-eligible.json") },
+    ]);
+    const result = await makeSource(fetchFn).getAllEligible([]);
+    // linear-eligible.json には 5 件
+    expect(result).toHaveLength(5);
+    // 先頭は Urgent、末尾は No priority
+    expect(result[0].id).toBe("i-urgent");
+    expect(result[4].id).toBe("i-none");
+  });
+
+  it("returns empty array when no eligible tickets exist", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-eligible-empty.json") },
+    ]);
+    const result = await makeSource(fetchFn).getAllEligible([]);
+    expect(result).toHaveLength(0);
+  });
+
+  it("returns empty array when every eligible issue is excluded", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-eligible.json") },
+    ]);
+    const result = await makeSource(fetchFn).getAllEligible([
+      "i-urgent", "i-high", "i-medium", "i-low", "i-none",
+    ]);
+    expect(result).toHaveLength(0);
+  });
+
+  // getAllEligible は getNextEligible と同じクエリ引数（projectId/todoStateId/label）を使う。
+  it("sends correct query variables for the todo state", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: fixture("linear-eligible.json") },
+    ]);
+    await makeSource(fetchFn).getAllEligible([]);
+    expect(calls[0].variables).toEqual({
+      projectId: "project-uuid-1",
+      todoStateId: "state-todo",
+      label: "ai-ok",
+    });
+  });
+});
