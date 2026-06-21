@@ -311,6 +311,7 @@ export class SqliteStore {
         | "failureReason"
         | "stopDetail"
         | "agentSummary"
+        | "planBrief"
         | "monitorStartedAt"
         | "endedAt"
         | "runId"

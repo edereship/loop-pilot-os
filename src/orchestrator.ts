@@ -15,8 +15,12 @@ import type {
   RecoveryContext,
   RecoveryOutcome,
   WorkflowRecovery,
+  PlanRunner,
+  PlanBrief,
+  PlanOutcome,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
+import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
@@ -37,6 +41,7 @@ export interface OrchestratorDeps {
   sleep: (ms: number) => Promise<void>;
   log: (line: string) => void;
   recovery: WorkflowRecovery;
+  planner: PlanRunner | null;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -61,6 +66,7 @@ export class Orchestrator {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: (line: string) => void;
   private readonly recovery: WorkflowRecovery;
+  private readonly planner: PlanRunner | null;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -79,6 +85,7 @@ export class Orchestrator {
     this.sleep = deps.sleep;
     this.log = deps.log;
     this.recovery = deps.recovery;
+    this.planner = deps.planner;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -446,20 +453,24 @@ export class Orchestrator {
       if (claim.control === "halt") return;
       const session = claim.session;
 
-      // 4) IMPLEMENT
+      // 4) PLAN
+      const plan = await this.plan(session, issue);
+      if (plan.control === "halt") return;
+
+      // 5) IMPLEMENT (was 4)
       const impl = await this.implement(session, issue);
       if (impl.control === "halt") return;
 
-      // 5) HANDOFF
+      // 6) HANDOFF (was 5)
       const handoff = await this.handoff(session, issue);
       if (handoff.control === "halt") return;
       const prNumber = handoff.prNumber;
 
-      // 6) MONITOR
+      // 7) MONITOR (was 6)
       const mon = await this.monitorSession(session, prNumber);
       if (mon.control === "halt") return;
 
-      // 7) DONE
+      // 8) DONE (was 7)
       await this.done(session, issue);
       // ループ継続（SELECT へ）
     }
@@ -506,6 +517,54 @@ export class Orchestrator {
       });
     }
     return { control: "continue", session };
+  }
+
+  // ---- PLAN（スコープ doc A2 / §1.1 / §1.5） ----
+  private async plan(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+  ): Promise<{ control: "continue"; brief: PlanBrief | null } | { control: "halt" }> {
+    if (this.planner === null) {
+      return { control: "continue", brief: null };
+    }
+
+    const worktreePath = session.worktreePath as string;
+
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(worktreePath, specDir);
+      } catch (err) {
+        this.log(`plan: spec loading failed, falling back to raw ticket: ${errMsg(err)}`);
+        return { control: "continue", brief: null };
+      }
+    }
+
+    const prompt = buildPlanPrompt({ issue, specContent });
+
+    let outcome: PlanOutcome;
+    try {
+      outcome = await this.planner.run({
+        worktreePath,
+        prompt,
+        timeoutMs: this.config.safety.codexTimeoutMinutes * 60_000,
+      });
+    } catch (err) {
+      this.log(`plan: codex exception, falling back to raw ticket: ${errMsg(err)}`);
+      return { control: "continue", brief: null };
+    }
+
+    if (outcome.kind === "error") {
+      this.log(`plan: codex failed, falling back to raw ticket: ${outcome.message}`);
+      return { control: "continue", brief: null };
+    }
+
+    const brief = parseBrief(outcome.text);
+    this.log(`plan: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
+    this.store.updateSession(session.id, { planBrief: brief.raw });
+
+    return { control: "continue", brief };
   }
 
   // ---- IMPLEMENT（仕様 §5.3） ----

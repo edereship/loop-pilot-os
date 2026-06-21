@@ -8,11 +8,12 @@ import {
   FakeMonitor,
   FakeNotifier,
   FakeWorkflowRecovery,
+  FakePlanRunner,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
 import type { Config } from "../src/config.js";
-import type { EligibleIssue, PromptArgs } from "../src/types.js";
+import type { EligibleIssue, PromptArgs, PlanRunner } from "../src/types.js";
 
 // ---- テストヘルパ ----
 function makeConfig(over: Partial<{
@@ -74,7 +75,7 @@ interface Harness {
   promptArgs: PromptArgs[];
 }
 
-function makeHarness(config: Config): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -111,6 +112,7 @@ function makeHarness(config: Config): Harness {
     sleep,
     log,
     recovery,
+    planner: opts?.planner ?? null,
   });
   return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
 }
@@ -610,6 +612,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       sleep: instantSleep(),
       log: (line: string) => { logs.push(line); },
       recovery,
+      planner: null,
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -1971,5 +1974,143 @@ describe("Orchestrator 進捗通知 — notify.progress opt-in（ES-378）", () 
     expect(merged).toHaveLength(2);
     expect((merged[0] as { mergedCount: number }).mergedCount).toBe(1);
     expect((merged[1] as { mergedCount: number }).mergedCount).toBe(2);
+  });
+});
+
+describe("Orchestrator PLAN phase (ES-381)", () => {
+  it("generates brief via planner, persists to DB, and proceeds to IMPLEMENT", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo the thing.\n\n## Change Targets\n- file.ts\n\n## Implementation Steps\n1. Step one\n\n## Acceptance Criteria\n- Tests pass\n\n## Out of Scope\n- Nothing" },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Planner was called
+    expect(planner.calls).toHaveLength(1);
+    expect(planner.calls[0]!.worktreePath).toBe("/wt/ty-1");
+    expect(planner.calls[0]!.prompt).toContain("TY-1");
+
+    // Brief persisted in DB
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.planBrief).toContain("## Goal");
+    expect(s.planBrief).toContain("Do the thing.");
+  });
+
+  it("falls back to null brief when planner returns error", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "error", message: "codex crashed" }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Still completed — fallback worked
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.planBrief).toBeNull();
+    expect(h.logs.some((l) => l.includes("codex failed") && l.includes("codex crashed"))).toBe(true);
+  });
+
+  it("falls back to null brief when planner throws", async () => {
+    const planner = new FakePlanRunner();
+    // No outcomes queued → FakePlanRunner throws
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.planBrief).toBeNull();
+    expect(h.logs.some((l) => l.includes("codex exception"))).toBe(true);
+  });
+
+  it("skips PLAN entirely when planner is null", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config); // planner defaults to null
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.planBrief).toBeNull();
+    // No plan-related log lines
+    expect(h.logs.some((l) => l.includes("plan:"))).toBe(false);
+  });
+
+  it("falls back when spec loading fails during PLAN (IMPLEMENT also stops)", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "completed", text: "## Goal\nShould not reach." }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const specConfig = { ...config, product: { ...config.product, specDir: "docs/specs" } } as Config;
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const agent = new FakeAgentRunner();
+    const git = new FakeGitPr();
+    const monitor = new FakeMonitor();
+    const notifier = new FakeNotifier();
+    const logs: string[] = [];
+    const orch = new Orchestrator({
+      config: specConfig,
+      source,
+      agent,
+      git,
+      monitor,
+      notifier,
+      store,
+      buildPrompt: (args: PromptArgs) => `PROMPT for ${args.issue.identifier}`,
+      specLoader: () => { throw new Error("requirements.md not found"); },
+      clock: fixedClock("2026-06-05T00:00:00.000Z"),
+      sleep: instantSleep(),
+      log: (line: string) => { logs.push(line); },
+      recovery: new FakeWorkflowRecovery(),
+      planner,
+    });
+
+    source.queue = [issue("issue-A", "TY-1")];
+    agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    monitor.verdicts = [{ kind: "merged" }];
+
+    await orch.run();
+
+    // PLAN fell back gracefully (did not halt the loop)
+    expect(planner.calls).toHaveLength(0);
+    expect(logs.some((l) => l.includes("plan: spec loading failed"))).toBe(true);
+    // IMPLEMENT independently also fails on spec loading → session stopped
+    const s = store.sessionsForRun(store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.planBrief).toBeNull();
+  });
+
+  it("passes codexTimeoutMinutes as timeoutMs to the planner", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "completed", text: "## Goal\nDone." }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // codexTimeoutMinutes=30 → 30 * 60_000 = 1_800_000 ms
+    expect(planner.calls[0]!.timeoutMs).toBe(30 * 60_000);
   });
 });
