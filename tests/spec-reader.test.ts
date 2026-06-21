@@ -51,6 +51,23 @@ describe("loadSpecContent", () => {
     expect(() => loadSpecContent(repoPath, "nonexistent/dir")).toThrow(/product\.spec_dir/);
   });
 
+  it("spec_dir が絶対パスのとき拒否する", () => {
+    const { repoPath } = makeTmpSpecDir({ "requirements.md": "要求" });
+    expect(() => loadSpecContent(repoPath, "/docs/specs")).toThrow(/relative/);
+  });
+
+  it("spec_dir が .. でリポジトリ外に逃げるとき拒否する", () => {
+    const { repoPath } = makeTmpSpecDir({ "requirements.md": "要求" });
+    expect(() => loadSpecContent(repoPath, "../outside")).toThrow(/outside/);
+  });
+
+  it("spec_dir が .. を含むがリポジトリ内に留まるとき許可する（パス解決後にリポジトリ外へ出ない）", () => {
+    const { repoPath } = makeTmpSpecDir({ "requirements.md": "要求" });
+    // docs/../docs/specs resolves to docs/specs which exists with requirements.md → succeeds
+    const result = loadSpecContent(repoPath, "docs/../docs/specs");
+    expect(result.requirements).toBe("要求");
+  });
+
   it("README.md を領域ファイルから除外する", () => {
     const { repoPath, specDir } = makeTmpSpecDir({
       "requirements.md": "要求",

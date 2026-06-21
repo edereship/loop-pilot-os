@@ -188,16 +188,6 @@ async function runLoop(configPath: string): Promise<number> {
       logLine,
     );
 
-    let specContent = null;
-    if (config.product.specDir) {
-      try {
-        specContent = loadSpecContent(config.repo.path, config.product.specDir);
-      } catch (err) {
-        process.stderr.write(`Spec loading failed: ${(err as Error).message}\n`);
-        return EXIT_PREFLIGHT;
-      }
-    }
-
     const orchestrator = new Orchestrator({
       config,
       source,
@@ -207,7 +197,7 @@ async function runLoop(configPath: string): Promise<number> {
       notifier,
       store,
       buildPrompt,
-      specContent,
+      specLoader: config.product.specDir ? loadSpecContent : null,
       clock: nowIso,
       sleep,
       log: logLine,

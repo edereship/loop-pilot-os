@@ -106,7 +106,7 @@ function makeHarness(config: Config): Harness {
     notifier,
     store,
     buildPrompt,
-    specContent: null,
+    specLoader: null,
     clock: fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,

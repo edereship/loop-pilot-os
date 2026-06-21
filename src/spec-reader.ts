@@ -3,7 +3,18 @@ import path from "node:path";
 import type { SpecContent } from "./types.js";
 
 export function loadSpecContent(repoPath: string, specDir: string): SpecContent {
-  const dir = path.resolve(repoPath, specDir);
+  if (path.isAbsolute(specDir)) {
+    throw new Error(
+      `product.spec_dir must be a relative path, got "${specDir}"`,
+    );
+  }
+  const repoNorm = path.resolve(repoPath);
+  const dir = path.resolve(repoNorm, specDir);
+  if (dir !== repoNorm && !dir.startsWith(repoNorm + path.sep)) {
+    throw new Error(
+      `product.spec_dir "${specDir}" resolves outside the repository at "${repoPath}"`,
+    );
+  }
 
   let entries: string[];
   try {

@@ -31,7 +31,8 @@ export interface OrchestratorDeps {
   notifier: Notifier;
   store: SqliteStore;
   buildPrompt: (args: PromptArgs) => string;
-  specContent: SpecContent | null;
+  /** Called per-session with the worktree path (post-fetch) and specDir. Null when spec_dir is unset. */
+  specLoader: ((repoPath: string, specDir: string) => SpecContent) | null;
   clock: () => string;
   sleep: (ms: number) => Promise<void>;
   log: (line: string) => void;
@@ -55,7 +56,7 @@ export class Orchestrator {
   private readonly notifier: Notifier;
   private readonly store: SqliteStore;
   private readonly buildPrompt: (args: PromptArgs) => string;
-  private readonly specContent: SpecContent | null;
+  private readonly specLoader: ((repoPath: string, specDir: string) => SpecContent) | null;
   private readonly clock: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: (line: string) => void;
@@ -73,7 +74,7 @@ export class Orchestrator {
     this.notifier = deps.notifier;
     this.store = deps.store;
     this.buildPrompt = deps.buildPrompt;
-    this.specContent = deps.specContent;
+    this.specLoader = deps.specLoader;
     this.clock = deps.clock;
     this.sleep = deps.sleep;
     this.log = deps.log;
@@ -513,13 +514,22 @@ export class Orchestrator {
     const digest = this.config.digest.enabled
       ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
       : [];
+    const worktreePath = session.worktreePath as string;
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(worktreePath, specDir);
+      } catch (err) {
+        return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
+      }
+    }
     const prompt = this.buildPrompt({
       goal: this.config.product.goal ?? null,
-      specContent: this.specContent,
+      specContent,
       issue,
       digest,
     });
-    const worktreePath = session.worktreePath as string;
     let outcome: AgentOutcome;
     try {
       outcome = await this.agent.runSession({
