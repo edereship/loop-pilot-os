@@ -92,7 +92,7 @@ export function formatDiffContext(
 ): string {
   const blocks: string[] = [];
 
-  blocks.push(`PR: ${summary.title}`);
+  blocks.push(`PR (${identifier}): ${summary.title}`);
   if (summary.body.trim().length > 0) {
     blocks.push(summary.body.trim());
   }
