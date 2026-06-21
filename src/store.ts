@@ -252,7 +252,7 @@ export class SqliteStore {
 
   setRunState(id: number, state: RunState, haltReason?: string): void {
     const info = this.db
-      .prepare(`UPDATE run SET state = ?, halt_reason = ? WHERE id = ?`)
+      .prepare(`UPDATE run SET state = ?, halt_reason = ?, pause_meta = NULL WHERE id = ?`)
       .run(state, haltReason ?? null, id);
     if (info.changes !== 1) {
       throw new Error(`setRunState affected ${info.changes} rows for run id=${id}`);

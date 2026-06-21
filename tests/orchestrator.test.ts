@@ -2349,7 +2349,9 @@ describe("Orchestrator.interruptablePause", () => {
     const resumedEvents = h.notifier.events.filter((e) => e.kind === "resumed");
     expect(resumedEvents).toHaveLength(0);
 
-    expect(h.store.getRun(run.id).state).toBe("halted");
+    const halted = h.store.getRun(run.id);
+    expect(halted.state).toBe("halted");
+    expect(halted.pauseMeta).toBeNull();
 
     // Sleep was never called (interrupted before first chunk)
     expect(h.sleepCalls).toHaveLength(0);

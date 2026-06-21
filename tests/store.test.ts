@@ -83,6 +83,24 @@ describe("SqliteStore: run", () => {
     expect(() => store.setRunState(999, "running")).toThrow();
   });
 
+  it("setRunState clears pause_meta when transitioning away from paused", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    store.setPauseMeta(run.id, {
+      reason: "rate_limit",
+      target: "claude",
+      pausedAt: "2026-06-06T01:00:00.000Z",
+      nextReprobeAt: "2026-06-06T01:10:00.000Z",
+      capDeadlineAt: "2026-06-06T02:00:00.000Z",
+    });
+    expect(store.getRun(run.id).pauseMeta).not.toBeNull();
+
+    store.setRunState(run.id, "halted", "user_interrupt");
+    const after = store.getRun(run.id);
+    expect(after.state).toBe("halted");
+    expect(after.pauseMeta).toBeNull();
+  });
+
   it("setPauseMeta transitions to paused and persists PauseMeta as JSON", () => {
     const store = newStore();
     const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
