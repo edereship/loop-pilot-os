@@ -11,6 +11,7 @@ import type {
   MergeReadiness,
   MonitorVerdict,
   PromptArgs,
+  SpecContent,
   RecoveryContext,
   RecoveryOutcome,
   WorkflowRecovery,
@@ -30,6 +31,7 @@ export interface OrchestratorDeps {
   notifier: Notifier;
   store: SqliteStore;
   buildPrompt: (args: PromptArgs) => string;
+  specContent: SpecContent | null;
   clock: () => string;
   sleep: (ms: number) => Promise<void>;
   log: (line: string) => void;
@@ -53,6 +55,7 @@ export class Orchestrator {
   private readonly notifier: Notifier;
   private readonly store: SqliteStore;
   private readonly buildPrompt: (args: PromptArgs) => string;
+  private readonly specContent: SpecContent | null;
   private readonly clock: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: (line: string) => void;
@@ -70,6 +73,7 @@ export class Orchestrator {
     this.notifier = deps.notifier;
     this.store = deps.store;
     this.buildPrompt = deps.buildPrompt;
+    this.specContent = deps.specContent;
     this.clock = deps.clock;
     this.sleep = deps.sleep;
     this.log = deps.log;
@@ -506,8 +510,15 @@ export class Orchestrator {
   // ---- IMPLEMENT（仕様 §5.3） ----
   private async implement(session: TaskSessionRow, issue: EligibleIssue): Promise<RunControl> {
     this.store.updateSession(session.id, { state: "implementing" });
-    const digest = this.store.recentMergedSummaries(this.config.digest.recentMergedCount);
-    const prompt = this.buildPrompt({ goal: this.config.product.goal, issue, digest });
+    const digest = this.config.digest.enabled
+      ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
+      : [];
+    const prompt = this.buildPrompt({
+      goal: this.config.product.goal ?? null,
+      specContent: this.specContent,
+      issue,
+      digest,
+    });
     const worktreePath = session.worktreePath as string;
     let outcome: AgentOutcome;
     try {

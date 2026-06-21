@@ -167,11 +167,22 @@ export interface WorkflowRecovery {
 }
 
 // ---- 文脈バンドル（context-bundle.ts） ----
+
+export interface SpecFile {
+  name: string;     // ファイル名（拡張子なし）
+  content: string;  // ファイル内容
+}
+
+export interface SpecContent {
+  requirements: string;    // requirements.md 全文
+  domainSpecs: SpecFile[]; // 領域別要件定義ファイル群（アルファベット順）
+}
+
 export interface PromptArgs {
-  goal: string;                                   // config.product.goal
+  goal: string | null;                            // config.product.goal（v1 フォールバック用）
+  specContent: SpecContent | null;                // spec_dir から読み込んだ仕様（v2）
   issue: EligibleIssue;
   digest: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
-  // digest は store.recentMergedSummaries(config.digest.recentMergedCount) の戻り値そのまま
 }
 // context-bundle.ts は export function buildPrompt(args: PromptArgs): string を公開
 

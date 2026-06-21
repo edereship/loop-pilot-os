@@ -28,8 +28,8 @@ function makeConfig(over: Partial<{
   notifyProgress: boolean;
 }> = {}): Config {
   return {
-    product: { goal: over.goal ?? "ship the product" },
-    digest: { recentMergedCount: over.recentMergedCount ?? 5 },
+    product: { goal: over.goal ?? "ship the product", specDir: undefined },
+    digest: { recentMergedCount: over.recentMergedCount ?? 5, enabled: true },
     safety: {
       maxTasksPerRun: over.maxTasksPerRun ?? 3,
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
@@ -106,6 +106,7 @@ function makeHarness(config: Config): Harness {
     notifier,
     store,
     buildPrompt,
+    specContent: null,
     clock: fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,

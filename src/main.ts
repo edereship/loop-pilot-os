@@ -19,6 +19,7 @@ import { GitPrManager } from "./git-pr.js";
 import { ClaudeAgentRunner } from "./agent-runner.js";
 import { GhLoopPilotMonitor } from "./monitor.js";
 import { buildPrompt } from "./context-bundle.js";
+import { loadSpecContent } from "./spec-reader.js";
 import { Orchestrator, type RunOutcome } from "./orchestrator.js";
 import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
@@ -187,6 +188,16 @@ async function runLoop(configPath: string): Promise<number> {
       logLine,
     );
 
+    let specContent = null;
+    if (config.product.specDir) {
+      try {
+        specContent = loadSpecContent(config.repo.path, config.product.specDir);
+      } catch (err) {
+        process.stderr.write(`Spec loading failed: ${(err as Error).message}\n`);
+        return EXIT_PREFLIGHT;
+      }
+    }
+
     const orchestrator = new Orchestrator({
       config,
       source,
@@ -196,6 +207,7 @@ async function runLoop(configPath: string): Promise<number> {
       notifier,
       store,
       buildPrompt,
+      specContent,
       clock: nowIso,
       sleep,
       log: logLine,
