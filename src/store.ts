@@ -5,6 +5,7 @@ import type {
   SessionState,
   FailureReason,
   TaskSessionRow,
+  PauseMeta,
 } from "./types.js";
 
 // ---- カーネル §4 のスキーマ（一字一句） ----
@@ -13,8 +14,9 @@ CREATE TABLE IF NOT EXISTS run (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started_at TEXT NOT NULL,
   task_cap INTEGER NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('running','idle','halted')),
-  halt_reason TEXT
+  state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+  halt_reason TEXT,
+  pause_meta TEXT
 );
 CREATE TABLE IF NOT EXISTS task_session (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +66,7 @@ interface RawRunRow {
   task_cap: number;
   state: string;
   halt_reason: string | null;
+  pause_meta: string | null;
 }
 function toRunRow(r: RawRunRow): RunRow {
   return {
@@ -72,6 +75,7 @@ function toRunRow(r: RawRunRow): RunRow {
     taskCap: r.task_cap,
     state: r.state as RunState,
     haltReason: r.halt_reason,
+    pauseMeta: r.pause_meta === null ? null : JSON.parse(r.pause_meta) as PauseMeta,
   };
 }
 
@@ -201,6 +205,17 @@ export class SqliteStore {
     if (!columns.has("plan_brief")) {
       this.db.exec(`ALTER TABLE task_session ADD COLUMN plan_brief TEXT`);
     }
+
+    const runColumns = new Set(
+      (
+        this.db.prepare(`PRAGMA table_info(run)`).all() as Array<{
+          name: string;
+        }>
+      ).map((c) => c.name),
+    );
+    if (!runColumns.has("pause_meta")) {
+      this.db.exec(`ALTER TABLE run ADD COLUMN pause_meta TEXT`);
+    }
   }
 
   close(): void {
@@ -241,6 +256,24 @@ export class SqliteStore {
       .run(state, haltReason ?? null, id);
     if (info.changes !== 1) {
       throw new Error(`setRunState affected ${info.changes} rows for run id=${id}`);
+    }
+  }
+
+  setPauseMeta(id: number, meta: PauseMeta): void {
+    const info = this.db
+      .prepare(`UPDATE run SET state = 'paused', pause_meta = ? WHERE id = ?`)
+      .run(JSON.stringify(meta), id);
+    if (info.changes !== 1) {
+      throw new Error(`setPauseMeta affected ${info.changes} rows for run id=${id}`);
+    }
+  }
+
+  clearPauseMeta(id: number): void {
+    const info = this.db
+      .prepare(`UPDATE run SET state = 'running', pause_meta = NULL WHERE id = ?`)
+      .run(id);
+    if (info.changes !== 1) {
+      throw new Error(`clearPauseMeta affected ${info.changes} rows for run id=${id}`);
     }
   }
 
