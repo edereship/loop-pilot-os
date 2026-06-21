@@ -113,6 +113,8 @@ export interface GitPrManager {
   postComment(prNumber: number, body: string): Promise<void>;
   discardWorktree(branch: string, worktreePath: string): Promise<void>; // cost_exceeded 時の破棄
   getPrDiffSummary(prNumber: number): Promise<PrDiffSummary>;
+  /** Fetch the default branch from origin so the local ref is up to date. */
+  fetchDefaultBranch(): Promise<void>;
 }
 
 /** 列挙順は precedence ではない。poll() の決定順は §5.4（merged 最優先）が正 */
@@ -240,6 +242,7 @@ export interface PrDiffSummary {
 }
 
 export interface SelectPromptArgs {
+  goal: string | null;
   specContent: SpecContent | null;
   eligible: EligibleIssue[];
   inProgress: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle">>;

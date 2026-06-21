@@ -304,4 +304,18 @@ export class GitPrManager implements GitPrManagerInterface {
 
     return { title, body, diff: diffRes.stdout };
   }
+
+  async fetchDefaultBranch(): Promise<void> {
+    const { repoPath, defaultBranch } = this.opts;
+    const res = await this.runner.run(
+      "git",
+      ["-C", repoPath, "fetch", "origin", defaultBranch],
+      { cwd: repoPath },
+    );
+    if (res.code !== 0) {
+      throw new Error(
+        `git fetch origin ${defaultBranch} failed: ${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
+  }
 }

@@ -369,6 +369,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
       postComment: async (_prNumber: number, _body: string): Promise<void> => {},
       discardWorktree: async (_branch: string, _worktreePath: string): Promise<void> => {},
       getPrDiffSummary: async (_prNumber: number) => ({ title: "", body: "", diff: "" }),
+      fetchDefaultBranch: async (): Promise<void> => {},
     };
     const monitor: LoopPilotMonitor = {
       poll: async (_prNumber: number): Promise<MonitorVerdict> => verdict,

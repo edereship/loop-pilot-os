@@ -286,6 +286,11 @@ export class FakeGitPr implements GitPrManager {
     this.takeFailure("discardWorktree");
   }
 
+  async fetchDefaultBranch(): Promise<void> {
+    this.calls.push({ method: "fetchDefaultBranch", args: [] });
+    this.takeFailure("fetchDefaultBranch");
+  }
+
   prDiffSummaries = new Map<number, import("../src/types.js").PrDiffSummary>();
 
   async getPrDiffSummary(prNumber: number): Promise<import("../src/types.js").PrDiffSummary> {

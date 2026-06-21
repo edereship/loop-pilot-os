@@ -141,6 +141,7 @@ describe("formatDiffContext", () => {
 
 describe("buildSelectPrompt", () => {
   const baseArgs: SelectPromptArgs = {
+    goal: null,
     specContent: null,
     eligible: [
       { id: "a", identifier: "TY-1", title: "Add auth", description: "Auth feature", priority: 1, sortOrder: 100, url: "u1" },

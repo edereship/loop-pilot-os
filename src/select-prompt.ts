@@ -68,9 +68,16 @@ export function computeDiffStat(unifiedDiff: string): string {
 
   if (files.length === 0) return "";
 
+  const MAX_BAR = 50;
   const lines = files.map((f) => {
     const total = f.insertions + f.deletions;
-    const bar = "+".repeat(f.insertions) + "-".repeat(f.deletions);
+    let plusCount = f.insertions;
+    let minusCount = f.deletions;
+    if (total > MAX_BAR) {
+      plusCount = Math.round((f.insertions / total) * MAX_BAR);
+      minusCount = MAX_BAR - plusCount;
+    }
+    const bar = "+".repeat(plusCount) + "-".repeat(minusCount);
     return ` ${f.path} | ${total} ${bar}`;
   });
 
@@ -154,7 +161,7 @@ function truncateDiffPerFile(unifiedDiff: string, budget: number): string {
 }
 
 export function buildSelectPrompt(args: SelectPromptArgs): string {
-  const { specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars } = args;
+  const { goal, specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars } = args;
 
   const blocks: string[] = [];
 
@@ -179,6 +186,8 @@ export function buildSelectPrompt(args: SelectPromptArgs): string {
       );
       blocks.push(["# Domain Specifications", "", ...sections].join("\n\n"));
     }
+  } else if (goal) {
+    blocks.push(["# Product Goal", "", goal].join("\n"));
   }
 
   // Board state: in-progress

@@ -495,6 +495,7 @@ describe("LinearTaskSource.getAllEligible", () => {
       projectId: "project-uuid-1",
       todoStateId: "state-todo",
       label: "ai-ok",
+      after: null,
     });
   });
 });

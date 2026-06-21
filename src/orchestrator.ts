@@ -484,6 +484,12 @@ export class Orchestrator {
         issue = eligible[0];
       }
 
+      // Safe point: honor a stop request after SELECT, before the mutating CLAIM phase.
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return;
+      }
+
       // 3) CLAIM
       const claim = await this.claim(issue);
       if (claim.control === "halt") return;
@@ -649,6 +655,13 @@ export class Orchestrator {
       return { control: "continue", issue: eligible[0], rationale: null };
     }
 
+    // Ensure the repo checkout is up-to-date before reading specs or running Codex.
+    try {
+      await this.git.fetchDefaultBranch();
+    } catch (err) {
+      this.log(`select: fetch failed (non-fatal): ${errMsg(err)}`);
+    }
+
     // Build PM selection context
     const inProgress = this.store.activeSessions().map((s) => ({
       linearIdentifier: s.linearIdentifier,
@@ -683,6 +696,7 @@ export class Orchestrator {
     }
 
     const prompt = buildSelectPrompt({
+      goal: this.config.product.goal ?? null,
       specContent,
       eligible,
       inProgress,

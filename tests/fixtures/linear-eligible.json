@@ -7,7 +7,8 @@
         { "id": "i-none", "identifier": "TY-5", "title": "No priority task", "description": "", "priority": 0, "sortOrder": 1, "url": "https://linear.app/ty/issue/TY-5" },
         { "id": "i-low", "identifier": "TY-4", "title": "Low task", "description": "l", "priority": 4, "sortOrder": 5, "url": "https://linear.app/ty/issue/TY-4" },
         { "id": "i-high", "identifier": "TY-2", "title": "High task", "description": "h", "priority": 2, "sortOrder": 50, "url": "https://linear.app/ty/issue/TY-2" }
-      ]
+      ],
+      "pageInfo": { "hasNextPage": false, "endCursor": null }
     }
   }
 }
