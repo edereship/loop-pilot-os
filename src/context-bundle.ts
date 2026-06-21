@@ -19,7 +19,7 @@ import type { PromptArgs } from "./types.js";
  * 副作用・時刻・乱数を含まないため、同入力 → 同出力。
  */
 export function buildPrompt(args: PromptArgs): string {
-  const { specContent, goal, issue, digest } = args;
+  const { specContent, goal, issue, digest, planBrief } = args;
 
   const description = issue.description.trim().length > 0 ? issue.description : "(説明なし)";
 
@@ -55,7 +55,12 @@ export function buildPrompt(args: PromptArgs): string {
     ].join("\n"),
   );
 
-  // ---- ④ 作業規則 ----
+  // ---- ④ 実装ブリーフ（PLAN フェーズ生成・存在時のみ） ----
+  if (planBrief && planBrief.raw.length > 0) {
+    blocks.push(["# 実装ブリーフ", "", planBrief.raw].join("\n"));
+  }
+
+  // ---- ⑤ 作業規則 ----
   blocks.push(
     [
       "# 作業規則",

@@ -2099,6 +2099,38 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     expect(s.planBrief).toBeNull();
   });
 
+  it("passes plan brief to buildPrompt so the implementation agent receives it", async () => {
+    const briefText = "## Goal\nDo the thing.\n\n## Change Targets\n- src/foo.ts\n\n## Implementation Steps\n1. Step one\n\n## Acceptance Criteria\n- Tests pass\n\n## Out of Scope\n- Nothing";
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "completed", text: briefText }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // buildPrompt must have been called with the plan brief
+    expect(h.promptArgs).toHaveLength(1);
+    expect(h.promptArgs[0]!.planBrief).not.toBeNull();
+    expect(h.promptArgs[0]!.planBrief?.raw).toContain("## Goal");
+    expect(h.promptArgs[0]!.planBrief?.raw).toContain("Do the thing.");
+  });
+
+  it("passes null brief to buildPrompt when planner is absent", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config); // planner defaults to null
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.promptArgs).toHaveLength(1);
+    expect(h.promptArgs[0]!.planBrief ?? null).toBeNull();
+  });
+
   it("stores null (not empty string) when planner returns whitespace-only output", async () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed" as const, text: "   \n  \n  " }];

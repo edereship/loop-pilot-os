@@ -478,6 +478,7 @@ export class Orchestrator {
       // 4) PLAN
       const plan = await this.plan(session, issue);
       if (plan.control === "halt") return;
+      const planBrief = plan.brief;
 
       // Safe point: honor a stop request before the mutating IMPLEMENT phase.
       // PLAN is read-only, so stopping here leaves the session in "claimed" —
@@ -489,7 +490,7 @@ export class Orchestrator {
       }
 
       // 5) IMPLEMENT (was 4)
-      const impl = await this.implement(session, issue);
+      const impl = await this.implement(session, issue, planBrief);
       if (impl.control === "halt") return;
 
       // 6) HANDOFF (was 5)
@@ -603,7 +604,7 @@ export class Orchestrator {
   }
 
   // ---- IMPLEMENT（仕様 §5.3） ----
-  private async implement(session: TaskSessionRow, issue: EligibleIssue): Promise<RunControl> {
+  private async implement(session: TaskSessionRow, issue: EligibleIssue, planBrief: PlanBrief | null = null): Promise<RunControl> {
     this.store.updateSession(session.id, { state: "implementing" });
     const digest = this.config.digest.enabled
       ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
@@ -625,6 +626,7 @@ export class Orchestrator {
       specContent,
       issue,
       digest,
+      planBrief,
     });
     let outcome: AgentOutcome;
     try {

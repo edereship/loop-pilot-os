@@ -184,6 +184,7 @@ export interface PromptArgs {
   specContent: SpecContent | null;                // spec_dir から読み込んだ仕様（v2）
   issue: EligibleIssue;
   digest: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
+  planBrief?: PlanBrief | null;                   // PLAN フェーズで生成した実装ブリーフ（任意）
 }
 // context-bundle.ts は export function buildPrompt(args: PromptArgs): string を公開
 
