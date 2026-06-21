@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { CodexPlanner } from "../src/codex-planner.js";
+import { CodexPlanner, classifyCodexError, type CodexRateLimitOpts } from "../src/codex-planner.js";
 import { FakeCommandRunner } from "./fakes.js";
-import type { RunOptions, CommandResult } from "../src/types.js";
+import type { RunOptions, CommandResult, PauseMeta } from "../src/types.js";
 
 const STDERR_TAIL = "Error: something broke in codex";
 
@@ -19,6 +19,28 @@ function makePlanner(
   return new CodexPlanner(runner, {
     log: (line: string) => logs.push(line),
     extraArgs,
+  });
+}
+
+function makeRateLimitOpts(overrides: Partial<CodexRateLimitOpts> = {}): CodexRateLimitOpts {
+  return {
+    reprobeMinutes: 15,
+    capHours: 6,
+    codexPatterns: [],
+    sleep: async () => {},
+    clock: () => 0,
+    ...overrides,
+  };
+}
+
+function makePlannerWithRateLimit(
+  runner: FakeCommandRunner,
+  logs: string[],
+  rlOpts: CodexRateLimitOpts,
+): CodexPlanner {
+  return new CodexPlanner(runner, {
+    log: (line: string) => logs.push(line),
+    rateLimit: rlOpts,
   });
 }
 
@@ -1157,5 +1179,257 @@ describe("CodexPlanner PATH sanitization (Finding 7)", () => {
       if (saved["PATH"] === undefined) delete process.env.PATH;
       else process.env.PATH = saved["PATH"];
     }
+  });
+});
+
+// ---- ES-408: Codex レートリミット検出・待機・再開 ----
+
+describe("classifyCodexError", () => {
+  it("デフォルトパターンで rate limit メッセージを検出する", () => {
+    const cases = [
+      "codex exited with code 1: HTTP 429 Too Many Requests",
+      "codex exited with code 1: rate limit exceeded",
+      "codex exited with code 1: Rate-limit hit",
+      "codex exited with code 1: too many requests, please slow down",
+      "codex exited with code 1: server overloaded",
+      "codex exited with code 1: quota exceeded for this account",
+    ];
+    for (const msg of cases) {
+      expect(classifyCodexError(msg, [], 0).isRateLimit).toBe(true);
+    }
+  });
+
+  it("非レートリミットエラーは検出しない", () => {
+    const cases = [
+      "codex exited with code 1: ENOENT spawn codex",
+      "codex exited with code 1: permission denied",
+      "codex exited with code 1: network error",
+      "codex exited with code 2: invalid prompt",
+    ];
+    for (const msg of cases) {
+      expect(classifyCodexError(msg, [], 0).isRateLimit).toBe(false);
+    }
+  });
+
+  it("config パターンが指定されたらデフォルトを上書きする", () => {
+    expect(
+      classifyCodexError("custom_pattern_match", ["custom_pattern"], 0).isRateLimit,
+    ).toBe(true);
+    expect(
+      classifyCodexError("rate limit exceeded", ["custom_pattern"], 0).isRateLimit,
+    ).toBe(false);
+  });
+
+  it("ベストエフォルトで resets 時刻を解析する", () => {
+    const nowMs = new Date("2026-06-21T10:00:00Z").getTime();
+    const result = classifyCodexError(
+      "rate limit exceeded, resets 11:00 utc",
+      [],
+      nowMs,
+    );
+    expect(result.isRateLimit).toBe(true);
+    expect(result.resetsAtMs).not.toBeNull();
+    expect(result.resetsAtMs!).toBeGreaterThan(nowMs);
+  });
+
+  it("resets 時刻がなければ resetsAtMs=null", () => {
+    const result = classifyCodexError("rate limit exceeded", [], 0);
+    expect(result.isRateLimit).toBe(true);
+    expect(result.resetsAtMs).toBeNull();
+  });
+});
+
+describe("CodexPlanner rate-limit retry loop", () => {
+  it("レートリミットエラー後に再試行し成功すれば completed を返す", async () => {
+    const runner = new FakeCommandRunner();
+    let callCount = 0;
+    runner.on([CODEX_CMD], () => {
+      callCount++;
+      if (callCount === 1) {
+        return { code: 1, stdout: "", stderr: "rate limit exceeded" };
+      }
+      return { code: 0, stdout: "plan output\n", stderr: "" };
+    });
+    const logs: string[] = [];
+    const rlOpts = makeRateLimitOpts({ clock: () => 0 });
+    const outcome = await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(callCount).toBe(2);
+    expect(outcome).toEqual({ kind: "completed", text: "plan output" });
+    expect(logs.some((l) => l.includes("rate limit detected"))).toBe(true);
+  });
+
+  it("非レートリミットエラーは再試行せず即返す", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 1, stdout: "", stderr: "permission denied" });
+    const logs: string[] = [];
+    const rlOpts = makeRateLimitOpts();
+    const outcome = await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(outcome.kind).toBe("error");
+    expect(runner.calls).toHaveLength(1);
+    expect(logs.some((l) => l.includes("rate limit detected"))).toBe(false);
+  });
+
+  it("cap 超過でエラーを返す", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 1, stdout: "", stderr: "rate limit exceeded" });
+    const logs: string[] = [];
+    const capMs = 2 * 3_600_000;
+    let clockCall = 0;
+    const rlOpts = makeRateLimitOpts({
+      capHours: 2,
+      clock: () => {
+        clockCall++;
+        return clockCall === 1 ? 0 : capMs;
+      },
+    });
+    const outcome = await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(outcome.kind).toBe("error");
+    expect((outcome as { kind: "error"; message: string }).message).toContain("rate limit cap exceeded");
+    expect(logs.some((l) => l.includes("cap exceeded"))).toBe(true);
+  });
+
+  it("wait コールバックが interrupted を返したら interrupted を返す", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 1, stdout: "", stderr: "rate limit exceeded" });
+    const logs: string[] = [];
+    const capturedMeta: PauseMeta[] = [];
+    const rlOpts = makeRateLimitOpts({
+      wait: async (meta) => {
+        capturedMeta.push(meta);
+        return "interrupted";
+      },
+    });
+    const outcome = await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(outcome).toEqual({ kind: "interrupted" });
+    expect(capturedMeta).toHaveLength(1);
+    expect(capturedMeta[0]!.target).toBe("codex");
+    expect(capturedMeta[0]!.reason).toBe("rate_limit");
+  });
+
+  it("isInterrupted が true を返したら interrupted を返す", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 1, stdout: "", stderr: "rate limit exceeded" });
+    const logs: string[] = [];
+    const rlOpts = makeRateLimitOpts({
+      isInterrupted: () => true,
+    });
+    const outcome = await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(outcome).toEqual({ kind: "interrupted" });
+  });
+
+  it("sleep 後に cap 超過していたらエラーを返す", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 1, stdout: "", stderr: "rate limit exceeded" });
+    const logs: string[] = [];
+    const capMs = 6 * 3_600_000;
+    let clockValue = 0;
+    const rlOpts = makeRateLimitOpts({
+      capHours: 6,
+      clock: () => clockValue,
+      sleep: async () => {
+        clockValue = capMs;
+      },
+    });
+    const outcome = await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(outcome.kind).toBe("error");
+    expect((outcome as { kind: "error"; message: string }).message).toContain("rate limit cap exceeded");
+  });
+
+  it("reprobe 間隔を sleep に渡す（resets 時刻なし→固定間隔）", async () => {
+    const runner = new FakeCommandRunner();
+    let callCount = 0;
+    runner.on([CODEX_CMD], () => {
+      callCount++;
+      if (callCount === 1) {
+        return { code: 1, stdout: "", stderr: "rate limit exceeded" };
+      }
+      return { code: 0, stdout: "ok\n", stderr: "" };
+    });
+    const logs: string[] = [];
+    let totalSleptMs = 0;
+    const rlOpts = makeRateLimitOpts({
+      reprobeMinutes: 10,
+      sleep: async (ms) => { totalSleptMs += ms; },
+    });
+    await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(totalSleptMs).toBe(10 * 60_000);
+  });
+
+  it("rateLimit 未設定時は再試行なしで動作する（既存動作）", async () => {
+    const runner = new FakeCommandRunner();
+    codexStub(runner, { code: 1, stdout: "", stderr: "rate limit exceeded" });
+    const logs: string[] = [];
+    const outcome = await makePlanner(runner, logs).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(outcome.kind).toBe("error");
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("wait コールバックに PauseMeta が正しく渡される", async () => {
+    const runner = new FakeCommandRunner();
+    let callCount = 0;
+    runner.on([CODEX_CMD], () => {
+      callCount++;
+      if (callCount === 1) {
+        return { code: 1, stdout: "", stderr: "rate limit exceeded" };
+      }
+      return { code: 0, stdout: "ok\n", stderr: "" };
+    });
+    const logs: string[] = [];
+    const capturedMeta: PauseMeta[] = [];
+    const capturedWaitMs: number[] = [];
+    const BASE_MS = new Date("2026-06-21T10:00:00Z").getTime();
+    const rlOpts = makeRateLimitOpts({
+      reprobeMinutes: 15,
+      capHours: 6,
+      clock: () => BASE_MS,
+      wait: async (meta, waitMs) => {
+        capturedMeta.push(meta);
+        capturedWaitMs.push(waitMs);
+        return "complete";
+      },
+    });
+    await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(capturedMeta).toHaveLength(1);
+    const meta = capturedMeta[0]!;
+    expect(meta.reason).toBe("rate_limit");
+    expect(meta.target).toBe("codex");
+    expect(meta.pausedAt).toBe(new Date(BASE_MS).toISOString());
+    expect(capturedWaitMs[0]).toBe(15 * 60_000);
   });
 });

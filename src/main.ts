@@ -24,7 +24,7 @@ import { Orchestrator, type RunOutcome } from "./orchestrator.js";
 import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
 import { AgentWorkflowRecovery } from "./workflow-recovery.js";
-import { CodexPlanner } from "./codex-planner.js";
+import { CodexPlanner, type CodexRateLimitOpts } from "./codex-planner.js";
 
 const EXIT_OK = 0;
 const EXIT_PREFLIGHT = 1;
@@ -190,8 +190,17 @@ async function runLoop(configPath: string): Promise<number> {
       logLine,
     );
 
+    const codexRateLimitOpts: CodexRateLimitOpts = {
+      reprobeMinutes: config.rateLimit.reprobeMinutes,
+      capHours: config.rateLimit.capHours,
+      codexPatterns: config.rateLimit.codexPatterns,
+      sleep,
+      clock: Date.now,
+      isInterrupted: () => stopRequested,
+    };
     const codexPlanner = new CodexPlanner(runner, {
       log: logLine,
+      rateLimit: codexRateLimitOpts,
     });
 
     const orchestrator = new Orchestrator({
@@ -215,6 +224,10 @@ async function runLoop(configPath: string): Promise<number> {
     // Claude API rate-limit waits set the run's paused state and fire
     // paused/resumed notifications, instead of sleeping silently.
     rateLimitOpts.wait = async (meta, waitMs) => {
+      const ctrl = await orchestrator.interruptablePause(meta, waitMs);
+      return ctrl.control === "halt" ? "interrupted" : "complete";
+    };
+    codexRateLimitOpts.wait = async (meta, waitMs) => {
       const ctrl = await orchestrator.interruptablePause(meta, waitMs);
       return ctrl.control === "halt" ? "interrupted" : "complete";
     };

@@ -588,6 +588,11 @@ export class Orchestrator {
       return { control: "continue", brief: null };
     }
 
+    if (outcome.kind === "interrupted") {
+      await this.haltForInterrupt();
+      return { control: "halt" };
+    }
+
     if (outcome.kind === "error") {
       this.log(`plan: codex failed, falling back to raw ticket: ${outcome.message}`);
       return { control: "continue", brief: null };
