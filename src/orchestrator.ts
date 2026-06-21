@@ -951,12 +951,13 @@ export class Orchestrator {
             const QUOTA_SLEEP_CHUNK_MS = 10_000;
             const quotaNowStr = this.clock();
             const quotaNowMs = Date.parse(quotaNowStr);
+            const remainingRetries = 7 - quotaRetryCount;
             const quotaPauseMeta: PauseMeta = {
               reason: "rate_limit",
-              target: "claude",
+              target: "codex",
               pausedAt: quotaNowStr,
               nextReprobeAt: new Date(quotaNowMs + QUOTA_WAIT_MS).toISOString(),
-              capDeadlineAt: new Date(quotaNowMs + QUOTA_WAIT_MS).toISOString(),
+              capDeadlineAt: new Date(quotaNowMs + remainingRetries * QUOTA_WAIT_MS).toISOString(),
             };
             const pauseCtrl = await this.interruptablePause(
               quotaPauseMeta,
@@ -1249,8 +1250,12 @@ export class Orchestrator {
     return CONTINUE;
   }
 
-  /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。 */
+  /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。
+   *  Idempotent: if the run is already halted (e.g. interruptablePause already
+   *  called this), the second call is a no-op — no duplicate notification. */
   private async haltForInterrupt(): Promise<void> {
+    const run = this.store.getRun(this.runId);
+    if (run.state === "halted") return;
     const detail = "user_interrupt: stop requested; halting at safe point";
     this.store.setRunState(this.runId, "halted", detail);
     // 他の全 stopSession 経路と同様に await（通知を main の store.close() 前に確実に配信し、
