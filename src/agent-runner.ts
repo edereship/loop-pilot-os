@@ -21,6 +21,8 @@ const RATE_LIMIT_BUFFER_MS = 60_000;
 // 注（残存リスク）: gh が `gh auth login`（~/.config/gh/hosts.yml）で認証済みかつ agent に
 //   Bash を許可している場合、env 除外だけでは ambient 認証経由の濫用は防げない。運用側で
 //   agent.allowed_tools を最小化（Bash/ネットワークを絞る）こと。
+// codex-planner.ts uses an allowlist instead of this denylist; the two are intentionally different
+// (Codex exec can run arbitrary shell commands, so a stricter allowlist is warranted there).
 const SENSITIVE_ENV_KEYS = [
   "LINEAR_API_KEY",
   "SLACK_WEBHOOK_URL",
@@ -28,6 +30,11 @@ const SENSITIVE_ENV_KEYS = [
   "GITHUB_TOKEN",
   "GH_ENTERPRISE_TOKEN",
   "GITHUB_ENTERPRISE_TOKEN",
+  // Codex/OpenAI auth credentials: must not be exposed to the claude child process
+  // because ticket-derived prompts run inside it and could exfiltrate them via Bash.
+  "CODEX_API_KEY",
+  "OPENAI_API_KEY",
+  "CODEX_ACCESS_TOKEN",
 ];
 
 /** process.env から機密キーを除いた env を作る（undefined 値も除去して型を満たす）。

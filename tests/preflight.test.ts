@@ -32,6 +32,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       sessionHardTimeoutMinutes: 120,
       maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2,
+      codexTimeoutMinutes: 30,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
     digest: { recentMergedCount: 5 },
