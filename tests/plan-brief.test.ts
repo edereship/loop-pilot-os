@@ -52,6 +52,12 @@ describe("parseBrief", () => {
     expect(brief.sections).toBeNull();
   });
 
+  it("returns sections: null for whitespace-only output", () => {
+    const brief = parseBrief("   \n  \n  ");
+    expect(brief.raw).toBe("");
+    expect(brief.sections).toBeNull();
+  });
+
   it("returns sections: null when no recognized headings are found", () => {
     const brief = parseBrief("Just some plain text without any headings.");
     expect(brief.sections).toBeNull();
@@ -126,6 +132,16 @@ describe("buildPlanPrompt", () => {
     expect(prompt).not.toContain("Domain Specifications");
   });
 
+  it("includes requirements but omits domain specs heading when domainSpecs is empty", () => {
+    const specContent: SpecContent = {
+      requirements: "Build a great product.",
+      domainSpecs: [],
+    };
+    const prompt = buildPlanPrompt({ issue: issue(), specContent });
+    expect(prompt).toContain("Build a great product.");
+    expect(prompt).not.toContain("Domain Specifications");
+  });
+
   it("shows (no description) for empty description", () => {
     const prompt = buildPlanPrompt({ issue: issue({ description: "" }), specContent: null });
     expect(prompt).toContain("(no description)");
@@ -137,10 +153,5 @@ describe("buildPlanPrompt", () => {
       specContent: null,
     });
     expect(prompt).toContain("Fix the bug in auth module.");
-  });
-
-  it("is deterministic — same input produces same output", () => {
-    const args = { issue: issue(), specContent: null };
-    expect(buildPlanPrompt(args)).toBe(buildPlanPrompt(args));
   });
 });

@@ -561,9 +561,11 @@ export class Orchestrator {
     }
 
     const brief = parseBrief(outcome.text);
-    this.log(`plan: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
     if (brief.raw.length > 0) {
+      this.log(`plan: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
       this.store.updateSession(session.id, { planBrief: brief.raw });
+    } else {
+      this.log("plan: codex returned empty output, falling back to raw ticket");
     }
 
     return { control: "continue", brief };

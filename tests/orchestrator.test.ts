@@ -2113,6 +2113,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("merged");
     expect(s.planBrief).toBeNull();
+    expect(h.logs.some((l) => l.includes("codex returned empty output"))).toBe(true);
   });
 
   it("passes codexTimeoutMinutes as timeoutMs to the planner", async () => {
