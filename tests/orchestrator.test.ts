@@ -2192,6 +2192,9 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     expect(s.failureReason).toBeNull();
     // IMPLEMENT was not invoked
     expect(h.agent.contexts).toHaveLength(0);
+    // postComment must not have been called — the brief writeback is an external
+    // Linear mutation and must be skipped when a stop is pending
+    expect(h.source.comments).toHaveLength(0);
     // Run halts cleanly as user_interrupt
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("user_interrupt");
