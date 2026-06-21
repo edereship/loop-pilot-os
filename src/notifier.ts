@@ -26,6 +26,10 @@ export function formatNotifyEvent(event: NotifyEvent): string {
       return `⏳ Codex quota 待機中: ${event.detail}`;
     case "quota_resumed":
       return `🔄 Codex quota 回復: ${event.detail}`;
+    case "paused":
+      return `⏸️ LoopPilot OS 一時停止 (${event.target}): ${event.detail}`;
+    case "resumed":
+      return `▶️ LoopPilot OS 再開 (${event.target}): ${event.detail}`;
   }
 }
 

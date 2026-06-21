@@ -48,6 +48,13 @@ export function renderStatus(store: SqliteStore): string {
   if (run.state === "halted") {
     lines.push(`  halt reason: ${run.haltReason ?? "(none)"}`);
   }
+  if (run.state === "paused" && run.pauseMeta !== null) {
+    const pm = run.pauseMeta;
+    lines.push(`  pause reason: ${pm.reason}`);
+    lines.push(`  pause target: ${pm.target}`);
+    lines.push(`  next re-probe: ${pm.nextReprobeAt}`);
+    lines.push(`  cap deadline: ${pm.capDeadlineAt}`);
+  }
 
   lines.push("");
   const active = store.activeSessions();

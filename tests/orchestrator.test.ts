@@ -13,7 +13,7 @@ import {
   instantSleep,
 } from "./fakes.js";
 import type { Config } from "../src/config.js";
-import type { EligibleIssue, PromptArgs, PlanRunner } from "../src/types.js";
+import type { EligibleIssue, PromptArgs, PlanRunner, PauseMeta } from "../src/types.js";
 
 // ---- テストヘルパ ----
 function makeConfig(over: Partial<{
@@ -2281,5 +2281,134 @@ describe("Orchestrator PLAN brief writeback (ES-406)", () => {
     await h.orch.run();
 
     expect(h.source.comments).toHaveLength(0);
+  });
+});
+
+describe("Orchestrator.interruptablePause", () => {
+  it("sets paused state, notifies once, sleeps in chunks, then resumes with notification", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const run = h.store.createRun(5, "2026-06-21T00:00:00.000Z");
+    (h.orch as any).runId = run.id;
+
+    const meta: PauseMeta = {
+      reason: "rate_limit",
+      target: "claude",
+      pausedAt: "2026-06-21T00:00:00.000Z",
+      nextReprobeAt: "2026-06-21T00:10:00.000Z",
+      capDeadlineAt: "2026-06-21T01:00:00.000Z",
+    };
+
+    const result = await h.orch.interruptablePause(meta, 30_000, 10_000);
+
+    expect(result.control).toBe("continue");
+
+    const updated = h.store.getRun(run.id);
+    expect(updated.state).toBe("running");
+    expect(updated.pauseMeta).toBeNull();
+
+    const pausedEvents = h.notifier.events.filter((e) => e.kind === "paused");
+    const resumedEvents = h.notifier.events.filter((e) => e.kind === "resumed");
+    expect(pausedEvents).toHaveLength(1);
+    expect(resumedEvents).toHaveLength(1);
+    expect(pausedEvents[0]).toEqual({
+      kind: "paused",
+      target: "claude",
+      detail: expect.stringContaining("rate_limit"),
+    });
+
+    // 30s / 10s chunks = 3 sleep calls
+    expect(h.sleepCalls).toEqual([10_000, 10_000, 10_000]);
+
+    h.store.close();
+  });
+
+  it("returns HALT and does not notify 'resumed' when interrupted during pause", async () => {
+    const config = makeConfig();
+    const h = makeHarness(config);
+    const run = h.store.createRun(5, "2026-06-21T00:00:00.000Z");
+    (h.orch as any).runId = run.id;
+
+    h.orch.requestStop();
+
+    const meta: PauseMeta = {
+      reason: "rate_limit",
+      target: "codex",
+      pausedAt: "2026-06-21T00:00:00.000Z",
+      nextReprobeAt: "2026-06-21T00:10:00.000Z",
+      capDeadlineAt: "2026-06-21T01:00:00.000Z",
+    };
+
+    const result = await h.orch.interruptablePause(meta, 60_000, 10_000);
+
+    expect(result.control).toBe("halt");
+
+    const pausedEvents = h.notifier.events.filter((e) => e.kind === "paused");
+    expect(pausedEvents).toHaveLength(1);
+
+    const resumedEvents = h.notifier.events.filter((e) => e.kind === "resumed");
+    expect(resumedEvents).toHaveLength(0);
+
+    const halted = h.store.getRun(run.id);
+    expect(halted.state).toBe("halted");
+    expect(halted.pauseMeta).toBeNull();
+
+    // Sleep was never called (interrupted before first chunk)
+    expect(h.sleepCalls).toHaveLength(0);
+
+    h.store.close();
+  });
+
+  it("returns HALT when interrupted mid-sleep (after some chunks complete)", async () => {
+    const config = makeConfig();
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const agent = new FakeAgentRunner();
+    const git = new FakeGitPr();
+    const monitor = new FakeMonitor();
+    const notifier = new FakeNotifier();
+    const sleepCalls: number[] = [];
+    const clock = fixedClock("2026-06-21T00:00:00.000Z");
+    let orchRef: Orchestrator | null = null;
+    const sleep = async (ms: number): Promise<void> => {
+      sleepCalls.push(ms);
+      if (sleepCalls.length === 2 && orchRef) {
+        orchRef.requestStop();
+      }
+    };
+    const orch = new Orchestrator({
+      config, source, agent, git, monitor, notifier, store,
+      buildPrompt: () => "prompt", specLoader: null, clock, sleep,
+      log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
+    });
+    orchRef = orch;
+
+    const run = store.createRun(5, clock());
+    (orch as any).runId = run.id;
+
+    const meta: PauseMeta = {
+      reason: "rate_limit",
+      target: "claude",
+      pausedAt: "2026-06-21T00:00:00.000Z",
+      nextReprobeAt: "2026-06-21T00:10:00.000Z",
+      capDeadlineAt: "2026-06-21T01:00:00.000Z",
+    };
+
+    const result = await orch.interruptablePause(meta, 60_000, 10_000);
+
+    expect(result.control).toBe("halt");
+    // Slept twice before interrupt was detected on 3rd iteration
+    expect(sleepCalls).toEqual([10_000, 10_000]);
+
+    const pausedEvents = notifier.events.filter((e) => e.kind === "paused");
+    expect(pausedEvents).toHaveLength(1);
+    const resumedEvents = notifier.events.filter((e) => e.kind === "resumed");
+    expect(resumedEvents).toHaveLength(0);
+
+    const halted = store.getRun(run.id);
+    expect(halted.state).toBe("halted");
+    expect(halted.pauseMeta).toBeNull();
+
+    store.close();
   });
 });

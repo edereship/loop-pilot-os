@@ -162,4 +162,39 @@ describe("renderStatus", () => {
       store.close();
     }
   });
+
+  it("Run が paused のときは pause 理由・対象・次 re-probe・cap 期限を表示する", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(3, "2026-06-05T10:00:00.000Z");
+      store.setPauseMeta(run.id, {
+        reason: "rate_limit",
+        target: "claude",
+        pausedAt: "2026-06-05T11:00:00.000Z",
+        nextReprobeAt: "2026-06-05T11:10:00.000Z",
+        capDeadlineAt: "2026-06-05T12:00:00.000Z",
+      });
+      const out = renderStatus(store);
+      expect(out).toContain("state: paused");
+      expect(out).toContain("pause reason: rate_limit");
+      expect(out).toContain("pause target: claude");
+      expect(out).toContain("next re-probe: 2026-06-05T11:10:00.000Z");
+      expect(out).toContain("cap deadline: 2026-06-05T12:00:00.000Z");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("Run が paused でも pauseMeta が null なら paused のみ表示する", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(3, "2026-06-05T10:00:00.000Z");
+      store.setRunState(run.id, "paused");
+      const out = renderStatus(store);
+      expect(out).toContain("state: paused");
+      expect(out).not.toContain("pause reason");
+    } finally {
+      store.close();
+    }
+  });
 });

@@ -18,6 +18,7 @@ import type {
   PlanRunner,
   PlanBrief,
   PlanOutcome,
+  PauseMeta,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
@@ -948,19 +949,22 @@ export class Orchestrator {
             }
             const QUOTA_WAIT_MS = 60 * 60 * 1000;
             const QUOTA_SLEEP_CHUNK_MS = 10_000;
-            for (let elapsed = 0; elapsed < QUOTA_WAIT_MS; elapsed += QUOTA_SLEEP_CHUNK_MS) {
-              if (this.interrupted) {
-                await this.haltForInterrupt();
-                return HALT;
-              }
-              await this.sleep(QUOTA_SLEEP_CHUNK_MS);
-            }
-            // Finding 3: re-check after the loop so a stop requested during
-            // the final sleep chunk halts before posting to the PR.
-            if (this.interrupted) {
-              await this.haltForInterrupt();
-              return HALT;
-            }
+            const quotaNowStr = this.clock();
+            const quotaNowMs = Date.parse(quotaNowStr);
+            const remainingRetries = 7 - quotaRetryCount;
+            const quotaPauseMeta: PauseMeta = {
+              reason: "rate_limit",
+              target: "codex",
+              pausedAt: quotaNowStr,
+              nextReprobeAt: new Date(quotaNowMs + QUOTA_WAIT_MS).toISOString(),
+              capDeadlineAt: new Date(quotaNowMs + remainingRetries * QUOTA_WAIT_MS).toISOString(),
+            };
+            const pauseCtrl = await this.interruptablePause(
+              quotaPauseMeta,
+              QUOTA_WAIT_MS,
+              QUOTA_SLEEP_CHUNK_MS,
+            );
+            if (pauseCtrl.control === "halt") return HALT;
             // Finding 1: a quota restart is a real restart boundary — clear any
             // prior readiness-failure streak so errors before and after the
             // hour-long wait are not treated as consecutive.
@@ -1212,8 +1216,50 @@ export class Orchestrator {
     return HALT;
   }
 
-  /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。 */
+  /** 停止要求チェックつきの安全点待機。rate-limit 等で呼ぶ。中断時は HALT、完了時は CONTINUE を返す。 */
+  public async interruptablePause(
+    meta: PauseMeta,
+    waitMs: number,
+    chunkMs: number = 10_000,
+  ): Promise<RunControl> {
+    this.store.setPauseMeta(this.runId, meta);
+    await this.notifier.notify({
+      kind: "paused",
+      target: meta.target,
+      detail: `${meta.reason}: waiting until ${meta.nextReprobeAt}`,
+    });
+
+    for (let elapsed = 0; elapsed < waitMs; elapsed += chunkMs) {
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return HALT;
+      }
+      await this.sleep(Math.min(chunkMs, waitMs - elapsed));
+    }
+    if (this.interrupted) {
+      await this.haltForInterrupt();
+      return HALT;
+    }
+
+    this.store.clearPauseMeta(this.runId);
+    await this.notifier.notify({
+      kind: "resumed",
+      target: meta.target,
+      detail: `${meta.reason}: resumed after ${waitMs / 1000}s wait`,
+    });
+    if (this.interrupted) {
+      await this.haltForInterrupt();
+      return HALT;
+    }
+    return CONTINUE;
+  }
+
+  /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。
+   *  Idempotent: if the run is already halted (e.g. interruptablePause already
+   *  called this), the second call is a no-op — no duplicate notification. */
   private async haltForInterrupt(): Promise<void> {
+    const run = this.store.getRun(this.runId);
+    if (run.state === "halted") return;
     const detail = "user_interrupt: stop requested; halting at safe point";
     this.store.setRunState(this.runId, "halted", detail);
     // 他の全 stopSession 経路と同様に await（通知を main の store.close() 前に確実に配信し、

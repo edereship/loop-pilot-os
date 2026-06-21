@@ -83,6 +83,76 @@ describe("SqliteStore: run", () => {
     expect(() => store.setRunState(999, "running")).toThrow();
   });
 
+  it("setRunState clears pause_meta when transitioning away from paused", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    store.setPauseMeta(run.id, {
+      reason: "rate_limit",
+      target: "claude",
+      pausedAt: "2026-06-06T01:00:00.000Z",
+      nextReprobeAt: "2026-06-06T01:10:00.000Z",
+      capDeadlineAt: "2026-06-06T02:00:00.000Z",
+    });
+    expect(store.getRun(run.id).pauseMeta).not.toBeNull();
+
+    store.setRunState(run.id, "halted", "user_interrupt");
+    const after = store.getRun(run.id);
+    expect(after.state).toBe("halted");
+    expect(after.pauseMeta).toBeNull();
+  });
+
+  it("setPauseMeta transitions to paused and persists PauseMeta as JSON", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    expect(run.pauseMeta).toBeNull();
+
+    const meta = {
+      reason: "rate_limit" as const,
+      target: "claude" as const,
+      pausedAt: "2026-06-06T01:00:00.000Z",
+      nextReprobeAt: "2026-06-06T01:10:00.000Z",
+      capDeadlineAt: "2026-06-06T02:00:00.000Z",
+    };
+    store.setPauseMeta(run.id, meta);
+
+    const updated = store.getRun(run.id);
+    expect(updated.state).toBe("paused");
+    expect(updated.pauseMeta).toEqual(meta);
+    expect(updated.haltReason).toBeNull();
+  });
+
+  it("clearPauseMeta transitions back to running and clears pause_meta", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    store.setPauseMeta(run.id, {
+      reason: "rate_limit",
+      target: "codex",
+      pausedAt: "2026-06-06T01:00:00.000Z",
+      nextReprobeAt: "2026-06-06T01:10:00.000Z",
+      capDeadlineAt: "2026-06-06T02:00:00.000Z",
+    });
+    expect(store.getRun(run.id).state).toBe("paused");
+
+    store.clearPauseMeta(run.id);
+    const cleared = store.getRun(run.id);
+    expect(cleared.state).toBe("running");
+    expect(cleared.pauseMeta).toBeNull();
+  });
+
+  it("setPauseMeta and clearPauseMeta throw for nonexistent run id", () => {
+    const store = newStore();
+    expect(() =>
+      store.setPauseMeta(999, {
+        reason: "rate_limit",
+        target: "claude",
+        pausedAt: "2026-06-06T01:00:00.000Z",
+        nextReprobeAt: "2026-06-06T01:10:00.000Z",
+        capDeadlineAt: "2026-06-06T02:00:00.000Z",
+      }),
+    ).toThrow();
+    expect(() => store.clearPauseMeta(999)).toThrow();
+  });
+
   // 仕様§7/§11: tasks_started = CLAIM 到達数（セッション行数）, merged = 導出実数
   it("countTasksStarted and countMerged derive counts from session rows", () => {
     const store = newStore();
@@ -530,5 +600,75 @@ describe("SqliteStore: run lock", () => {
     // 1111 は依然保持者 → 2222（1111 生存）は取得不可
     const isAlive = (pid: number): boolean => pid === 1111;
     expect(store.acquireRunLock(2222, isAlive, "2026-06-06T00:00:02.000Z")).toBe(false);
+  });
+});
+
+describe("SqliteStore: migration adds pause_meta column to existing run table", () => {
+  it("opens a legacy DB without pause_meta, recreates run table with updated CHECK, and setPauseMeta works", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "lpos-mig-"));
+    const dbPath = path.join(dir, "test.db");
+    try {
+      const raw = new Database(dbPath);
+      raw.exec(`
+        CREATE TABLE run (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT NOT NULL,
+          task_cap INTEGER NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('running','idle','halted')),
+          halt_reason TEXT
+        );
+        CREATE TABLE task_session (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id INTEGER NOT NULL REFERENCES run(id),
+          linear_issue_id TEXT NOT NULL,
+          linear_identifier TEXT NOT NULL,
+          issue_title TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          worktree_path TEXT,
+          pr_number INTEGER,
+          state TEXT NOT NULL CHECK (state IN
+            ('claimed','implementing','handing_off','in_review','merged','stopped')),
+          cost_usd REAL,
+          failure_reason TEXT,
+          stop_detail TEXT,
+          agent_summary TEXT,
+          plan_brief TEXT,
+          started_at TEXT NOT NULL,
+          monitor_started_at TEXT,
+          ended_at TEXT,
+          workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
+          workflow_handled_error_count INTEGER NOT NULL DEFAULT 0,
+          auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
+          pending_restart_reason TEXT
+        );
+        INSERT INTO run (started_at, task_cap, state) VALUES ('2026-01-01T00:00:00Z', 5, 'running');
+      `);
+      raw.close();
+
+      const store = new SqliteStore(dbPath);
+      openStores.push(store);
+      const run = store.getRun(1);
+      expect(run.pauseMeta).toBeNull();
+
+      // setPauseMeta must work on migrated DB (CHECK constraint updated)
+      const meta = {
+        reason: "rate_limit" as const,
+        target: "claude" as const,
+        pausedAt: "2026-06-06T01:00:00.000Z",
+        nextReprobeAt: "2026-06-06T01:10:00.000Z",
+        capDeadlineAt: "2026-06-06T02:00:00.000Z",
+      };
+      expect(() => store.setPauseMeta(run.id, meta)).not.toThrow();
+      const paused = store.getRun(run.id);
+      expect(paused.state).toBe("paused");
+      expect(paused.pauseMeta).toEqual(meta);
+
+      store.clearPauseMeta(run.id);
+      const cleared = store.getRun(run.id);
+      expect(cleared.state).toBe("running");
+      expect(cleared.pauseMeta).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

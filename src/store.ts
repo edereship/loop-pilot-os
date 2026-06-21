@@ -5,6 +5,7 @@ import type {
   SessionState,
   FailureReason,
   TaskSessionRow,
+  PauseMeta,
 } from "./types.js";
 
 // ---- カーネル §4 のスキーマ（一字一句） ----
@@ -13,8 +14,9 @@ CREATE TABLE IF NOT EXISTS run (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started_at TEXT NOT NULL,
   task_cap INTEGER NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('running','idle','halted')),
-  halt_reason TEXT
+  state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+  halt_reason TEXT,
+  pause_meta TEXT
 );
 CREATE TABLE IF NOT EXISTS task_session (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +66,15 @@ interface RawRunRow {
   task_cap: number;
   state: string;
   halt_reason: string | null;
+  pause_meta: string | null;
+}
+function parsePauseMeta(raw: string | null): PauseMeta | null {
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw) as PauseMeta;
+  } catch {
+    return null;
+  }
 }
 function toRunRow(r: RawRunRow): RunRow {
   return {
@@ -72,6 +83,7 @@ function toRunRow(r: RawRunRow): RunRow {
     taskCap: r.task_cap,
     state: r.state as RunState,
     haltReason: r.halt_reason,
+    pauseMeta: parsePauseMeta(r.pause_meta),
   };
 }
 
@@ -201,6 +213,44 @@ export class SqliteStore {
     if (!columns.has("plan_brief")) {
       this.db.exec(`ALTER TABLE task_session ADD COLUMN plan_brief TEXT`);
     }
+
+    const runColumns = new Set(
+      (
+        this.db.prepare(`PRAGMA table_info(run)`).all() as Array<{
+          name: string;
+        }>
+      ).map((c) => c.name),
+    );
+    if (!runColumns.has("pause_meta")) {
+      // pause_meta 追加と同時に CHECK 制約を ('running','idle','halted','paused') へ更新する。
+      // SQLite は ALTER CONSTRAINT 非対応のためテーブル再作成が必要。
+      // Wrap in an explicit transaction so the recreate/copy/drop/rename sequence
+      // is all-or-nothing: a mid-migration crash cannot leave an empty run table
+      // with the data stranded in run_new.
+      const fkWasOn = this.db.pragma("foreign_keys", { simple: true }) as number;
+      this.db.pragma("foreign_keys = OFF");
+      try {
+        const runMigration = this.db.transaction(() => {
+          this.db.exec(`
+            CREATE TABLE run_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              started_at TEXT NOT NULL,
+              task_cap INTEGER NOT NULL,
+              state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+              halt_reason TEXT,
+              pause_meta TEXT
+            );
+            INSERT INTO run_new (id, started_at, task_cap, state, halt_reason)
+              SELECT id, started_at, task_cap, state, halt_reason FROM run;
+            DROP TABLE run;
+            ALTER TABLE run_new RENAME TO run;
+          `);
+        });
+        runMigration();
+      } finally {
+        this.db.pragma(`foreign_keys = ${fkWasOn}`);
+      }
+    }
   }
 
   close(): void {
@@ -237,10 +287,28 @@ export class SqliteStore {
 
   setRunState(id: number, state: RunState, haltReason?: string): void {
     const info = this.db
-      .prepare(`UPDATE run SET state = ?, halt_reason = ? WHERE id = ?`)
+      .prepare(`UPDATE run SET state = ?, halt_reason = ?, pause_meta = NULL WHERE id = ?`)
       .run(state, haltReason ?? null, id);
     if (info.changes !== 1) {
       throw new Error(`setRunState affected ${info.changes} rows for run id=${id}`);
+    }
+  }
+
+  setPauseMeta(id: number, meta: PauseMeta): void {
+    const info = this.db
+      .prepare(`UPDATE run SET state = 'paused', pause_meta = ? WHERE id = ?`)
+      .run(JSON.stringify(meta), id);
+    if (info.changes !== 1) {
+      throw new Error(`setPauseMeta affected ${info.changes} rows for run id=${id}`);
+    }
+  }
+
+  clearPauseMeta(id: number): void {
+    const info = this.db
+      .prepare(`UPDATE run SET state = 'running', pause_meta = NULL WHERE id = ?`)
+      .run(id);
+    if (info.changes !== 1) {
+      throw new Error(`clearPauseMeta affected ${info.changes} rows for run id=${id}`);
     }
   }
 
