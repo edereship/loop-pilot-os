@@ -2,9 +2,12 @@ import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import type { CommandRunner, RunOptions } from "./types.js";
+import type { CommandRunner, PauseMeta, RunOptions } from "./types.js";
+import { parseResetsTime } from "./agent-runner.js";
 
 const STDERR_TAIL_MAX = 1000;
+const RATE_LIMIT_MIN_WAIT_MS = 30_000;
+const RATE_LIMIT_BUFFER_MS = 60_000;
 
 // On Windows, npm-installed CLI tools are wrapped in .cmd shims that cannot
 // be resolved by Node's spawn() with shell:false. Use the explicit .cmd form.
@@ -217,13 +220,56 @@ export interface CodexPlannerContext {
 
 export type CodexOutcome =
   | { kind: "completed"; text: string }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string; rawStderr?: string }
+  | { kind: "interrupted" };
+
+export interface CodexRateLimitOpts {
+  reprobeMinutes: number;
+  capHours: number;
+  codexPatterns: string[];
+  sleep: (ms: number) => Promise<void>;
+  clock: () => number;
+  isInterrupted?: () => boolean;
+  wait?: (meta: PauseMeta, waitMs: number) => Promise<"interrupted" | "complete">;
+}
+
+export interface CodexRateLimitClassification {
+  isRateLimit: boolean;
+  resetsAtMs: number | null;
+}
+
+const DEFAULT_CODEX_RATE_LIMIT_PATTERNS: RegExp[] = [
+  /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\(429\)/i,
+  /rate.?limit/i,
+  /usage.?limit/i,
+  /too many requests/i,
+  /overloaded/i,
+  /quota.?exceed/i,
+];
+
+export function classifyCodexError(
+  message: string,
+  configPatterns: string[],
+  nowMs: number,
+): CodexRateLimitClassification {
+  const patterns =
+    configPatterns.length > 0
+      ? configPatterns.map((p) => new RegExp(p, "i"))
+      : DEFAULT_CODEX_RATE_LIMIT_PATTERNS;
+  const isRateLimit = patterns.some((p) => p.test(message));
+  if (!isRateLimit) return { isRateLimit: false, resetsAtMs: null };
+  return {
+    isRateLimit: true,
+    resetsAtMs: parseResetsTime(message, nowMs),
+  };
+}
 
 export interface CodexPlannerOptions {
   log: (line: string) => void;
   extraArgs?: string[];
   /** Fallback timeout for run() when ctx.timeoutMs is not set (e.g. config.safety.codexTimeoutMinutes * 60_000). */
   defaultTimeoutMs?: number;
+  rateLimit?: CodexRateLimitOpts;
 }
 
 // Detect a flag by its long form, short alias, or --flag=value / -f=value forms.
@@ -257,10 +303,79 @@ export class CodexPlanner {
   ) {}
 
   async run(ctx: CodexPlannerContext): Promise<CodexOutcome> {
-    // A lone "-" is Codex's stdin sentinel: even after "--", Codex interprets
-    // "-" as "read prompt from stdin". Reject it early to avoid ambiguity —
-    // callers that intend to pass a literal dash should use something more
-    // descriptive, and a bare dash is almost certainly a mis-invocation.
+    if (!this.opts.rateLimit) {
+      return this.runOnce(ctx);
+    }
+
+    const rl = this.opts.rateLimit;
+    const capMs = rl.capHours * 3_600_000;
+    const reprobeMs = rl.reprobeMinutes * 60_000;
+    const startMs = rl.clock();
+
+    while (true) {
+      const outcome = await this.runOnce(ctx);
+      if (outcome.kind !== "error") return outcome;
+
+      const nowMs = rl.clock();
+      const classification = classifyCodexError(outcome.rawStderr ?? outcome.message, rl.codexPatterns, nowMs);
+      if (!classification.isRateLimit) return outcome;
+
+      const elapsed = nowMs - startMs;
+      if (elapsed >= capMs) {
+        this.opts.log(`rate limit cap exceeded (${rl.capHours}h); falling back`);
+        return { kind: "error", message: `rate limit cap exceeded (${rl.capHours}h): ${outcome.message}` };
+      }
+
+      let waitMs: number;
+      if (classification.resetsAtMs !== null) {
+        waitMs = Math.max(0, classification.resetsAtMs - nowMs + RATE_LIMIT_BUFFER_MS);
+      } else {
+        waitMs = reprobeMs;
+      }
+      waitMs = Math.max(waitMs, RATE_LIMIT_MIN_WAIT_MS);
+      const remainingMs = capMs - elapsed;
+      waitMs = Math.min(waitMs, remainingMs);
+
+      this.opts.log(
+        `rate limit detected; waiting ${Math.ceil(waitMs / 60_000)}m before re-probe`,
+      );
+
+      if (rl.wait) {
+        const meta: PauseMeta = {
+          reason: "rate_limit",
+          target: "codex",
+          pausedAt: new Date(nowMs).toISOString(),
+          nextReprobeAt: new Date(nowMs + waitMs).toISOString(),
+          capDeadlineAt: new Date(startMs + capMs).toISOString(),
+        };
+        const waitResult = await rl.wait(meta, waitMs);
+        if (waitResult === "interrupted") {
+          return { kind: "interrupted" };
+        }
+      } else if (rl.isInterrupted) {
+        const SLEEP_CHUNK_MS = 10_000;
+        for (let slept = 0; slept < waitMs; slept += SLEEP_CHUNK_MS) {
+          if (rl.isInterrupted()) {
+            return { kind: "interrupted" };
+          }
+          await rl.sleep(Math.min(SLEEP_CHUNK_MS, waitMs - slept));
+        }
+        if (rl.isInterrupted()) {
+          return { kind: "interrupted" };
+        }
+      } else {
+        await rl.sleep(waitMs);
+      }
+
+      const postSleepElapsed = rl.clock() - startMs;
+      if (postSleepElapsed >= capMs) {
+        this.opts.log(`rate limit cap exceeded (${rl.capHours}h); falling back`);
+        return { kind: "error", message: `rate limit cap exceeded (${rl.capHours}h): ${outcome.message}` };
+      }
+    }
+  }
+
+  private async runOnce(ctx: CodexPlannerContext): Promise<CodexOutcome> {
     if (ctx.prompt === "-") {
       return {
         kind: "error",
@@ -268,32 +383,14 @@ export class CodexPlanner {
       };
     }
 
-    // Default to read-only sandbox so planning prompts (which only need to
-    // read the worktree) cannot mutate files before implementation starts.
-    // Callers that need write access must pass "--sandbox"/"-s" in extraArgs.
     const hasCustomSandbox = hasFlagOrAlias(this.opts.extraArgs ?? [], "--sandbox", "-s");
-    // stdin carries the prompt, so there is no user path to approve commands;
-    // add --ask-for-approval never unless the caller already specified it.
     const hasCustomApproval = hasFlagOrAlias(this.opts.extraArgs ?? [], "--ask-for-approval", "-a");
-    // Ignore operator's interactive Codex config (config.toml, project rules,
-    // hooks) so planner runs don't inherit unexpected MCP servers or custom
-    // instructions that are unrelated to LoopPilot. Authentication still works
-    // because CODEX_HOME is forwarded explicitly in codexChildEnv().
     const hasIgnoreUserConfig = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-user-config" || a.startsWith("--ignore-user-config="),
     );
-    // --ignore-rules skips project/.rules files separately from --ignore-user-config.
-    // Without it a repo-supplied rule can deny planner-generated shell commands even
-    // when approvals are set to never.
     const hasIgnoreRules = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-rules" || a.startsWith("--ignore-rules="),
     );
-    // Always pass the prompt via stdin rather than as a positional argument.
-    // On Windows, cmd.exe imposes an 8191-character command-line limit; large
-    // ticket descriptions or digest-heavy prompts can exceed it after
-    // quoteCmdExeToken escaping. On POSIX, the kernel ARG_MAX can be exceeded
-    // by very large prompts, causing spawn to fail with E2BIG. Codex accepts
-    // "-" as the prompt argument to read from stdin, which has no size limit.
     const promptArg = "-";
 
     const args: string[] = [
@@ -304,26 +401,18 @@ export class CodexPlanner {
       ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
       ...(hasIgnoreRules ? [] : ["--ignore-rules"]),
       ...(this.opts.extraArgs ?? []),
-      // Terminate options before the prompt so that a prompt starting with '-'
-      // (including the literal '-' which codex reads as stdin) is never
-      // misinterpreted as a CLI flag.
       "--",
       promptArg,
     ];
 
     const timeoutMs = ctx.timeoutMs ?? this.opts.defaultTimeoutMs;
 
-    // Create a private per-run home directory so concurrent planner runs don't
-    // share state and so dotfiles in the global temp root cannot affect the run.
-    // CODEX_HOME is set to the real auth directory in codexChildEnv(); HOME
-    // itself does not contain a .codex entry so auth files are outside HOME.
     const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
     if (process.platform !== "win32") chmodSync(privateHome, 0o700);
 
     const runOpts: RunOptions = {
       cwd: ctx.worktreePath,
       env: codexChildEnv(privateHome),
-      // Prompt is always piped via stdin (promptArg is always "-").
       stdin: ctx.prompt,
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
@@ -341,10 +430,15 @@ export class CodexPlanner {
       }
 
       if (result.code !== 0) {
-        const tail = result.stderr.trim().slice(-STDERR_TAIL_MAX);
+        const trimmedStderr = result.stderr.trim();
+        const tail = trimmedStderr.slice(-STDERR_TAIL_MAX);
         const msg = `codex exited with code ${result.code}`;
         this.opts.log(`codex session error: ${msg}`);
-        return { kind: "error", message: tail ? `${msg}: ${tail}` : msg };
+        return {
+          kind: "error",
+          message: tail ? `${msg}: ${tail}` : msg,
+          ...(trimmedStderr ? { rawStderr: trimmedStderr } : {}),
+        };
       }
 
       this.opts.log("codex session completed");

@@ -207,7 +207,8 @@ export interface PromptArgs {
 
 export type PlanOutcome =
   | { kind: "completed"; text: string }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  | { kind: "interrupted" };
 
 export interface PlanRunner {
   run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number }): Promise<PlanOutcome>;

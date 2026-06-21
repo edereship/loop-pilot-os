@@ -584,6 +584,7 @@ describe("loadConfig", () => {
       reprobeMinutes: 15,
       capHours: 6,
       claudePatterns: [],
+      codexPatterns: [],
     });
   });
 
@@ -593,6 +594,7 @@ describe("loadConfig", () => {
       reprobeMinutes: 5,
       capHours: 2,
       claudePatterns: [],
+      codexPatterns: [],
     });
   });
 
@@ -602,6 +604,20 @@ describe("loadConfig", () => {
       "custom_429",
       "my_rate_limit_pattern",
     ]);
+  });
+
+  it("reads codex_patterns from [rate_limit]", () => {
+    const config = loadConfig(fixture("config-rate-limit-codex.toml"), fullEnv);
+    expect(config.rateLimit.codexPatterns).toEqual([
+      "codex_quota",
+      "openai_rate_limit",
+    ]);
+  });
+
+  it("rejects invalid codex_patterns regex", () => {
+    expect(() =>
+      loadConfig(fixture("config-rate-limit-codex-invalid.toml"), fullEnv),
+    ).toThrow(/rate_limit\.codex_patterns.*invalid regex/);
   });
 
   // notify.progress: 既定 false（未設定 or empty [notify]）

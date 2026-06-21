@@ -77,6 +77,7 @@ const rawSchema = z.object({
     reprobe_minutes: z.number().positive().default(15),
     cap_hours: z.number().positive().default(6),
     claude_patterns: z.array(z.string()).default([]),
+    codex_patterns: z.array(z.string()).default([]),
   }).strict().optional(),
 }).strict();
 
@@ -145,6 +146,7 @@ export interface Config {
     reprobeMinutes: number;
     capHours: number;
     claudePatterns: string[];
+    codexPatterns: string[];
   };
   linearApiKey: string;
   slackWebhookUrl: string | undefined;
@@ -552,6 +554,17 @@ export function loadConfig(
         }
       }
     }
+    if (result.data.rate_limit?.codex_patterns) {
+      for (const pattern of result.data.rate_limit.codex_patterns) {
+        try {
+          new RegExp(pattern, "i");
+        } catch {
+          errors.push(
+            `rate_limit.codex_patterns: invalid regex "${pattern}"`,
+          );
+        }
+      }
+    }
   }
 
   if (!result.success || errors.length > 0) {
@@ -632,6 +645,7 @@ export function loadConfig(
       reprobeMinutes: raw.rate_limit?.reprobe_minutes ?? 15,
       capHours: raw.rate_limit?.cap_hours ?? 6,
       claudePatterns: raw.rate_limit?.claude_patterns ?? [],
+      codexPatterns: raw.rate_limit?.codex_patterns ?? [],
     },
     linearApiKey: linearApiKey as string,
     slackWebhookUrl,
