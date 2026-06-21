@@ -129,7 +129,7 @@ export class FakeTaskSource implements TaskSource {
   /** メソッド名 → 次の1回だけ throw させるエラー */
   private failOnce = new Map<string, Error>();
 
-  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment", error?: Error): void {
+  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment" | "getAllEligible", error?: Error): void {
     this.failOnce.set(method, error ?? new Error(`FakeTaskSource.${method} injected failure`));
   }
 
@@ -163,6 +163,26 @@ export class FakeTaskSource implements TaskSource {
   async postComment(issueId: string, body: string): Promise<void> {
     this.takeFailure("postComment");
     this.comments.push({ issueId, body });
+  }
+
+  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
+    this.eligibleCalls.push([...excludeIds]);
+    this.takeFailure("getAllEligible");
+    const exclude = new Set(excludeIds);
+    // Mimic real LinearTaskSource: only return issues in "todo" state.
+    // Derive each issue's current state from the most recent transition.
+    const lastTransition = new Map<string, TicketState>();
+    for (const t of this.transitions) {
+      lastTransition.set(t.issueId, t.state);
+    }
+    return this.queue.filter((i) => {
+      if (exclude.has(i.id)) return false;
+      const state = lastTransition.get(i.id);
+      // No transition recorded = still in original todo state
+      // Transitioned back to todo = eligible again (e.g. after claim rollback)
+      // Any other state = not eligible
+      return state === undefined || state === "todo";
+    });
   }
 }
 
@@ -264,6 +284,21 @@ export class FakeGitPr implements GitPrManager {
   async discardWorktree(branch: string, worktreePath: string): Promise<void> {
     this.calls.push({ method: "discardWorktree", args: [branch, worktreePath] });
     this.takeFailure("discardWorktree");
+  }
+
+  async fetchDefaultBranch(): Promise<void> {
+    this.calls.push({ method: "fetchDefaultBranch", args: [] });
+    this.takeFailure("fetchDefaultBranch");
+  }
+
+  prDiffSummaries = new Map<number, import("../src/types.js").PrDiffSummary>();
+
+  async getPrDiffSummary(prNumber: number, _maxDiffChars?: number): Promise<import("../src/types.js").PrDiffSummary> {
+    this.calls.push({ method: "getPrDiffSummary", args: [prNumber] });
+    this.takeFailure("getPrDiffSummary");
+    const preset = this.prDiffSummaries.get(prNumber);
+    if (preset) return preset;
+    return { title: `PR #${prNumber}`, body: "", diff: "" };
   }
 }
 

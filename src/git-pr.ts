@@ -3,6 +3,7 @@ import type {
   EligibleIssue,
   ClaimResult,
   GitPrManager as GitPrManagerInterface,
+  PrDiffSummary,
 } from "./types.js";
 
 export interface GitPrManagerOptions {
@@ -265,5 +266,71 @@ export class GitPrManager implements GitPrManagerInterface {
     await this.runner.run("git", ["-C", repoPath, "branch", "-D", branch], {
       cwd: repoPath,
     });
+  }
+
+  async getPrDiffSummary(prNumber: number, maxDiffChars?: number): Promise<PrDiffSummary> {
+    const { repoPath, remote } = this.opts;
+    const viewRes = await this.runner.run(
+      "gh",
+      ["pr", "view", String(prNumber), "-R", remote, "--json", "title,body"],
+      { cwd: repoPath },
+    );
+    if (viewRes.code !== 0) {
+      throw new Error(
+        `gh pr view failed for #${prNumber}: ${viewRes.stderr.trim() || `exit ${viewRes.code}`}`,
+      );
+    }
+    let parsed: { title: string; body: string | null };
+    try {
+      parsed = JSON.parse(viewRes.stdout) as { title: string; body: string | null };
+    } catch {
+      throw new Error(
+        `gh pr view for #${prNumber} returned unparseable JSON: ${viewRes.stdout.slice(0, 200)}`,
+      );
+    }
+    const { title, body: rawBody } = parsed;
+    const body = rawBody ?? "";
+
+    const diffRes = await this.runner.run(
+      "gh",
+      ["pr", "diff", String(prNumber), "-R", remote],
+      { cwd: repoPath },
+    );
+    if (diffRes.code !== 0) {
+      throw new Error(
+        `gh pr diff failed for #${prNumber}: ${diffRes.stderr.trim() || `exit ${diffRes.code}`}`,
+      );
+    }
+
+    const diff =
+      maxDiffChars !== undefined && diffRes.stdout.length > maxDiffChars
+        ? diffRes.stdout.slice(0, maxDiffChars)
+        : diffRes.stdout;
+
+    return { title, body, diff };
+  }
+
+  async fetchDefaultBranch(): Promise<void> {
+    const { repoPath, defaultBranch } = this.opts;
+    const fetchRes = await this.runner.run(
+      "git",
+      ["-C", repoPath, "fetch", "origin", defaultBranch],
+      { cwd: repoPath },
+    );
+    if (fetchRes.code !== 0) {
+      throw new Error(
+        `git fetch origin ${defaultBranch} failed: ${fetchRes.stderr.trim() || `exit ${fetchRes.code}`}`,
+      );
+    }
+    const resetRes = await this.runner.run(
+      "git",
+      ["-C", repoPath, "reset", "--hard", `origin/${defaultBranch}`],
+      { cwd: repoPath },
+    );
+    if (resetRes.code !== 0) {
+      throw new Error(
+        `git reset --hard origin/${defaultBranch} failed: ${resetRes.stderr.trim() || `exit ${resetRes.code}`}`,
+      );
+    }
   }
 }

@@ -631,4 +631,16 @@ describe("loadConfig", () => {
     const config = loadConfig(fixture("config-notify-progress.toml"), fullEnv);
     expect(config.notify.progress).toBe(true);
   });
+
+  // ES-382: select_diff_budget_chars defaults to 6000
+  it("select_diff_budget_chars defaults to 6000", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.safety.selectDiffBudgetChars).toBe(6000);
+  });
+
+  // ES-382: select_diff_budget_chars is configurable
+  it("select_diff_budget_chars is configurable", () => {
+    const config = loadConfig(fixture("config-select-diff-budget.toml"), fullEnv);
+    expect(config.safety.selectDiffBudgetChars).toBe(10000);
+  });
 });

@@ -17,6 +17,14 @@ const ELIGIBLE_QUERY = `query Eligible($projectId: ID, $todoStateId: ID!, $label
   }) { nodes { id identifier title description priority sortOrder url } }
 }`;
 
+const ELIGIBLE_QUERY_PAGINATED = `query EligiblePaginated($projectId: ID, $todoStateId: ID!, $label: String!, $after: String) {
+  issues(first: 50, after: $after, filter: {
+    project: { id: { eq: $projectId } },
+    state: { id: { eq: $todoStateId } },
+    labels: { name: { eq: $label } }
+  }) { nodes { id identifier title description priority sortOrder url } pageInfo { hasNextPage endCursor } }
+}`;
+
 // カーネル §5.5: 遷移 mutation。一字一句一致。
 const TRANSITION_MUTATION = `mutation IssueUpdate($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`;
 
@@ -51,6 +59,13 @@ interface IssueNode {
 
 interface IssuesData {
   issues: { nodes: IssueNode[] };
+}
+
+interface IssuesPaginatedData {
+  issues: {
+    nodes: IssueNode[];
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
+  };
 }
 
 /** 優先度の意味写像（カーネル §5.5 / 仕様 §5）: 1→0, 2→1, 3→2, 4→3, 0→4。 */
@@ -156,6 +171,29 @@ export class LinearTaskSource implements TaskSource {
     return data.issues.nodes;
   }
 
+  private async queryAllByState(stateId: string): Promise<IssueNode[]> {
+    const all: IssueNode[] = [];
+    let after: string | null = null;
+    let hasNext = true;
+    while (hasNext) {
+      const data: IssuesPaginatedData = await graphql<IssuesPaginatedData>(
+        this.fetchFn,
+        this.apiKey,
+        ELIGIBLE_QUERY_PAGINATED,
+        {
+          projectId: this.projectId,
+          todoStateId: stateId,
+          label: this.optInLabel,
+          after,
+        },
+      );
+      all.push(...data.issues.nodes);
+      hasNext = data.issues.pageInfo.hasNextPage;
+      after = data.issues.pageInfo.endCursor;
+    }
+    return all;
+  }
+
   async getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null> {
     const exclude = new Set(excludeIds);
     const nodes = (await this.queryByState(this.stateIds.todo))
@@ -163,6 +201,14 @@ export class LinearTaskSource implements TaskSource {
       .sort(compareIssues);
     const first = nodes[0];
     return first ? toEligible(first) : null;
+  }
+
+  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
+    const exclude = new Set(excludeIds);
+    return (await this.queryAllByState(this.stateIds.todo))
+      .filter((n) => !exclude.has(n.id))
+      .sort(compareIssues)
+      .map(toEligible);
   }
 
   async transition(issueId: string, state: TicketState): Promise<void> {

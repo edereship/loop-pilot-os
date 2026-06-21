@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS task_session (
   stop_detail TEXT,
   agent_summary TEXT,
   plan_brief TEXT,
+  select_rationale TEXT,
   started_at TEXT NOT NULL,
   monitor_started_at TEXT,
   ended_at TEXT,
@@ -102,6 +103,7 @@ interface RawSessionRow {
   stop_detail: string | null;
   agent_summary: string | null;
   plan_brief: string | null;
+  select_rationale: string | null;
   started_at: string;
   monitor_started_at: string | null;
   ended_at: string | null;
@@ -126,6 +128,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     stopDetail: r.stop_detail,
     agentSummary: r.agent_summary,
     planBrief: r.plan_brief,
+    selectRationale: r.select_rationale,
     startedAt: r.started_at,
     monitorStartedAt: r.monitor_started_at,
     endedAt: r.ended_at,
@@ -146,6 +149,7 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   stopDetail: "stop_detail",
   agentSummary: "agent_summary",
   planBrief: "plan_brief",
+  selectRationale: "select_rationale",
   monitorStartedAt: "monitor_started_at",
   endedAt: "ended_at",
   runId: "run_id",
@@ -212,6 +216,9 @@ export class SqliteStore {
     }
     if (!columns.has("plan_brief")) {
       this.db.exec(`ALTER TABLE task_session ADD COLUMN plan_brief TEXT`);
+    }
+    if (!columns.has("select_rationale")) {
+      this.db.exec(`ALTER TABLE task_session ADD COLUMN select_rationale TEXT`);
     }
 
     const runColumns = new Set(
@@ -380,6 +387,7 @@ export class SqliteStore {
         | "stopDetail"
         | "agentSummary"
         | "planBrief"
+        | "selectRationale"
         | "monitorStartedAt"
         | "endedAt"
         | "runId"
@@ -480,6 +488,18 @@ export class SqliteStore {
       issueTitle: r.issue_title,
       agentSummary: r.agent_summary,
     }));
+  }
+
+  lastMergedWithPr(): TaskSessionRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM task_session
+         WHERE state = 'merged' AND pr_number IS NOT NULL
+         ORDER BY ended_at DESC, id DESC
+         LIMIT 1`,
+      )
+      .get() as RawSessionRow | undefined;
+    return row === undefined ? null : toSessionRow(row);
   }
 
   sessionsForRun(runId: number): TaskSessionRow[] {

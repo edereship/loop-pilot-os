@@ -33,6 +33,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2,
       codexTimeoutMinutes: 30,
+      selectDiffBudgetChars: 6000,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
     digest: { recentMergedCount: 5, enabled: true },

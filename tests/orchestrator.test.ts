@@ -30,6 +30,7 @@ function makeConfig(over: Partial<{
 }> = {}): Config {
   return {
     product: { goal: over.goal ?? "ship the product", specDir: undefined },
+    repo: { path: "/repo", remote: "owner/name", defaultBranch: "main", worktreeRoot: "/wt" },
     digest: { recentMergedCount: over.recentMergedCount ?? 5, enabled: true },
     safety: {
       maxTasksPerRun: over.maxTasksPerRun ?? 3,
@@ -40,6 +41,7 @@ function makeConfig(over: Partial<{
       maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2,
       codexTimeoutMinutes: 30,
+      selectDiffBudgetChars: 6000,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -181,8 +183,8 @@ describe("Orchestrator 正常系 — 2チケット逐次（仕様 §3 逐次・�
       { issueId: "issue-B", state: "done" },
     ]);
 
-    // 2件目の SELECT 時、1件目はもう active ではない（merged）→ excludeIds は空のまま
-    // （冪等性: 進行中セッションだけ除外。merged は除外対象外）
+    // 2件目の SELECT 時、1件目はもう in_progress 以降（merged）→ getAllEligible が除外
+    // （FakeTaskSource は transition 済み issue を eligible から除外する）
     expect(h.source.eligibleCalls.length).toBe(2); // A選定 / B選定（3反復目は taskCap 到達で SELECT 前に HALT）
   });
 });
@@ -264,8 +266,7 @@ describe("Orchestrator 正常系 — タスク上限 HALT（仕様 §11 / §5.1�
     // 1件だけ着手・完走
     expect(h.store.countTasksStarted(run.id)).toBe(1);
     expect(h.store.countMerged(run.id)).toBe(1);
-    // 2件目は未着手のままキューに残る
-    expect(h.source.queue.map((i) => i.identifier)).toEqual(["TY-2"]);
+    // getAllEligible はキューを変化させない（実 LinearTaskSource も再クエリするだけ）
 
     // Run は halted・理由は task cap
     expect(run.state).toBe("halted");
@@ -279,13 +280,13 @@ describe("Orchestrator 正常系 — タスク上限 HALT（仕様 §11 / §5.1�
 });
 
 describe("Orchestrator 失敗系 — SELECT の Linear 例外（仕様 §5.1 / 安全弁: 全失敗は HALT+通知）", () => {
-  // getNextEligible が throw（Linear 一時障害等）→ 無人ループを Fatal 落ちさせず、
+  // getAllEligible が throw（Linear 一時障害等）→ 無人ループを Fatal 落ちさせず、
   // CLAIM① と同様に Run=halted(exception)+notify(halted) で人間に上げる。
-  it("getNextEligible が throw → run() は throw せず Run=halted(exception)・notify(halted) する", async () => {
+  it("getAllEligible が throw → run() は throw せず Run=halted(exception)・notify(halted) する", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
-    h.source.failNext("getNextEligible", new Error("Linear HTTP 503"));
+    h.source.failNext("getAllEligible", new Error("Linear HTTP 503"));
 
     // run() 自体が reject しない（main().catch の Fatal 経路に到達しない）こと
     await expect(h.orch.run()).resolves.toBe("finished");
@@ -294,6 +295,7 @@ describe("Orchestrator 失敗系 — SELECT の Linear 例外（仕様 §5.1 / �
     expect(run.state).toBe("halted");
     // haltReason は記述的 detail（select_failed 接頭辞 + 原因）。notify の reason が exception。
     expect(run.haltReason).toContain("select_failed");
+    expect(run.haltReason).toContain("getAllEligible");
     expect(run.haltReason).toContain("Linear HTTP 503");
     // セッションは作られない（SELECT 段の失敗）
     expect(h.store.sessionsForRun(run.id)).toHaveLength(0);
@@ -308,17 +310,15 @@ describe("Orchestrator 正常系 — IDLE→復帰（仕様 §5.1 / §10）", ()
     const config = makeConfig({ maxTasksPerRun: 1, idleRecheckSeconds: 300 });
     const h = makeHarness(config);
 
-    // getNextEligible: 1回目 null（IDLE）、2回目以降は復帰した issue を返す
+    // getAllEligible: 1回目 []（IDLE）、2回目以降は復帰した issue を返す
     let eligibleCall = 0;
     const recovered = issue("issue-A", "TY-1");
-    const origGetNext = h.source.getNextEligible.bind(h.source);
-    h.source.getNextEligible = async (excludeIds: string[]) => {
+    h.source.getAllEligible = async (excludeIds: string[]) => {
       h.source.eligibleCalls.push([...excludeIds]);
       eligibleCall += 1;
-      if (eligibleCall === 1) return null; // 初回 IDLE
-      // 復帰後は1回だけ issue を流し、それ以降は queue 経由
-      if (eligibleCall === 2) return recovered;
-      return origGetNext(excludeIds);
+      if (eligibleCall === 1) return []; // 初回 IDLE
+      // 復帰後は issue を返す（2回目以降）
+      return [recovered];
     };
 
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
@@ -2281,6 +2281,201 @@ describe("Orchestrator PLAN brief writeback (ES-406)", () => {
     await h.orch.run();
 
     expect(h.source.comments).toHaveLength(0);
+  });
+});
+
+describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
+  it("planner ありで eligible 複数 → Codex が選んだチケットを CLAIM する", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    // 2 eligible: TY-1 (Urgent), TY-2 (Medium)
+    const ty1 = issue("id-1", "TY-1", { priority: 1 });
+    const ty2 = issue("id-2", "TY-2", { priority: 3 });
+    h.source.queue = [ty1, ty2];
+
+    // Planner outcomes: first call is SELECT, second is PLAN
+    planner.outcomes = [
+      // SELECT: Codex picks TY-2 (not the deterministic first)
+      { kind: "completed", text: '```json\n{"identifier":"TY-2","rationale":"Continues recent work"}\n```' },
+      // PLAN: brief for the selected ticket
+      { kind: "completed", text: "## Goal\nFix the thing" },
+    ];
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].linearIdentifier).toBe("TY-2"); // PM picked TY-2, not deterministic TY-1
+    expect(sessions[0].selectRationale).toBe("Continues recent work");
+  });
+
+  it("planner ありで Codex 失敗 → 決定的順序にフォールバック", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.source.queue = [issue("id-1", "TY-1", { priority: 1 }), issue("id-2", "TY-2", { priority: 3 })];
+
+    planner.outcomes = [
+      // SELECT: Codex error
+      { kind: "error", message: "codex timeout" },
+      // PLAN: runs for TY-1 (fallback pick)
+      { kind: "completed", text: "## Goal\nPlan" },
+    ];
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1"); // deterministic fallback
+    expect(sessions[0].selectRationale).toContain("deterministic fallback");
+  });
+
+  it("planner ありで Codex が無効な identifier → 決定的順序にフォールバック", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    // 2 eligible so PM selection is actually invoked (with 1 eligible it is skipped)
+    h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
+
+    planner.outcomes = [
+      // SELECT: Codex returns non-existent identifier
+      { kind: "completed", text: '```json\n{"identifier":"TY-999","rationale":"does not exist"}\n```' },
+      // PLAN
+      { kind: "completed", text: "## Goal\nPlan" },
+    ];
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1");
+    expect(sessions[0].selectRationale).toContain("deterministic fallback");
+  });
+
+  it("planner ありで eligible が 1 件 → PM 選別スキップ、planner を SELECT に消費しない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.source.queue = [issue("id-1", "TY-1")];
+
+    // Only PLAN outcome (no SELECT since only 1 eligible)
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nPlan" },
+    ];
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1");
+    // planner called only once (PLAN), not twice (SELECT + PLAN)
+    expect(planner.calls).toHaveLength(1);
+  });
+
+  it("planner なし → 決定的順序のまま（既存動作不変）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config); // no planner
+
+    h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1"); // deterministic first
+    expect(sessions[0].selectRationale).toBeNull();
+  });
+
+  it("planner.run() が例外を throw → 決定的フォールバック", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
+
+    // SELECT: planner throws (no outcomes queued → FakePlanRunner throws)
+    // We need to re-queue a PLAN outcome after the throw
+    planner.outcomes = []; // empty → throws on first call (SELECT)
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    // Override planner to throw on first call, succeed on second
+    let callCount = 0;
+    const origRun = planner.run.bind(planner);
+    planner.run = async (ctx) => {
+      callCount++;
+      if (callCount === 1) throw new Error("codex crashed");
+      planner.outcomes = [{ kind: "completed", text: "## Goal\nPlan" }];
+      return origRun(ctx);
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1"); // deterministic fallback
+    expect(sessions[0].selectRationale).toContain("deterministic fallback");
+    expect(sessions[0].selectRationale).toContain("codex exception");
+  });
+
+  it("Codex が JSON を含まないテキストを返す → パース失敗で決定的フォールバック", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
+
+    planner.outcomes = [
+      // SELECT: returns prose without JSON
+      { kind: "completed", text: "I think TY-2 is the best choice because it continues the auth work." },
+      // PLAN
+      { kind: "completed", text: "## Goal\nPlan" },
+    ];
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1"); // deterministic fallback
+    expect(sessions[0].selectRationale).toBe("deterministic fallback: parse failure");
+    // Verify log contains raw output preview
+    expect(h.logs.some((l) => l.includes("Raw output:"))).toBe(true);
+  });
+
+  it("Codex interrupted → HALT（安全停止）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
+
+    planner.outcomes = [
+      { kind: "interrupted" },
+    ];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // No sessions created (interrupted before CLAIM)
+    expect(h.store.sessionsForRun(run.id)).toHaveLength(0);
   });
 });
 
