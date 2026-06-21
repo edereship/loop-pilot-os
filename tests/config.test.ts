@@ -66,10 +66,18 @@ describe("loadConfig", () => {
     expect(config.loop.idleRecheckSeconds).toBe(300);
 
     expect(config.digest.recentMergedCount).toBe(5);
+    expect(config.digest.enabled).toBe(true);
 
     expect(config.slackWebhookUrl).toBe(
       "https://hooks.slack.com/services/T/B/X",
     );
+  });
+
+  // B1: spec_dir のみ（goal なし）でも有効な config として読み込める。
+  it("loads config with spec_dir only (no goal) — v2 primary path", () => {
+    const config = loadConfig(fixture("config-spec-dir.toml"), fullEnv);
+    expect(config.product.specDir).toBe("docs/specs");
+    expect(config.product.goal).toBeUndefined();
   });
 
   // 仕様 §8: stateDbPath = config と同ディレクトリの looppilot-os.db（カーネル §3）。
@@ -122,11 +130,18 @@ describe("loadConfig", () => {
     ).toThrow(/LINEAR_API_KEY/);
   });
 
-  // 仕様 §8: 必須キー欠落（[product].goal が無い）→ 該当パスを message に出す。
-  it("throws listing the missing required key", () => {
+  // product.goal と product.spec_dir が両方欠落 → refine エラー。
+  it("throws when both product.goal and product.spec_dir are missing", () => {
     expect(() =>
       loadConfig(fixture("config-missing-required.toml"), fullEnv),
-    ).toThrow(/product\.goal/);
+    ).toThrow(/product\.goal or product\.spec_dir/);
+  });
+
+  // product.goal と product.spec_dir が両方設定 → refine エラー（相互排他）。
+  it("throws when both product.goal and product.spec_dir are set", () => {
+    expect(() =>
+      loadConfig(fixture("config-both-goal-specdir.toml"), fullEnv),
+    ).toThrow(/mutually exclusive/);
   });
 
   // 型不正（max_tasks_per_run に文字列）→ 該当パスを message に出す。
@@ -144,8 +159,8 @@ describe("loadConfig", () => {
     } catch (err) {
       message = (err as Error).message;
     }
-    // [product].goal 欠落（zod 由来）と LINEAR_API_KEY 欠落（env 由来）の両方が同じ message に出る。
-    expect(message).toContain("product.goal");
+    // product.goal/spec_dir 両欠落（zod refine 由来）と LINEAR_API_KEY 欠落（env 由来）の両方が同じ message に出る。
+    expect(message).toContain("product.goal or product.spec_dir");
     expect(message).toContain("LINEAR_API_KEY");
   });
 

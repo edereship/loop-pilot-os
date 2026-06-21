@@ -28,8 +28,8 @@ function makeConfig(over: Partial<{
   notifyProgress: boolean;
 }> = {}): Config {
   return {
-    product: { goal: over.goal ?? "ship the product" },
-    digest: { recentMergedCount: over.recentMergedCount ?? 5 },
+    product: { goal: over.goal ?? "ship the product", specDir: undefined },
+    digest: { recentMergedCount: over.recentMergedCount ?? 5, enabled: true },
     safety: {
       maxTasksPerRun: over.maxTasksPerRun ?? 3,
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
@@ -106,6 +106,7 @@ function makeHarness(config: Config): Harness {
     notifier,
     store,
     buildPrompt,
+    specLoader: null,
     clock: fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,
@@ -574,6 +575,56 @@ describe("Orchestrator 失敗系 — IMPLEMENT（仕様 §5.3 / カーネル §7
     expect(run.haltReason).toContain("user_interrupt");
     expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
     expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "user_interrupt" });
+  });
+});
+
+describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
+  it("spec loading failure discards worktree and transitions issue back to todo", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    (config.product as { goal: string | undefined; specDir: string | undefined }).specDir = "docs/specs";
+    (config.product as { goal: string | undefined; specDir: string | undefined }).goal = undefined;
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const agent = new FakeAgentRunner();
+    const git = new FakeGitPr();
+    const monitor = new FakeMonitor();
+    const notifier = new FakeNotifier();
+    const logs: string[] = [];
+    const promptArgs: PromptArgs[] = [];
+    const buildPrompt = (args: PromptArgs): string => {
+      promptArgs.push(args);
+      return `PROMPT for ${args.issue.identifier}`;
+    };
+    const recovery = new FakeWorkflowRecovery();
+    const orch = new Orchestrator({
+      config,
+      source,
+      agent,
+      git,
+      monitor,
+      notifier,
+      store,
+      buildPrompt,
+      specLoader: () => { throw new Error("requirements.md not found"); },
+      clock: fixedClock("2026-06-05T00:00:00.000Z"),
+      sleep: instantSleep(),
+      log: (line: string) => { logs.push(line); },
+      recovery,
+    });
+    source.queue = [issue("issue-A", "TY-1")];
+    git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+
+    await orch.run();
+
+    const s = store.sessionsForRun(store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("spec loading failed");
+    expect(git.calls).toContainEqual({
+      method: "discardWorktree",
+      args: ["looppilot/ty-1-x", "/wt/ty-1"],
+    });
+    expect(source.transitions).toContainEqual({ issueId: "issue-A", state: "todo" });
   });
 });
 

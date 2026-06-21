@@ -19,6 +19,7 @@ import { GitPrManager } from "./git-pr.js";
 import { ClaudeAgentRunner } from "./agent-runner.js";
 import { GhLoopPilotMonitor } from "./monitor.js";
 import { buildPrompt } from "./context-bundle.js";
+import { loadSpecContent } from "./spec-reader.js";
 import { Orchestrator, type RunOutcome } from "./orchestrator.js";
 import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
@@ -196,6 +197,7 @@ async function runLoop(configPath: string): Promise<number> {
       notifier,
       store,
       buildPrompt,
+      specLoader: config.product.specDir ? loadSpecContent : null,
       clock: nowIso,
       sleep,
       log: logLine,

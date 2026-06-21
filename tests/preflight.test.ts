@@ -8,7 +8,7 @@ import type { FetchFn } from "../src/task-source.js";
 // ---- テスト用の最小 Config（config.ts §の Config 形・camelCase は解決済みの形） ----
 function makeConfig(overrides: Partial<Config> = {}): Config {
   const base: Config = {
-    product: { goal: "ship it" },
+    product: { goal: "ship it", specDir: undefined },
     repo: {
       path: "/abs/repo",
       remote: "owner/name",
@@ -35,7 +35,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       codexTimeoutMinutes: 30,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
-    digest: { recentMergedCount: 5 },
+    digest: { recentMergedCount: 5, enabled: true },
     notify: { progress: false },
     rateLimit: { reprobeMinutes: 15, capHours: 6, claudePatterns: [] },
     linearApiKey: "lin_api_test",

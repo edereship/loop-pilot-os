@@ -7,8 +7,15 @@ import { z } from "zod";
 // ---- snake_case TOML スキーマ（カーネル §3 の全キー） ----
 const rawSchema = z.object({
   product: z.object({
-    goal: z.string(),
-  }).strict(),
+    goal: z.string().min(1, "product.goal must not be empty").optional(),
+    spec_dir: z.string().min(1, "product.spec_dir must not be empty").optional(),
+  }).strict().refine(
+    (p) => p.goal !== undefined || p.spec_dir !== undefined,
+    { message: "product.goal or product.spec_dir is required" },
+  ).refine(
+    (p) => !(p.goal !== undefined && p.spec_dir !== undefined),
+    { message: "product.goal and product.spec_dir are mutually exclusive; set one or the other" },
+  ),
   repo: z.object({
     path: z.string(),
     remote: z.string(),
@@ -61,6 +68,7 @@ const rawSchema = z.object({
   }).strict(),
   digest: z.object({
     recent_merged_count: z.number().int().positive(),
+    enabled: z.boolean().default(true),
   }).strict(),
   notify: z.object({
     progress: z.boolean().default(false),
@@ -76,7 +84,10 @@ type RawConfig = z.infer<typeof rawSchema>;
 
 // ---- camelCase Config（このモジュールが唯一の定義元・types.ts には置かない。カーネル §3） ----
 export interface Config {
-  product: { goal: string };
+  product: {
+    goal: string | undefined;
+    specDir: string | undefined;
+  };
   repo: {
     path: string;
     remote: string;
@@ -125,6 +136,7 @@ export interface Config {
   };
   digest: {
     recentMergedCount: number;
+    enabled: boolean;
   };
   notify: {
     progress: boolean;
@@ -562,7 +574,7 @@ export function loadConfig(
   const stateDbPath = path.join(path.dirname(path.resolve(configPath)), "looppilot-os.db");
 
   return {
-    product: { goal: raw.product.goal },
+    product: { goal: raw.product.goal, specDir: raw.product.spec_dir },
     repo: {
       path: raw.repo.path,
       remote: raw.repo.remote,
@@ -611,6 +623,7 @@ export function loadConfig(
     },
     digest: {
       recentMergedCount: raw.digest.recent_merged_count,
+      enabled: raw.digest.enabled,
     },
     notify: {
       progress: raw.notify?.progress ?? false,

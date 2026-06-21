@@ -286,6 +286,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
   it("PromptArgs.digest は store.recentMergedSummaries の戻り型と同型である", () => {
     const args: PromptArgs = {
       goal: "ship it",
+      specContent: null,
       issue: {
         id: "11111111-2222-3333-4444-555555555555",
         identifier: "TY-1",

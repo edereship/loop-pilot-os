@@ -1,5 +1,8 @@
 [product]
-goal = "プロダクトのゴールと制約。毎セッションのプロンプト冒頭に入る"
+goal = "プロダクトのゴールと制約（spec_dir を使う場合はコメントアウト）"
+# spec_dir = "docs/specs"   # repo 内の仕様ディレクトリ。requirements.md（必須）+ 領域別要件定義を注入
+#                            # 使用条件: <spec_dir>/requirements.md が存在し空でないこと。
+#                            # 設定した場合は goal を削除またはコメントアウトすること。
 
 [repo]
 path = "/abs/path/to/target-repo"
@@ -60,6 +63,7 @@ idle_recheck_seconds = 300
 
 [digest]
 recent_merged_count = 5
+# enabled = true           # false にすると digest セクションを丸ごと省略（効果測定後に廃止可能）
 
 [notify]
 # Slack Webhook は環境変数 SLACK_WEBHOOK_URL（未設定ならコンソールのみ）

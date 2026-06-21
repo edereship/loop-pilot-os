@@ -11,6 +11,7 @@ import type {
   MergeReadiness,
   MonitorVerdict,
   PromptArgs,
+  SpecContent,
   RecoveryContext,
   RecoveryOutcome,
   WorkflowRecovery,
@@ -30,6 +31,8 @@ export interface OrchestratorDeps {
   notifier: Notifier;
   store: SqliteStore;
   buildPrompt: (args: PromptArgs) => string;
+  /** Called per-session with the worktree path (post-fetch) and specDir. Null when spec_dir is unset. */
+  specLoader: ((repoPath: string, specDir: string) => SpecContent) | null;
   clock: () => string;
   sleep: (ms: number) => Promise<void>;
   log: (line: string) => void;
@@ -53,6 +56,7 @@ export class Orchestrator {
   private readonly notifier: Notifier;
   private readonly store: SqliteStore;
   private readonly buildPrompt: (args: PromptArgs) => string;
+  private readonly specLoader: ((repoPath: string, specDir: string) => SpecContent) | null;
   private readonly clock: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: (line: string) => void;
@@ -70,6 +74,7 @@ export class Orchestrator {
     this.notifier = deps.notifier;
     this.store = deps.store;
     this.buildPrompt = deps.buildPrompt;
+    this.specLoader = deps.specLoader;
     this.clock = deps.clock;
     this.sleep = deps.sleep;
     this.log = deps.log;
@@ -506,9 +511,27 @@ export class Orchestrator {
   // ---- IMPLEMENT（仕様 §5.3） ----
   private async implement(session: TaskSessionRow, issue: EligibleIssue): Promise<RunControl> {
     this.store.updateSession(session.id, { state: "implementing" });
-    const digest = this.store.recentMergedSummaries(this.config.digest.recentMergedCount);
-    const prompt = this.buildPrompt({ goal: this.config.product.goal, issue, digest });
+    const digest = this.config.digest.enabled
+      ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
+      : [];
     const worktreePath = session.worktreePath as string;
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(worktreePath, specDir);
+      } catch (err) {
+        await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
+        await bestEffort(() => this.source.transition(issue.id, "todo"));
+        return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
+      }
+    }
+    const prompt = this.buildPrompt({
+      goal: this.config.product.goal ?? null,
+      specContent,
+      issue,
+      digest,
+    });
     let outcome: AgentOutcome;
     try {
       outcome = await this.agent.runSession({
