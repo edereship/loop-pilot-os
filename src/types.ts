@@ -67,6 +67,8 @@ export interface TaskSource {
   transition(issueId: string, state: TicketState): Promise<void>;
   /** In Progress なのに渡された issueIds に無いチケット（CLAIM途中クラッシュ孤児）を返す */
   findOrphanedInProgress(knownIssueIds: string[]): Promise<EligibleIssue[]>;
+  /** チケットに Markdown コメントを投稿する（§1.6 監査書き戻し） */
+  postComment(issueId: string, body: string): Promise<void>;
 }
 
 export interface SessionContext {

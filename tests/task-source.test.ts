@@ -401,3 +401,35 @@ describe("resolveLinearSetup", () => {
     ).rejects.toThrow(/Linear GraphQL error/i);
   });
 });
+
+describe("LinearTaskSource.postComment", () => {
+  it("calls commentCreate mutation with issueId and body", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: fixture("linear-comment-create-success.json") },
+    ]);
+    await makeSource(fetchFn).postComment("i-urgent", "## Goal\nDo the thing.");
+    expect(calls[0].query).toContain("commentCreate");
+    expect(calls[0].variables).toEqual({
+      issueId: "i-urgent",
+      body: "## Goal\nDo the thing.",
+    });
+  });
+
+  it("throws when commentCreate returns success=false", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-comment-create-fail.json") },
+    ]);
+    await expect(
+      makeSource(fetchFn).postComment("i-urgent", "brief"),
+    ).rejects.toThrow(/commentCreate failed/i);
+  });
+
+  it("throws when commentCreate response carries GraphQL errors", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-errors.json") },
+    ]);
+    await expect(
+      makeSource(fetchFn).postComment("i-urgent", "brief"),
+    ).rejects.toThrow(/Linear GraphQL error/i);
+  });
+});

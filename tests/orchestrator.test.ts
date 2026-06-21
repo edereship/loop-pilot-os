@@ -2192,10 +2192,94 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     expect(s.failureReason).toBeNull();
     // IMPLEMENT was not invoked
     expect(h.agent.contexts).toHaveLength(0);
+    // postComment must not have been called — the brief writeback is an external
+    // Linear mutation and must be skipped when a stop is pending
+    expect(h.source.comments).toHaveLength(0);
     // Run halts cleanly as user_interrupt
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("user_interrupt");
     expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
     expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "user_interrupt" });
+  });
+});
+
+describe("Orchestrator PLAN brief writeback (ES-406)", () => {
+  it("writes back the brief as a Linear comment after successful generation", async () => {
+    const briefText = "## Goal\nDo the thing.\n\n## Change Targets\n- file.ts\n\n## Implementation Steps\n1. Step one\n\n## Acceptance Criteria\n- Tests pass\n\n## Out of Scope\n- Nothing";
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "completed", text: briefText }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.source.comments).toHaveLength(1);
+    expect(h.source.comments[0]).toEqual({
+      issueId: "issue-A",
+      body: briefText,
+    });
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+  });
+
+  it("continues the loop when brief writeback fails (non-fatal)", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "completed", text: "## Goal\nDo it." }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    h.source.failNext("postComment", new Error("Linear API 503"));
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.planBrief).toContain("## Goal");
+    expect(h.logs.some((l) => l.includes("brief writeback failed") && l.includes("Linear API 503"))).toBe(true);
+  });
+
+  it("does not write back when planner returns empty output", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "completed", text: "   \n  \n  " }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.source.comments).toHaveLength(0);
+  });
+
+  it("does not write back when planner is absent", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config); // planner defaults to null
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.source.comments).toHaveLength(0);
+  });
+
+  it("does not write back when planner returns error (fallback to raw ticket)", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "error", message: "codex crashed" }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.source.comments).toHaveLength(0);
   });
 });

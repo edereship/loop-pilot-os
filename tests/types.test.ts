@@ -336,6 +336,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
       getNextEligible: async (_excludeIds: string[]): Promise<EligibleIssue | null> => eligible,
       transition: async (_issueId: string, _state: TicketState): Promise<void> => {},
       findOrphanedInProgress: async (_knownIssueIds: string[]): Promise<EligibleIssue[]> => [],
+      postComment: async (_issueId: string, _body: string): Promise<void> => {},
     };
     const agent: AgentRunner = {
       runSession: async (_ctx: SessionContext): Promise<AgentOutcome> => completed,

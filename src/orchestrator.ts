@@ -596,6 +596,13 @@ export class Orchestrator {
     if (brief.raw.length > 0) {
       this.log(`plan: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
       this.store.updateSession(session.id, { planBrief: brief.raw });
+      if (!this.interrupted) {
+        try {
+          await this.source.postComment(issue.id, brief.raw);
+        } catch (err) {
+          this.log(`plan: brief writeback failed (non-fatal): ${errMsg(err)}`);
+        }
+      }
     } else {
       this.log("plan: codex returned empty output, falling back to raw ticket");
     }
