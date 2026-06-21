@@ -19,9 +19,11 @@ import type {
   PlanBrief,
   PlanOutcome,
   PauseMeta,
+  PrDiffSummary,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
+import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
@@ -444,20 +446,20 @@ export class Orchestrator {
         return;
       }
 
-      // 2) SELECT（仕様 §5.1）
-      // getNextEligible の失敗（Linear 一時障害等）は CLAIM① と同様にセッション無しで
+      // 2) SELECT（仕様 §5.1 + A1 PM 選別ターン）
+      // getAllEligible の失敗（Linear 一時障害等）は CLAIM① と同様にセッション無しで
       // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
-      let issue: EligibleIssue | null;
+      let eligible: EligibleIssue[];
       try {
-        issue = await this.source.getNextEligible(this.store.activeIssueIds());
+        eligible = await this.source.getAllEligible(this.store.activeIssueIds());
       } catch (err) {
-        const detail = `select_failed: getNextEligible: ${errMsg(err)}`;
+        const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
       }
-      if (issue === null) {
+      if (eligible.length === 0) {
         // IDLE（キュー空 → 通知は初回のみ → 定期再確認）
         if (!idleNotified) {
           await this.notifier.notify({ kind: "idle", detail: "no eligible tickets" });
@@ -471,10 +473,26 @@ export class Orchestrator {
       idleNotified = false;
       this.store.setRunState(this.runId, "running");
 
+      let issue: EligibleIssue;
+      let selectRationale: string | null = null;
+      if (this.planner !== null) {
+        const sel = await this.selectWithPm(eligible);
+        if (sel.control === "halt") return;
+        issue = sel.issue;
+        selectRationale = sel.rationale;
+      } else {
+        issue = eligible[0];
+      }
+
       // 3) CLAIM
       const claim = await this.claim(issue);
       if (claim.control === "halt") return;
       const session = claim.session;
+
+      // Record PM selection rationale (§1.6)
+      if (selectRationale !== null) {
+        this.store.updateSession(session.id, { selectRationale });
+      }
 
       // 4) PLAN
       const plan = await this.plan(session, issue);
@@ -614,6 +632,118 @@ export class Orchestrator {
     }
 
     return { control: "continue", brief };
+  }
+
+  // ---- SELECT PM（スコープ doc A1 / §1.4 / §1.5） ----
+  private async selectWithPm(
+    eligible: EligibleIssue[],
+  ): Promise<
+    | { control: "continue"; issue: EligibleIssue; rationale: string | null }
+    | { control: "halt" }
+  > {
+    // Only 1 eligible → no point asking PM, skip to avoid wasting a Codex call
+    if (eligible.length <= 1) {
+      return { control: "continue", issue: eligible[0], rationale: null };
+    }
+
+    // Build PM selection context
+    const inProgress = this.store.activeSessions().map((s) => ({
+      linearIdentifier: s.linearIdentifier,
+      issueTitle: s.issueTitle,
+    }));
+
+    const recentMerged = this.config.digest.enabled
+      ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
+      : [];
+
+    // Load spec content for the anchor
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(this.config.repo?.path ?? ".", specDir);
+      } catch (err) {
+        this.log(`select: spec loading failed (non-fatal): ${errMsg(err)}`);
+      }
+    }
+
+    // Get last merged PR diff context
+    let lastPrDiff: { identifier: string; summary: PrDiffSummary } | null = null;
+    const lastMerged = this.store.lastMergedWithPr();
+    if (lastMerged !== null && lastMerged.prNumber !== null) {
+      try {
+        const summary = await this.git.getPrDiffSummary(lastMerged.prNumber);
+        lastPrDiff = { identifier: lastMerged.linearIdentifier, summary };
+      } catch (err) {
+        this.log(`select: PR diff retrieval failed (non-fatal): ${errMsg(err)}`);
+      }
+    }
+
+    const prompt = buildSelectPrompt({
+      specContent,
+      eligible,
+      inProgress,
+      recentMerged,
+      lastPrDiff,
+      diffBudgetChars: this.config.safety.selectDiffBudgetChars,
+    });
+
+    let outcome: PlanOutcome;
+    // SELECT runs before CLAIM so no worktree exists yet; use the repo root.
+    const repoPath: string = this.config.repo?.path ?? ".";
+    try {
+      outcome = await this.planner!.run({
+        worktreePath: repoPath,
+        prompt,
+        timeoutMs: this.config.safety.codexTimeoutMinutes * 60_000,
+      });
+    } catch (err) {
+      this.log(`select: codex exception, deterministic fallback: ${errMsg(err)}`);
+      return {
+        control: "continue",
+        issue: eligible[0],
+        rationale: `deterministic fallback: codex exception: ${errMsg(err)}`,
+      };
+    }
+
+    if (outcome.kind === "interrupted") {
+      await this.haltForInterrupt();
+      return { control: "halt" };
+    }
+
+    if (outcome.kind === "error") {
+      this.log(`select: codex failed, deterministic fallback: ${outcome.message}`);
+      return {
+        control: "continue",
+        issue: eligible[0],
+        rationale: `deterministic fallback: codex error: ${outcome.message}`,
+      };
+    }
+
+    // Parse Codex output
+    const parsed = parseSelection(outcome.text);
+    if (parsed === null) {
+      this.log("select: failed to parse codex output, deterministic fallback");
+      return {
+        control: "continue",
+        issue: eligible[0],
+        rationale: "deterministic fallback: parse failure",
+      };
+    }
+
+    // Match identifier against eligible set
+    const matched = eligible.find((e) => e.identifier === parsed.identifier);
+    if (matched === undefined) {
+      this.log(`select: identifier "${parsed.identifier}" not in eligible set, deterministic fallback`);
+      return {
+        control: "continue",
+        issue: eligible[0],
+        rationale: `deterministic fallback: identifier "${parsed.identifier}" not in eligible set`,
+      };
+    }
+
+    this.log(`select: PM picked ${matched.identifier}: ${parsed.rationale}`);
+    return { control: "continue", issue: matched, rationale: parsed.rationale };
   }
 
   // ---- IMPLEMENT（仕様 §5.3） ----

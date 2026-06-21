@@ -169,7 +169,20 @@ export class FakeTaskSource implements TaskSource {
     this.eligibleCalls.push([...excludeIds]);
     this.takeFailure("getAllEligible");
     const exclude = new Set(excludeIds);
-    return this.queue.filter((i) => !exclude.has(i.id));
+    // Mimic real LinearTaskSource: only return issues in "todo" state.
+    // Derive each issue's current state from the most recent transition.
+    const lastTransition = new Map<string, TicketState>();
+    for (const t of this.transitions) {
+      lastTransition.set(t.issueId, t.state);
+    }
+    return this.queue.filter((i) => {
+      if (exclude.has(i.id)) return false;
+      const state = lastTransition.get(i.id);
+      // No transition recorded = still in original todo state
+      // Transitioned back to todo = eligible again (e.g. after claim rollback)
+      // Any other state = not eligible
+      return state === undefined || state === "todo";
+    });
   }
 }
 
