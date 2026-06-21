@@ -30,6 +30,7 @@ function makeConfig(over: Partial<{
 }> = {}): Config {
   return {
     product: { goal: over.goal ?? "ship the product", specDir: undefined },
+    repo: { path: "/repo", remote: "owner/name", defaultBranch: "main", worktreeRoot: "/wt" },
     digest: { recentMergedCount: over.recentMergedCount ?? 5, enabled: true },
     safety: {
       maxTasksPerRun: over.maxTasksPerRun ?? 3,

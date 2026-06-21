@@ -661,7 +661,7 @@ export class Orchestrator {
     const specDir = this.config.product.specDir;
     if (specDir !== undefined && this.specLoader !== null) {
       try {
-        specContent = this.specLoader(this.config.repo?.path ?? ".", specDir);
+        specContent = this.specLoader(this.config.repo.path, specDir);
       } catch (err) {
         this.log(`select: spec loading failed (non-fatal): ${errMsg(err)}`);
       }
@@ -690,7 +690,7 @@ export class Orchestrator {
 
     let outcome: PlanOutcome;
     // SELECT runs before CLAIM so no worktree exists yet; use the repo root.
-    const repoPath: string = this.config.repo?.path ?? ".";
+    const repoPath = this.config.repo.path;
     try {
       outcome = await this.planner!.run({
         worktreePath: repoPath,
