@@ -1,5 +1,5 @@
 import type { SqliteStore } from "./store.js";
-import type { TaskSessionRow, PauseMeta } from "./types.js";
+import type { TaskSessionRow } from "./types.js";
 
 function fmtCost(costUsd: number | null): string {
   return costUsd === null ? "n/a" : `$${costUsd.toFixed(2)}`;
