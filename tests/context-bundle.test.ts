@@ -45,7 +45,7 @@ describe("buildPrompt — v1 フォールバック（goal のみ）", () => {
     expect(out).toContain("(説明なし)");
   });
 
-  it("③ 作業規則を全て含む", () => {
+  it("④ 作業規則を全て含む", () => {
     const out = buildPrompt(makeArgs());
     expect(out).toContain("このworktreeの現在ブランチで実装");
     expect(out).toContain("全ての変更をコミット");
@@ -57,12 +57,12 @@ describe("buildPrompt — v1 フォールバック（goal のみ）", () => {
     expect(out).toContain("最後に変更内容の要約を出力");
   });
 
-  it("④ digest が空のときは digest セクションを丸ごと省略する", () => {
+  it("⑤ digest が空のときは digest セクションを丸ごと省略する", () => {
     const out = buildPrompt(makeArgs({ digest: [] }));
     expect(out).not.toContain("直近の変更");
   });
 
-  it("④ digest が非空のとき各1行で含む", () => {
+  it("⑤ digest が非空のとき各1行で含む", () => {
     const out = buildPrompt(
       makeArgs({
         digest: [
@@ -213,6 +213,41 @@ describe("buildPrompt — planBrief 注入（A2 PLAN フェーズ）", () => {
     expect(idxRules).toBeGreaterThanOrEqual(0);
     expect(idxTicket).toBeLessThan(idxBrief);
     expect(idxBrief).toBeLessThan(idxRules);
+  });
+
+  // ---- A2-b: ガードレール（ES-405） ----
+
+  it("planBrief 存在時、ガードレール文言を含む（HOW は出発仮説・逸脱可）", () => {
+    const out = buildPrompt(makeArgs({ planBrief: sampleBrief }));
+    expect(out).toContain("出発仮説");
+    expect(out).toContain("逸脱してよい");
+  });
+
+  it("planBrief が null のときはガードレール文言を含まない", () => {
+    const out = buildPrompt(makeArgs({ planBrief: null }));
+    expect(out).not.toContain("出発仮説");
+    expect(out).not.toContain("逸脱してよい");
+  });
+
+  it("planBrief 未定義のときはガードレール文言を含まない", () => {
+    const out = buildPrompt(makeArgs());
+    expect(out).not.toContain("出発仮説");
+    expect(out).not.toContain("逸脱してよい");
+  });
+
+  it("ガードレールはブリーフ本文の後に配置される", () => {
+    const out = buildPrompt(makeArgs({ planBrief: sampleBrief }));
+    const idxBriefBody = out.indexOf("Implement login.");
+    const idxGuardrail = out.indexOf("出発仮説");
+    expect(idxBriefBody).toBeGreaterThanOrEqual(0);
+    expect(idxGuardrail).toBeGreaterThanOrEqual(0);
+    expect(idxBriefBody).toBeLessThan(idxGuardrail);
+  });
+
+  it("v2 レイアウトでもガードレールが注入される", () => {
+    const out = buildPrompt(makeV2Args({ planBrief: sampleBrief }));
+    expect(out).toContain("出発仮説");
+    expect(out).toContain("逸脱してよい");
   });
 });
 

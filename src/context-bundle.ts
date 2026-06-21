@@ -7,14 +7,16 @@ import type { PromptArgs } from "./types.js";
  *   ① 要求（requirements.md 全文 — 不変の錨・必須）
  *   ② 要件定義（領域ファイル群 — 該当分。B1-a では全領域注入）
  *   ③ 担当チケット（identifier / title / url / description）
- *   ④ 作業規則
- *   ⑤ 直近の変更アウェアネス（digest — 軽い手がかり・任意。空配列で省略）
+ *   ④ 実装ブリーフ + ガードレール（PLAN フェーズ生成・存在時のみ）
+ *   ⑤ 作業規則
+ *   ⑥ 直近の変更アウェアネス（digest — 軽い手がかり・任意。空配列で省略）
  *
  * v1 フォールバック（spec_dir 未設定・goal のみ）:
  *   ① プロダクトのゴール（config.product.goal）
  *   ② 担当チケット
- *   ③ 作業規則
- *   ④ digest
+ *   ③ 実装ブリーフ + ガードレール（存在時のみ）
+ *   ④ 作業規則
+ *   ⑤ digest
  *
  * 副作用・時刻・乱数を含まないため、同入力 → 同出力。
  */
@@ -55,9 +57,18 @@ export function buildPrompt(args: PromptArgs): string {
     ].join("\n"),
   );
 
-  // ---- ④ 実装ブリーフ（PLAN フェーズ生成・存在時のみ） ----
+  // ---- ④ 実装ブリーフ + ガードレール（PLAN フェーズ生成・存在時のみ） ----
   if (planBrief && planBrief.raw.length > 0) {
-    blocks.push(["# 実装ブリーフ", "", planBrief.raw].join("\n"));
+    blocks.push(
+      [
+        "# 実装ブリーフ",
+        "",
+        planBrief.raw,
+        "",
+        "> **注意**: 上記ブリーフの実装手順（HOW）は拘束ではなく強い出発仮説である。",
+        "> コードの実態と食い違う場合は、コードの現実を優先し逸脱してよい。",
+      ].join("\n"),
+    );
   }
 
   // ---- ⑤ 作業規則 ----
@@ -75,7 +86,7 @@ export function buildPrompt(args: PromptArgs): string {
     ].join("\n"),
   );
 
-  // ---- ⑤ digest（B1-b: 格下げ・最小化。digest.enabled=false 時は呼び出し側が空配列を渡す） ----
+  // ---- ⑥ digest（B1-b: 格下げ・最小化。digest.enabled=false 時は呼び出し側が空配列を渡す） ----
   if (digest.length > 0) {
     const lines = digest.map((d) => {
       const summary = truncateToOneLine(d.agentSummary ?? "(要約なし)");
