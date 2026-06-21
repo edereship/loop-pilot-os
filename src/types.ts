@@ -1,7 +1,17 @@
 // ---- 状態語彙（仕様 §7） ----
 export type SessionState =
   | "claimed" | "implementing" | "handing_off" | "in_review" | "merged" | "stopped";
-export type RunState = "running" | "idle" | "halted";
+
+export type PauseTarget = "claude" | "codex";
+export interface PauseMeta {
+  reason: "rate_limit";
+  target: PauseTarget;
+  pausedAt: string;        // ISO-8601 UTC
+  nextReprobeAt: string;   // ISO-8601 UTC
+  capDeadlineAt: string;   // ISO-8601 UTC
+}
+
+export type RunState = "running" | "idle" | "halted" | "paused";
 export type FailureReason =
   | "agent_no_change"        // コミット無し/空差分/未コミット残骸（stop_detail で区別）
   | "cost_exceeded"
@@ -34,6 +44,7 @@ export interface RunRow {
   taskCap: number;
   state: RunState;
   haltReason: string | null;
+  pauseMeta: PauseMeta | null;
 }
 
 export interface TaskSessionRow {
@@ -134,7 +145,9 @@ export type NotifyEvent =
   | { kind: "task_started"; identifier: string; title: string }  // CLAIM 成功（opt-in）
   | { kind: "task_merged"; identifier: string; title: string; mergedCount: number } // DONE 完了（opt-in）
   | { kind: "quota_waiting"; detail: string }             // 初回 Codex quota exhausted
-  | { kind: "quota_resumed"; detail: string };            // Codex quota 回復
+  | { kind: "quota_resumed"; detail: string }             // Codex quota 回復
+  | { kind: "paused"; target: PauseTarget; detail: string }
+  | { kind: "resumed"; target: PauseTarget; detail: string };
 export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */
