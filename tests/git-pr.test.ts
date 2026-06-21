@@ -537,6 +537,18 @@ describe("GitPrManager.getPrDiffSummary", () => {
     const mgr = new GitPrManager(runner, OPTS);
     await expect(mgr.getPrDiffSummary(99)).rejects.toThrow(/gh pr diff failed/);
   });
+
+  it("throws descriptive error when gh pr view returns unparseable JSON", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view", "42"], {
+      code: 0,
+      stdout: "<html>502 Bad Gateway</html>",
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.getPrDiffSummary(42)).rejects.toThrow(/unparseable JSON/);
+  });
 });
 
 describe("GitPrManager.discardWorktree", () => {

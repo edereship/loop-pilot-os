@@ -641,8 +641,11 @@ export class Orchestrator {
     | { control: "continue"; issue: EligibleIssue; rationale: string | null }
     | { control: "halt" }
   > {
+    if (eligible.length === 0) {
+      throw new Error("selectWithPm called with empty eligible list");
+    }
     // Only 1 eligible → no point asking PM, skip to avoid wasting a Codex call
-    if (eligible.length <= 1) {
+    if (eligible.length === 1) {
       return { control: "continue", issue: eligible[0], rationale: null };
     }
 
@@ -723,7 +726,8 @@ export class Orchestrator {
     // Parse Codex output
     const parsed = parseSelection(outcome.text);
     if (parsed === null) {
-      this.log("select: failed to parse codex output, deterministic fallback");
+      const preview = outcome.text.slice(0, 300);
+      this.log(`select: failed to parse codex output, deterministic fallback. Raw output: ${preview}`);
       return {
         control: "continue",
         issue: eligible[0],

@@ -2401,6 +2401,64 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
     expect(sessions[0].selectRationale).toBeNull();
   });
 
+  it("planner.run() が例外を throw → 決定的フォールバック", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
+
+    // SELECT: planner throws (no outcomes queued → FakePlanRunner throws)
+    // We need to re-queue a PLAN outcome after the throw
+    planner.outcomes = []; // empty → throws on first call (SELECT)
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    // Override planner to throw on first call, succeed on second
+    let callCount = 0;
+    const origRun = planner.run.bind(planner);
+    planner.run = async (ctx) => {
+      callCount++;
+      if (callCount === 1) throw new Error("codex crashed");
+      planner.outcomes = [{ kind: "completed", text: "## Goal\nPlan" }];
+      return origRun(ctx);
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1"); // deterministic fallback
+    expect(sessions[0].selectRationale).toContain("deterministic fallback");
+    expect(sessions[0].selectRationale).toContain("codex exception");
+  });
+
+  it("Codex が JSON を含まないテキストを返す → パース失敗で決定的フォールバック", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
+
+    planner.outcomes = [
+      // SELECT: returns prose without JSON
+      { kind: "completed", text: "I think TY-2 is the best choice because it continues the auth work." },
+      // PLAN
+      { kind: "completed", text: "## Goal\nPlan" },
+    ];
+
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].linearIdentifier).toBe("TY-1"); // deterministic fallback
+    expect(sessions[0].selectRationale).toBe("deterministic fallback: parse failure");
+    // Verify log contains raw output preview
+    expect(h.logs.some((l) => l.includes("Raw output:"))).toBe(true);
+  });
+
   it("Codex interrupted → HALT（安全停止）", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
