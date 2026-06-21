@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS task_session (
   failure_reason TEXT,
   stop_detail TEXT,
   agent_summary TEXT,
+  plan_brief TEXT,
   started_at TEXT NOT NULL,
   monitor_started_at TEXT,
   ended_at TEXT,
@@ -88,6 +89,7 @@ interface RawSessionRow {
   failure_reason: string | null;
   stop_detail: string | null;
   agent_summary: string | null;
+  plan_brief: string | null;
   started_at: string;
   monitor_started_at: string | null;
   ended_at: string | null;
@@ -111,6 +113,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     failureReason: r.failure_reason as FailureReason | null,
     stopDetail: r.stop_detail,
     agentSummary: r.agent_summary,
+    planBrief: r.plan_brief,
     startedAt: r.started_at,
     monitorStartedAt: r.monitor_started_at,
     endedAt: r.ended_at,
@@ -130,6 +133,7 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   failureReason: "failure_reason",
   stopDetail: "stop_detail",
   agentSummary: "agent_summary",
+  planBrief: "plan_brief",
   monitorStartedAt: "monitor_started_at",
   endedAt: "ended_at",
   runId: "run_id",
@@ -193,6 +197,9 @@ export class SqliteStore {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN pending_restart_reason TEXT`,
       );
+    }
+    if (!columns.has("plan_brief")) {
+      this.db.exec(`ALTER TABLE task_session ADD COLUMN plan_brief TEXT`);
     }
   }
 
