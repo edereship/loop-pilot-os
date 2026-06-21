@@ -18,6 +18,7 @@ import type {
   PlanRunner,
   PlanBrief,
   PlanOutcome,
+  PauseMeta,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
@@ -1210,6 +1211,40 @@ export class Orchestrator {
     this.store.setRunState(this.runId, "halted", haltDetail);
     this.log(haltDetail);
     return HALT;
+  }
+
+  /** 停止要求チェックつきの安全点待機。rate-limit 等で呼ぶ。中断時は HALT、完了時は CONTINUE を返す。 */
+  public async interruptablePause(
+    meta: PauseMeta,
+    waitMs: number,
+    chunkMs: number = 10_000,
+  ): Promise<RunControl> {
+    this.store.setPauseMeta(this.runId, meta);
+    await this.notifier.notify({
+      kind: "paused",
+      target: meta.target,
+      detail: `${meta.reason}: waiting until ${meta.capDeadlineAt}`,
+    });
+
+    for (let elapsed = 0; elapsed < waitMs; elapsed += chunkMs) {
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return HALT;
+      }
+      await this.sleep(chunkMs);
+    }
+    if (this.interrupted) {
+      await this.haltForInterrupt();
+      return HALT;
+    }
+
+    this.store.clearPauseMeta(this.runId);
+    await this.notifier.notify({
+      kind: "resumed",
+      target: meta.target,
+      detail: `${meta.reason}: resumed after ${waitMs / 1000}s wait`,
+    });
+    return CONTINUE;
   }
 
   /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。 */
