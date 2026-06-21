@@ -191,7 +191,6 @@ async function runLoop(configPath: string): Promise<number> {
 
     const codexPlanner = new CodexPlanner(runner, {
       log: logLine,
-      defaultTimeoutMs: config.safety.codexTimeoutMinutes * 60_000,
     });
 
     const orchestrator = new Orchestrator({

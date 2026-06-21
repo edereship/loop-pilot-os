@@ -562,7 +562,9 @@ export class Orchestrator {
 
     const brief = parseBrief(outcome.text);
     this.log(`plan: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
-    this.store.updateSession(session.id, { planBrief: brief.raw });
+    if (brief.raw.length > 0) {
+      this.store.updateSession(session.id, { planBrief: brief.raw });
+    }
 
     return { control: "continue", brief };
   }

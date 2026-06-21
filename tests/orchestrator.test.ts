@@ -2099,6 +2099,22 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     expect(s.planBrief).toBeNull();
   });
 
+  it("stores null (not empty string) when planner returns whitespace-only output", async () => {
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "completed" as const, text: "   \n  \n  " }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.planBrief).toBeNull();
+  });
+
   it("passes codexTimeoutMinutes as timeoutMs to the planner", async () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed", text: "## Goal\nDone." }];
