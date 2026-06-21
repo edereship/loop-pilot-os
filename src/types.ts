@@ -50,6 +50,7 @@ export interface TaskSessionRow {
   failureReason: FailureReason | null;
   stopDetail: string | null;     // looppilot stopReason / 例外メッセージ等
   agentSummary: string | null;
+  planBrief: string | null;
   startedAt: string;
   monitorStartedAt: string | null; // in_review 入り時刻。未起動ガード/監視timeoutの起点（再起動でリセットしない）
   endedAt: string | null;
@@ -183,8 +184,32 @@ export interface PromptArgs {
   specContent: SpecContent | null;                // spec_dir から読み込んだ仕様（v2）
   issue: EligibleIssue;
   digest: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
+  planBrief?: PlanBrief | null;                   // PLAN フェーズで生成した実装ブリーフ（任意）
 }
 // context-bundle.ts は export function buildPrompt(args: PromptArgs): string を公開
+
+// ---- チケット濃化（A2: PLAN フェーズ） ----
+
+export type PlanOutcome =
+  | { kind: "completed"; text: string }
+  | { kind: "error"; message: string };
+
+export interface PlanRunner {
+  run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number }): Promise<PlanOutcome>;
+}
+
+export interface BriefSections {
+  goal: string;
+  changeTargets: string;
+  steps: string;
+  acceptance: string;
+  outOfScope: string;
+}
+
+export interface PlanBrief {
+  raw: string;
+  sections: BriefSections | null;
+}
 
 // ---- 実行コマンド抽象（git/gh/claude 共通） ----
 export interface CommandResult { code: number; stdout: string; stderr: string; }

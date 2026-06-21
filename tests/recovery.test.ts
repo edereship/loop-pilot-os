@@ -111,6 +111,7 @@ function makeHarness(config: Config): Harness {
     sleep,
     log,
     recovery,
+    planner: null,
   });
   return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }
@@ -367,8 +368,11 @@ describe("回復 — claimed/implementing/handing_off で open PR ヒット → 
   });
 });
 
-describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 / カーネル §8: 手動掃除）", () => {
-  it("claimed で findOpenPrForBranch が null → stopped(exception, stop_detail に branch/worktree/identifier) + HALT・ループに入らない", async () => {
+describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 / カーネル §8）", () => {
+  it("claimed + no PR → auto-cleanup: discardWorktree + ticket→Todo + stopped(exception) + HALT (Finding 2)", async () => {
+    // PLAN is read-only — a claimed session with no open PR can never have agent
+    // commits. Recovery auto-reverts it (discard worktree + Todo) instead of
+    // halting for manual cleanup.
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
@@ -385,8 +389,9 @@ describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 /
     const s = h.store.getSession(crashed.id);
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("exception");
-    // stop_detail に branch / worktree / identifier を明記（手動掃除を促す。カーネル §8）
-    expect(s.stopDetail).toContain("crash recovery: no open PR");
+    // stop_detail に PLAN phase auto-cleanup の識別子と branch/worktree/identifier
+    expect(s.stopDetail).toContain("crash recovery: no open PR (PLAN phase)");
+    expect(s.stopDetail).toContain("ticket reverted to Todo");
     expect(s.stopDetail).toContain("looppilot/ty-7-x");
     expect(s.stopDetail).toContain("/wt/ty-7");
     expect(s.stopDetail).toContain("TY-7");
@@ -397,12 +402,18 @@ describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 /
     // 通知列: run_started → halted（停止 1 回）
     expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
     expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "exception" });
-    // pushAndOpenPr / mergePr は呼ばれない（タスク内再開は v1 スコープ外）
+    // worktree が破棄され、チケットが Todo へ戻された
+    expect(h.git.calls).toContainEqual({
+      method: "discardWorktree",
+      args: ["looppilot/ty-7-x", "/wt/ty-7"],
+    });
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-G", state: "todo" });
+    // pushAndOpenPr / mergePr は呼ばれない
     expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
     expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(false);
   });
 
-  it("worktreePath=null でも stop_detail にプレースホルダを出して HALT する", async () => {
+  it("claimed + no PR + worktreePath=null → ticket→Todo + stop_detail にプレースホルダ (Finding 2)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
@@ -416,9 +427,37 @@ describe("回復 — open PR ミス → stopped(exception) + HALT（仕様 §9 /
     const s = h.store.getSession(crashed.id);
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("crash recovery: no open PR (PLAN phase)");
+    expect(s.stopDetail).toContain("ticket reverted to Todo");
     expect(s.stopDetail).toContain("<no worktree>");
     expect(s.stopDetail).toContain("looppilot/ty-8-x");
     expect(s.stopDetail).toContain("TY-8");
+    // worktreePath が null なので discardWorktree は呼ばれない
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
+    // チケットは Todo へ戻される
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-H", state: "todo" });
+  });
+
+  it("claimed + no PR + transition(todo) fails → detail says revert FAILED (Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "claimed" },
+      { branch: "looppilot/ty-9c-x", worktreePath: "/wt/ty-9c", linearIssueId: "issue-9C", linearIdentifier: "TY-9C" },
+    );
+    h.source.failNext("transition", new Error("Linear 5xx"));
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("ticket revert to Todo FAILED");
+    expect(s.stopDetail).toContain("may be stuck In Progress");
+    expect(s.stopDetail).toContain("TY-9C");
+    // Worktree was still discarded (best-effort, before transition)
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(true);
   });
 
   // findOpenPrForBranch が throw（gh 一時障害）→ Fatal 落ち・無通知ではなく

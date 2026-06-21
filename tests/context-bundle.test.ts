@@ -168,6 +168,54 @@ describe("buildPrompt — v2 注入レイアウト（B1 グラウンディング
   });
 });
 
+// ---- A2: PLAN ブリーフ注入 ----
+
+describe("buildPrompt — planBrief 注入（A2 PLAN フェーズ）", () => {
+  const sampleBrief = {
+    raw: "## Goal\nImplement login.\n\n## Change Targets\n- auth.ts\n\n## Implementation Steps\n1. Add handler\n\n## Acceptance Criteria\n- Tests pass\n\n## Out of Scope\n- Nothing",
+    sections: {
+      goal: "Implement login.",
+      changeTargets: "- auth.ts",
+      steps: "1. Add handler",
+      acceptance: "- Tests pass",
+      outOfScope: "- Nothing",
+    },
+  };
+
+  it("planBrief が存在するときは 実装ブリーフ セクションを注入する", () => {
+    const out = buildPrompt(makeArgs({ planBrief: sampleBrief }));
+    expect(out).toContain("# 実装ブリーフ");
+    expect(out).toContain("Implement login.");
+  });
+
+  it("planBrief が null のときは 実装ブリーフ セクションを省略する", () => {
+    const out = buildPrompt(makeArgs({ planBrief: null }));
+    expect(out).not.toContain("実装ブリーフ");
+  });
+
+  it("planBrief が未定義（省略）のときは 実装ブリーフ セクションを省略する", () => {
+    const out = buildPrompt(makeArgs());
+    expect(out).not.toContain("実装ブリーフ");
+  });
+
+  it("planBrief の raw が空文字のときは 実装ブリーフ セクションを省略する", () => {
+    const out = buildPrompt(makeArgs({ planBrief: { raw: "", sections: null } }));
+    expect(out).not.toContain("実装ブリーフ");
+  });
+
+  it("ブロック順序: チケット → 実装ブリーフ → 作業規則", () => {
+    const out = buildPrompt(makeArgs({ planBrief: sampleBrief }));
+    const idxTicket = out.indexOf("担当チケット");
+    const idxBrief = out.indexOf("実装ブリーフ");
+    const idxRules = out.indexOf("作業規則");
+    expect(idxTicket).toBeGreaterThanOrEqual(0);
+    expect(idxBrief).toBeGreaterThanOrEqual(0);
+    expect(idxRules).toBeGreaterThanOrEqual(0);
+    expect(idxTicket).toBeLessThan(idxBrief);
+    expect(idxBrief).toBeLessThan(idxRules);
+  });
+});
+
 // ---- グラウンディングなし（goal=null, specContent=null） ----
 
 describe("buildPrompt — グラウンディングなし", () => {

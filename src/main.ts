@@ -24,6 +24,7 @@ import { Orchestrator, type RunOutcome } from "./orchestrator.js";
 import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
 import { AgentWorkflowRecovery } from "./workflow-recovery.js";
+import { CodexPlanner } from "./codex-planner.js";
 
 const EXIT_OK = 0;
 const EXIT_PREFLIGHT = 1;
@@ -188,6 +189,10 @@ async function runLoop(configPath: string): Promise<number> {
       logLine,
     );
 
+    const codexPlanner = new CodexPlanner(runner, {
+      log: logLine,
+    });
+
     const orchestrator = new Orchestrator({
       config,
       source,
@@ -202,6 +207,7 @@ async function runLoop(configPath: string): Promise<number> {
       sleep,
       log: logLine,
       recovery,
+      planner: codexPlanner,
     });
 
     // 停止シグナル → orchestrator.requestStop()（次の安全点でクリーン halt）。

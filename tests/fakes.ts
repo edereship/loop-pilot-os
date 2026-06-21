@@ -16,6 +16,8 @@ import type {
   WorkflowRecovery,
   RecoveryContext,
   RecoveryOutcome,
+  PlanRunner,
+  PlanOutcome,
 } from "../src/types.js";
 
 type StubResponder =
@@ -314,5 +316,18 @@ export class FakeWorkflowRecovery implements WorkflowRecovery {
       return this.outcomes[0];
     }
     throw new Error("FakeWorkflowRecovery: no outcome queued");
+  }
+}
+
+// ---- FakePlanRunner ----
+export class FakePlanRunner implements PlanRunner {
+  outcomes: PlanOutcome[] = [];
+  calls: Array<{ worktreePath: string; prompt: string; timeoutMs?: number }> = [];
+
+  async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number }): Promise<PlanOutcome> {
+    this.calls.push(ctx);
+    const out = this.outcomes.shift();
+    if (!out) throw new Error("FakePlanRunner: no outcome queued");
+    return out;
   }
 }
