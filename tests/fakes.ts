@@ -124,10 +124,12 @@ export class FakeTaskSource implements TaskSource {
   eligibleCalls: string[][] = [];
   /** findOrphanedInProgress の戻り値 */
   orphans: EligibleIssue[] = [];
+  /** postComment の呼び出し記録 */
+  comments: Array<{ issueId: string; body: string }> = [];
   /** メソッド名 → 次の1回だけ throw させるエラー */
   private failOnce = new Map<string, Error>();
 
-  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress", error?: Error): void {
+  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment", error?: Error): void {
     this.failOnce.set(method, error ?? new Error(`FakeTaskSource.${method} injected failure`));
   }
 
@@ -156,6 +158,11 @@ export class FakeTaskSource implements TaskSource {
   async findOrphanedInProgress(_knownIssueIds: string[]): Promise<EligibleIssue[]> {
     this.takeFailure("findOrphanedInProgress");
     return this.orphans;
+  }
+
+  async postComment(issueId: string, body: string): Promise<void> {
+    this.takeFailure("postComment");
+    this.comments.push({ issueId, body });
   }
 }
 

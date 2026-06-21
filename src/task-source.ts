@@ -20,6 +20,9 @@ const ELIGIBLE_QUERY = `query Eligible($projectId: ID, $todoStateId: ID!, $label
 // カーネル §5.5: 遷移 mutation。一字一句一致。
 const TRANSITION_MUTATION = `mutation IssueUpdate($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`;
 
+// §1.6: brief 書き戻し用 commentCreate mutation。
+const COMMENT_CREATE_MUTATION = `mutation CommentCreate($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }`;
+
 // カーネル §5.5 プリフライト解決: viewer 検証 + team/project/states/labels。
 // project は team.projects から解決する（ワークスペース横断の名前解決は、同名 project が
 // 他チームにある場合に誤った projectId へ解決し得るため。仕様 §5.1「指定Team/PJ」）。
@@ -182,6 +185,18 @@ export class LinearTaskSource implements TaskSource {
     const known = new Set(knownIssueIds);
     const nodes = await this.queryByState(this.stateIds.in_progress);
     return nodes.filter((n) => !known.has(n.id)).map(toEligible);
+  }
+
+  async postComment(issueId: string, body: string): Promise<void> {
+    const data = await graphql<{ commentCreate: { success: boolean } }>(
+      this.fetchFn,
+      this.apiKey,
+      COMMENT_CREATE_MUTATION,
+      { issueId, body },
+    );
+    if (!data.commentCreate.success) {
+      throw new Error(`Linear commentCreate failed for ${issueId}`);
+    }
   }
 }
 
