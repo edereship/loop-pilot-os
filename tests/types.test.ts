@@ -61,13 +61,14 @@ describe("状態語彙ユニオン（仕様 §7）", () => {
     expect(all.map(ensureExhaustive).length).toBe(6);
   });
 
-  it("RunState は running/idle/halted の 3 値である", () => {
-    const all = ["running", "idle", "halted"] as const satisfies readonly RunState[];
+  it("RunState は running/idle/halted/paused の 4 値である", () => {
+    const all = ["running", "idle", "halted", "paused"] as const satisfies readonly RunState[];
     const ensureExhaustive = (s: RunState): (typeof all)[number] => {
       switch (s) {
         case "running":
         case "idle":
         case "halted":
+        case "paused":
           return s;
         default: {
           const never: never = s;
@@ -75,7 +76,7 @@ describe("状態語彙ユニオン（仕様 §7）", () => {
         }
       }
     };
-    expect(all.map(ensureExhaustive).length).toBe(3);
+    expect(all.map(ensureExhaustive).length).toBe(4);
   });
 
   it("FailureReason は仕様 §7 の 11 種の失敗理由を網羅する", () => {
@@ -275,14 +276,21 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
     expect(reasons).toHaveLength(5);
   });
 
-  it("NotifyEvent は kind で halted/idle/run_started を判別できる（仕様 §10）", () => {
+  it("NotifyEvent は kind で 9 バリアント（halted/idle/run_started/task_started/task_merged/quota_waiting/quota_resumed/paused/resumed）を判別できる（仕様 §10）", () => {
     const events = [
       { kind: "halted", reason: "task_cap", detail: "limit reached" },
       { kind: "idle", detail: "queue empty" },
       { kind: "run_started", detail: "started" },
+      { kind: "task_started", identifier: "TY-1", title: "t" },
+      { kind: "task_merged", identifier: "TY-1", title: "t", mergedCount: 1 },
+      { kind: "quota_waiting", detail: "d" },
+      { kind: "quota_resumed", detail: "d" },
+      { kind: "paused", target: "claude", detail: "d" },
+      { kind: "resumed", target: "codex", detail: "d" },
     ] as const satisfies readonly NotifyEvent[];
     const kinds = events.map((e) => e.kind);
-    expect(kinds).toEqual(["halted", "idle", "run_started"]);
+    expect(kinds).toEqual(["halted", "idle", "run_started", "task_started", "task_merged", "quota_waiting", "quota_resumed", "paused", "resumed"]);
+    expect(kinds).toHaveLength(9);
   });
 });
 
