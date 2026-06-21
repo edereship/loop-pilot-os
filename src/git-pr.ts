@@ -269,10 +269,10 @@ export class GitPrManager implements GitPrManagerInterface {
   }
 
   async getPrDiffSummary(prNumber: number): Promise<PrDiffSummary> {
-    const { repoPath } = this.opts;
+    const { repoPath, remote } = this.opts;
     const viewRes = await this.runner.run(
       "gh",
-      ["pr", "view", String(prNumber), "--json", "title,body"],
+      ["pr", "view", String(prNumber), "-R", remote, "--json", "title,body"],
       { cwd: repoPath },
     );
     if (viewRes.code !== 0) {
@@ -288,7 +288,7 @@ export class GitPrManager implements GitPrManagerInterface {
 
     const diffRes = await this.runner.run(
       "gh",
-      ["pr", "diff", String(prNumber)],
+      ["pr", "diff", String(prNumber), "-R", remote],
       { cwd: repoPath },
     );
     if (diffRes.code !== 0) {
