@@ -1,5 +1,5 @@
 import type { SqliteStore } from "./store.js";
-import type { TaskSessionRow } from "./types.js";
+import type { TaskSessionRow, PauseMeta } from "./types.js";
 
 function fmtCost(costUsd: number | null): string {
   return costUsd === null ? "n/a" : `$${costUsd.toFixed(2)}`;
@@ -47,6 +47,13 @@ export function renderStatus(store: SqliteStore): string {
   lines.push(`  merged: ${store.countMerged(run.id)}`);
   if (run.state === "halted") {
     lines.push(`  halt reason: ${run.haltReason ?? "(none)"}`);
+  }
+  if (run.state === "paused" && run.pauseMeta !== null) {
+    const pm = run.pauseMeta;
+    lines.push(`  pause reason: ${pm.reason}`);
+    lines.push(`  pause target: ${pm.target}`);
+    lines.push(`  next re-probe: ${pm.nextReprobeAt}`);
+    lines.push(`  cap deadline: ${pm.capDeadlineAt}`);
   }
 
   lines.push("");
