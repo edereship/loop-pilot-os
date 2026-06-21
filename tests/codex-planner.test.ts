@@ -69,8 +69,6 @@ describe("CodexPlanner.run", () => {
       "--ephemeral",
       "--sandbox",
       "read-only",
-      "--ask-for-approval",
-      "never",
       "--ignore-user-config",
       "--ignore-rules",
       "--",
@@ -92,8 +90,6 @@ describe("CodexPlanner.run", () => {
     expect(runner.calls[0]!.args).toEqual([
       "exec",
       "--ephemeral",
-      "--ask-for-approval",
-      "never",
       "--ignore-user-config",
       "--ignore-rules",
       "--sandbox",
@@ -594,7 +590,7 @@ describe("CodexPlanner flag alias detection (Finding 3)", () => {
     expect(args).toContain("--sandbox=workspace-write");
   });
 
-  it("-a 短縮エイリアスで ask-for-approval が指定された場合はデフォルトを追加しない", async () => {
+  it("-a エイリアスが extraArgs にある場合もそのまま透過される", async () => {
     const runner = new FakeCommandRunner();
     codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
     const logs: string[] = [];
@@ -604,23 +600,8 @@ describe("CodexPlanner flag alias detection (Finding 3)", () => {
     });
 
     const args = runner.calls[0]!.args;
-    expect(args).not.toContain("--ask-for-approval");
     expect(args).toContain("-a");
     expect(args).toContain("on-request");
-  });
-
-  it("--ask-for-approval=value 形式で approval が指定された場合はデフォルトを追加しない", async () => {
-    const runner = new FakeCommandRunner();
-    codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
-    const logs: string[] = [];
-    await makePlanner(runner, logs, ["--ask-for-approval=on-request"]).run({
-      worktreePath: "/wt",
-      prompt: "task",
-    });
-
-    const args = runner.calls[0]!.args;
-    expect(args).not.toContain("--ask-for-approval");
-    expect(args).toContain("--ask-for-approval=on-request");
   });
 });
 
