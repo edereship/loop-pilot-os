@@ -227,24 +227,29 @@ export class SqliteStore {
       // Wrap in an explicit transaction so the recreate/copy/drop/rename sequence
       // is all-or-nothing: a mid-migration crash cannot leave an empty run table
       // with the data stranded in run_new.
+      const fkWasOn = this.db.pragma("foreign_keys", { simple: true }) as number;
       this.db.pragma("foreign_keys = OFF");
-      const runMigration = this.db.transaction(() => {
-        this.db.exec(`
-          CREATE TABLE run_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT NOT NULL,
-            task_cap INTEGER NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
-            halt_reason TEXT,
-            pause_meta TEXT
-          );
-          INSERT INTO run_new (id, started_at, task_cap, state, halt_reason)
-            SELECT id, started_at, task_cap, state, halt_reason FROM run;
-          DROP TABLE run;
-          ALTER TABLE run_new RENAME TO run;
-        `);
-      });
-      runMigration();
+      try {
+        const runMigration = this.db.transaction(() => {
+          this.db.exec(`
+            CREATE TABLE run_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              started_at TEXT NOT NULL,
+              task_cap INTEGER NOT NULL,
+              state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+              halt_reason TEXT,
+              pause_meta TEXT
+            );
+            INSERT INTO run_new (id, started_at, task_cap, state, halt_reason)
+              SELECT id, started_at, task_cap, state, halt_reason FROM run;
+            DROP TABLE run;
+            ALTER TABLE run_new RENAME TO run;
+          `);
+        });
+        runMigration();
+      } finally {
+        this.db.pragma(`foreign_keys = ${fkWasOn}`);
+      }
     }
   }
 

@@ -1247,6 +1247,10 @@ export class Orchestrator {
       target: meta.target,
       detail: `${meta.reason}: resumed after ${waitMs / 1000}s wait`,
     });
+    if (this.interrupted) {
+      await this.haltForInterrupt();
+      return HALT;
+    }
     return CONTINUE;
   }
 
