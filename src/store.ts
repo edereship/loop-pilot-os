@@ -68,6 +68,14 @@ interface RawRunRow {
   halt_reason: string | null;
   pause_meta: string | null;
 }
+function parsePauseMeta(raw: string | null): PauseMeta | null {
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw) as PauseMeta;
+  } catch {
+    return null;
+  }
+}
 function toRunRow(r: RawRunRow): RunRow {
   return {
     id: r.id,
@@ -75,7 +83,7 @@ function toRunRow(r: RawRunRow): RunRow {
     taskCap: r.task_cap,
     state: r.state as RunState,
     haltReason: r.halt_reason,
-    pauseMeta: r.pause_meta === null ? null : JSON.parse(r.pause_meta) as PauseMeta,
+    pauseMeta: parsePauseMeta(r.pause_meta),
   };
 }
 
@@ -214,7 +222,23 @@ export class SqliteStore {
       ).map((c) => c.name),
     );
     if (!runColumns.has("pause_meta")) {
-      this.db.exec(`ALTER TABLE run ADD COLUMN pause_meta TEXT`);
+      // pause_meta 追加と同時に CHECK 制約を ('running','idle','halted','paused') へ更新する。
+      // SQLite は ALTER CONSTRAINT 非対応のためテーブル再作成が必要。
+      this.db.pragma("foreign_keys = OFF");
+      this.db.exec(`
+        CREATE TABLE run_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT NOT NULL,
+          task_cap INTEGER NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+          halt_reason TEXT,
+          pause_meta TEXT
+        );
+        INSERT INTO run_new (id, started_at, task_cap, state, halt_reason)
+          SELECT id, started_at, task_cap, state, halt_reason FROM run;
+        DROP TABLE run;
+        ALTER TABLE run_new RENAME TO run;
+      `);
     }
   }
 

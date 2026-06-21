@@ -2358,4 +2358,57 @@ describe("Orchestrator.interruptablePause", () => {
 
     h.store.close();
   });
+
+  it("returns HALT when interrupted mid-sleep (after some chunks complete)", async () => {
+    const config = makeConfig();
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const agent = new FakeAgentRunner();
+    const git = new FakeGitPr();
+    const monitor = new FakeMonitor();
+    const notifier = new FakeNotifier();
+    const sleepCalls: number[] = [];
+    const clock = fixedClock("2026-06-21T00:00:00.000Z");
+    let orchRef: Orchestrator | null = null;
+    const sleep = async (ms: number): Promise<void> => {
+      sleepCalls.push(ms);
+      if (sleepCalls.length === 2 && orchRef) {
+        orchRef.requestStop();
+      }
+    };
+    const orch = new Orchestrator({
+      config, source, agent, git, monitor, notifier, store,
+      buildPrompt: () => "prompt", specLoader: null, clock, sleep,
+      log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
+    });
+    orchRef = orch;
+
+    const run = store.createRun(5, clock());
+    (orch as any).runId = run.id;
+
+    const meta: PauseMeta = {
+      reason: "rate_limit",
+      target: "claude",
+      pausedAt: "2026-06-21T00:00:00.000Z",
+      nextReprobeAt: "2026-06-21T00:10:00.000Z",
+      capDeadlineAt: "2026-06-21T01:00:00.000Z",
+    };
+
+    const result = await orch.interruptablePause(meta, 60_000, 10_000);
+
+    expect(result.control).toBe("halt");
+    // Slept twice before interrupt was detected on 3rd iteration
+    expect(sleepCalls).toEqual([10_000, 10_000]);
+
+    const pausedEvents = notifier.events.filter((e) => e.kind === "paused");
+    expect(pausedEvents).toHaveLength(1);
+    const resumedEvents = notifier.events.filter((e) => e.kind === "resumed");
+    expect(resumedEvents).toHaveLength(0);
+
+    const halted = store.getRun(run.id);
+    expect(halted.state).toBe("halted");
+    expect(halted.pauseMeta).toBeNull();
+
+    store.close();
+  });
 });

@@ -604,11 +604,10 @@ describe("SqliteStore: run lock", () => {
 });
 
 describe("SqliteStore: migration adds pause_meta column to existing run table", () => {
-  it("opens a legacy DB without pause_meta and auto-adds the column", () => {
+  it("opens a legacy DB without pause_meta, recreates run table with updated CHECK, and setPauseMeta works", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "lpos-mig-"));
     const dbPath = path.join(dir, "test.db");
     try {
-      // Create a DB with old schema (no pause_meta on run)
       const raw = new Database(dbPath);
       raw.exec(`
         CREATE TABLE run (
@@ -646,11 +645,28 @@ describe("SqliteStore: migration adds pause_meta column to existing run table", 
       `);
       raw.close();
 
-      // Re-open via SqliteStore — migration should add pause_meta
       const store = new SqliteStore(dbPath);
       openStores.push(store);
       const run = store.getRun(1);
       expect(run.pauseMeta).toBeNull();
+
+      // setPauseMeta must work on migrated DB (CHECK constraint updated)
+      const meta = {
+        reason: "rate_limit" as const,
+        target: "claude" as const,
+        pausedAt: "2026-06-06T01:00:00.000Z",
+        nextReprobeAt: "2026-06-06T01:10:00.000Z",
+        capDeadlineAt: "2026-06-06T02:00:00.000Z",
+      };
+      expect(() => store.setPauseMeta(run.id, meta)).not.toThrow();
+      const paused = store.getRun(run.id);
+      expect(paused.state).toBe("paused");
+      expect(paused.pauseMeta).toEqual(meta);
+
+      store.clearPauseMeta(run.id);
+      const cleared = store.getRun(run.id);
+      expect(cleared.state).toBe("running");
+      expect(cleared.pauseMeta).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
