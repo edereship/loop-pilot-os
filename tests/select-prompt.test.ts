@@ -50,6 +50,33 @@ describe("parseSelection", () => {
     const result = parseSelection(output);
     expect(result).toEqual({ identifier: "TY-7", rationale: "trimmed" });
   });
+
+  it("handles multi-line unfenced JSON object", () => {
+    const output = [
+      "Some analysis here.",
+      "{",
+      '  "identifier": "TY-5",',
+      '  "rationale": "Best next pick"',
+      "}",
+    ].join("\n");
+    const result = parseSelection(output);
+    expect(result).toEqual({ identifier: "TY-5", rationale: "Best next pick" });
+  });
+
+  it("prefers the last fenced block over an unfenced multi-line JSON", () => {
+    const output = [
+      "{",
+      '  "identifier": "TY-1",',
+      '  "rationale": "unfenced"',
+      "}",
+      "More reasoning...",
+      '```json',
+      '{"identifier":"TY-9","rationale":"fenced wins"}',
+      "```",
+    ].join("\n");
+    const result = parseSelection(output);
+    expect(result).toEqual({ identifier: "TY-9", rationale: "fenced wins" });
+  });
 });
 
 describe("computeDiffStat", () => {

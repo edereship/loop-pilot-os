@@ -12,15 +12,31 @@ export function parseSelection(codexOutput: string): ParsedSelection | null {
     lastFenceMatch = m[1];
   }
 
-  // Fallback: try to find a raw JSON object on a line by itself
+  // Fallback: try to find a raw JSON object (single-line or multi-line)
   let jsonStr = lastFenceMatch;
   if (jsonStr === null) {
     const lines = trimmed.split("\n");
+    // First: look for a single-line JSON object (last one wins)
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();
       if (line.startsWith("{") && line.endsWith("}")) {
         jsonStr = line;
         break;
+      }
+    }
+    // Then: try a multi-line JSON object spanning several lines
+    if (jsonStr === null) {
+      let endLine = -1;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trimEnd().endsWith("}")) { endLine = i; break; }
+      }
+      if (endLine !== -1) {
+        for (let startLine = endLine; startLine >= 0; startLine--) {
+          if (lines[startLine].trimStart().startsWith("{")) {
+            jsonStr = lines.slice(startLine, endLine + 1).join("\n");
+            break;
+          }
+        }
       }
     }
   }

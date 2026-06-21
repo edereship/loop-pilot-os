@@ -268,7 +268,7 @@ export class GitPrManager implements GitPrManagerInterface {
     });
   }
 
-  async getPrDiffSummary(prNumber: number): Promise<PrDiffSummary> {
+  async getPrDiffSummary(prNumber: number, maxDiffChars?: number): Promise<PrDiffSummary> {
     const { repoPath, remote } = this.opts;
     const viewRes = await this.runner.run(
       "gh",
@@ -302,19 +302,34 @@ export class GitPrManager implements GitPrManagerInterface {
       );
     }
 
-    return { title, body, diff: diffRes.stdout };
+    const diff =
+      maxDiffChars !== undefined && diffRes.stdout.length > maxDiffChars
+        ? diffRes.stdout.slice(0, maxDiffChars)
+        : diffRes.stdout;
+
+    return { title, body, diff };
   }
 
   async fetchDefaultBranch(): Promise<void> {
     const { repoPath, defaultBranch } = this.opts;
-    const res = await this.runner.run(
+    const fetchRes = await this.runner.run(
       "git",
       ["-C", repoPath, "fetch", "origin", defaultBranch],
       { cwd: repoPath },
     );
-    if (res.code !== 0) {
+    if (fetchRes.code !== 0) {
       throw new Error(
-        `git fetch origin ${defaultBranch} failed: ${res.stderr.trim() || `exit ${res.code}`}`,
+        `git fetch origin ${defaultBranch} failed: ${fetchRes.stderr.trim() || `exit ${fetchRes.code}`}`,
+      );
+    }
+    const resetRes = await this.runner.run(
+      "git",
+      ["-C", repoPath, "reset", "--hard", `origin/${defaultBranch}`],
+      { cwd: repoPath },
+    );
+    if (resetRes.code !== 0) {
+      throw new Error(
+        `git reset --hard origin/${defaultBranch} failed: ${resetRes.stderr.trim() || `exit ${resetRes.code}`}`,
       );
     }
   }

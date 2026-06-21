@@ -603,3 +603,88 @@ describe("GitPrManager.postComment", () => {
     await expect(mgr.postComment(42, "hello")).rejects.toThrow(/postComment.*Not Found/);
   });
 });
+
+describe("GitPrManager.fetchDefaultBranch", () => {
+  it("issues git fetch then git reset --hard in sequence", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "fetch", "origin", "main"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "reset", "--hard", "origin/main"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchDefaultBranch();
+
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls[0]).toEqual({
+      cmd: "git",
+      args: ["-C", "/repo", "fetch", "origin", "main"],
+      opts: { cwd: "/repo" },
+    });
+    expect(runner.calls[1]).toEqual({
+      cmd: "git",
+      args: ["-C", "/repo", "reset", "--hard", "origin/main"],
+      opts: { cwd: "/repo" },
+    });
+  });
+
+  it("throws and skips reset when git fetch fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "fetch", "origin", "main"], {
+      code: 128,
+      stdout: "",
+      stderr: "fatal: unable to access remote",
+    });
+    runner.on(["git", "-C", "/repo", "reset", "--hard", "origin/main"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.fetchDefaultBranch()).rejects.toThrow(/git fetch origin main failed/);
+    // reset must not be called when fetch fails
+    const resets = runner.calls.filter((c) => c.args[3] === "reset");
+    expect(resets).toHaveLength(0);
+  });
+
+  it("throws when git reset --hard fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "fetch", "origin", "main"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "reset", "--hard", "origin/main"], {
+      code: 1,
+      stdout: "",
+      stderr: "fatal: could not reset",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.fetchDefaultBranch()).rejects.toThrow(/git reset --hard origin\/main failed/);
+  });
+});
+
+describe("GitPrManager.getPrDiffSummary (maxDiffChars)", () => {
+  it("truncates diff to maxDiffChars when the fetched diff exceeds the limit", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view", "42"], {
+      code: 0,
+      stdout: JSON.stringify({ title: "TY-1: Big PR", body: "large change" }),
+      stderr: "",
+    });
+    const longDiff = "diff --git a/x.ts b/x.ts\n" + "+".repeat(500);
+    runner.on(["gh", "pr", "diff", "42"], { code: 0, stdout: longDiff, stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.getPrDiffSummary(42, 100);
+    expect(result.diff.length).toBe(100);
+    expect(result.diff).toBe(longDiff.slice(0, 100));
+  });
+
+  it("returns the full diff when it is within maxDiffChars", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "view", "7"], {
+      code: 0,
+      stdout: JSON.stringify({ title: "TY-2: Small PR", body: "" }),
+      stderr: "",
+    });
+    const smallDiff = "diff --git a/x.ts b/x.ts\n+line\n";
+    runner.on(["gh", "pr", "diff", "7"], { code: 0, stdout: smallDiff, stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.getPrDiffSummary(7, 10000);
+    expect(result.diff).toBe(smallDiff);
+  });
+});

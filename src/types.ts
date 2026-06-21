@@ -112,8 +112,8 @@ export interface GitPrManager {
   mergePr(prNumber: number, headSha: string): Promise<void>;     // squash --match-head-commit
   postComment(prNumber: number, body: string): Promise<void>;
   discardWorktree(branch: string, worktreePath: string): Promise<void>; // cost_exceeded 時の破棄
-  getPrDiffSummary(prNumber: number): Promise<PrDiffSummary>;
-  /** Fetch the default branch from origin so the local ref is up to date. */
+  getPrDiffSummary(prNumber: number, maxDiffChars?: number): Promise<PrDiffSummary>;
+  /** Fetch the default branch from origin and reset the working tree to match it. */
   fetchDefaultBranch(): Promise<void>;
 }
 

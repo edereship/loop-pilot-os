@@ -293,7 +293,7 @@ export class FakeGitPr implements GitPrManager {
 
   prDiffSummaries = new Map<number, import("../src/types.js").PrDiffSummary>();
 
-  async getPrDiffSummary(prNumber: number): Promise<import("../src/types.js").PrDiffSummary> {
+  async getPrDiffSummary(prNumber: number, _maxDiffChars?: number): Promise<import("../src/types.js").PrDiffSummary> {
     this.calls.push({ method: "getPrDiffSummary", args: [prNumber] });
     this.takeFailure("getPrDiffSummary");
     const preset = this.prDiffSummaries.get(prNumber);

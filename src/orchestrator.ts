@@ -688,7 +688,7 @@ export class Orchestrator {
     const lastMerged = this.store.lastMergedWithPr();
     if (lastMerged !== null && lastMerged.prNumber !== null) {
       try {
-        const summary = await this.git.getPrDiffSummary(lastMerged.prNumber);
+        const summary = await this.git.getPrDiffSummary(lastMerged.prNumber, this.config.safety.selectDiffBudgetChars);
         lastPrDiff = { identifier: lastMerged.linearIdentifier, summary };
       } catch (err) {
         this.log(`select: PR diff retrieval failed (non-fatal): ${errMsg(err)}`);
