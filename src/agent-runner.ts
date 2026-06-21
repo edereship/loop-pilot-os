@@ -5,6 +5,7 @@ import type {
   CommandRunner,
   RunOptions,
   SessionContext,
+  PauseMeta,
 } from "./types.js";
 
 const SUMMARY_MAX = 2000;
@@ -65,6 +66,11 @@ export interface RateLimitOpts {
   sleep: (ms: number) => Promise<void>;
   clock: () => number;
   isInterrupted?: () => boolean;
+  // When provided, replaces the built-in sleep for rate-limit waits and handles
+  // run-state tracking (paused/running) and pause/resume notifications. The
+  // callback is responsible for the full wait; the caller must not also sleep.
+  // Returns "interrupted" if a stop was requested, "complete" otherwise.
+  wait?: (meta: PauseMeta, waitMs: number) => Promise<"interrupted" | "complete">;
 }
 
 interface AgentRunnerOptions {
@@ -539,7 +545,20 @@ export class ClaudeAgentRunner implements AgentRunner {
         `rate limit detected; waiting ${Math.ceil(waitMs / 60_000)}m before re-probe`,
       );
 
-      if (rl.isInterrupted) {
+      if (rl.wait) {
+        const pausedAt = new Date(nowMs).toISOString();
+        const meta: PauseMeta = {
+          reason: "rate_limit",
+          target: "claude",
+          pausedAt,
+          nextReprobeAt: new Date(nowMs + waitMs).toISOString(),
+          capDeadlineAt: new Date(startMs + capMs).toISOString(),
+        };
+        const waitResult = await rl.wait(meta, waitMs);
+        if (waitResult === "interrupted") {
+          return { kind: "interrupted", costUsd: totalCost };
+        }
+      } else if (rl.isInterrupted) {
         const SLEEP_CHUNK_MS = 10_000;
         for (let slept = 0; slept < waitMs; slept += SLEEP_CHUNK_MS) {
           if (rl.isInterrupted()) {

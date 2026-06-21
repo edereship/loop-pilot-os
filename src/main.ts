@@ -16,7 +16,7 @@ import {
   type LinearSetupRequest,
 } from "./task-source.js";
 import { GitPrManager } from "./git-pr.js";
-import { ClaudeAgentRunner } from "./agent-runner.js";
+import { ClaudeAgentRunner, type RateLimitOpts } from "./agent-runner.js";
 import { GhLoopPilotMonitor } from "./monitor.js";
 import { buildPrompt } from "./context-bundle.js";
 import { loadSpecContent } from "./spec-reader.js";
@@ -146,6 +146,14 @@ async function runLoop(configPath: string): Promise<number> {
       modelSupportsEffort(config.agent.model);
     let stopRequested = false;
     const effort = config.agent.effort;
+    const rateLimitOpts: RateLimitOpts = {
+      reprobeMinutes: config.rateLimit.reprobeMinutes,
+      capHours: config.rateLimit.capHours,
+      claudePatterns: config.rateLimit.claudePatterns,
+      sleep,
+      clock: Date.now,
+      isInterrupted: () => stopRequested,
+    };
     const agent = new ClaudeAgentRunner(runner, {
       model: config.agent.model,
       // omit --effort flag for "auto" or models that do not support effort
@@ -158,14 +166,7 @@ async function runLoop(configPath: string): Promise<number> {
       allowedTools: config.agent.allowedTools,
       extraArgs: config.agent.extraArgs,
       log: logLine,
-      rateLimit: {
-        reprobeMinutes: config.rateLimit.reprobeMinutes,
-        capHours: config.rateLimit.capHours,
-        claudePatterns: config.rateLimit.claudePatterns,
-        sleep,
-        clock: Date.now,
-        isInterrupted: () => stopRequested,
-      },
+      rateLimit: rateLimitOpts,
     });
     const git = new GitPrManager(runner, {
       repoPath: config.repo.path,
@@ -209,6 +210,14 @@ async function runLoop(configPath: string): Promise<number> {
       recovery,
       planner: codexPlanner,
     });
+
+    // Wire the orchestrator's interruptablePause into the agent runner so that
+    // Claude API rate-limit waits set the run's paused state and fire
+    // paused/resumed notifications, instead of sleeping silently.
+    rateLimitOpts.wait = async (meta, waitMs) => {
+      const ctrl = await orchestrator.interruptablePause(meta, waitMs);
+      return ctrl.control === "halt" ? "interrupted" : "complete";
+    };
 
     // 停止シグナル → orchestrator.requestStop()（次の安全点でクリーン halt）。
     // SIGINT に加え、常駐運用で一般的な SIGTERM（systemd/コンテナ停止）・SIGHUP（端末切断）も

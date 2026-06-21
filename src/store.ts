@@ -224,21 +224,27 @@ export class SqliteStore {
     if (!runColumns.has("pause_meta")) {
       // pause_meta 追加と同時に CHECK 制約を ('running','idle','halted','paused') へ更新する。
       // SQLite は ALTER CONSTRAINT 非対応のためテーブル再作成が必要。
+      // Wrap in an explicit transaction so the recreate/copy/drop/rename sequence
+      // is all-or-nothing: a mid-migration crash cannot leave an empty run table
+      // with the data stranded in run_new.
       this.db.pragma("foreign_keys = OFF");
-      this.db.exec(`
-        CREATE TABLE run_new (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          started_at TEXT NOT NULL,
-          task_cap INTEGER NOT NULL,
-          state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
-          halt_reason TEXT,
-          pause_meta TEXT
-        );
-        INSERT INTO run_new (id, started_at, task_cap, state, halt_reason)
-          SELECT id, started_at, task_cap, state, halt_reason FROM run;
-        DROP TABLE run;
-        ALTER TABLE run_new RENAME TO run;
-      `);
+      const runMigration = this.db.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE run_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            task_cap INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+            halt_reason TEXT,
+            pause_meta TEXT
+          );
+          INSERT INTO run_new (id, started_at, task_cap, state, halt_reason)
+            SELECT id, started_at, task_cap, state, halt_reason FROM run;
+          DROP TABLE run;
+          ALTER TABLE run_new RENAME TO run;
+        `);
+      });
+      runMigration();
     }
   }
 

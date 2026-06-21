@@ -949,19 +949,21 @@ export class Orchestrator {
             }
             const QUOTA_WAIT_MS = 60 * 60 * 1000;
             const QUOTA_SLEEP_CHUNK_MS = 10_000;
-            for (let elapsed = 0; elapsed < QUOTA_WAIT_MS; elapsed += QUOTA_SLEEP_CHUNK_MS) {
-              if (this.interrupted) {
-                await this.haltForInterrupt();
-                return HALT;
-              }
-              await this.sleep(QUOTA_SLEEP_CHUNK_MS);
-            }
-            // Finding 3: re-check after the loop so a stop requested during
-            // the final sleep chunk halts before posting to the PR.
-            if (this.interrupted) {
-              await this.haltForInterrupt();
-              return HALT;
-            }
+            const quotaNowStr = this.clock();
+            const quotaNowMs = Date.parse(quotaNowStr);
+            const quotaPauseMeta: PauseMeta = {
+              reason: "rate_limit",
+              target: "claude",
+              pausedAt: quotaNowStr,
+              nextReprobeAt: new Date(quotaNowMs + QUOTA_WAIT_MS).toISOString(),
+              capDeadlineAt: new Date(quotaNowMs + QUOTA_WAIT_MS).toISOString(),
+            };
+            const pauseCtrl = await this.interruptablePause(
+              quotaPauseMeta,
+              QUOTA_WAIT_MS,
+              QUOTA_SLEEP_CHUNK_MS,
+            );
+            if (pauseCtrl.control === "halt") return HALT;
             // Finding 1: a quota restart is a real restart boundary — clear any
             // prior readiness-failure streak so errors before and after the
             // hour-long wait are not treated as consecutive.
@@ -1223,7 +1225,7 @@ export class Orchestrator {
     await this.notifier.notify({
       kind: "paused",
       target: meta.target,
-      detail: `${meta.reason}: waiting until ${meta.capDeadlineAt}`,
+      detail: `${meta.reason}: waiting until ${meta.nextReprobeAt}`,
     });
 
     for (let elapsed = 0; elapsed < waitMs; elapsed += chunkMs) {
@@ -1231,7 +1233,7 @@ export class Orchestrator {
         await this.haltForInterrupt();
         return HALT;
       }
-      await this.sleep(chunkMs);
+      await this.sleep(Math.min(chunkMs, waitMs - elapsed));
     }
     if (this.interrupted) {
       await this.haltForInterrupt();
