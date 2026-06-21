@@ -1199,6 +1199,17 @@ describe("classifyCodexError", () => {
     }
   });
 
+  it("usage limit 表現をデフォルトパターンで検出する（Finding 1）", () => {
+    const cases = [
+      "codex exited with code 1: usage limit reached",
+      "codex exited with code 1: You've hit your usage limit for this period",
+      "codex exited with code 1: usage-limit exceeded",
+    ];
+    for (const msg of cases) {
+      expect(classifyCodexError(msg, [], 0).isRateLimit).toBe(true);
+    }
+  });
+
   it("非レートリミットエラーは検出しない", () => {
     const cases = [
       "codex exited with code 1: ENOENT spawn codex",
@@ -1381,6 +1392,33 @@ describe("CodexPlanner rate-limit retry loop", () => {
     });
 
     expect(totalSleptMs).toBe(10 * 60_000);
+  });
+
+  it("rate limit マーカーが stderr 末尾 1000 文字より前にある場合でも全 stderr で検出する（Finding 2）", async () => {
+    const runner = new FakeCommandRunner();
+    // Rate-limit marker at the start, followed by >1000 chars of diagnostics.
+    // The tail-only message would not contain the marker; the full stderr must be used.
+    const rateLimitPrefix = "HTTP 429 Too Many Requests";
+    const laterDiagnostics = "D".repeat(1500);
+    const fullStderr = `${rateLimitPrefix}\n${laterDiagnostics}`;
+    let callCount = 0;
+    runner.on([CODEX_CMD], () => {
+      callCount++;
+      if (callCount === 1) {
+        return { code: 1, stdout: "", stderr: fullStderr };
+      }
+      return { code: 0, stdout: "ok\n", stderr: "" };
+    });
+    const logs: string[] = [];
+    const rlOpts = makeRateLimitOpts({ clock: () => 0 });
+    const outcome = await makePlannerWithRateLimit(runner, logs, rlOpts).run({
+      worktreePath: "/wt",
+      prompt: "plan task",
+    });
+
+    expect(callCount).toBe(2);
+    expect(outcome).toEqual({ kind: "completed", text: "ok" });
+    expect(logs.some((l) => l.includes("rate limit detected"))).toBe(true);
   });
 
   it("rateLimit 未設定時は再試行なしで動作する（既存動作）", async () => {

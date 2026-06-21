@@ -220,7 +220,7 @@ export interface CodexPlannerContext {
 
 export type CodexOutcome =
   | { kind: "completed"; text: string }
-  | { kind: "error"; message: string }
+  | { kind: "error"; message: string; rawStderr?: string }
   | { kind: "interrupted" };
 
 export interface CodexRateLimitOpts {
@@ -241,6 +241,7 @@ export interface CodexRateLimitClassification {
 const DEFAULT_CODEX_RATE_LIMIT_PATTERNS: RegExp[] = [
   /\bHTTP[/ ]\s*429\b|\bstatus\s*(?:code\s*)?:?\s*429\b|\(429\)/i,
   /rate.?limit/i,
+  /usage.?limit/i,
   /too many requests/i,
   /overloaded/i,
   /quota.?exceed/i,
@@ -316,7 +317,7 @@ export class CodexPlanner {
       if (outcome.kind !== "error") return outcome;
 
       const nowMs = rl.clock();
-      const classification = classifyCodexError(outcome.message, rl.codexPatterns, nowMs);
+      const classification = classifyCodexError(outcome.rawStderr ?? outcome.message, rl.codexPatterns, nowMs);
       if (!classification.isRateLimit) return outcome;
 
       const elapsed = nowMs - startMs;
@@ -429,10 +430,15 @@ export class CodexPlanner {
       }
 
       if (result.code !== 0) {
-        const tail = result.stderr.trim().slice(-STDERR_TAIL_MAX);
+        const trimmedStderr = result.stderr.trim();
+        const tail = trimmedStderr.slice(-STDERR_TAIL_MAX);
         const msg = `codex exited with code ${result.code}`;
         this.opts.log(`codex session error: ${msg}`);
-        return { kind: "error", message: tail ? `${msg}: ${tail}` : msg };
+        return {
+          kind: "error",
+          message: tail ? `${msg}: ${tail}` : msg,
+          ...(trimmedStderr ? { rawStderr: trimmedStderr } : {}),
+        };
       }
 
       this.opts.log("codex session completed");
