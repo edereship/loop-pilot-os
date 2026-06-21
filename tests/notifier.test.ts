@@ -279,4 +279,22 @@ describe("formatNotifyEvent", () => {
     });
     expect(text).toBe("🔄 Codex quota 回復: TY-789 quota recovered after 2 retries");
   });
+
+  it("formats paused with pause emoji, target and detail", () => {
+    const text = formatNotifyEvent({
+      kind: "paused",
+      target: "claude",
+      detail: "rate limited until 02:00 UTC",
+    });
+    expect(text).toBe("⏸️ LoopPilot OS 一時停止 (claude): rate limited until 02:00 UTC");
+  });
+
+  it("formats resumed with play emoji, target and detail", () => {
+    const text = formatNotifyEvent({
+      kind: "resumed",
+      target: "codex",
+      detail: "rate limit cleared",
+    });
+    expect(text).toBe("▶️ LoopPilot OS 再開 (codex): rate limit cleared");
+  });
 });
