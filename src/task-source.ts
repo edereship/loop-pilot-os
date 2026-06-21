@@ -165,6 +165,14 @@ export class LinearTaskSource implements TaskSource {
     return first ? toEligible(first) : null;
   }
 
+  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
+    const exclude = new Set(excludeIds);
+    return (await this.queryByState(this.stateIds.todo))
+      .filter((n) => !exclude.has(n.id))
+      .sort(compareIssues)
+      .map(toEligible);
+  }
+
   async transition(issueId: string, state: TicketState): Promise<void> {
     const data = await graphql<{ issueUpdate: { success: boolean } }>(
       this.fetchFn,

@@ -61,6 +61,7 @@ const rawSchema = z.object({
     max_workflow_fix_attempts: z.number().int().positive().default(2),
     max_cost_usd_per_fix: z.number().positive().default(2),
     codex_timeout_minutes: z.number().positive().default(30),
+    select_diff_budget_chars: z.number().int().positive().default(6000),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -130,6 +131,7 @@ export interface Config {
     maxWorkflowFixAttempts: number;
     maxCostUsdPerFix: number;
     codexTimeoutMinutes: number;
+    selectDiffBudgetChars: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -629,6 +631,7 @@ export function loadConfig(
       maxWorkflowFixAttempts: raw.safety.max_workflow_fix_attempts,
       maxCostUsdPerFix: raw.safety.max_cost_usd_per_fix,
       codexTimeoutMinutes: raw.safety.codex_timeout_minutes,
+      selectDiffBudgetChars: raw.safety.select_diff_budget_chars,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,

@@ -62,6 +62,7 @@ export interface TaskSessionRow {
   stopDetail: string | null;     // looppilot stopReason / 例外メッセージ等
   agentSummary: string | null;
   planBrief: string | null;
+  selectRationale: string | null;
   startedAt: string;
   monitorStartedAt: string | null; // in_review 入り時刻。未起動ガード/監視timeoutの起点（再起動でリセットしない）
   endedAt: string | null;
@@ -75,6 +76,8 @@ export interface TaskSessionRow {
 export interface TaskSource {
   /** 適格(Team/PJ ∧ Todo ∧ オプトインラベル)を決定的順序で。excludeIds は Store 由来 */
   getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null>;
+  /** 適格チケットを全件返す（PM 選別ターン用）。excludeIds は Store 由来 */
+  getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]>;
   transition(issueId: string, state: TicketState): Promise<void>;
   /** In Progress なのに渡された issueIds に無いチケット（CLAIM途中クラッシュ孤児）を返す */
   findOrphanedInProgress(knownIssueIds: string[]): Promise<EligibleIssue[]>;
@@ -109,6 +112,7 @@ export interface GitPrManager {
   mergePr(prNumber: number, headSha: string): Promise<void>;     // squash --match-head-commit
   postComment(prNumber: number, body: string): Promise<void>;
   discardWorktree(branch: string, worktreePath: string): Promise<void>; // cost_exceeded 時の破棄
+  getPrDiffSummary(prNumber: number): Promise<PrDiffSummary>;
 }
 
 /** 列挙順は precedence ではない。poll() の決定順は §5.4（merged 最優先）が正 */
@@ -225,6 +229,28 @@ export interface BriefSections {
 export interface PlanBrief {
   raw: string;
   sections: BriefSections | null;
+}
+
+// ---- PM 選別ターン（A1: select-prompt.ts） ----
+
+export interface PrDiffSummary {
+  title: string;
+  body: string;
+  diff: string;
+}
+
+export interface SelectPromptArgs {
+  specContent: SpecContent | null;
+  eligible: EligibleIssue[];
+  inProgress: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle">>;
+  recentMerged: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
+  lastPrDiff: { identifier: string; summary: PrDiffSummary } | null;
+  diffBudgetChars: number;
+}
+
+export interface ParsedSelection {
+  identifier: string;
+  rationale: string;
 }
 
 // ---- 実行コマンド抽象（git/gh/claude 共通） ----

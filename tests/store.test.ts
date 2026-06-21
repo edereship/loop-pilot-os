@@ -672,3 +672,70 @@ describe("SqliteStore: migration adds pause_meta column to existing run table", 
     }
   });
 });
+
+describe("select_rationale column", () => {
+  it("updateSession sets and reads select_rationale", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "id-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "b",
+      worktreePath: "/wt",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    expect(session.selectRationale).toBeNull();
+
+    store.updateSession(session.id, { selectRationale: "highest priority after auth refactor" });
+    const updated = store.getSession(session.id);
+    expect(updated.selectRationale).toBe("highest priority after auth refactor");
+  });
+});
+
+describe("lastMergedWithPr", () => {
+  it("returns null when no merged sessions", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    expect(store.lastMergedWithPr()).toBeNull();
+  });
+
+  it("returns the most recently merged session with a PR", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s1 = store.createSession({
+      runId: run.id, linearIssueId: "id-1", linearIdentifier: "TY-1",
+      issueTitle: "First", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s1.id, { state: "merged", prNumber: 10, endedAt: "2026-01-01T00:01:00.000Z" });
+    const s2 = store.createSession({
+      runId: run.id, linearIssueId: "id-2", linearIdentifier: "TY-2",
+      issueTitle: "Second", branch: "b2", worktreePath: "/wt2",
+      now: "2026-01-01T00:00:02.000Z",
+    });
+    store.updateSession(s2.id, { state: "merged", prNumber: 11, endedAt: "2026-01-01T00:02:00.000Z" });
+
+    const last = store.lastMergedWithPr();
+    expect(last).not.toBeNull();
+    expect(last!.linearIdentifier).toBe("TY-2");
+    expect(last!.prNumber).toBe(11);
+  });
+
+  it("skips merged sessions without pr_number", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s1 = store.createSession({
+      runId: run.id, linearIssueId: "id-1", linearIdentifier: "TY-1",
+      issueTitle: "NoPr", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s1.id, { state: "merged", endedAt: "2026-01-01T00:01:00.000Z" });
+
+    expect(store.lastMergedWithPr()).toBeNull();
+  });
+});

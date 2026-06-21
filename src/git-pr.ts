@@ -3,6 +3,7 @@ import type {
   EligibleIssue,
   ClaimResult,
   GitPrManager as GitPrManagerInterface,
+  PrDiffSummary,
 } from "./types.js";
 
 export interface GitPrManagerOptions {
@@ -265,5 +266,36 @@ export class GitPrManager implements GitPrManagerInterface {
     await this.runner.run("git", ["-C", repoPath, "branch", "-D", branch], {
       cwd: repoPath,
     });
+  }
+
+  async getPrDiffSummary(prNumber: number): Promise<PrDiffSummary> {
+    const { repoPath } = this.opts;
+    const viewRes = await this.runner.run(
+      "gh",
+      ["pr", "view", String(prNumber), "--json", "title,body"],
+      { cwd: repoPath },
+    );
+    if (viewRes.code !== 0) {
+      throw new Error(
+        `gh pr view failed for #${prNumber}: ${viewRes.stderr.trim() || `exit ${viewRes.code}`}`,
+      );
+    }
+    const { title, body } = JSON.parse(viewRes.stdout) as {
+      title: string;
+      body: string;
+    };
+
+    const diffRes = await this.runner.run(
+      "gh",
+      ["pr", "diff", String(prNumber)],
+      { cwd: repoPath },
+    );
+    if (diffRes.code !== 0) {
+      throw new Error(
+        `gh pr diff failed for #${prNumber}: ${diffRes.stderr.trim() || `exit ${diffRes.code}`}`,
+      );
+    }
+
+    return { title, body, diff: diffRes.stdout };
   }
 }

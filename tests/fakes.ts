@@ -164,6 +164,12 @@ export class FakeTaskSource implements TaskSource {
     this.takeFailure("postComment");
     this.comments.push({ issueId, body });
   }
+
+  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
+    this.takeFailure("getAllEligible");
+    const exclude = new Set(excludeIds);
+    return this.queue.filter((i) => !exclude.has(i.id));
+  }
 }
 
 // ---- FakeAgentRunner ----
@@ -264,6 +270,12 @@ export class FakeGitPr implements GitPrManager {
   async discardWorktree(branch: string, worktreePath: string): Promise<void> {
     this.calls.push({ method: "discardWorktree", args: [branch, worktreePath] });
     this.takeFailure("discardWorktree");
+  }
+
+  async getPrDiffSummary(prNumber: number): Promise<import("../src/types.js").PrDiffSummary> {
+    this.calls.push({ method: "getPrDiffSummary", args: [prNumber] });
+    this.takeFailure("getPrDiffSummary");
+    return { title: `PR #${prNumber}`, body: "", diff: "" };
   }
 }
 
