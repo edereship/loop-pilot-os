@@ -12,6 +12,9 @@ const rawSchema = z.object({
   }).strict().refine(
     (p) => p.goal !== undefined || p.spec_dir !== undefined,
     { message: "product.goal or product.spec_dir is required" },
+  ).refine(
+    (p) => !(p.goal !== undefined && p.spec_dir !== undefined),
+    { message: "product.goal and product.spec_dir are mutually exclusive; set one or the other" },
   ),
   repo: z.object({
     path: z.string(),

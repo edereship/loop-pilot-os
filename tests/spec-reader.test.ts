@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { loadSpecContent } from "../src/spec-reader.js";
@@ -114,5 +114,35 @@ describe("loadSpecContent", () => {
     const result = loadSpecContent(repoPath, specDir);
     expect(result.domainSpecs[0].name).toBe("design-spec-v1-core-loop");
     expect(result.domainSpecs[0].content).toBe("仕様内容。");
+  });
+
+  it("spec_dir がリポジトリ外へのシンボリックリンクのとき拒否する", () => {
+    const repoPath = mkdtempSync(path.join(os.tmpdir(), "spec-reader-"));
+    const outsideDir = mkdtempSync(path.join(os.tmpdir(), "spec-outside-"));
+    writeFileSync(path.join(outsideDir, "requirements.md"), "要求", "utf-8");
+    const linkPath = path.join(repoPath, "docs");
+    symlinkSync(outsideDir, linkPath);
+    expect(() => loadSpecContent(repoPath, "docs")).toThrow(/outside|symlink/);
+  });
+
+  it("requirements.md がリポジトリ外へのシンボリックリンクのとき拒否する", () => {
+    const repoPath = mkdtempSync(path.join(os.tmpdir(), "spec-reader-"));
+    const outsideDir = mkdtempSync(path.join(os.tmpdir(), "spec-outside-"));
+    writeFileSync(path.join(outsideDir, "secret.md"), "外部ファイル", "utf-8");
+    const specDirAbs = path.join(repoPath, "docs", "specs");
+    mkdirSync(specDirAbs, { recursive: true });
+    symlinkSync(path.join(outsideDir, "secret.md"), path.join(specDirAbs, "requirements.md"));
+    expect(() => loadSpecContent(repoPath, "docs/specs")).toThrow(/outside|symlink/);
+  });
+
+  it("領域ファイルがリポジトリ外へのシンボリックリンクのとき拒否する", () => {
+    const repoPath = mkdtempSync(path.join(os.tmpdir(), "spec-reader-"));
+    const outsideDir = mkdtempSync(path.join(os.tmpdir(), "spec-outside-"));
+    writeFileSync(path.join(outsideDir, "secret.md"), "外部ファイル", "utf-8");
+    const specDirAbs = path.join(repoPath, "docs", "specs");
+    mkdirSync(specDirAbs, { recursive: true });
+    writeFileSync(path.join(specDirAbs, "requirements.md"), "要求", "utf-8");
+    symlinkSync(path.join(outsideDir, "secret.md"), path.join(specDirAbs, "external.md"));
+    expect(() => loadSpecContent(repoPath, "docs/specs")).toThrow(/outside|symlink/);
   });
 });

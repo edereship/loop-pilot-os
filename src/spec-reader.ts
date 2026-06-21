@@ -1,6 +1,12 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import type { SpecContent } from "./types.js";
+
+function assertInsideRepo(realPath: string, repoReal: string, label: string): void {
+  if (realPath !== repoReal && !realPath.startsWith(repoReal + path.sep)) {
+    throw new Error(`${label} resolves outside the repository (symlink escape)`);
+  }
+}
 
 export function loadSpecContent(repoPath: string, specDir: string): SpecContent {
   if (path.isAbsolute(specDir)) {
@@ -8,28 +14,41 @@ export function loadSpecContent(repoPath: string, specDir: string): SpecContent 
       `product.spec_dir must be a relative path, got "${specDir}"`,
     );
   }
-  const repoNorm = path.resolve(repoPath);
-  const dir = path.resolve(repoNorm, specDir);
-  if (dir !== repoNorm && !dir.startsWith(repoNorm + path.sep)) {
+  const repoReal = realpathSync(path.resolve(repoPath));
+  const dirLogical = path.resolve(repoReal, specDir);
+  if (dirLogical !== repoReal && !dirLogical.startsWith(repoReal + path.sep)) {
     throw new Error(
       `product.spec_dir "${specDir}" resolves outside the repository at "${repoPath}"`,
     );
   }
 
-  let entries: string[];
+  let dirReal: string;
   try {
-    entries = readdirSync(dir);
+    dirReal = realpathSync(dirLogical);
   } catch (err) {
     throw new Error(
-      `Failed to read spec directory "${dir}" (product.spec_dir = "${specDir}"): ${(err as Error).message}`,
+      `Failed to read spec directory "${dirLogical}" (product.spec_dir = "${specDir}"): ${(err as Error).message}`,
+    );
+  }
+  assertInsideRepo(dirReal, repoReal, `product.spec_dir "${specDir}"`);
+
+  let entries: string[];
+  try {
+    entries = readdirSync(dirReal);
+  } catch (err) {
+    throw new Error(
+      `Failed to read spec directory "${dirReal}" (product.spec_dir = "${specDir}"): ${(err as Error).message}`,
     );
   }
 
-  const requirementsPath = path.join(dir, "requirements.md");
+  const requirementsPath = path.join(dirReal, "requirements.md");
   let requirements: string;
   try {
-    requirements = readFileSync(requirementsPath, "utf-8");
+    const requirementsReal = realpathSync(requirementsPath);
+    assertInsideRepo(requirementsReal, repoReal, `requirements.md`);
+    requirements = readFileSync(requirementsReal, "utf-8");
   } catch (err) {
+    if (err instanceof Error && err.message.includes("symlink escape")) throw err;
     throw new Error(
       `Failed to read "${requirementsPath}": ${(err as Error).message}. ` +
       `When product.spec_dir is set, requirements.md is mandatory.`,
@@ -48,11 +67,20 @@ export function loadSpecContent(repoPath: string, specDir: string): SpecContent 
     .sort();
 
   const domainSpecs = mdFiles.map((f) => {
-    const filePath = path.join(dir, f);
+    const filePath = path.join(dirReal, f);
+    let fileReal: string;
+    try {
+      fileReal = realpathSync(filePath);
+    } catch (err) {
+      throw new Error(
+        `Failed to read domain spec "${filePath}": ${(err as Error).message}`,
+      );
+    }
+    assertInsideRepo(fileReal, repoReal, `domain spec "${f}"`);
     try {
       return {
         name: f.replace(/\.md$/, ""),
-        content: readFileSync(filePath, "utf-8"),
+        content: readFileSync(fileReal, "utf-8"),
       };
     } catch (err) {
       throw new Error(

@@ -521,6 +521,8 @@ export class Orchestrator {
       try {
         specContent = this.specLoader(worktreePath, specDir);
       } catch (err) {
+        await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
+        await bestEffort(() => this.source.transition(issue.id, "todo"));
         return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
       }
     }

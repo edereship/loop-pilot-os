@@ -137,6 +137,13 @@ describe("loadConfig", () => {
     ).toThrow(/product\.goal or product\.spec_dir/);
   });
 
+  // product.goal と product.spec_dir が両方設定 → refine エラー（相互排他）。
+  it("throws when both product.goal and product.spec_dir are set", () => {
+    expect(() =>
+      loadConfig(fixture("config-both-goal-specdir.toml"), fullEnv),
+    ).toThrow(/mutually exclusive/);
+  });
+
   // 型不正（max_tasks_per_run に文字列）→ 該当パスを message に出す。
   it("throws on a type mismatch with the offending path", () => {
     expect(() =>
