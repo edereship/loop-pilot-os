@@ -257,6 +257,28 @@ export class Orchestrator {
       });
       return await this.adoptAndMonitor(session, prNumber, monitorStartedAt);
     }
+    // PLAN is read-only: a claimed session can never have agent implementation
+    // commits. Any worktree changes are Codex analysis artifacts — always safe
+    // to discard and revert to Todo so the next run can retry the full cycle.
+    if (session.state === "claimed") {
+      if (session.worktreePath) {
+        await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+      }
+      let revertedToTodo = true;
+      try {
+        await this.source.transition(session.linearIssueId, "todo");
+      } catch {
+        revertedToTodo = false;
+      }
+      this.store.updateSession(session.id, { runId: this.runId });
+      const revertStatus = revertedToTodo
+        ? "ticket reverted to Todo"
+        : "ticket revert to Todo FAILED — may be stuck In Progress";
+      const detail =
+        `crash recovery: no open PR (PLAN phase); ${revertStatus}: ` +
+        `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+      return await this.stopSession(session, "exception", detail);
+    }
     // IMPLEMENT interrupted before PR creation (e.g. SIGINT during rate-limit sleep):
     // revert the ticket to Todo and discard the worktree only when no committed work
     // exists yet. If the agent already committed changes (crash between runSession
@@ -456,6 +478,15 @@ export class Orchestrator {
       // 4) PLAN
       const plan = await this.plan(session, issue);
       if (plan.control === "halt") return;
+
+      // Safe point: honor a stop request before the mutating IMPLEMENT phase.
+      // PLAN is read-only, so stopping here leaves the session in "claimed" —
+      // recoverByOpenPr auto-reverts claimed sessions with no open PR on the
+      // next startup rather than halting for manual cleanup.
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return;
+      }
 
       // 5) IMPLEMENT (was 4)
       const impl = await this.implement(session, issue);

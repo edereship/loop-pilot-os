@@ -2130,4 +2130,40 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     // codexTimeoutMinutes=30 → 30 * 60_000 = 1_800_000 ms
     expect(planner.calls[0]!.timeoutMs).toBe(30 * 60_000);
   });
+
+  it("requestStop() during PLAN halts before IMPLEMENT starts — session stays in claimed (Finding 1)", async () => {
+    // PLAN is read-only. If SIGINT arrives during PLAN, the safe point between
+    // PLAN and IMPLEMENT must honor the stop request so IMPLEMENT (the mutating
+    // phase) never launches.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+
+    // Planner calls requestStop when invoked, simulating SIGINT during PLAN
+    const origPlannerRun = planner.run.bind(planner);
+    planner.run = async (ctx) => {
+      h.orch.requestStop();
+      planner.outcomes = [{ kind: "completed", text: "## Goal\nBrief." }];
+      return origPlannerRun(ctx);
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Session stays in "claimed" — IMPLEMENT never ran
+    expect(s.state).toBe("claimed");
+    expect(s.failureReason).toBeNull();
+    // IMPLEMENT was not invoked
+    expect(h.agent.contexts).toHaveLength(0);
+    // Run halts cleanly as user_interrupt
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
+    expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "user_interrupt" });
+  });
 });
