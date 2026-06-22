@@ -27,7 +27,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     safety: {
       maxTasksPerRun: 3,
       maxCostUsdPerSession: 10,
-      monitorTimeoutMinutes: undefined,
+      monitorTimeoutMinutes: 60,
       notEngagedGuardMinutes: 30,
       sessionHardTimeoutMinutes: 120,
       maxWorkflowFixAttempts: 2,

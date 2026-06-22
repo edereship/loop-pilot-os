@@ -53,7 +53,7 @@ const rawSchema = z.object({
   safety: z.object({
     max_tasks_per_run: z.number().int().positive(),
     max_cost_usd_per_session: z.number().positive(),
-    monitor_timeout_minutes: z.number().positive().optional(),
+    monitor_timeout_minutes: z.number().positive().default(60),
     not_engaged_guard_minutes: z.number().positive().default(30),
     // 停止した（コストを消費しない）claude が無人ループを永久に固めるのを防ぐ hard backstop。
     // コスト一本化（仕様§11）は維持し、これは進捗・支出ゼロのハングを切る最終手段。
@@ -126,7 +126,7 @@ export interface Config {
   safety: {
     maxTasksPerRun: number;
     maxCostUsdPerSession: number;
-    monitorTimeoutMinutes: number | undefined;
+    monitorTimeoutMinutes: number;
     notEngagedGuardMinutes: number;
     sessionHardTimeoutMinutes: number;
     maxWorkflowFixAttempts: number;

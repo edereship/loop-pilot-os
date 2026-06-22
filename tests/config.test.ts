@@ -96,13 +96,13 @@ describe("loadConfig", () => {
   });
 
   // カーネル §3: 任意キーの既定値解決（default_branch=main, extra_args=[],
-  // monitor_timeout_minutes=undefined, not_engaged_guard_minutes=30）。
+  // monitor_timeout_minutes=60, not_engaged_guard_minutes=30）。
   it("applies defaults for omitted optional keys", () => {
     const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
     expect(config.repo.defaultBranch).toBe("main");
     expect(config.agent.extraArgs).toEqual([]);
     expect(config.agent.effort).toBe("max");
-    expect(config.safety.monitorTimeoutMinutes).toBeUndefined();
+    expect(config.safety.monitorTimeoutMinutes).toBe(60);
     expect(config.safety.notEngagedGuardMinutes).toBe(30);
     expect(config.safety.sessionHardTimeoutMinutes).toBe(120); // 省略時の既定
   });

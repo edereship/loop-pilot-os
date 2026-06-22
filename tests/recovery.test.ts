@@ -21,7 +21,7 @@ function makeConfig(over: Partial<{
   maxTasksPerRun: number;
   maxCostUsdPerSession: number;
   notEngagedGuardMinutes: number;
-  monitorTimeoutMinutes: number | undefined;
+  monitorTimeoutMinutes: number;
   monitorPollSeconds: number;
   idleRecheckSeconds: number;
   gateLabel: string;
@@ -33,7 +33,7 @@ function makeConfig(over: Partial<{
       maxTasksPerRun: over.maxTasksPerRun ?? 3,
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
-      monitorTimeoutMinutes: over.monitorTimeoutMinutes,
+      monitorTimeoutMinutes: over.monitorTimeoutMinutes ?? 60,
       sessionHardTimeoutMinutes: 120,
       maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2,
@@ -962,7 +962,7 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
   // The first verdict is consumed by crash-recovery adoption; the second drives the
   // pending-restart branch inside monitorSession.
   it("workflow_failed pending restart with live state comment → guard does not stop the review", async () => {
-    const config = makeConfig({ maxTasksPerRun: 1 }); // monitorTimeoutMinutes unset
+    const config = makeConfig({ maxTasksPerRun: 1, monitorTimeoutMinutes: 99999 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(h.store, {
       state: "in_review",
@@ -1034,7 +1034,7 @@ describe("MONITOR — workflow_failed verdict (ES-397)", () => {
   // Counterpart to Finding 3: when the restart never engaged (no state comment), the
   // always-on not-engaged guard still backstops indefinite polling.
   it("workflow_failed pending restart without state comment → not-engaged guard stops it", async () => {
-    const config = makeConfig({ maxTasksPerRun: 1 }); // monitorTimeoutMinutes unset
+    const config = makeConfig({ maxTasksPerRun: 1, monitorTimeoutMinutes: 99999 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(h.store, {
       state: "in_review",
