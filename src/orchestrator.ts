@@ -1431,7 +1431,7 @@ export class Orchestrator {
     // --- Recovery gate (ES-450) ---
     if (reason !== "cost_exceeded" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
-      if (!fresh.recoveryAttempted) {
+      if (!fresh.recoveryAttempted && fresh.prNumber !== null) {
         this.store.updateSession(session.id, { recoveryAttempted: 1 });
         await this.notifier.notify({
           kind: "recovery_started",
@@ -1450,7 +1450,7 @@ export class Orchestrator {
           this.log(`recovery: exception: ${err instanceof Error ? err.message : String(err)}`);
           result = { kind: "escalated" as const, action: "escalate" as const };
         }
-        const actionStr = "action" in result ? result.action : "escalate";
+        const actionStr = result.action;
         this.store.updateSession(session.id, { recoveryAction: actionStr });
         if (result.kind === "recovered") {
           const recoveryCost = result.costUsd;

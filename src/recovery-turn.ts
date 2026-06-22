@@ -28,7 +28,7 @@ export interface RecoveryAction {
 export type RecoveryTurnResult =
   | { kind: "recovered"; action: RecoveryActionKind; costUsd: number }
   | { kind: "escalated"; action: RecoveryActionKind }
-  | { kind: "failed"; message: string };
+  | { kind: "failed"; action: RecoveryActionKind; message: string };
 
 export interface RecoveryTurnDeps {
   planner: PlanRunner;
@@ -221,11 +221,11 @@ async function executeFixCode(
   // Sync to origin before fixing
   const fetchResult = await runner.run("git", ["-C", worktreePath, "fetch", "origin", branch], { cwd: worktreePath });
   if (fetchResult.code !== 0) {
-    return { kind: "failed", message: `recovery fetch failed: ${fetchResult.stderr.trim() || `exit ${fetchResult.code}`}` };
+    return { kind: "failed", action: "fix_code", message: `recovery fetch failed: ${fetchResult.stderr.trim() || `exit ${fetchResult.code}`}` };
   }
   const resetResult = await runner.run("git", ["-C", worktreePath, "reset", "--hard", `origin/${branch}`], { cwd: worktreePath });
   if (resetResult.code !== 0) {
-    return { kind: "failed", message: `recovery reset failed: ${resetResult.stderr.trim() || `exit ${resetResult.code}`}` };
+    return { kind: "failed", action: "fix_code", message: `recovery reset failed: ${resetResult.stderr.trim() || `exit ${resetResult.code}`}` };
   }
 
   // Run agent with instruction
@@ -238,23 +238,23 @@ async function executeFixCode(
 
   if (outcome.kind !== "completed") {
     log(`recovery: fix agent outcome=${outcome.kind}`);
-    return { kind: "failed", message: `recovery fix agent: ${outcome.kind}` };
+    return { kind: "failed", action: "fix_code", message: `recovery fix agent: ${outcome.kind}` };
   }
 
   // Verify commits
   const statusResult = await runner.run("git", ["-C", worktreePath, "status", "--porcelain"], { cwd: worktreePath });
   if (statusResult.stdout.trim() !== "") {
-    return { kind: "failed", message: "recovery fix agent left uncommitted changes" };
+    return { kind: "failed", action: "fix_code", message: "recovery fix agent left uncommitted changes" };
   }
   const logResult = await runner.run("git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"], { cwd: worktreePath });
   if (logResult.stdout.trim() === "") {
-    return { kind: "failed", message: "recovery fix agent made no commits" };
+    return { kind: "failed", action: "fix_code", message: "recovery fix agent made no commits" };
   }
 
   // Push
   const pushResult = await runner.run("git", ["push", "origin", `HEAD:${branch}`], { cwd: worktreePath });
   if (pushResult.code !== 0) {
-    return { kind: "failed", message: `recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}` };
+    return { kind: "failed", action: "fix_code", message: `recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}` };
   }
 
   // Post /restart-review if PR exists
@@ -262,7 +262,7 @@ async function executeFixCode(
     try {
       await git.postComment(session.prNumber, "/restart-review");
     } catch (err) {
-      return { kind: "failed", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
+      return { kind: "failed", action: "fix_code", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
     }
   }
 
@@ -283,7 +283,7 @@ async function executeRebase(
     { cwd: worktreePath },
   );
   if (fetchResult.code !== 0) {
-    return { kind: "failed", message: `recovery rebase fetch failed: ${fetchResult.stderr.trim() || `exit ${fetchResult.code}`}` };
+    return { kind: "failed", action: "rebase", message: `recovery rebase fetch failed: ${fetchResult.stderr.trim() || `exit ${fetchResult.code}`}` };
   }
 
   const rebaseResult = await runner.run(
@@ -293,7 +293,7 @@ async function executeRebase(
   if (rebaseResult.code !== 0) {
     // Abort the failed rebase
     await runner.run("git", ["-C", worktreePath, "rebase", "--abort"], { cwd: worktreePath });
-    return { kind: "failed", message: `recovery rebase failed: ${rebaseResult.stderr.trim() || `exit ${rebaseResult.code}`}` };
+    return { kind: "failed", action: "rebase", message: `recovery rebase failed: ${rebaseResult.stderr.trim() || `exit ${rebaseResult.code}`}` };
   }
 
   // Force push with lease
@@ -302,14 +302,14 @@ async function executeRebase(
     { cwd: worktreePath },
   );
   if (pushResult.code !== 0) {
-    return { kind: "failed", message: `recovery rebase push failed: ${pushResult.stderr.trim()}` };
+    return { kind: "failed", action: "rebase", message: `recovery rebase push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}` };
   }
 
   if (session.prNumber !== null) {
     try {
       await git.postComment(session.prNumber, "/restart-review");
     } catch (err) {
-      return { kind: "failed", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
+      return { kind: "failed", action: "rebase", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
     }
   }
 
@@ -322,12 +322,12 @@ async function executeRestartReview(
   session: TaskSessionRow,
 ): Promise<RecoveryTurnResult> {
   if (session.prNumber === null) {
-    return { kind: "failed", message: "recovery restart_review: no PR to comment on" };
+    return { kind: "failed", action: "restart_review", message: "recovery restart_review: no PR to comment on" };
   }
   try {
     await deps.git.postComment(session.prNumber, "/restart-review");
   } catch (err) {
-    return { kind: "failed", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
+    return { kind: "failed", action: "restart_review", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
   }
   return { kind: "recovered", action: "restart_review", costUsd: 0 };
 }
