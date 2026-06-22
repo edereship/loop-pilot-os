@@ -12,7 +12,9 @@ function parseWcOutput(stdout: string, fileSet: Set<string>): Map<string, number
   for (const line of stdout.trim().split("\n")) {
     const match = /^\s*(\d+)\s+(.+)$/.exec(line);
     if (!match) continue;
-    const path = match[2].trim();
+    let path = match[2].trim();
+    // Strip leading "./" normalization added when sanitizing "-"-prefixed filenames
+    if (path.startsWith("./")) path = path.slice(2);
     if (fileSet.has(path) && !map.has(path)) {
       map.set(path, parseInt(match[1], 10));
     }
@@ -48,7 +50,8 @@ function formatSummary(entries: FileEntry[], budgetChars: number): string {
     listed++;
   }
 
-  return lines.join("\n");
+  const result = lines.join("\n");
+  return result.length <= budgetChars ? result : result.slice(0, budgetChars);
 }
 
 export async function generateCodebaseSummary(
@@ -65,13 +68,16 @@ export async function generateCodebaseSummary(
   const files = lsResult.stdout.trim().split("\n").filter(f => f.length > 0);
   if (files.length === 0) return "";
 
-  const fileSet = new Set(files);
   const lineCounts = new Map<string, number>();
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     const batch = files.slice(i, i + BATCH_SIZE);
-    const wcResult = await cmd.run("wc", ["-l", ...batch], { cwd: repoPath });
+    // Prefix filenames starting with '-' with "./" to prevent wc from treating them
+    // as options or as stdin (the special "-" filename).
+    const sanitizedBatch = batch.map(f => f.startsWith("-") ? `./${f}` : f);
+    const batchSet = new Set(batch);
+    const wcResult = await cmd.run("wc", ["-l", ...sanitizedBatch], { cwd: repoPath });
     if (wcResult.code === 0) {
-      for (const [path, count] of parseWcOutput(wcResult.stdout, fileSet)) {
+      for (const [path, count] of parseWcOutput(wcResult.stdout, batchSet)) {
         lineCounts.set(path, count);
       }
     }
