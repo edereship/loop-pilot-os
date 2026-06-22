@@ -2876,6 +2876,51 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(h.store.latestRun()!.state).toBe("halted");
   });
 
+  // ES-450 Finding 2: after auto-restart cap exceeded + recovery succeeds, pendingRestartReason
+  // must be reloaded so the stale guard fires on the next poll instead of re-exhausting the counter.
+  it("auto-restart limit exceeded + recovery fix_code → pendingRestartReason reloaded, stale guard fires next poll", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // Recovery fix agent: succeeds
+      { kind: "completed", costUsd: 0.5, summary: "fixed" },
+    ];
+    // 4 consecutive stopped verdicts with DIFFERENT stop reasons bypass the stale guard,
+    // hitting the auto-restart cap on poll 4. Recovery sets pendingRestartReason = "test_failure".
+    // Poll 5: "test_failure" → stale guard fires (only with the fix; without fix the counter
+    //         is re-incremented, recoveryAttempted blocks recovery, and the session stops).
+    // Poll 6: merged.
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },    // auto_restart #1
+      { kind: "stopped", stopReason: "action_timeout" },      // auto_restart #2
+      { kind: "stopped", stopReason: "max_turns_exceeded" },  // auto_restart #3
+      { kind: "stopped", stopReason: "test_failure" },        // cap exceeded → recovery fires
+      { kind: "stopped", stopReason: "test_failure" },        // stale guard (pendingRestartReason reloaded)
+      { kind: "merged" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nDo it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the test failure"}' },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Stale guard fires at poll 5, then merges at poll 6
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("fix_code");
+  });
+
   // Finding 2: after an abandon recovery the abandoned ticket must not be immediately reselected
   it("abandon recovery: abandoned ticket excluded from subsequent SELECT", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });

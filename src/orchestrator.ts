@@ -1107,6 +1107,8 @@ export class Orchestrator {
                 `auto-restart limit exceeded (${autoRestartCount}x): ${verdict.stopReason}`,
               );
               if (ctrl.control === "halt") return HALT;
+              // Reload so the stale guard fires on the next poll if recovery posted /restart-review.
+              pendingRestartReason = this.store.getSession(session.id).pendingRestartReason ?? undefined;
               continue;
             }
             // A real restart event breaks any prior readiness-failure streak: errors before
@@ -1172,6 +1174,8 @@ export class Orchestrator {
                 `quota retry limit exceeded (${quotaRetryCount}x): ${verdict.stopReason}`,
               );
               if (ctrl.control === "halt") return HALT;
+              // Reload so the stale guard fires on the next poll if recovery posted /restart-review.
+              pendingRestartReason = this.store.getSession(session.id).pendingRestartReason ?? undefined;
               continue;
             }
             if (quotaRetryCount === 1) {

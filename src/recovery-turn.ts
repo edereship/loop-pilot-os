@@ -240,8 +240,23 @@ async function executeFixCode(
   if (outcome.kind !== "completed") {
     log(`recovery: fix agent outcome=${outcome.kind}`);
     if (outcome.kind === "interrupted") {
-      // Push any commits the agent made before the interrupt so they survive a later worktree reset.
+      // Push any commits or dirty edits the agent made before the interrupt so they survive a
+      // later worktree reset to origin/<branch>. Without this, uncommitted changes would be
+      // silently discarded on the next recovery attempt (recoveryAttempted is not set for
+      // interrupted outcomes, so the next run resets the worktree and retries from scratch).
       try {
+        const statusResult = await runner.run(
+          "git", ["-C", worktreePath, "status", "--porcelain"],
+          { cwd: worktreePath },
+        );
+        if (statusResult.code === 0 && statusResult.stdout.trim() !== "") {
+          // Uncommitted edits: wrap them in a WIP commit so the next reset preserves them.
+          await runner.run("git", ["-C", worktreePath, "add", "-A"], { cwd: worktreePath });
+          await runner.run(
+            "git", ["-C", worktreePath, "commit", "-m", "wip: interrupted recovery"],
+            { cwd: worktreePath },
+          );
+        }
         const logResult = await runner.run(
           "git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"],
           { cwd: worktreePath },

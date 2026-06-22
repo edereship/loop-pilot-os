@@ -346,6 +346,33 @@ describe("executeRecoveryTurn", () => {
     expect(pushCall).toBeDefined();
   });
 
+  // ES-450 Finding 1: interrupted fix agent with dirty (uncommitted) changes → create WIP commit and push
+  it("fix_code: agent interrupted with dirty changes and no commits ahead → creates WIP commit and pushes", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.15 }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: " M src/foo.ts\n" }; // dirty file
+      if (args.includes("add")) return { code: 0 };
+      if (args.includes("commit")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "abc wip\n" }; // WIP commit shows up
+      return { code: 0, stdout: "" };
+    });
+    runner.on(["git", "push"], { code: 0 });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted", costUsd: 0.15 });
+    const addCall = runner.calls.find((c) => c.cmd === "git" && c.args.includes("add"));
+    expect(addCall).toBeDefined();
+    const commitCall = runner.calls.find((c) => c.cmd === "git" && c.args.includes("commit"));
+    expect(commitCall).toBeDefined();
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeDefined();
+  });
+
   // Finding 3: interrupted fix agent with no ahead commits → no push
   it("fix_code: agent interrupted with no commits ahead → returns interrupted without push", async () => {
     const { deps, planner, agent, runner } = makeDeps();
