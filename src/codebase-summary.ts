@@ -59,13 +59,27 @@ export async function generateCodebaseSummary(
   cmd: CommandRunner,
   budgetChars: number,
 ): Promise<string> {
+  // Use -s (stage info for mode detection) and -z (NUL-delimited, safe for unusual filenames).
   const lsResult = await cmd.run(
-    "git", ["-c", "core.quotePath=false", "ls-files"],
+    "git", ["-c", "core.quotePath=false", "ls-files", "-sz"],
     { cwd: repoPath },
   );
   if (lsResult.code !== 0) return "";
 
-  const files = lsResult.stdout.trim().split("\n").filter(f => f.length > 0);
+  // Parse NUL-delimited stage records: "<mode> <sha> <stage>\t<path>"
+  const files: string[] = [];
+  for (const record of lsResult.stdout.split("\0")) {
+    if (record.length === 0) continue;
+    const spaceIdx = record.indexOf(" ");
+    const tabIdx = record.indexOf("\t");
+    if (spaceIdx === -1 || tabIdx === -1) continue;
+    const modeStr = record.slice(0, spaceIdx);
+    // Skip symlinks (mode 120000): wc follows the symlink and blocks indefinitely
+    // on device/pipe targets such as /dev/zero.
+    if (modeStr === "120000") continue;
+    const filePath = record.slice(tabIdx + 1);
+    if (filePath.length > 0) files.push(filePath);
+  }
   if (files.length === 0) return "";
 
   const lineCounts = new Map<string, number>();
@@ -75,11 +89,20 @@ export async function generateCodebaseSummary(
     // as options or as stdin (the special "-" filename).
     const sanitizedBatch = batch.map(f => f.startsWith("-") ? `./${f}` : f);
     const batchSet = new Set(batch);
-    const wcResult = await cmd.run("wc", ["-l", ...sanitizedBatch], { cwd: repoPath });
-    if (wcResult.code === 0) {
-      for (const [path, count] of parseWcOutput(wcResult.stdout, batchSet)) {
-        lineCounts.set(path, count);
-      }
+    let wcStdout: string;
+    try {
+      const wcResult = await cmd.run("wc", ["-l", ...sanitizedBatch], { cwd: repoPath });
+      wcStdout = wcResult.stdout;
+    } catch {
+      // wc binary not available (e.g. Windows minimal containers) — skip line counts
+      // for this batch so the file-list fallback is still emitted.
+      continue;
+    }
+    // Parse stdout regardless of exit code: GNU wc emits counts for successfully
+    // read files even when it exits nonzero (e.g. a submodule directory in the
+    // batch causes failure but the other files' counts are still valid).
+    for (const [path, count] of parseWcOutput(wcStdout, batchSet)) {
+      lineCounts.set(path, count);
     }
   }
 
