@@ -237,6 +237,7 @@ describe("executeRecoveryTurn", () => {
     const { deps, planner, git, source, runner } = makeDeps();
     planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
     runner.on(["gh", "pr", "close"], { code: 0 });
+    runner.on(["git", "push", "origin", "--delete"], { code: 0 });
 
     const session = fakeSession({ prNumber: 42, linearIssueId: "issue-1" });
     const result = await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
@@ -514,20 +515,24 @@ describe("executeRecoveryTurn", () => {
     expect(source.transitions).toEqual([]);
   });
 
-  // Finding 6: ticket revert throws → failed(abandon) without discarding worktree
-  it("abandon: ticket revert fails → failed(abandon) without worktree discard", async () => {
+  // Finding 6: ticket revert throws → failed(abandon); worktree is already discarded
+  // (best-effort) since it happens before the ticket transition in the new ordering.
+  it("abandon: ticket revert fails → failed(abandon)", async () => {
     const { deps, planner, runner, source, git } = makeDeps();
     planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
     runner.on(["gh", "pr", "close"], { code: 0 });
+    runner.on(["git", "push", "origin", "--delete"], { code: 0 });
     source.failNext("transition", new Error("Linear 5xx"));
 
     const session = fakeSession({ prNumber: 42, linearIssueId: "issue-1" });
     const result = await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
 
     expect(result).toMatchObject<Partial<RecoveryTurnResult>>({ kind: "failed", action: "abandon" });
-    // Worktree must NOT be discarded — the session is unresolved
+    // Worktree is discarded (best-effort) before ticket transition in the new
+    // ordering — the worktree is a local copy and the remote branch is what
+    // matters for future retries.
     const discardCall = git.calls.find((c) => c.method === "discardWorktree");
-    expect(discardCall).toBeUndefined();
+    expect(discardCall).toBeDefined();
   });
 
   // Finding 1: buildRecoveryPrompt does not tell the fix agent to push or restart review

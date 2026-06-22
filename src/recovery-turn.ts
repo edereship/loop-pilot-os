@@ -294,8 +294,14 @@ async function executeFixCode(
           { cwd: worktreePath },
         );
         hasPushableCommits = logResult.code === 0 && logResult.stdout.trim() !== "";
-      } catch {
-        // Best-effort: if status/commit check fails, skip the push
+      } catch (preserveErr) {
+        return {
+          kind: "failed",
+          action: "fix_code",
+          message: `interrupted recovery preservation failed: ${preserveErr instanceof Error ? preserveErr.message : String(preserveErr)}`,
+          costUsd: outcome.costUsd,
+          preserveWorktree: true,
+        };
       }
       if (hasPushableCommits) {
         const pushResult = await runner.run("git", ["push", "origin", `HEAD:${branch}`], { cwd: worktreePath });
@@ -457,12 +463,11 @@ async function executeAbandon(
 ): Promise<RecoveryTurnResult> {
   const { runner, source, git, config, log } = deps;
   // Close the PR first so a transient close failure leaves the ticket in its current state
-  // (In Progress) rather than Todo. A ticket in Todo with an open PR and no active session
-  // is eligible for scheduling, which can cause a second PR to be opened for the same issue
-  // before the first is cleaned up (ES-450 Finding 4). Do not pass --delete-branch: if the
-  // branch is checked out in a linked worktree that flag causes gh to fail (local branch
-  // deletion is blocked), aborting before the worktree cleanup even though GitHub may have
-  // already closed the PR. Branch cleanup is handled by discardWorktree below.
+  // (In Progress) rather than Todo. Do not pass --delete-branch: if the branch is checked
+  // out in a linked worktree that flag causes gh to fail (local branch deletion is blocked),
+  // aborting before the worktree cleanup even though GitHub may have already closed the PR.
+  // Tolerate "already closed" errors so a retry after a prior partial abandon (PR closed but
+  // ticket revert or branch delete failed) does not abort here (ES-450 Finding 1).
   if (session.prNumber !== null) {
     const closeResult = await runner.run(
       "gh", ["pr", "close", String(session.prNumber), "-R", config.repo.remote],
@@ -470,19 +475,12 @@ async function executeAbandon(
     );
     if (closeResult.code !== 0) {
       const msg = closeResult.stderr.trim() || `exit ${closeResult.code}`;
-      log(`recovery: abandon PR close failed: ${msg}`);
-      return { kind: "failed", action: "abandon", message: `PR close failed: ${msg}` };
+      if (!/already\s*closed/i.test(msg)) {
+        log(`recovery: abandon PR close failed: ${msg}`);
+        return { kind: "failed", action: "abandon", message: `PR close failed: ${msg}` };
+      }
+      log(`recovery: abandon PR already closed, proceeding with cleanup`);
     }
-  }
-  // Revert ticket to Todo after the PR is closed. A failure here leaves the ticket in
-  // In Progress with a closed PR — visible for human cleanup, but not eligible for
-  // scheduling (Linear In Progress is not in the eligible set).
-  try {
-    await source.transition(session.linearIssueId, "todo");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(`recovery: abandon ticket revert failed: ${msg}`);
-    return { kind: "failed", action: "abandon", message: `ticket revert to Todo failed: ${msg}` };
   }
   // Discard worktree (best-effort)
   if (session.worktreePath) {
@@ -492,20 +490,37 @@ async function executeAbandon(
       log("recovery: abandon worktree discard failed (best-effort)");
     }
   }
-  // Delete the remote branch so a later retry for the same issue can push to the
-  // same branch name without a non-fast-forward rejection (ES-450 Finding 5).
-  // Best-effort: GitHub may have already deleted the branch on PR close (exit 1
-  // with "remote ref does not exist" is expected and safe to ignore).
+  // Delete remote branch before ticket transition so a non-benign failure keeps the ticket
+  // in its current state (not Todo/eligible for scheduling) and avoids non-fast-forward push
+  // failures when a later run reuses the deterministic branch name (ES-450 Finding 6).
+  // GitHub may have already deleted the branch on PR close — "does not exist" is benign.
   try {
     const deleteResult = await runner.run(
       "git", ["push", "origin", "--delete", session.branch],
       { cwd: config.repo.path },
     );
     if (deleteResult.code !== 0) {
-      log(`recovery: abandon remote branch delete exit ${deleteResult.code}: ${deleteResult.stderr.trim()}`);
+      const stderr = deleteResult.stderr.trim();
+      if (!/remote ref does not exist|not found/i.test(stderr)) {
+        log(`recovery: abandon remote branch delete failed (non-benign): ${stderr}`);
+        return { kind: "failed", action: "abandon", message: `remote branch delete failed: ${stderr}` };
+      }
+      log(`recovery: abandon remote branch already deleted`);
     }
   } catch (err) {
-    log(`recovery: abandon remote branch delete failed: ${err instanceof Error ? err.message : String(err)}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`recovery: abandon remote branch delete threw: ${msg}`);
+    return { kind: "failed", action: "abandon", message: `remote branch delete failed: ${msg}` };
+  }
+  // Revert ticket to Todo after PR close and branch cleanup succeed. A failure here leaves
+  // the ticket in In Progress with a closed PR — visible for human cleanup, but not eligible
+  // for scheduling (Linear In Progress is not in the eligible set).
+  try {
+    await source.transition(session.linearIssueId, "todo");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`recovery: abandon ticket revert failed: ${msg}`);
+    return { kind: "failed", action: "abandon", message: `ticket revert to Todo failed: ${msg}` };
   }
   return { kind: "continued", action: "abandon" };
 }

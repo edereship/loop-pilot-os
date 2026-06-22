@@ -162,6 +162,13 @@ export class Orchestrator {
         ctrl = await this.recoverByOpenPr(session);
       }
       if (ctrl.control === "halt") return HALT;
+      // If recovery re-activated the session to in_review, resume monitoring so
+      // it doesn't sit idle until the next daemon restart (ES-450 Finding 4).
+      const refreshed = this.store.getSession(session.id);
+      if (refreshed.state === "in_review" && refreshed.prNumber !== null) {
+        const monCtrl = await this.adoptAndMonitor(refreshed, refreshed.prNumber, refreshed.monitorStartedAt);
+        if (monCtrl.control === "halt") return HALT;
+      }
     }
 
     // 3) stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）
@@ -422,6 +429,28 @@ export class Orchestrator {
               session.stopDetail.startsWith("quota retry limit exceeded") &&
               extractExhaustedStopReason(stripRecoveryFailedSuffix(session.stopDetail) ?? "") === verdict.stopReason)
           ) {
+            // Before skipping, retry if a prior Codex recovery failed (e.g. transient
+            // /restart-review post failure). Without this the failed recovery is never
+            // retried: this guard returns before the retry block below and
+            // stoppedSessionsWithFailedRecovery excludes looppilot_stopped (ES-450 Finding 2).
+            if (
+              !session.recoveryAttempted &&
+              session.stopDetail !== null &&
+              session.stopDetail.includes("(recovery failed:")
+            ) {
+              this.store.updateSession(session.id, { runId: this.runId });
+              const retryCtrl = await this.stopSession(
+                session,
+                session.failureReason as FailureReason,
+                stripRecoveryFailedSuffix(session.stopDetail),
+              );
+              if (retryCtrl.control === "halt") return HALT;
+              const retried = this.store.getSession(session.id);
+              if (retried.state === "in_review" && retried.prNumber !== null) {
+                return await this.adoptAndMonitor(retried, retried.prNumber, retried.monitorStartedAt);
+              }
+              return retryCtrl;
+            }
             this.log(
               `recovery: skipping exhausted stopped session PR #${prNumber}: ${session.stopDetail}`,
             );
@@ -1719,11 +1748,22 @@ export class Orchestrator {
           // For done-path stops (ci_failed, merge_conflict) detail is null — fall back to reason
           // so the done-case stale guard can detect and consume it (ES-450 Finding 1).
           if (result.action === "restart_review" || result.action === "fix_code" || result.action === "rebase") {
-            const rawReason = detail !== null && (
+            let pendingReason: string;
+            if (reason === "ci_failed" || reason === "merge_conflict") {
+              // Done-path stops: always use reason so the monitor's preservation
+              // logic (which keeps exact "ci_failed"/"merge_conflict" markers
+              // through non-stopped verdicts) works correctly even when detail
+              // carries extra context like branch-protection details (ES-450 Finding 3).
+              pendingReason = reason;
+            } else if (detail !== null && (
               detail.startsWith("auto-restart limit exceeded") ||
               detail.startsWith("quota retry limit exceeded")
-            ) ? extractExhaustedStopReason(detail) : detail;
-            recoveryUpdate.pendingRestartReason = rawReason ?? reason;
+            )) {
+              pendingReason = extractExhaustedStopReason(detail);
+            } else {
+              pendingReason = detail ?? reason;
+            }
+            recoveryUpdate.pendingRestartReason = pendingReason;
           }
           // handoff_failed + any action that restarts review: transition the Linear ticket
           // to In Review now that recovery is confirmed to succeed. fix_code and rebase also
