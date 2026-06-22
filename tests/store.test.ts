@@ -350,6 +350,29 @@ describe("SqliteStore: session", () => {
     // a3 excluded because failure_reason is cost_exceeded (not looppilot_stopped)
   });
 
+  it("stoppedSessionsWithPr excludes sessions with recovery_action=abandon (ES-450 Finding 1)", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const run = store.createRun(3, clock());
+
+    // abandoned session: recovery_action=abandon → excluded even though it matches state/reason/prNumber
+    const a = seedSession(store, run.id, clock(), { linearIssueId: "i-a", linearIdentifier: "TY-1", branch: "b-a" });
+    store.updateSession(a.id, {
+      state: "stopped",
+      failureReason: "looppilot_stopped",
+      prNumber: 100,
+      recoveryAction: "abandon",
+    });
+
+    // non-abandoned session → included
+    const b = seedSession(store, run.id, clock(), { linearIssueId: "i-b", linearIdentifier: "TY-2", branch: "b-b" });
+    store.updateSession(b.id, { state: "stopped", failureReason: "looppilot_stopped", prNumber: 200 });
+
+    const result = store.stoppedSessionsWithPr("looppilot_stopped");
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe(b.id);
+  });
+
   // カーネル §2/§7: recentMergedSummaries は merged のみを ended_at 降順で n 件
   it("recentMergedSummaries returns only merged sessions, newest-ended first, limited to n", () => {
     const store = newStore();

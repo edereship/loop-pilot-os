@@ -461,6 +461,7 @@ export class SqliteStore {
       .prepare(
         `SELECT * FROM task_session
          WHERE state = 'stopped' AND failure_reason = ? AND pr_number IS NOT NULL
+           AND (recovery_action IS NULL OR recovery_action != 'abandon')
            AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
          ORDER BY id ASC`,
       )

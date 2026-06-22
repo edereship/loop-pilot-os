@@ -252,11 +252,27 @@ async function executeFixCode(
         );
         if (statusResult.code === 0 && statusResult.stdout.trim() !== "") {
           // Uncommitted edits: wrap them in a WIP commit so the next reset preserves them.
-          await runner.run("git", ["-C", worktreePath, "add", "-A"], { cwd: worktreePath });
-          await runner.run(
+          const addResult = await runner.run("git", ["-C", worktreePath, "add", "-A"], { cwd: worktreePath });
+          if (addResult.code !== 0) {
+            return {
+              kind: "failed",
+              action: "fix_code",
+              message: `interrupted recovery WIP commit failed (add): ${addResult.stderr.trim() || `exit ${addResult.code}`}`,
+              costUsd: outcome.costUsd,
+            };
+          }
+          const commitResult = await runner.run(
             "git", ["-C", worktreePath, "commit", "-m", "wip: interrupted recovery"],
             { cwd: worktreePath },
           );
+          if (commitResult.code !== 0) {
+            return {
+              kind: "failed",
+              action: "fix_code",
+              message: `interrupted recovery WIP commit failed (commit): ${commitResult.stderr.trim() || `exit ${commitResult.code}`}`,
+              costUsd: outcome.costUsd,
+            };
+          }
         }
         const logResult = await runner.run(
           "git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"],

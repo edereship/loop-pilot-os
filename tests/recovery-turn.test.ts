@@ -373,6 +373,57 @@ describe("executeRecoveryTurn", () => {
     expect(pushCall).toBeDefined();
   });
 
+  // ES-450 Finding 2: git add fails during WIP commit → failed result (not interrupted)
+  it("fix_code: agent interrupted with dirty changes and git add fails → failed result (not interrupted)", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.15 }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: " M src/foo.ts\n" }; // dirty file
+      if (args.includes("add")) return { code: 1, stderr: "index lock error" };
+      return { code: 0, stdout: "" };
+    });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({
+      kind: "failed",
+      action: "fix_code",
+      message: expect.stringContaining("WIP commit failed"),
+      costUsd: 0.15,
+    });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
+  // ES-450 Finding 2: git commit fails during WIP commit → failed result (not interrupted)
+  it("fix_code: agent interrupted with dirty changes and git commit fails → failed result (not interrupted)", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.12 }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: " M src/foo.ts\n" }; // dirty file
+      if (args.includes("add")) return { code: 0 };
+      if (args.includes("commit")) return { code: 1, stderr: "pre-commit hook rejected" };
+      return { code: 0, stdout: "" };
+    });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({
+      kind: "failed",
+      action: "fix_code",
+      message: expect.stringContaining("WIP commit failed"),
+      costUsd: 0.12,
+    });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
   // Finding 3: interrupted fix agent with no ahead commits → no push
   it("fix_code: agent interrupted with no commits ahead → returns interrupted without push", async () => {
     const { deps, planner, agent, runner } = makeDeps();
