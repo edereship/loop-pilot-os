@@ -113,6 +113,7 @@ function makeHarness(config: Config): Harness {
     log,
     recovery,
     planner: null,
+    codebaseSummaryGenerator: async () => "",
   });
   return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }

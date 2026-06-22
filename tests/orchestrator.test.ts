@@ -615,6 +615,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       log: (line: string) => { logs.push(line); },
       recovery,
       planner: null,
+      codebaseSummaryGenerator: async () => "",
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -2083,6 +2084,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       log: (line: string) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
       planner,
+      codebaseSummaryGenerator: async () => "",
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -2595,6 +2597,7 @@ describe("Orchestrator.interruptablePause", () => {
       config, source, agent, git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
+      codebaseSummaryGenerator: async () => "",
     });
     orchRef = orch;
 
