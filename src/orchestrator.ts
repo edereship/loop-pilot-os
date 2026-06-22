@@ -533,6 +533,14 @@ export class Orchestrator {
       const handoff = await this.handoff(session, issue);
       if (!("prNumber" in handoff)) {
         if (handoff.control === "halt") return;
+        // Recovery CONTINUE: if the session was recovered to in_review (e.g. handoff_failed
+        // after a PR was already created), resume MONITOR with the recovered PR number.
+        const recoveredSession = this.store.getSession(session.id);
+        if (recoveredSession.state === "in_review" && recoveredSession.prNumber !== null) {
+          const mon = await this.monitorSession(recoveredSession, recoveredSession.prNumber);
+          if (mon.control === "halt") return;
+          await this.done(recoveredSession, issue);
+        }
         continue; // recovery CONTINUE → retry from SELECT
       }
       const prNumber = handoff.prNumber;
@@ -1194,6 +1202,14 @@ export class Orchestrator {
             continue;
           }
           // human_required / null → HALT
+          // Stale check: if ES-450 recovery already posted /restart-review for this exact
+          // stop reason, give one poll of grace before the restart is consumed (Finding 6).
+          if (pendingRestartReason !== undefined &&
+              pendingRestartReason === (verdict.stopReason ?? "looppilot stopped (no reason)")) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
           {
             const ctrl = await this.stopSession(
               session,
@@ -1201,6 +1217,9 @@ export class Orchestrator {
               verdict.stopReason ?? "looppilot stopped (no reason)",
             );
             if (ctrl.control === "halt") return HALT;
+            // Recovery succeeded: reload pendingRestartReason so next poll gives grace.
+            const recoveredState = this.store.getSession(session.id);
+            pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
             continue;
           }
         }
@@ -1268,6 +1287,7 @@ export class Orchestrator {
               session,
               "workflow_setup_failed",
               `workflow recovery error: ${errMsg(err)}`,
+              { workflowHandledErrorCount: verdict.errorCommentCount },
             );
             if (ctrl.control === "halt") return HALT;
             continue;
@@ -1338,6 +1358,7 @@ export class Orchestrator {
               session,
               "workflow_setup_failed",
               detail,
+              { workflowHandledErrorCount: verdict.errorCommentCount },
             );
             if (ctrl.control === "halt") return HALT;
             continue;
@@ -1426,8 +1447,9 @@ export class Orchestrator {
     session: TaskSessionRow,
     reason: FailureReason,
     detail: string | null,
-    extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber">> = {},
+    extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber" | "workflowHandledErrorCount">> = {},
   ): Promise<RunControl> {
+    let patch = extraPatch;
     // --- Recovery gate (ES-450) ---
     if (reason !== "cost_exceeded" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
@@ -1450,29 +1472,59 @@ export class Orchestrator {
           this.log(`recovery: exception: ${err instanceof Error ? err.message : String(err)}`);
           result = { kind: "escalated" as const, action: "escalate" as const };
         }
+        // Operator interrupted during recovery analysis: propagate like other interrupts.
+        if (result.kind === "interrupted") {
+          await this.haltForInterrupt();
+          return HALT;
+        }
+        // Abandon completed cleanup and wants the loop to continue to next task.
+        if (result.kind === "continued") {
+          this.store.updateSession(session.id, { recoveryAction: result.action });
+          this.store.updateSession(session.id, {
+            state: "stopped",
+            failureReason: reason,
+            stopDetail: detail,
+            endedAt: this.clock(),
+          });
+          return CONTINUE;
+        }
         const actionStr = result.action;
         this.store.updateSession(session.id, { recoveryAction: actionStr });
         if (result.kind === "recovered") {
           const recoveryCost = result.costUsd;
+          const refreshed = this.store.getSession(session.id);
+          const recoveryUpdate: Partial<TaskSessionRow> = {
+            state: "in_review",
+            monitorStartedAt: this.clock(),
+            failureReason: null,
+            stopDetail: null,
+            endedAt: null,
+          };
           if (recoveryCost > 0) {
-            const refreshed = this.store.getSession(session.id);
-            this.store.updateSession(session.id, {
-              costUsd: (refreshed.costUsd ?? 0) + recoveryCost,
-            });
+            recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
+          }
+          // Carry over workflowHandledErrorCount from caller (Finding 2: prevents re-triggering
+          // the same stale workflow error after fix_code recovery of workflow_setup_failed).
+          if (patch.workflowHandledErrorCount !== undefined) {
+            recoveryUpdate.workflowHandledErrorCount = patch.workflowHandledErrorCount;
+          }
+          // Track restart_review as pending so monitor gives grace on the next stale stop
+          // before the /restart-review comment is consumed (Finding 6).
+          if (result.action === "restart_review") {
+            recoveryUpdate.pendingRestartReason = detail;
           }
           await this.notifier.notify({
             kind: "recovery_succeeded",
             identifier: session.linearIdentifier,
             action: result.action,
           });
-          this.store.updateSession(session.id, {
-            state: "in_review",
-            monitorStartedAt: this.clock(),
-            failureReason: null,
-            stopDetail: null,
-            endedAt: null,
-          });
+          this.store.updateSession(session.id, recoveryUpdate);
           return CONTINUE;
+        }
+        // failed: preserve any recovery agent cost before falling through to normal stop.
+        if (result.kind === "failed" && result.costUsd !== undefined && result.costUsd > 0) {
+          const freshened = this.store.getSession(session.id);
+          patch = { ...patch, costUsd: (freshened.costUsd ?? 0) + result.costUsd };
         }
         // escalated / failed → fall through to normal stop
       }
@@ -1483,7 +1535,7 @@ export class Orchestrator {
       failureReason: reason,
       stopDetail: detail,
       endedAt: this.clock(),
-      ...extraPatch,
+      ...patch,
     });
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${detail ? `: ${detail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });

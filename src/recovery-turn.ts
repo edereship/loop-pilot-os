@@ -28,7 +28,9 @@ export interface RecoveryAction {
 export type RecoveryTurnResult =
   | { kind: "recovered"; action: RecoveryActionKind; costUsd: number }
   | { kind: "escalated"; action: RecoveryActionKind }
-  | { kind: "failed"; action: RecoveryActionKind; message: string };
+  | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number }
+  | { kind: "interrupted" }
+  | { kind: "continued"; action: RecoveryActionKind };
 
 export interface RecoveryTurnDeps {
   planner: PlanRunner;
@@ -177,7 +179,7 @@ export async function executeRecoveryTurn(
       return { kind: "escalated", action: "escalate" };
     }
     if (outcome.kind === "interrupted") {
-      return { kind: "escalated", action: "escalate" };
+      return { kind: "interrupted" };
     }
     codexText = outcome.text;
   } catch (err) {
@@ -196,7 +198,7 @@ export async function executeRecoveryTurn(
 
     case "abandon":
       await executeAbandon(deps, session);
-      return { kind: "escalated", action: "abandon" };
+      return { kind: "continued", action: "abandon" };
 
     case "restart_review":
       return await executeRestartReview(deps, session);
@@ -238,7 +240,7 @@ async function executeFixCode(
 
   if (outcome.kind !== "completed") {
     log(`recovery: fix agent outcome=${outcome.kind}`);
-    return { kind: "failed", action: "fix_code", message: `recovery fix agent: ${outcome.kind}` };
+    return { kind: "failed", action: "fix_code", message: `recovery fix agent: ${outcome.kind}`, costUsd: outcome.costUsd };
   }
 
   // Verify commits

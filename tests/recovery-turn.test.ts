@@ -233,7 +233,7 @@ describe("executeRecoveryTurn", () => {
     expect(result).toEqual<RecoveryTurnResult>({ kind: "escalated", action: "escalate" });
   });
 
-  it("abandon: codex says abandon → close PR → revert ticket → escalated(abandon)", async () => {
+  it("abandon: codex says abandon → close PR → revert ticket → continued(abandon)", async () => {
     const { deps, planner, git, source, runner } = makeDeps();
     planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
     runner.on(["gh", "pr", "close"], { code: 0 });
@@ -241,7 +241,7 @@ describe("executeRecoveryTurn", () => {
     const session = fakeSession({ prNumber: 42, linearIssueId: "issue-1" });
     const result = await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
 
-    expect(result).toEqual<RecoveryTurnResult>({ kind: "escalated", action: "abandon" });
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "continued", action: "abandon" });
     const closeCall = runner.calls.find((c) => c.cmd === "gh" && c.args.includes("close"));
     expect(closeCall).toBeDefined();
     expect(source.transitions).toContainEqual({ issueId: "issue-1", state: "todo" });
