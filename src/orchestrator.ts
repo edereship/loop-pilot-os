@@ -1567,6 +1567,24 @@ export class Orchestrator {
             ) ? extractExhaustedStopReason(detail) : detail;
             recoveryUpdate.pendingRestartReason = rawReason;
           }
+          // handoff_failed recovery: retry the side-effects that failed during the original
+          // handoff so the gate label and Linear state are correct before we flip to in_review.
+          // Without this, the PR can lack the required gate label and LoopPilot never engages,
+          // causing monitor_never_engaged instead of recovering the transient handoff failure
+          // (ES-450 Finding 1). Best-effort: log failures but proceed to in_review regardless.
+          if (reason === "handoff_failed" && refreshed.prNumber !== null) {
+            const prNum = refreshed.prNumber;
+            try {
+              await retry(3, () => this.git.addLabel(prNum, this.config.looppilot.gateLabel));
+            } catch (err) {
+              this.log(`recovery: handoff_failed retry addLabel failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            try {
+              await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
+            } catch (err) {
+              this.log(`recovery: handoff_failed retry transition(in_review) failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
           await this.notifier.notify({
             kind: "recovery_succeeded",
             identifier: session.linearIdentifier,

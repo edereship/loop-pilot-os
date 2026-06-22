@@ -493,8 +493,9 @@ describe("executeRecoveryTurn", () => {
     });
   });
 
-  // Finding 5: gh pr close exits non-zero → failed before reverting ticket
-  it("abandon: gh pr close fails → failed(abandon) without ticket revert", async () => {
+  // Finding 5 (updated): ticket is reverted first; when gh pr close then fails the ticket
+  // is already back in Todo so the task remains schedulable (ES-450 Finding 2 fix).
+  it("abandon: ticket reverted then gh pr close fails → failed(abandon), ticket is in Todo", async () => {
     const { deps, planner, runner, source } = makeDeps();
     planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
     runner.on(["gh", "pr", "close"], { code: 1, stderr: "not found" });
@@ -503,8 +504,9 @@ describe("executeRecoveryTurn", () => {
     const result = await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
 
     expect(result).toMatchObject<Partial<RecoveryTurnResult>>({ kind: "failed", action: "abandon" });
-    // Ticket must NOT be reverted — PR may still be open
-    expect(source.transitions).toHaveLength(0);
+    // Ticket IS reverted to Todo before the PR close attempt so the task remains schedulable
+    // even when the PR close fails.
+    expect(source.transitions).toEqual([{ issueId: "issue-1", state: "todo" }]);
   });
 
   // Finding 6: ticket revert throws → failed(abandon) without discarding worktree

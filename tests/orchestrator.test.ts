@@ -2987,6 +2987,48 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(recoveryEvents).toHaveLength(0);
   });
 
+  // ES-450 Finding 1 (iteration 9): when handoff_failed recovery succeeds, addLabel and
+  // transition(in_review) must be retried before flipping to in_review so the gate label is
+  // present and LoopPilot can engage — without the retry the PR lacks the label and the run
+  // later stops as monitor_never_engaged instead of recovering the transient handoff failure.
+  it("handoff_failed recovery retries addLabel and transition(in_review) before flipping to in_review", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    // Force PR creation to #100
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    // addLabel fails for the initial handoff (3 retries) but succeeds on recovery retry.
+    let addLabelCalls = 0;
+    h.git.addLabel = async (prNumber: number, label: string): Promise<void> => {
+      h.git.calls.push({ method: "addLabel", args: [prNumber, label] });
+      addLabelCalls++;
+      if (addLabelCalls <= 3) throw new Error("gh: label not found");
+      // 4th+ call (from recovery retry) succeeds
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nDo the thing" },
+      // Recovery codex chooses restart_review
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+    // After recovery flips to in_review, monitor immediately merges
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.recoveryAction).toBe("restart_review");
+    // addLabel was retried in the recovery path (calls > 3 initial failures)
+    expect(addLabelCalls).toBeGreaterThan(3);
+    // transition(in_review) was retried during recovery before the session flipped
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "in_review" });
+    // Session fully recovered and merged
+    expect(s.state).toBe("merged");
+  });
+
   // ES-450 Finding (iteration 8): failed abandon must not record recovery_action so
   // stoppedSessionsWithPr can pick the session up again on the next daemon start.
   it("failed abandon does not set recoveryAction, allowing startup re-recovery", async () => {

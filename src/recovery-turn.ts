@@ -409,11 +409,21 @@ async function executeAbandon(
   session: TaskSessionRow,
 ): Promise<RecoveryTurnResult> {
   const { runner, source, git, config, log } = deps;
-  // Close PR — a non-zero exit means the PR may remain open; fail before reverting the ticket.
-  // Do not pass --delete-branch: if the branch is checked out in a linked worktree that flag
-  // causes gh to fail (local branch deletion is blocked), aborting before the ticket revert
-  // even though GitHub may have already closed the PR. Branch cleanup is handled separately
-  // by the discardWorktree call below.
+  // Revert ticket to Todo first — if the PR close later fails the ticket is already back in
+  // Todo, so the task remains schedulable and the worst partial-abandon state (closed PR +
+  // ticket stuck In Progress with no active session and no recoverable path) is avoided.
+  try {
+    await source.transition(session.linearIssueId, "todo");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`recovery: abandon ticket revert failed: ${msg}`);
+    return { kind: "failed", action: "abandon", message: `ticket revert to Todo failed: ${msg}` };
+  }
+  // Close PR after the ticket has been safely reverted. A failure here leaves the ticket in
+  // Todo (good) with an open PR that is visible to humans for manual cleanup. Do not pass
+  // --delete-branch: if the branch is checked out in a linked worktree that flag causes gh to
+  // fail (local branch deletion is blocked), aborting before the worktree cleanup even though
+  // GitHub may have already closed the PR. Branch cleanup is handled by discardWorktree below.
   if (session.prNumber !== null) {
     const closeResult = await runner.run(
       "gh", ["pr", "close", String(session.prNumber), "-R", config.repo.remote],
@@ -424,14 +434,6 @@ async function executeAbandon(
       log(`recovery: abandon PR close failed: ${msg}`);
       return { kind: "failed", action: "abandon", message: `PR close failed: ${msg}` };
     }
-  }
-  // Revert ticket to Todo — a failure leaves the ticket stuck In Progress/In Review with no active session.
-  try {
-    await source.transition(session.linearIssueId, "todo");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(`recovery: abandon ticket revert failed: ${msg}`);
-    return { kind: "failed", action: "abandon", message: `ticket revert to Todo failed: ${msg}` };
   }
   // Discard worktree (best-effort)
   if (session.worktreePath) {
