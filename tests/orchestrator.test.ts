@@ -100,6 +100,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
     return `PROMPT for ${args.issue.identifier}`;
   };
   const recovery = new FakeWorkflowRecovery();
+  const codebaseSummaryGenerator = async () => "3 files, 100 lines total\n\nsrc/a.ts (40L)\nsrc/b.ts (30L)\nsrc/c.ts (30L)";
   const orch = new Orchestrator({
     config,
     source,
@@ -115,6 +116,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
     log,
     recovery,
     planner: opts?.planner ?? null,
+    codebaseSummaryGenerator,
   });
   return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
 }
@@ -2476,6 +2478,24 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
     expect(run.state).toBe("halted");
     // No sessions created (interrupted before CLAIM)
     expect(h.store.sessionsForRun(run.id)).toHaveLength(0);
+  });
+
+  it("passes codebase summary to buildSelectPrompt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '{"identifier":"TY-2","rationale":"has summary context"}' },
+    ];
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("a", "TY-1"), issue("b", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // planner was called with a prompt containing codebase summary
+    const selectPrompt = planner.calls[0]?.prompt ?? "";
+    expect(selectPrompt).toContain("Codebase Structure");
   });
 });
 
