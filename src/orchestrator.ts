@@ -1483,7 +1483,11 @@ export class Orchestrator {
   ): Promise<RunControl> {
     let patch = extraPatch;
     // --- Recovery gate (ES-450) ---
-    if (reason !== "cost_exceeded" && this.recoveryTurn !== null && this.planner !== null) {
+    // pr_closed is terminal — the PR is gone, so fix_code/rebase/restart_review would
+    // post comments or push to a closed PR then flip the session back to in_review where
+    // it will not be monitored again. Only escalate/abandon apply, and retrying them on
+    // every daemon start is not useful. Skip recovery entirely for this reason.
+    if (reason !== "cost_exceeded" && reason !== "pr_closed" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
       if (!fresh.recoveryAttempted && fresh.prNumber !== null) {
         await this.notifier.notify({
@@ -1526,8 +1530,13 @@ export class Orchestrator {
           });
           return CONTINUE;
         }
-        const actionStr = result.action;
-        this.store.updateSession(session.id, { recoveryAction: actionStr });
+        // Only record the recovery action for non-failed outcomes. A failed abandon must
+        // not write recovery_action='abandon' — that would cause stoppedSessionsWithPr to
+        // exclude the session on the next daemon start, leaving an un-abandoned PR/ticket
+        // with no active session and no way to retry cleanup.
+        if (result.kind !== "failed") {
+          this.store.updateSession(session.id, { recoveryAction: result.action });
+        }
         if (result.kind === "recovered") {
           const recoveryCost = result.costUsd;
           const refreshed = this.store.getSession(session.id);

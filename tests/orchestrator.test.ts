@@ -2955,4 +2955,67 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const secondSelectExcluded = h.source.eligibleCalls[1];
     expect(secondSelectExcluded).toContain("issue-A");
   });
+
+  // ES-450 Finding (iteration 8): pr_closed is terminal — recovery must not run even when
+  // recoveryTurn is configured and recoveryAttempted is still 0.
+  it("pr_closed with planner configured → no recovery, stops with pr_closed", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    // Monitor: pr_closed immediately (before any recovery attempt)
+    h.monitor.verdicts = [{ kind: "pr_closed" }];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // No second outcome queued — recovery must NOT call the planner
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("pr_closed");
+    // Recovery must be skipped — recoveryAttempted stays 0 (the pr_closed gate fires first)
+    expect(s.recoveryAttempted).toBe(0);
+    // No recovery notifications
+    const recoveryEvents = h.notifier.events.filter(
+      (e) => e.kind === "recovery_started" || e.kind === "recovery_succeeded",
+    );
+    expect(recoveryEvents).toHaveLength(0);
+  });
+
+  // ES-450 Finding (iteration 8): failed abandon must not record recovery_action so
+  // stoppedSessionsWithPr can pick the session up again on the next daemon start.
+  it("failed abandon does not set recoveryAction, allowing startup re-recovery", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      { kind: "completed", text: '{"action":"abandon"}' },
+    ];
+    // Make gh pr close fail so abandon returns { kind: "failed" }
+    h.recoveryRunner.on(["gh", "pr", "close"], { code: 1, stderr: "PR not found" });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAttempted).toBe(1);
+    // recoveryAction must NOT be 'abandon' — the cleanup did not complete, so startup
+    // recovery must be able to pick this session up via stoppedSessionsWithPr.
+    expect(s.recoveryAction).toBeNull();
+  });
 });

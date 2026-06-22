@@ -250,7 +250,19 @@ async function executeFixCode(
           "git", ["-C", worktreePath, "status", "--porcelain"],
           { cwd: worktreePath },
         );
-        if (statusResult.code === 0 && statusResult.stdout.trim() !== "") {
+        if (statusResult.code !== 0) {
+          // git status itself failed (e.g. index lock, inaccessible worktree). Returning
+          // interrupted here would leave uncommitted edits unprotected: the next recovery
+          // attempt resets to origin/<branch> and silently discards them. Return failed
+          // instead so recoveryAttempted is set and cleanup is escalated to a human.
+          return {
+            kind: "failed",
+            action: "fix_code",
+            message: `interrupted recovery: git status failed (exit ${statusResult.code})`,
+            costUsd: outcome.costUsd,
+          };
+        }
+        if (statusResult.stdout.trim() !== "") {
           // Uncommitted edits: wrap them in a WIP commit so the next reset preserves them.
           const addResult = await runner.run("git", ["-C", worktreePath, "add", "-A"], { cwd: worktreePath });
           if (addResult.code !== 0) {
