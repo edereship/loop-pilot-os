@@ -272,6 +272,18 @@ export interface CodexPlannerOptions {
   rateLimit?: CodexRateLimitOpts;
 }
 
+// Detect a flag by its long form, short alias, or --flag=value / -f=value forms.
+// Used to avoid prepending defaults when the caller has already supplied the flag.
+function hasFlagOrAlias(args: string[], longFlag: string, shortAlias: string): boolean {
+  return args.some(
+    (a) =>
+      a === longFlag ||
+      a === shortAlias ||
+      a.startsWith(`${longFlag}=`) ||
+      a.startsWith(`${shortAlias}=`),
+  );
+}
+
 // Returns true when extraArgs opt out of the default bwrap-backed sandbox,
 // meaning bwrap availability is not a prerequisite for Codex to succeed.
 function isSandboxBypassed(extraArgs: string[]): boolean {
@@ -371,6 +383,7 @@ export class CodexPlanner {
       };
     }
 
+    const hasCustomSandbox = hasFlagOrAlias(this.opts.extraArgs ?? [], "--sandbox", "-s");
     const hasIgnoreUserConfig = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-user-config" || a.startsWith("--ignore-user-config="),
     );
@@ -382,6 +395,7 @@ export class CodexPlanner {
     const args: string[] = [
       "exec",
       "--ephemeral",
+      ...(hasCustomSandbox ? [] : ["--sandbox", "danger-full-access"]),
       ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
       ...(hasIgnoreRules ? [] : ["--ignore-rules"]),
       ...(this.opts.extraArgs ?? []),

@@ -67,6 +67,8 @@ describe("CodexPlanner.run", () => {
     expect(call.args).toEqual([
       "exec",
       "--ephemeral",
+      "--sandbox",
+      "danger-full-access",
       "--ignore-user-config",
       "--ignore-rules",
       "--",
