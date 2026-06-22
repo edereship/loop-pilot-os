@@ -177,7 +177,7 @@ function truncateDiffPerFile(unifiedDiff: string, budget: number): string {
 }
 
 export function buildSelectPrompt(args: SelectPromptArgs): string {
-  const { goal, specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars } = args;
+  const { goal, specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars, codebaseSummary } = args;
 
   const blocks: string[] = [];
 
@@ -191,6 +191,7 @@ export function buildSelectPrompt(args: SelectPromptArgs): string {
     "- Strategic sequencing (does recent work create momentum for a specific next task?)",
     "- Priority and urgency",
     "- Dependencies and risk",
+    "- Codebase structure (what exists, what's unimplemented, module sizes)",
   ].join("\n"));
 
   // Requirements / specs (anchor)
@@ -204,6 +205,11 @@ export function buildSelectPrompt(args: SelectPromptArgs): string {
     }
   } else if (goal) {
     blocks.push(["# Product Goal", "", goal].join("\n"));
+  }
+
+  // Codebase structure
+  if (codebaseSummary !== null && codebaseSummary.length > 0) {
+    blocks.push(["# Codebase Structure", "", codebaseSummary].join("\n"));
   }
 
   // Board state: in-progress

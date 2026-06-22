@@ -178,6 +178,7 @@ describe("buildSelectPrompt", () => {
     recentMerged: [],
     lastPrDiff: null,
     diffBudgetChars: 6000,
+    codebaseSummary: null,
   };
 
   it("includes system instruction and eligible candidates", () => {
@@ -239,5 +240,25 @@ describe("buildSelectPrompt", () => {
     const prompt = buildSelectPrompt(baseArgs);
     expect(prompt).toContain("Auth feature");
     expect(prompt).toContain("Bug fix");
+  });
+
+  it("includes codebase summary when provided", () => {
+    const args: SelectPromptArgs = {
+      ...baseArgs,
+      codebaseSummary: "3 files, 500 lines total\n\nsrc/main.ts (200L)\nsrc/util.ts (180L)\nsrc/config.ts (120L)",
+    };
+    const prompt = buildSelectPrompt(args);
+    expect(prompt).toContain("# Codebase Structure");
+    expect(prompt).toContain("3 files, 500 lines total");
+    expect(prompt).toContain("src/main.ts (200L)");
+  });
+
+  it("omits codebase summary section when null", () => {
+    const args: SelectPromptArgs = {
+      ...baseArgs,
+      codebaseSummary: null,
+    };
+    const prompt = buildSelectPrompt(args);
+    expect(prompt).not.toContain("Codebase Structure");
   });
 });
