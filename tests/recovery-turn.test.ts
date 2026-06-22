@@ -281,7 +281,7 @@ describe("executeRecoveryTurn", () => {
 
     const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
 
-    expect(result).toEqual<RecoveryTurnResult>({ kind: "failed", action: "fix_code", message: "recovery fix agent made no commits" });
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "failed", action: "fix_code", message: "recovery fix agent made no commits", costUsd: 0.3 });
   });
 
   it("rebase: successful rebase → push → restart → recovered", async () => {

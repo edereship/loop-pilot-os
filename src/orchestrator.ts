@@ -238,8 +238,10 @@ export class Orchestrator {
     const fresh = this.store.getSession(session.id);
     const ctrl = await this.monitorSession(fresh, prNumber);
     if (ctrl.control === "halt") return HALT;
-    // merged 到達 → DONE 後段
-    await this.recoverDone(fresh);
+    // merged 到達 → DONE 後段（abandon で stopped になった場合はスキップ）
+    if (this.store.getSession(fresh.id).state !== "stopped") {
+      await this.recoverDone(fresh);
+    }
     return CONTINUE;
   }
 
@@ -539,7 +541,10 @@ export class Orchestrator {
         if (recoveredSession.state === "in_review" && recoveredSession.prNumber !== null) {
           const mon = await this.monitorSession(recoveredSession, recoveredSession.prNumber);
           if (mon.control === "halt") return;
-          await this.done(recoveredSession, issue);
+          // Skip done() if abandon recovery stopped the session during monitor
+          if (this.store.getSession(recoveredSession.id).state !== "stopped") {
+            await this.done(recoveredSession, issue);
+          }
         }
         continue; // recovery CONTINUE → retry from SELECT
       }
@@ -549,8 +554,10 @@ export class Orchestrator {
       const mon = await this.monitorSession(session, prNumber);
       if (mon.control === "halt") return;
 
-      // 8) DONE (was 7)
-      await this.done(session, issue);
+      // 8) DONE (was 7): skip if abandon recovery stopped the session during monitor
+      if (this.store.getSession(session.id).state !== "stopped") {
+        await this.done(session, issue);
+      }
       // ループ継続（SELECT へ）
     }
   }
@@ -917,6 +924,10 @@ export class Orchestrator {
     let quotaResumedNotified = false;
     let firstPoll = true;
     while (true) {
+      // ES-450 Finding 2: if recovery abandoned the session, exit the monitor loop so the
+      // outer loop can proceed to SELECT the next task instead of continuing to poll a
+      // closed PR and eventually halting the run.
+      if (this.store.getSession(session.id).state === "stopped") return CONTINUE;
       if (!firstPoll && this.interrupted) {
         await this.haltForInterrupt();
         return HALT;
@@ -934,6 +945,9 @@ export class Orchestrator {
         if (pollFailures >= 5) {
           const ctrl = await this.stopSession(session, "exception", `monitor poll failed 5x: ${errMsg(err)}`);
           if (ctrl.control === "halt") return HALT;
+          // ES-450 Finding 1: reset streak so recovery gets a full fresh window.
+          pollFailures = 0;
+          backoffMultiplier = 1;
           continue;
         }
         backoffMultiplier = Math.min(backoffMultiplier * 2, 8);
@@ -975,6 +989,7 @@ export class Orchestrator {
                 `merge readiness check failed 5x: ${outcome.error}`,
               );
               if (ctrl.control === "halt") return HALT;
+              readinessFailures = 0; // ES-450 Finding 1: reset after recovery
               continue;
             }
             // 直前の poll 成功で backoffMultiplier は 1 に戻っているため、連続失敗数から導出（×2..×8）。
@@ -992,6 +1007,7 @@ export class Orchestrator {
                 `merge call failed under ready verdict: ${outcome.error}`,
               );
               if (ctrl.control === "halt") return HALT;
+              mergeFailures = 0; // ES-450 Finding 1: reset after recovery
               continue;
             }
             continue; // 1 回目は次ポーリングで再評価
@@ -1022,6 +1038,7 @@ export class Orchestrator {
                   `merge readiness check failed 5x: ${outcome.error}`,
                 );
                 if (ctrl.control === "halt") return HALT;
+                readinessFailures = 0; // ES-450 Finding 1: reset after recovery
                 continue;
               }
               backoffMultiplier = Math.min(2 ** readinessFailures, 8);
@@ -1037,6 +1054,7 @@ export class Orchestrator {
                   `merge call failed under ready verdict: ${outcome.error}`,
                 );
                 if (ctrl.control === "halt") return HALT;
+                mergeFailures = 0; // ES-450 Finding 1: reset after recovery
                 continue;
               }
               continue;
@@ -1508,9 +1526,9 @@ export class Orchestrator {
           if (patch.workflowHandledErrorCount !== undefined) {
             recoveryUpdate.workflowHandledErrorCount = patch.workflowHandledErrorCount;
           }
-          // Track restart_review as pending so monitor gives grace on the next stale stop
-          // before the /restart-review comment is consumed (Finding 6).
-          if (result.action === "restart_review") {
+          // Track restart_review, fix_code, and rebase as pending so monitor gives grace on
+          // the next stale stop before the /restart-review comment is consumed (ES-450 Finding 3).
+          if (result.action === "restart_review" || result.action === "fix_code" || result.action === "rebase") {
             recoveryUpdate.pendingRestartReason = detail;
           }
           await this.notifier.notify({

@@ -240,17 +240,20 @@ async function executeFixCode(
 
   if (outcome.kind !== "completed") {
     log(`recovery: fix agent outcome=${outcome.kind}`);
+    if (outcome.kind === "interrupted") {
+      return { kind: "interrupted" };
+    }
     return { kind: "failed", action: "fix_code", message: `recovery fix agent: ${outcome.kind}`, costUsd: outcome.costUsd };
   }
 
   // Verify commits
   const statusResult = await runner.run("git", ["-C", worktreePath, "status", "--porcelain"], { cwd: worktreePath });
   if (statusResult.stdout.trim() !== "") {
-    return { kind: "failed", action: "fix_code", message: "recovery fix agent left uncommitted changes" };
+    return { kind: "failed", action: "fix_code", message: "recovery fix agent left uncommitted changes", costUsd: outcome.costUsd };
   }
   const logResult = await runner.run("git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"], { cwd: worktreePath });
   if (logResult.stdout.trim() === "") {
-    return { kind: "failed", action: "fix_code", message: "recovery fix agent made no commits" };
+    return { kind: "failed", action: "fix_code", message: "recovery fix agent made no commits", costUsd: outcome.costUsd };
   }
 
   // Push
@@ -343,7 +346,7 @@ async function executeAbandon(
   if (session.prNumber !== null) {
     try {
       await runner.run(
-        "gh", ["pr", "close", String(session.prNumber), "-R", config.repo.remote],
+        "gh", ["pr", "close", String(session.prNumber), "--delete-branch", "-R", config.repo.remote],
         { cwd: config.repo.path },
       );
     } catch {
