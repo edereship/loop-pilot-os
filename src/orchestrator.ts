@@ -461,7 +461,10 @@ export class Orchestrator {
       // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
       let eligible: EligibleIssue[];
       try {
-        eligible = await this.source.getAllEligible(this.store.activeIssueIds());
+        eligible = await this.source.getAllEligible([
+          ...this.store.activeIssueIds(),
+          ...this.store.abandonedIssueIds(),
+        ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
@@ -1472,7 +1475,6 @@ export class Orchestrator {
     if (reason !== "cost_exceeded" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
       if (!fresh.recoveryAttempted && fresh.prNumber !== null) {
-        this.store.updateSession(session.id, { recoveryAttempted: 1 });
         await this.notifier.notify({
           kind: "recovery_started",
           identifier: session.linearIdentifier,
@@ -1491,10 +1493,13 @@ export class Orchestrator {
           result = { kind: "escalated" as const, action: "escalate" as const };
         }
         // Operator interrupted during recovery analysis: propagate like other interrupts.
+        // recoveryAttempted is NOT marked so the next run can retry recovery.
         if (result.kind === "interrupted") {
           await this.haltForInterrupt();
           return HALT;
         }
+        // Mark recovery attempted for all non-interrupted outcomes.
+        this.store.updateSession(session.id, { recoveryAttempted: 1 });
         // Abandon completed cleanup and wants the loop to continue to next task.
         if (result.kind === "continued") {
           this.store.updateSession(session.id, { recoveryAction: result.action });

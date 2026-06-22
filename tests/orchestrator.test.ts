@@ -2844,4 +2844,70 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // Log contains recovery codex exception
     expect(h.logs.some((l) => l.includes("recovery: codex exception"))).toBe(true);
   });
+
+  // Finding 1: an interrupt during recovery must not consume the recoveryAttempted flag
+  it("recovery interrupted → recoveryAttempted stays 0, session stays in_review, run halted", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery Codex is interrupted before choosing an action
+      { kind: "interrupted" },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Interrupt must NOT consume the recovery gate — next run can retry
+    expect(s.recoveryAttempted).toBe(0);
+    // Session was not stopped (interrupt halts the run before stopSession completes)
+    expect(s.state).toBe("in_review");
+    // Run is halted
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  // Finding 2: after an abandon recovery the abandoned ticket must not be immediately reselected
+  it("abandon recovery: abandoned ticket excluded from subsequent SELECT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    // Single issue so selectWithPm is skipped (eligible.length===1), keeping planner outcomes simple
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nDo the work" }, // PLAN phase
+      { kind: "completed", text: '{"action":"abandon"}' },  // Recovery Codex chooses abandon
+    ];
+    // Stop after the second SELECT so the loop doesn't run indefinitely.
+    // eligibleCalls is populated inside origGetAllEligible; we don't push here to avoid duplicates.
+    let selectCount = 0;
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      selectCount += 1;
+      if (selectCount >= 2) h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Second SELECT must include issue-A in the exclude list (abandoned ticket blocked)
+    expect(h.source.eligibleCalls.length).toBeGreaterThanOrEqual(2);
+    const secondSelectExcluded = h.source.eligibleCalls[1];
+    expect(secondSelectExcluded).toContain("issue-A");
+  });
 });

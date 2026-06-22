@@ -733,6 +733,51 @@ describe("recovery columns (ES-450)", () => {
   });
 });
 
+describe("abandonedIssueIds (ES-450 Finding 2)", () => {
+  it("returns empty array when no abandoned sessions", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    expect(store.abandonedIssueIds()).toEqual([]);
+  });
+
+  it("returns issue IDs for stopped sessions with recovery_action=abandon", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s1 = store.createSession({
+      runId: run.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s1.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    const s2 = store.createSession({
+      runId: run.id, linearIssueId: "issue-B", linearIdentifier: "TY-2",
+      issueTitle: "B", branch: "b2", worktreePath: "/wt2",
+      now: "2026-01-01T00:00:02.000Z",
+    });
+    store.updateSession(s2.id, { state: "stopped", recoveryAction: "escalate", endedAt: "2026-01-01T02:00:00.000Z" });
+
+    const ids = store.abandonedIssueIds();
+    expect(ids).toContain("issue-A");
+    expect(ids).not.toContain("issue-B");
+  });
+
+  it("excludes merged sessions even if they have recovery_action=abandon", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s = store.createSession({
+      runId: run.id, linearIssueId: "issue-C", linearIdentifier: "TY-3",
+      issueTitle: "C", branch: "b3", worktreePath: "/wt3",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s.id, { state: "merged", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    expect(store.abandonedIssueIds()).toEqual([]);
+  });
+});
+
 describe("lastMergedWithPr", () => {
   it("returns null when no merged sessions", () => {
     const store = new SqliteStore(":memory:");

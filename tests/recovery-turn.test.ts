@@ -325,4 +325,98 @@ describe("executeRecoveryTurn", () => {
     // Still recovered — the session can be picked up later
     expect(result.kind).toBe("recovered");
   });
+
+  // Finding 3: interrupted fix agent with ahead commits → push before halting
+  it("fix_code: agent interrupted with commits ahead → push attempted before returning interrupted", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.2 }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" }; // commits ahead
+      return { code: 0, stdout: "" };
+    });
+    runner.on(["git", "push"], { code: 0 });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted" });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeDefined();
+  });
+
+  // Finding 3: interrupted fix agent with no ahead commits → no push
+  it("fix_code: agent interrupted with no commits ahead → returns interrupted without push", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.1 }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "" }; // no commits ahead
+      return { code: 0, stdout: "" };
+    });
+    runner.on(["git", "push"], { code: 0 });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted" });
+    const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+    expect(pushCall).toBeUndefined();
+  });
+
+  // Finding 4: push failure after fix agent → failed result must include costUsd
+  it("fix_code: push fails after fix agent → failed result includes costUsd", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "completed", costUsd: 0.4, summary: "fixed" }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "" };
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    runner.on(["git", "push"], { code: 1, stderr: "rejected" });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({
+      kind: "failed",
+      action: "fix_code",
+      message: expect.stringContaining("recovery push failed"),
+      costUsd: 0.4,
+    });
+  });
+
+  // Finding 5: gh pr close exits non-zero → failed before reverting ticket
+  it("abandon: gh pr close fails → failed(abandon) without ticket revert", async () => {
+    const { deps, planner, runner, source } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
+    runner.on(["gh", "pr", "close"], { code: 1, stderr: "not found" });
+
+    const session = fakeSession({ prNumber: 42, linearIssueId: "issue-1" });
+    const result = await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
+
+    expect(result).toMatchObject<Partial<RecoveryTurnResult>>({ kind: "failed", action: "abandon" });
+    // Ticket must NOT be reverted — PR may still be open
+    expect(source.transitions).toHaveLength(0);
+  });
+
+  // Finding 6: ticket revert throws → failed(abandon) without discarding worktree
+  it("abandon: ticket revert fails → failed(abandon) without worktree discard", async () => {
+    const { deps, planner, runner, source, git } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
+    runner.on(["gh", "pr", "close"], { code: 0 });
+    source.failNext("transition", new Error("Linear 5xx"));
+
+    const session = fakeSession({ prNumber: 42, linearIssueId: "issue-1" });
+    const result = await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
+
+    expect(result).toMatchObject<Partial<RecoveryTurnResult>>({ kind: "failed", action: "abandon" });
+    // Worktree must NOT be discarded — the session is unresolved
+    const discardCall = git.calls.find((c) => c.method === "discardWorktree");
+    expect(discardCall).toBeUndefined();
+  });
 });

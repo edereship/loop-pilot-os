@@ -197,8 +197,7 @@ export async function executeRecoveryTurn(
       return { kind: "escalated", action: "escalate" };
 
     case "abandon":
-      await executeAbandon(deps, session);
-      return { kind: "continued", action: "abandon" };
+      return await executeAbandon(deps, session);
 
     case "restart_review":
       return await executeRestartReview(deps, session);
@@ -241,6 +240,18 @@ async function executeFixCode(
   if (outcome.kind !== "completed") {
     log(`recovery: fix agent outcome=${outcome.kind}`);
     if (outcome.kind === "interrupted") {
+      // Push any commits the agent made before the interrupt so they survive a later worktree reset.
+      try {
+        const logResult = await runner.run(
+          "git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"],
+          { cwd: worktreePath },
+        );
+        if (logResult.code === 0 && logResult.stdout.trim() !== "") {
+          await runner.run("git", ["push", "origin", `HEAD:${branch}`], { cwd: worktreePath });
+        }
+      } catch {
+        // Best-effort: ignore errors, session will be halted
+      }
       return { kind: "interrupted" };
     }
     return { kind: "failed", action: "fix_code", message: `recovery fix agent: ${outcome.kind}`, costUsd: outcome.costUsd };
@@ -259,7 +270,7 @@ async function executeFixCode(
   // Push
   const pushResult = await runner.run("git", ["push", "origin", `HEAD:${branch}`], { cwd: worktreePath });
   if (pushResult.code !== 0) {
-    return { kind: "failed", action: "fix_code", message: `recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}` };
+    return { kind: "failed", action: "fix_code", message: `recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}`, costUsd: outcome.costUsd };
   }
 
   // Post /restart-review if PR exists
@@ -340,24 +351,27 @@ async function executeRestartReview(
 async function executeAbandon(
   deps: RecoveryTurnDeps,
   session: TaskSessionRow,
-): Promise<void> {
+): Promise<RecoveryTurnResult> {
   const { runner, source, git, config, log } = deps;
-  // Close PR (best-effort)
+  // Close PR — a non-zero exit means the PR may remain open; fail before reverting the ticket.
   if (session.prNumber !== null) {
-    try {
-      await runner.run(
-        "gh", ["pr", "close", String(session.prNumber), "--delete-branch", "-R", config.repo.remote],
-        { cwd: config.repo.path },
-      );
-    } catch {
-      log("recovery: abandon PR close failed (best-effort)");
+    const closeResult = await runner.run(
+      "gh", ["pr", "close", String(session.prNumber), "--delete-branch", "-R", config.repo.remote],
+      { cwd: config.repo.path },
+    );
+    if (closeResult.code !== 0) {
+      const msg = closeResult.stderr.trim() || `exit ${closeResult.code}`;
+      log(`recovery: abandon PR close failed: ${msg}`);
+      return { kind: "failed", action: "abandon", message: `PR close failed: ${msg}` };
     }
   }
-  // Revert ticket to Todo (best-effort)
+  // Revert ticket to Todo — a failure leaves the ticket stuck In Progress/In Review with no active session.
   try {
     await source.transition(session.linearIssueId, "todo");
-  } catch {
-    log("recovery: abandon ticket revert failed (best-effort)");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`recovery: abandon ticket revert failed: ${msg}`);
+    return { kind: "failed", action: "abandon", message: `ticket revert to Todo failed: ${msg}` };
   }
   // Discard worktree (best-effort)
   if (session.worktreePath) {
@@ -367,4 +381,5 @@ async function executeAbandon(
       log("recovery: abandon worktree discard failed (best-effort)");
     }
   }
+  return { kind: "continued", action: "abandon" };
 }

@@ -478,6 +478,16 @@ export class SqliteStore {
     return rows.map((r) => r.id);
   }
 
+  abandonedIssueIds(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT linear_issue_id AS id FROM task_session
+         WHERE state = 'stopped' AND recovery_action = 'abandon'`,
+      )
+      .all() as Array<{ id: string }>;
+    return rows.map((r) => r.id);
+  }
+
   knownIssueIds(): string[] {
     const rows = this.db
       .prepare(`SELECT DISTINCT linear_issue_id AS id FROM task_session`)
