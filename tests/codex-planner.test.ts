@@ -68,9 +68,7 @@ describe("CodexPlanner.run", () => {
       "exec",
       "--ephemeral",
       "--sandbox",
-      "read-only",
-      "--ask-for-approval",
-      "never",
+      "danger-full-access",
       "--ignore-user-config",
       "--ignore-rules",
       "--",
@@ -92,8 +90,6 @@ describe("CodexPlanner.run", () => {
     expect(runner.calls[0]!.args).toEqual([
       "exec",
       "--ephemeral",
-      "--ask-for-approval",
-      "never",
       "--ignore-user-config",
       "--ignore-rules",
       "--sandbox",
@@ -563,7 +559,7 @@ describe("CodexPlanner proxy credential scrubbing (Finding 1)", () => {
 });
 
 describe("CodexPlanner flag alias detection (Finding 3)", () => {
-  it("-s 短縮エイリアスで sandbox が指定された場合はデフォルトの --sandbox read-only を追加しない", async () => {
+  it("-s 短縮エイリアスで sandbox が指定された場合はデフォルトの --sandbox danger-full-access を追加しない", async () => {
     const runner = new FakeCommandRunner();
     codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
     const logs: string[] = [];
@@ -573,14 +569,14 @@ describe("CodexPlanner flag alias detection (Finding 3)", () => {
     });
 
     const args = runner.calls[0]!.args;
-    // Default --sandbox read-only must not be prepended
+    // Default --sandbox danger-full-access must not be prepended
     const sandboxDefaultIdx = args.indexOf("--sandbox");
     expect(sandboxDefaultIdx).toBe(-1);
     expect(args).toContain("-s");
     expect(args).toContain("workspace-write");
   });
 
-  it("--sandbox=value 形式で sandbox が指定された場合はデフォルトの --sandbox read-only を追加しない", async () => {
+  it("--sandbox=value 形式で sandbox が指定された場合はデフォルトの --sandbox danger-full-access を追加しない", async () => {
     const runner = new FakeCommandRunner();
     codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
     const logs: string[] = [];
@@ -594,7 +590,7 @@ describe("CodexPlanner flag alias detection (Finding 3)", () => {
     expect(args).toContain("--sandbox=workspace-write");
   });
 
-  it("-a 短縮エイリアスで ask-for-approval が指定された場合はデフォルトを追加しない", async () => {
+  it("-a エイリアスが extraArgs にある場合もそのまま透過される", async () => {
     const runner = new FakeCommandRunner();
     codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
     const logs: string[] = [];
@@ -604,23 +600,8 @@ describe("CodexPlanner flag alias detection (Finding 3)", () => {
     });
 
     const args = runner.calls[0]!.args;
-    expect(args).not.toContain("--ask-for-approval");
     expect(args).toContain("-a");
     expect(args).toContain("on-request");
-  });
-
-  it("--ask-for-approval=value 形式で approval が指定された場合はデフォルトを追加しない", async () => {
-    const runner = new FakeCommandRunner();
-    codexStub(runner, { code: 0, stdout: "done\n", stderr: "" });
-    const logs: string[] = [];
-    await makePlanner(runner, logs, ["--ask-for-approval=on-request"]).run({
-      worktreePath: "/wt",
-      prompt: "task",
-    });
-
-    const args = runner.calls[0]!.args;
-    expect(args).not.toContain("--ask-for-approval");
-    expect(args).toContain("--ask-for-approval=on-request");
   });
 });
 

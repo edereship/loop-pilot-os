@@ -384,7 +384,6 @@ export class CodexPlanner {
     }
 
     const hasCustomSandbox = hasFlagOrAlias(this.opts.extraArgs ?? [], "--sandbox", "-s");
-    const hasCustomApproval = hasFlagOrAlias(this.opts.extraArgs ?? [], "--ask-for-approval", "-a");
     const hasIgnoreUserConfig = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-user-config" || a.startsWith("--ignore-user-config="),
     );
@@ -396,8 +395,7 @@ export class CodexPlanner {
     const args: string[] = [
       "exec",
       "--ephemeral",
-      ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
-      ...(hasCustomApproval ? [] : ["--ask-for-approval", "never"]),
+      ...(hasCustomSandbox ? [] : ["--sandbox", "danger-full-access"]),
       ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
       ...(hasIgnoreRules ? [] : ["--ignore-rules"]),
       ...(this.opts.extraArgs ?? []),
