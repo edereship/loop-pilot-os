@@ -25,6 +25,7 @@ import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
 import { AgentWorkflowRecovery } from "./workflow-recovery.js";
 import { CodexPlanner, type CodexRateLimitOpts } from "./codex-planner.js";
+import { generateCodebaseSummary } from "./codebase-summary.js";
 
 const EXIT_OK = 0;
 const EXIT_PREFLIGHT = 1;
@@ -203,6 +204,9 @@ async function runLoop(configPath: string): Promise<number> {
       rateLimit: codexRateLimitOpts,
     });
 
+    const codebaseSummaryGenerator = (repoPath: string) =>
+      generateCodebaseSummary(repoPath, runner, config.safety.selectCodebaseSummaryBudgetChars);
+
     const orchestrator = new Orchestrator({
       config,
       source,
@@ -218,6 +222,7 @@ async function runLoop(configPath: string): Promise<number> {
       log: logLine,
       recovery,
       planner: codexPlanner,
+      codebaseSummaryGenerator,
     });
 
     // Wire the orchestrator's interruptablePause into the agent runner so that

@@ -45,6 +45,7 @@ export interface OrchestratorDeps {
   log: (line: string) => void;
   recovery: WorkflowRecovery;
   planner: PlanRunner | null;
+  codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -70,6 +71,7 @@ export class Orchestrator {
   private readonly log: (line: string) => void;
   private readonly recovery: WorkflowRecovery;
   private readonly planner: PlanRunner | null;
+  private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -89,6 +91,7 @@ export class Orchestrator {
     this.log = deps.log;
     this.recovery = deps.recovery;
     this.planner = deps.planner;
+    this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -695,6 +698,15 @@ export class Orchestrator {
       }
     }
 
+    // コードベースサマリ生成（ES-445）
+    let codebaseSummary: string | null = null;
+    try {
+      const summary = await this.codebaseSummaryGenerator(this.config.repo.path);
+      if (summary.length > 0) codebaseSummary = summary;
+    } catch (err) {
+      this.log(`select: codebase summary generation failed (non-fatal): ${errMsg(err)}`);
+    }
+
     const prompt = buildSelectPrompt({
       goal: this.config.product.goal ?? null,
       specContent,
@@ -703,6 +715,7 @@ export class Orchestrator {
       recentMerged,
       lastPrDiff,
       diffBudgetChars: this.config.safety.selectDiffBudgetChars,
+      codebaseSummary,
     });
 
     let outcome: PlanOutcome;

@@ -249,6 +249,7 @@ export interface SelectPromptArgs {
   recentMerged: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
   lastPrDiff: { identifier: string; summary: PrDiffSummary } | null;
   diffBudgetChars: number;
+  codebaseSummary: string | null;
 }
 
 export interface ParsedSelection {

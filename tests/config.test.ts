@@ -61,6 +61,7 @@ describe("loadConfig", () => {
     expect(config.safety.maxWorkflowFixAttempts).toBe(2); // default (not in config-valid.toml)
     expect(config.safety.maxCostUsdPerFix).toBe(2); // default (not in config-valid.toml)
     expect(config.safety.codexTimeoutMinutes).toBe(30); // default (not in config-valid.toml)
+    expect(config.safety.selectCodebaseSummaryBudgetChars).toBe(5000); // default (not in config-valid.toml)
 
     expect(config.loop.monitorPollSeconds).toBe(60);
     expect(config.loop.idleRecheckSeconds).toBe(300);

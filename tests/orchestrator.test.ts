@@ -100,6 +100,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
     return `PROMPT for ${args.issue.identifier}`;
   };
   const recovery = new FakeWorkflowRecovery();
+  const codebaseSummaryGenerator = async () => "3 files, 100 lines total\n\nsrc/a.ts (40L)\nsrc/b.ts (30L)\nsrc/c.ts (30L)";
   const orch = new Orchestrator({
     config,
     source,
@@ -115,6 +116,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
     log,
     recovery,
     planner: opts?.planner ?? null,
+    codebaseSummaryGenerator,
   });
   return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
 }
@@ -613,6 +615,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       log: (line: string) => { logs.push(line); },
       recovery,
       planner: null,
+      codebaseSummaryGenerator: async () => "",
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -2081,6 +2084,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       log: (line: string) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
       planner,
+      codebaseSummaryGenerator: async () => "",
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -2477,6 +2481,24 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
     // No sessions created (interrupted before CLAIM)
     expect(h.store.sessionsForRun(run.id)).toHaveLength(0);
   });
+
+  it("passes codebase summary to buildSelectPrompt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '{"identifier":"TY-2","rationale":"has summary context"}' },
+    ];
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("a", "TY-1"), issue("b", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // SELECT プロンプトにコードベースサマリが含まれることを確認
+    const selectPrompt = planner.calls[0]?.prompt ?? "";
+    expect(selectPrompt).toContain("Codebase Structure");
+  });
 });
 
 describe("Orchestrator.interruptablePause", () => {
@@ -2575,6 +2597,7 @@ describe("Orchestrator.interruptablePause", () => {
       config, source, agent, git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
+      codebaseSummaryGenerator: async () => "",
     });
     orchRef = orch;
 
