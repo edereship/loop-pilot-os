@@ -2495,7 +2495,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
 
     await h.orch.run();
 
-    // planner was called with a prompt containing codebase summary
+    // SELECT プロンプトにコードベースサマリが含まれることを確認
     const selectPrompt = planner.calls[0]?.prompt ?? "";
     expect(selectPrompt).toContain("Codebase Structure");
   });

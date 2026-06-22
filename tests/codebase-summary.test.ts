@@ -66,7 +66,7 @@ describe("generateCodebaseSummary", () => {
 
     expect(result).toContain("2 files");
     expect(result).not.toContain("lines total");
-    expect(result).not.toContain("(");
+    expect(result).not.toMatch(/\(\d+L\)/);
     expect(result).toContain("src/a.ts");
     expect(result).toContain("src/b.ts");
   });

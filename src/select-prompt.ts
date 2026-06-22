@@ -208,7 +208,7 @@ export function buildSelectPrompt(args: SelectPromptArgs): string {
   }
 
   // Codebase structure
-  if (codebaseSummary !== null && codebaseSummary.length > 0) {
+  if (codebaseSummary) {
     blocks.push(["# Codebase Structure", "", codebaseSummary].join("\n"));
   }
 

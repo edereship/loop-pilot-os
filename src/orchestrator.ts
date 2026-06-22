@@ -698,7 +698,7 @@ export class Orchestrator {
       }
     }
 
-    // Generate codebase summary
+    // コードベースサマリ生成（ES-445）
     let codebaseSummary: string | null = null;
     try {
       const summary = await this.codebaseSummaryGenerator(this.config.repo.path);

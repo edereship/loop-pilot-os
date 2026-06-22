@@ -39,7 +39,8 @@ function formatSummary(entries: FileEntry[], budgetChars: number): string {
       : entry.path;
     if (used + line.length + 1 + omissionReserve > budgetChars) {
       const remaining = entries.length - listed;
-      lines.push(`... (${remaining} more files omitted)`);
+      const fileWord = remaining === 1 ? "file" : "files";
+      lines.push(`... (${remaining} more ${fileWord} omitted)`);
       break;
     }
     lines.push(line);
