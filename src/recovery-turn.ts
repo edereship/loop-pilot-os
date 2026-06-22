@@ -351,11 +351,22 @@ async function executeRebase(
   const branch = session.branch;
 
   const fetchResult = await runner.run(
-    "git", ["-C", worktreePath, "fetch", "origin", defaultBranch],
+    "git", ["-C", worktreePath, "fetch", "origin", defaultBranch, branch],
     { cwd: worktreePath },
   );
   if (fetchResult.code !== 0) {
     return { kind: "failed", action: "rebase", message: `recovery rebase fetch failed: ${fetchResult.stderr.trim() || `exit ${fetchResult.code}`}` };
+  }
+
+  // Sync local HEAD to origin/${branch} before rebasing. MONITOR does not keep the
+  // worktree up-to-date, so remote commits pushed by LoopPilot or a prior recovery
+  // would otherwise be omitted and the force-with-lease push would fail or drop them.
+  const resetResult = await runner.run(
+    "git", ["-C", worktreePath, "reset", "--hard", `origin/${branch}`],
+    { cwd: worktreePath },
+  );
+  if (resetResult.code !== 0) {
+    return { kind: "failed", action: "rebase", message: `recovery rebase reset failed: ${resetResult.stderr.trim() || `exit ${resetResult.code}`}` };
   }
 
   const rebaseResult = await runner.run(
@@ -409,21 +420,13 @@ async function executeAbandon(
   session: TaskSessionRow,
 ): Promise<RecoveryTurnResult> {
   const { runner, source, git, config, log } = deps;
-  // Revert ticket to Todo first — if the PR close later fails the ticket is already back in
-  // Todo, so the task remains schedulable and the worst partial-abandon state (closed PR +
-  // ticket stuck In Progress with no active session and no recoverable path) is avoided.
-  try {
-    await source.transition(session.linearIssueId, "todo");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(`recovery: abandon ticket revert failed: ${msg}`);
-    return { kind: "failed", action: "abandon", message: `ticket revert to Todo failed: ${msg}` };
-  }
-  // Close PR after the ticket has been safely reverted. A failure here leaves the ticket in
-  // Todo (good) with an open PR that is visible to humans for manual cleanup. Do not pass
-  // --delete-branch: if the branch is checked out in a linked worktree that flag causes gh to
-  // fail (local branch deletion is blocked), aborting before the worktree cleanup even though
-  // GitHub may have already closed the PR. Branch cleanup is handled by discardWorktree below.
+  // Close the PR first so a transient close failure leaves the ticket in its current state
+  // (In Progress) rather than Todo. A ticket in Todo with an open PR and no active session
+  // is eligible for scheduling, which can cause a second PR to be opened for the same issue
+  // before the first is cleaned up (ES-450 Finding 4). Do not pass --delete-branch: if the
+  // branch is checked out in a linked worktree that flag causes gh to fail (local branch
+  // deletion is blocked), aborting before the worktree cleanup even though GitHub may have
+  // already closed the PR. Branch cleanup is handled by discardWorktree below.
   if (session.prNumber !== null) {
     const closeResult = await runner.run(
       "gh", ["pr", "close", String(session.prNumber), "-R", config.repo.remote],
@@ -434,6 +437,16 @@ async function executeAbandon(
       log(`recovery: abandon PR close failed: ${msg}`);
       return { kind: "failed", action: "abandon", message: `PR close failed: ${msg}` };
     }
+  }
+  // Revert ticket to Todo after the PR is closed. A failure here leaves the ticket in
+  // In Progress with a closed PR — visible for human cleanup, but not eligible for
+  // scheduling (Linear In Progress is not in the eligible set).
+  try {
+    await source.transition(session.linearIssueId, "todo");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`recovery: abandon ticket revert failed: ${msg}`);
+    return { kind: "failed", action: "abandon", message: `ticket revert to Todo failed: ${msg}` };
   }
   // Discard worktree (best-effort)
   if (session.worktreePath) {

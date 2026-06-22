@@ -493,9 +493,10 @@ describe("executeRecoveryTurn", () => {
     });
   });
 
-  // Finding 5 (updated): ticket is reverted first; when gh pr close then fails the ticket
-  // is already back in Todo so the task remains schedulable (ES-450 Finding 2 fix).
-  it("abandon: ticket reverted then gh pr close fails → failed(abandon), ticket is in Todo", async () => {
+  // ES-450 Finding 4: PR is closed first; when gh pr close fails the ticket stays in its
+  // current state (In Progress) rather than Todo. A ticket in Todo with an open PR and no
+  // active session is eligible for scheduling and could trigger a duplicate PR on the next run.
+  it("abandon: gh pr close fails → failed(abandon), ticket NOT moved to Todo", async () => {
     const { deps, planner, runner, source } = makeDeps();
     planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
     runner.on(["gh", "pr", "close"], { code: 1, stderr: "not found" });
@@ -504,9 +505,9 @@ describe("executeRecoveryTurn", () => {
     const result = await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
 
     expect(result).toMatchObject<Partial<RecoveryTurnResult>>({ kind: "failed", action: "abandon" });
-    // Ticket IS reverted to Todo before the PR close attempt so the task remains schedulable
-    // even when the PR close fails.
-    expect(source.transitions).toEqual([{ issueId: "issue-1", state: "todo" }]);
+    // Ticket must NOT be moved to Todo when PR close fails — keeps the issue out of the
+    // eligible pool so a duplicate PR cannot be opened on the next daemon run.
+    expect(source.transitions).toEqual([]);
   });
 
   // Finding 6: ticket revert throws → failed(abandon) without discarding worktree

@@ -1528,6 +1528,24 @@ export class Orchestrator {
           identifier: session.linearIdentifier,
           reason,
         });
+        // handoff_failed recovery: retry the side-effects before dispatching the recovery
+        // action so the gate label is in place when /restart-review is posted. Without this
+        // the restart command is sent while the label is still missing and LoopPilot can
+        // ignore it, causing monitor_never_engaged instead of recovering the failure
+        // (ES-450 Finding 2). Best-effort: log failures but proceed to recovery regardless.
+        if (reason === "handoff_failed") {
+          const prNum = fresh.prNumber;
+          try {
+            await retry(3, () => this.git.addLabel(prNum, this.config.looppilot.gateLabel));
+          } catch (err) {
+            this.log(`recovery: handoff_failed retry addLabel failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          try {
+            await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
+          } catch (err) {
+            this.log(`recovery: handoff_failed retry transition(in_review) failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
         let result;
         try {
           result = await executeRecoveryTurn(
@@ -1587,9 +1605,12 @@ export class Orchestrator {
           if (recoveryCost > 0) {
             recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
           }
-          // Carry over workflowHandledErrorCount from caller (Finding 2: prevents re-triggering
-          // the same stale workflow error after fix_code recovery of workflow_setup_failed).
-          if (patch.workflowHandledErrorCount !== undefined) {
+          // Only carry workflowHandledErrorCount for actions that actually changed the branch.
+          // restart_review does not fix the error, so the same workflow_failed comment stays;
+          // carrying the count would cause AgentWorkflowRecovery to see errorCommentCount <=
+          // handledErrorCount and skip the fix on the next poll, masking the setup failure.
+          if (patch.workflowHandledErrorCount !== undefined &&
+              (result.action === "fix_code" || result.action === "rebase")) {
             recoveryUpdate.workflowHandledErrorCount = patch.workflowHandledErrorCount;
           }
           // Track restart_review, fix_code, and rebase as pending so monitor gives grace on
@@ -1605,24 +1626,6 @@ export class Orchestrator {
               detail.startsWith("quota retry limit exceeded")
             ) ? extractExhaustedStopReason(detail) : detail;
             recoveryUpdate.pendingRestartReason = rawReason ?? reason;
-          }
-          // handoff_failed recovery: retry the side-effects that failed during the original
-          // handoff so the gate label and Linear state are correct before we flip to in_review.
-          // Without this, the PR can lack the required gate label and LoopPilot never engages,
-          // causing monitor_never_engaged instead of recovering the transient handoff failure
-          // (ES-450 Finding 1). Best-effort: log failures but proceed to in_review regardless.
-          if (reason === "handoff_failed" && refreshed.prNumber !== null) {
-            const prNum = refreshed.prNumber;
-            try {
-              await retry(3, () => this.git.addLabel(prNum, this.config.looppilot.gateLabel));
-            } catch (err) {
-              this.log(`recovery: handoff_failed retry addLabel failed: ${err instanceof Error ? err.message : String(err)}`);
-            }
-            try {
-              await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
-            } catch (err) {
-              this.log(`recovery: handoff_failed retry transition(in_review) failed: ${err instanceof Error ? err.message : String(err)}`);
-            }
           }
           await this.notifier.notify({
             kind: "recovery_succeeded",
