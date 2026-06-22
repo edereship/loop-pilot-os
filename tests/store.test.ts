@@ -737,10 +737,11 @@ describe("abandonedIssueIds (ES-450 Finding 2)", () => {
   it("returns empty array when no abandoned sessions", () => {
     const store = new SqliteStore(":memory:");
     openStores.push(store);
-    expect(store.abandonedIssueIds()).toEqual([]);
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    expect(store.abandonedIssueIds(run.id)).toEqual([]);
   });
 
-  it("returns issue IDs for stopped sessions with recovery_action=abandon", () => {
+  it("returns issue IDs for stopped sessions with recovery_action=abandon in the given run", () => {
     const store = new SqliteStore(":memory:");
     openStores.push(store);
     const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
@@ -758,9 +759,25 @@ describe("abandonedIssueIds (ES-450 Finding 2)", () => {
     });
     store.updateSession(s2.id, { state: "stopped", recoveryAction: "escalate", endedAt: "2026-01-01T02:00:00.000Z" });
 
-    const ids = store.abandonedIssueIds();
+    const ids = store.abandonedIssueIds(run.id);
     expect(ids).toContain("issue-A");
     expect(ids).not.toContain("issue-B");
+  });
+
+  it("excludes sessions abandoned in a different run (allows retry in later runs)", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s = store.createSession({
+      runId: run1.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
+    // A new run should not exclude the ticket abandoned in run1 (revert-to-Todo is now effective)
+    expect(store.abandonedIssueIds(run2.id)).not.toContain("issue-A");
   });
 
   it("excludes merged sessions even if they have recovery_action=abandon", () => {
@@ -774,7 +791,7 @@ describe("abandonedIssueIds (ES-450 Finding 2)", () => {
     });
     store.updateSession(s.id, { state: "merged", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    expect(store.abandonedIssueIds()).toEqual([]);
+    expect(store.abandonedIssueIds(run.id)).toEqual([]);
   });
 });
 

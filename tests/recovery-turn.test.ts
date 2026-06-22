@@ -341,7 +341,7 @@ describe("executeRecoveryTurn", () => {
 
     const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
 
-    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted" });
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted", costUsd: 0.2 });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeDefined();
   });
@@ -361,7 +361,7 @@ describe("executeRecoveryTurn", () => {
 
     const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
 
-    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted" });
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted", costUsd: 0.1 });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeUndefined();
   });

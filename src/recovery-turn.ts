@@ -29,7 +29,7 @@ export type RecoveryTurnResult =
   | { kind: "recovered"; action: RecoveryActionKind; costUsd: number }
   | { kind: "escalated"; action: RecoveryActionKind }
   | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number }
-  | { kind: "interrupted" }
+  | { kind: "interrupted"; costUsd?: number }
   | { kind: "continued"; action: RecoveryActionKind };
 
 export interface RecoveryTurnDeps {
@@ -252,13 +252,16 @@ async function executeFixCode(
       } catch {
         // Best-effort: ignore errors, session will be halted
       }
-      return { kind: "interrupted" };
+      return { kind: "interrupted", costUsd: outcome.costUsd };
     }
     return { kind: "failed", action: "fix_code", message: `recovery fix agent: ${outcome.kind}`, costUsd: outcome.costUsd };
   }
 
   // Verify commits
   const statusResult = await runner.run("git", ["-C", worktreePath, "status", "--porcelain"], { cwd: worktreePath });
+  if (statusResult.code !== 0) {
+    return { kind: "failed", action: "fix_code", message: `git status exited ${statusResult.code}`, costUsd: outcome.costUsd };
+  }
   if (statusResult.stdout.trim() !== "") {
     return { kind: "failed", action: "fix_code", message: "recovery fix agent left uncommitted changes", costUsd: outcome.costUsd };
   }

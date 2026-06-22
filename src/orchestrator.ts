@@ -206,11 +206,18 @@ export class Orchestrator {
           return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
         }
         this.store.updateSession(session.id, { runId: this.runId });
-        return await this.stopSession(
+        const stopCtrl = await this.stopSession(
           session,
           "looppilot_stopped",
           verdict.stopReason ?? "looppilot stopped (no reason)",
         );
+        if (stopCtrl.control === "halt") return HALT;
+        // If recovery re-activated the session to in_review, resume monitoring it.
+        const refreshed = this.store.getSession(session.id);
+        if (refreshed.state === "in_review" && refreshed.prNumber !== null) {
+          return await this.adoptAndMonitor(refreshed, refreshed.prNumber, refreshed.monitorStartedAt);
+        }
+        return stopCtrl;
       }
       // done / in_progress / corrupted / not_engaged = open 扱い → 採用して MONITOR 再開
       case "done":
@@ -463,7 +470,7 @@ export class Orchestrator {
       try {
         eligible = await this.source.getAllEligible([
           ...this.store.activeIssueIds(),
-          ...this.store.abandonedIssueIds(),
+          ...this.store.abandonedIssueIds(this.runId),
         ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
@@ -1495,6 +1502,10 @@ export class Orchestrator {
         // Operator interrupted during recovery analysis: propagate like other interrupts.
         // recoveryAttempted is NOT marked so the next run can retry recovery.
         if (result.kind === "interrupted") {
+          if (result.costUsd !== undefined && result.costUsd > 0) {
+            const freshened = this.store.getSession(session.id);
+            this.store.updateSession(session.id, { costUsd: (freshened.costUsd ?? 0) + result.costUsd });
+          }
           await this.haltForInterrupt();
           return HALT;
         }
@@ -1533,8 +1544,15 @@ export class Orchestrator {
           }
           // Track restart_review, fix_code, and rebase as pending so monitor gives grace on
           // the next stale stop before the /restart-review comment is consumed (ES-450 Finding 3).
+          // pendingRestartReason must match the raw verdict.stopReason used by the stale guard;
+          // for exhaustion details like "auto-restart limit exceeded (4x): workflow_crashed" we
+          // extract just the trailing stop reason rather than storing the full synthesized message.
           if (result.action === "restart_review" || result.action === "fix_code" || result.action === "rebase") {
-            recoveryUpdate.pendingRestartReason = detail;
+            const rawReason = detail !== null && (
+              detail.startsWith("auto-restart limit exceeded") ||
+              detail.startsWith("quota retry limit exceeded")
+            ) ? extractExhaustedStopReason(detail) : detail;
+            recoveryUpdate.pendingRestartReason = rawReason;
           }
           await this.notifier.notify({
             kind: "recovery_succeeded",
