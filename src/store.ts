@@ -470,10 +470,11 @@ export class SqliteStore {
   }
 
   /**
-   * Stopped sessions with a PR where Codex recovery was attempted but its action failed
-   * (recovery_attempted=0). Excludes terminal reasons (cost_exceeded, pr_closed),
-   * looppilot_stopped (handled by stoppedSessionsWithPr), and abandoned sessions. Used
-   * by startup recovery to retry failed recovery actions (ES-450 Finding 3).
+   * Stopped sessions with a PR where Codex recovery was attempted but its action failed.
+   * Requires the recovery-failure marker in stop_detail so that historical sessions whose
+   * recovery_attempted defaulted to 0 during migration are not retried (ES-450 Finding 4).
+   * Excludes terminal reasons (cost_exceeded, pr_closed), looppilot_stopped (handled by
+   * stoppedSessionsWithPr), and abandoned sessions.
    */
   stoppedSessionsWithFailedRecovery(): TaskSessionRow[] {
     const rows = this.db
@@ -484,6 +485,7 @@ export class SqliteStore {
            AND recovery_attempted = 0
            AND failure_reason NOT IN ('cost_exceeded', 'pr_closed', 'looppilot_stopped')
            AND (recovery_action IS NULL OR recovery_action != 'abandon')
+           AND (stop_detail LIKE '%(recovery failed:%' OR stop_detail LIKE 'recovery failed:%')
            AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
          ORDER BY id ASC`,
       )

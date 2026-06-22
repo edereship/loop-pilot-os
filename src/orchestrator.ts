@@ -416,11 +416,11 @@ export class Orchestrator {
             (recoveryCategory === "auto_restart" &&
               session.stopDetail !== null &&
               session.stopDetail.startsWith("auto-restart limit exceeded") &&
-              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason) ||
+              extractExhaustedStopReason(stripRecoveryFailedSuffix(session.stopDetail) ?? "") === verdict.stopReason) ||
             (recoveryCategory === "quota_wait" &&
               session.stopDetail !== null &&
               session.stopDetail.startsWith("quota retry limit exceeded") &&
-              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason)
+              extractExhaustedStopReason(stripRecoveryFailedSuffix(session.stopDetail) ?? "") === verdict.stopReason)
           ) {
             this.log(
               `recovery: skipping exhausted stopped session PR #${prNumber}: ${session.stopDetail}`,
@@ -456,8 +456,26 @@ export class Orchestrator {
         }
         return CONTINUE;
       }
-      case "pr_closed":
+      case "pr_closed": {
+        // If a prior abandon recovery closed the PR but failed at the ticket revert to Todo,
+        // retry the transition now. The PR is already closed so only the ticket cleanup remains.
+        // Leave for the next daemon start on transient failure (no state update on error).
+        if (
+          !session.recoveryAttempted &&
+          session.stopDetail !== null &&
+          session.stopDetail.includes("(recovery failed: ticket revert to Todo failed:")
+        ) {
+          try {
+            this.store.updateSession(session.id, { runId: this.runId });
+            await this.source.transition(session.linearIssueId, "todo");
+            this.store.updateSession(session.id, { recoveryAttempted: 1, recoveryAction: "abandon" });
+            this.log(`recovery: retried abandon ticket revert for session ${session.id} → todo`);
+          } catch (err) {
+            this.log(`recovery: abandon ticket revert retry failed: ${errMsg(err)}`);
+          }
+        }
         return CONTINUE;
+      }
       case "merged":
         this.resetAndAdopt(session.id);
         await this.recoverDone(session);
@@ -1707,10 +1725,16 @@ export class Orchestrator {
             ) ? extractExhaustedStopReason(detail) : detail;
             recoveryUpdate.pendingRestartReason = rawReason ?? reason;
           }
-          // handoff_failed + restart_review: transition the Linear ticket to In Review now
-          // that recovery is confirmed to succeed. Deferred from the pre-recovery block so
-          // the ticket stays in its prior state on escalation or failure (ES-450 Finding 2).
-          if (reason === "handoff_failed" && result.action === "restart_review") {
+          // handoff_failed + any action that restarts review: transition the Linear ticket
+          // to In Review now that recovery is confirmed to succeed. fix_code and rebase also
+          // push changes and post /restart-review, so they need the same transition.
+          // Deferred from the pre-recovery block so the ticket stays in its prior state on
+          // escalation or failure (ES-450 Finding 5).
+          if (reason === "handoff_failed" && (
+            result.action === "restart_review" ||
+            result.action === "fix_code" ||
+            result.action === "rebase"
+          )) {
             try {
               await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
             } catch (err) {

@@ -311,7 +311,39 @@ async function executeFixCode(
       }
       return { kind: "interrupted", costUsd: outcome.costUsd };
     }
-    return { kind: "failed", action: "fix_code", message: `recovery fix agent: ${outcome.kind}`, costUsd: outcome.costUsd };
+    // cost_exceeded or error: check whether the agent left uncommitted changes or unpushed
+    // commits. If so, set preserveWorktree=true so the orchestrator marks recoveryAttempted=1
+    // and the next startup does not reset the worktree to origin/<branch>, silently discarding
+    // partial work (ES-450 Finding 2).
+    let preserveWorktree = false;
+    try {
+      const statusResult = await runner.run(
+        "git", ["-C", worktreePath, "status", "--porcelain"],
+        { cwd: worktreePath },
+      );
+      if (statusResult.code !== 0) {
+        preserveWorktree = true;
+      } else if (statusResult.stdout.trim() !== "") {
+        preserveWorktree = true;
+      } else {
+        const logResult = await runner.run(
+          "git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"],
+          { cwd: worktreePath },
+        );
+        if (logResult.code === 0 && logResult.stdout.trim() !== "") {
+          preserveWorktree = true;
+        }
+      }
+    } catch {
+      preserveWorktree = true;
+    }
+    return {
+      kind: "failed",
+      action: "fix_code",
+      message: `recovery fix agent: ${outcome.kind}`,
+      costUsd: outcome.costUsd,
+      ...(preserveWorktree ? { preserveWorktree: true } : {}),
+    };
   }
 
   // Verify commits
