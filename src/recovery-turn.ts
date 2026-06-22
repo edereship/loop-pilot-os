@@ -283,7 +283,7 @@ async function executeRebase(
     { cwd: worktreePath },
   );
   if (fetchResult.code !== 0) {
-    return { kind: "failed", message: `recovery rebase fetch failed: ${fetchResult.stderr.trim()}` };
+    return { kind: "failed", message: `recovery rebase fetch failed: ${fetchResult.stderr.trim() || `exit ${fetchResult.code}`}` };
   }
 
   const rebaseResult = await runner.run(
