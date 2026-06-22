@@ -170,6 +170,21 @@ export class Orchestrator {
       if (ctrl.control === "halt") return HALT;
     }
 
+    // 4) Stopped sessions where Codex recovery ran but its action failed (e.g. transient
+    // /restart-review post failure). recovery_attempted=0 means recovery was not completed
+    // successfully — retry it now so the PR is not left unmonitored (ES-450 Finding 3).
+    for (const session of this.store.stoppedSessionsWithFailedRecovery()) {
+      this.store.updateSession(session.id, { runId: this.runId });
+      // Strip the "(recovery failed: ...)" suffix stopSession appended so the re-entered
+      // recovery prompt sees the original detail rather than the accumulated failure chain.
+      const ctrl = await this.stopSession(
+        session,
+        session.failureReason as FailureReason,
+        stripRecoveryFailedSuffix(session.stopDetail),
+      );
+      if (ctrl.control === "halt") return HALT;
+    }
+
     return CONTINUE;
   }
 
@@ -970,7 +985,10 @@ export class Orchestrator {
       // Exception: "ci_failed" and "merge_conflict" are done-path recovery markers, not
       // LoopPilot stop reasons. LoopPilot never emits these as stopReason, so they must
       // survive until the done-case stale guard consumes them (ES-450 Finding 1).
-      if (verdict.kind !== "stopped") {
+      // Exception: "workflow_failed" preserves pendingRestartReason so the workflow_failed
+      // case below can give a one-poll grace period for stale error comments after a
+      // Codex-recovery /restart-review (ES-450 Finding 4).
+      if (verdict.kind !== "stopped" && verdict.kind !== "workflow_failed") {
         if (pendingRestartReason !== undefined &&
             pendingRestartReason !== "ci_failed" &&
             pendingRestartReason !== "merge_conflict") {
@@ -1329,6 +1347,17 @@ export class Orchestrator {
           continue;
         }
         case "workflow_failed": {
+          // Stale-error grace: if a /restart-review was posted in the previous recovery
+          // turn (by Codex recovery or auto_restart), skip one poll so LoopPilot has a
+          // chance to process the restart before AgentWorkflowRecovery sees the still-
+          // visible workflow_failed comment and triggers another fix agent. Without this,
+          // recoveryAttempted=1 causes the session to halt immediately after a successful
+          // /restart-review on a workflow_setup_failed recovery (ES-450 Finding 4).
+          if (pendingRestartReason !== undefined) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
           const current = this.store.getSession(session.id);
           const recoveryCtx: RecoveryContext = {
             worktreePath: session.worktreePath as string,
@@ -1520,7 +1549,14 @@ export class Orchestrator {
     // post comments or push to a closed PR then flip the session back to in_review where
     // it will not be monitored again. Only escalate/abandon apply, and retrying them on
     // every daemon start is not useful. Skip recovery entirely for this reason.
-    if (reason !== "cost_exceeded" && reason !== "pr_closed" && this.recoveryTurn !== null && this.planner !== null) {
+    // workflow_setup_failed with "fix agent exceeded cost limit" detail is also terminal:
+    // AgentWorkflowRecovery already hit the cost cap, so another fix agent would exceed it
+    // again immediately. Treat this the same as cost_exceeded (ES-450 Finding 1).
+    const isWorkflowCostExhaustion =
+      reason === "workflow_setup_failed" &&
+      detail !== null &&
+      detail.includes("fix agent exceeded cost limit");
+    if (reason !== "cost_exceeded" && reason !== "pr_closed" && !isWorkflowCostExhaustion && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
       if (!fresh.recoveryAttempted && fresh.prNumber !== null) {
         await this.notifier.notify({
@@ -1528,22 +1564,18 @@ export class Orchestrator {
           identifier: session.linearIdentifier,
           reason,
         });
-        // handoff_failed recovery: retry the side-effects before dispatching the recovery
-        // action so the gate label is in place when /restart-review is posted. Without this
-        // the restart command is sent while the label is still missing and LoopPilot can
-        // ignore it, causing monitor_never_engaged instead of recovering the failure
-        // (ES-450 Finding 2). Best-effort: log failures but proceed to recovery regardless.
+        // handoff_failed recovery: add the gate label before dispatching so it is in place
+        // when /restart-review is posted — without it LoopPilot ignores the restart command
+        // (ES-450 Finding 2). Do NOT pre-emptively transition the Linear ticket to In Review
+        // here: if Codex escalates or the recovery action fails the ticket must stay in its
+        // current state rather than getting stuck In Review with a stopped session. The
+        // transition is deferred to the 'recovered' path below (restart_review action only).
         if (reason === "handoff_failed") {
           const prNum = fresh.prNumber;
           try {
             await retry(3, () => this.git.addLabel(prNum, this.config.looppilot.gateLabel));
           } catch (err) {
             this.log(`recovery: handoff_failed retry addLabel failed: ${err instanceof Error ? err.message : String(err)}`);
-          }
-          try {
-            await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
-          } catch (err) {
-            this.log(`recovery: handoff_failed retry transition(in_review) failed: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
         let result;
@@ -1626,6 +1658,16 @@ export class Orchestrator {
               detail.startsWith("quota retry limit exceeded")
             ) ? extractExhaustedStopReason(detail) : detail;
             recoveryUpdate.pendingRestartReason = rawReason ?? reason;
+          }
+          // handoff_failed + restart_review: transition the Linear ticket to In Review now
+          // that recovery is confirmed to succeed. Deferred from the pre-recovery block so
+          // the ticket stays in its prior state on escalation or failure (ES-450 Finding 2).
+          if (reason === "handoff_failed" && result.action === "restart_review") {
+            try {
+              await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
+            } catch (err) {
+              this.log(`recovery: handoff_failed post-recovery transition(in_review) failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
           }
           await this.notifier.notify({
             kind: "recovery_succeeded",
@@ -1775,6 +1817,19 @@ async function retry(times: number, fn: () => Promise<void>): Promise<void> {
 function extractExhaustedStopReason(stopDetail: string): string {
   const idx = stopDetail.lastIndexOf(": ");
   return idx === -1 ? "" : stopDetail.slice(idx + 2);
+}
+
+/**
+ * Removes the " (recovery failed: ...)" suffix appended by stopSession's failed path so
+ * that a re-entered recovery attempt receives the original stop detail rather than the
+ * accumulated failure chain (ES-450 Finding 3).
+ */
+function stripRecoveryFailedSuffix(detail: string | null): string | null {
+  if (detail === null) return null;
+  const idx = detail.lastIndexOf(" (recovery failed: ");
+  if (idx >= 0) return detail.slice(0, idx) || null;
+  if (detail.startsWith("recovery failed: ")) return null;
+  return detail;
 }
 
 function reconstructIssue(session: TaskSessionRow): EligibleIssue {

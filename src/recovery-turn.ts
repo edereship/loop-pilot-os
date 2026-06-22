@@ -456,5 +456,20 @@ async function executeAbandon(
       log("recovery: abandon worktree discard failed (best-effort)");
     }
   }
+  // Delete the remote branch so a later retry for the same issue can push to the
+  // same branch name without a non-fast-forward rejection (ES-450 Finding 5).
+  // Best-effort: GitHub may have already deleted the branch on PR close (exit 1
+  // with "remote ref does not exist" is expected and safe to ignore).
+  try {
+    const deleteResult = await runner.run(
+      "git", ["push", "origin", "--delete", session.branch],
+      { cwd: config.repo.path },
+    );
+    if (deleteResult.code !== 0) {
+      log(`recovery: abandon remote branch delete exit ${deleteResult.code}: ${deleteResult.stderr.trim()}`);
+    }
+  } catch (err) {
+    log(`recovery: abandon remote branch delete failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
   return { kind: "continued", action: "abandon" };
 }

@@ -469,6 +469,28 @@ export class SqliteStore {
     return rows.map(toSessionRow);
   }
 
+  /**
+   * Stopped sessions with a PR where Codex recovery was attempted but its action failed
+   * (recovery_attempted=0). Excludes terminal reasons (cost_exceeded, pr_closed),
+   * looppilot_stopped (handled by stoppedSessionsWithPr), and abandoned sessions. Used
+   * by startup recovery to retry failed recovery actions (ES-450 Finding 3).
+   */
+  stoppedSessionsWithFailedRecovery(): TaskSessionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM task_session
+         WHERE state = 'stopped'
+           AND pr_number IS NOT NULL
+           AND recovery_attempted = 0
+           AND failure_reason NOT IN ('cost_exceeded', 'pr_closed', 'looppilot_stopped')
+           AND (recovery_action IS NULL OR recovery_action != 'abandon')
+           AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
+         ORDER BY id ASC`,
+      )
+      .all() as RawSessionRow[];
+    return rows.map(toSessionRow);
+  }
+
   activeIssueIds(): string[] {
     const rows = this.db
       .prepare(
