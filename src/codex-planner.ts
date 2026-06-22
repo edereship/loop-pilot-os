@@ -395,7 +395,7 @@ export class CodexPlanner {
     const args: string[] = [
       "exec",
       "--ephemeral",
-      ...(hasCustomSandbox ? [] : ["--sandbox", "read-only"]),
+      ...(hasCustomSandbox ? [] : ["--sandbox", "danger-full-access"]),
       ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
       ...(hasIgnoreRules ? [] : ["--ignore-rules"]),
       ...(this.opts.extraArgs ?? []),
