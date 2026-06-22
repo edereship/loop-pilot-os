@@ -98,7 +98,7 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `looppilot.state_comment_authors` | LoopPilot の信頼著者（既定 `["github-actions[bot]"]`） |
 | `safety.max_tasks_per_run` | 1 ラン中の着手上限（到達で HALT） |
 | `safety.max_cost_usd_per_session` | 1 セッションのコスト上限（`claude --max-budget-usd`） |
-| `safety.monitor_timeout_minutes` | 全体監視のタイムアウト（任意・既定オフ／コメントアウト） |
+| `safety.monitor_timeout_minutes` | 全体監視のタイムアウト（任意・既定60分） |
 | `safety.not_engaged_guard_minutes` | LoopPilot 未起動ガード（常時オン） |
 | `safety.session_hard_timeout_minutes` | hung（無進捗・無支出）claude を切る hard backstop（任意・既定120分。コスト一本化を維持しつつ無人ループの永久ハングを防ぐ） |
 | `loop.monitor_poll_seconds` | MONITOR のポーリング間隔 |

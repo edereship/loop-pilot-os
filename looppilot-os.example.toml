@@ -53,7 +53,7 @@ state_comment_authors = ["github-actions[bot]"] # 信頼著者
 [safety]
 max_tasks_per_run = 3
 max_cost_usd_per_session = 10.0
-# monitor_timeout_minutes = 120  # 任意。既定オフ（コメントアウト）
+# monitor_timeout_minutes = 60   # 任意。既定60分。長時間 in_progress レビューを強制停止するタイムアウト
 not_engaged_guard_minutes = 30   # 常時オン
 session_hard_timeout_minutes = 120  # 任意。既定120。hung（無進捗・無支出）claude を切る hard backstop
 # select_diff_budget_chars = 6000  # PM選別ターンに渡す直前PRの full diff 予算（文字数）。超過時は per-file head で機械 truncate
