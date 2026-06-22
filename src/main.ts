@@ -223,6 +223,15 @@ async function runLoop(configPath: string): Promise<number> {
       recovery,
       planner: codexPlanner,
       codebaseSummaryGenerator,
+      recoveryTurn: {
+        planner: codexPlanner,
+        agent,
+        git,
+        runner,
+        source,
+        config,
+        log: logLine,
+      },
     });
 
     // Wire the orchestrator's interruptablePause into the agent runner so that

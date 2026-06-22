@@ -9,6 +9,7 @@ import {
   FakeNotifier,
   FakeWorkflowRecovery,
   FakePlanRunner,
+  FakeCommandRunner,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
@@ -75,6 +76,7 @@ interface Harness {
   sleepCalls: number[];
   logs: string[];
   promptArgs: PromptArgs[];
+  recoveryRunner: FakeCommandRunner;
 }
 
 function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Harness {
@@ -101,6 +103,14 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   };
   const recovery = new FakeWorkflowRecovery();
   const codebaseSummaryGenerator = async () => "3 files, 100 lines total\n\nsrc/a.ts (40L)\nsrc/b.ts (30L)\nsrc/c.ts (30L)";
+  const recoveryRunner = new FakeCommandRunner();
+  // Stub common git operations for recovery
+  recoveryRunner.on(["git", "-C"], (_args, _opts) => {
+    return { code: 0, stdout: "" };
+  });
+  recoveryRunner.on(["git", "push"], { code: 0 });
+  recoveryRunner.on(["gh"], { code: 0 });
+  const planner = opts?.planner ?? null;
   const orch = new Orchestrator({
     config,
     source,
@@ -115,10 +125,19 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
     sleep,
     log,
     recovery,
-    planner: opts?.planner ?? null,
+    planner,
     codebaseSummaryGenerator,
+    recoveryTurn: planner !== null ? {
+      planner,
+      agent,
+      git,
+      runner: recoveryRunner,
+      source,
+      config,
+      log,
+    } : null,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
+  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner };
 }
 
 describe("Orchestrator 正常系 — 1チケット完走（仕様 §5 SELECT→CLAIM→IMPLEMENT→HANDOFF→MONITOR→DONE）", () => {
@@ -616,6 +635,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       recovery,
       planner: null,
       codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -2085,6 +2105,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       recovery: new FakeWorkflowRecovery(),
       planner,
       codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -2598,6 +2619,7 @@ describe("Orchestrator.interruptablePause", () => {
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
       codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
     });
     orchRef = orch;
 
@@ -2628,5 +2650,198 @@ describe("Orchestrator.interruptablePause", () => {
     expect(halted.pauseMeta).toBeNull();
 
     store.close();
+  });
+});
+
+describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
+  it("ci_failed triggers recovery -> fix_code -> session resumes monitoring and merges", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // Recovery fix agent outcome
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    // Monitor: done(ci_failed) triggers stopSession -> recovery succeeds -> back to monitoring
+    // After recovery: done(ready) -> merged
+    h.monitor.verdicts = [
+      { kind: "done" },   // 1st poll: tryMerge -> ci_failed -> recovery gate
+      { kind: "done" },   // 2nd poll: after recovery, tryMerge -> ready -> merged
+    ];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    // Plan phase outcome (for initial PLAN)
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nFix it" },
+      // Recovery Codex outcome: fix_code
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Run npm install"}' },
+    ];
+    // Stub git operations for recovery (FakeCommandRunner for log specifically)
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("fix_code");
+    expect(s.state).toBe("merged");
+    // Cost includes recovery agent cost
+    expect(s.costUsd).toBeCloseTo(1.5);
+    // recovery_started and recovery_succeeded notifications
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(1);
+    const recoverySucceeded = h.notifier.events.filter((e) => e.kind === "recovery_succeeded");
+    expect(recoverySucceeded).toHaveLength(1);
+  });
+
+  it("cost_exceeded skips recovery entirely", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, maxCostUsdPerSession: 0.5 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // PLAN outcome
+    planner.outcomes = [{ kind: "completed", text: "## Goal\nDo it" }];
+    h.agent.outcomes = [{ kind: "cost_exceeded", costUsd: 0.6 }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("cost_exceeded");
+    expect(s.recoveryAttempted).toBe(0);
+    // No recovery notifications
+    const recoveryEvents = h.notifier.events.filter(
+      (e) => e.kind === "recovery_started" || e.kind === "recovery_succeeded",
+    );
+    expect(recoveryEvents).toHaveLength(0);
+  });
+
+  it("recovery escalation -> no recovery, just halt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    // Monitor: human_required stop (not auto_restart category) -> triggers stopSession
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: null },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery: codex says escalate
+      { kind: "completed", text: '{"action":"escalate"}' },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("escalate");
+  });
+
+  it("second stop after recovery attempted -> no recovery, just halt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // Recovery fix agent outcome (for restart_review recovery)
+    ];
+    // Monitor: merge_conflict -> recovery succeeds with restart_review -> back to monitoring
+    // Then: pr_closed -> stopSession again, but recoveryAttempted is already 1, so no second recovery
+    h.monitor.verdicts = [
+      { kind: "done" },     // 1st: tryMerge -> conflict -> recovery (restart_review)
+      { kind: "pr_closed" }, // 2nd: stopSession -> recoveryAttempted=1, skip recovery -> halt
+    ];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "conflict" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery: restart_review (simple, no agent cost)
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Final state is stopped from pr_closed (second stop, no recovery)
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("pr_closed");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("restart_review");
+  });
+
+  it("recovery with no planner -> skips recovery entirely", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config); // no planner
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: null }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.recoveryAttempted).toBe(0);
+    // No recovery notifications
+    const recoveryEvents = h.notifier.events.filter(
+      (e) => e.kind === "recovery_started" || e.kind === "recovery_succeeded",
+    );
+    expect(recoveryEvents).toHaveLength(0);
+  });
+
+  it("recovery codex exception -> falls through to normal stop", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: null }];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery codex call: throws (no outcome queued -> FakePlanRunner throws)
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAttempted).toBe(1);
+    // Exception during recovery -> escalated action
+    expect(s.recoveryAction).toBe("escalate");
+    // Log contains recovery codex exception
+    expect(h.logs.some((l) => l.includes("recovery: codex exception"))).toBe(true);
   });
 });

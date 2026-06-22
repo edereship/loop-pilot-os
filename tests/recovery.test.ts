@@ -114,6 +114,7 @@ function makeHarness(config: Config): Harness {
     recovery,
     planner: null,
     codebaseSummaryGenerator: async () => "",
+    recoveryTurn: null,
   });
   return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }

@@ -24,6 +24,8 @@ import type {
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
+import { executeRecoveryTurn } from "./recovery-turn.js";
+import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
@@ -46,6 +48,7 @@ export interface OrchestratorDeps {
   recovery: WorkflowRecovery;
   planner: PlanRunner | null;
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
+  recoveryTurn: RecoveryTurnDeps | null;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -72,6 +75,7 @@ export class Orchestrator {
   private readonly recovery: WorkflowRecovery;
   private readonly planner: PlanRunner | null;
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
+  private readonly recoveryTurn: RecoveryTurnDeps | null;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -92,6 +96,7 @@ export class Orchestrator {
     this.recovery = deps.recovery;
     this.planner = deps.planner;
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
+    this.recoveryTurn = deps.recoveryTurn;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -495,7 +500,10 @@ export class Orchestrator {
 
       // 3) CLAIM
       const claim = await this.claim(issue);
-      if (claim.control === "halt") return;
+      if (!("session" in claim)) {
+        if (claim.control === "halt") return;
+        continue; // recovery CONTINUE → retry from SELECT
+      }
       const session = claim.session;
 
       // Record PM selection rationale (§1.6)
@@ -523,7 +531,10 @@ export class Orchestrator {
 
       // 6) HANDOFF (was 5)
       const handoff = await this.handoff(session, issue);
-      if (handoff.control === "halt") return;
+      if (!("prNumber" in handoff)) {
+        if (handoff.control === "halt") return;
+        continue; // recovery CONTINUE → retry from SELECT
+      }
       const prNumber = handoff.prNumber;
 
       // 7) MONITOR (was 6)
@@ -539,7 +550,7 @@ export class Orchestrator {
   // ---- CLAIM（仕様 §5.2） ----
   private async claim(
     issue: EligibleIssue,
-  ): Promise<{ control: "halt" } | { control: "continue"; session: TaskSessionRow }> {
+  ): Promise<RunControl | { control: "continue"; session: TaskSessionRow }> {
     let claimResult;
     try {
       claimResult = await this.git.prepareWorktree(issue);
@@ -566,8 +577,8 @@ export class Orchestrator {
       // ② transition 失敗：discardWorktree + stopped(claim_failed) + ticket→Todo（best-effort）→ HALT
       await bestEffort(() => this.git.discardWorktree(claimResult.branch, claimResult.worktreePath));
       await bestEffort(() => this.source.transition(issue.id, "todo"));
-      const ctrl = await this.stopSession(session, "claim_failed", `transition(in_progress) failed: ${errMsg(err)}`);
-      return ctrl;
+      return await this.stopSession(session, "claim_failed", `transition(in_progress) failed: ${errMsg(err)}`);
+
     }
     if (this.config.notify.progress) {
       await this.notifier.notify({
@@ -850,7 +861,7 @@ export class Orchestrator {
   private async handoff(
     session: TaskSessionRow,
     issue: EligibleIssue,
-  ): Promise<{ control: "halt" } | { control: "continue"; prNumber: number }> {
+  ): Promise<RunControl | { control: "continue"; prNumber: number }> {
     this.store.updateSession(session.id, { state: "handing_off" });
     const worktreePath = session.worktreePath as string;
     let prNumber: number;
@@ -913,7 +924,9 @@ export class Orchestrator {
         pollFailures += 1;
         mergeFailures = 0;
         if (pollFailures >= 5) {
-          return await this.stopSession(session, "exception", `monitor poll failed 5x: ${errMsg(err)}`);
+          const ctrl = await this.stopSession(session, "exception", `monitor poll failed 5x: ${errMsg(err)}`);
+          if (ctrl.control === "halt") return HALT;
+          continue;
         }
         backoffMultiplier = Math.min(backoffMultiplier * 2, 8);
         continue;
@@ -948,11 +961,13 @@ export class Orchestrator {
             readinessFailures += 1;
             mergeFailures = 0; // done+ready 以外の評価 → ready ストリーク断絶
             if (readinessFailures >= 5) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "exception",
                 `merge readiness check failed 5x: ${outcome.error}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             // 直前の poll 成功で backoffMultiplier は 1 に戻っているため、連続失敗数から導出（×2..×8）。
             backoffMultiplier = Math.min(2 ** readinessFailures, 8);
@@ -963,11 +978,13 @@ export class Orchestrator {
             // ready verdict のまま mergePr が throw。2 連続で fail-closed（カーネル §7.6）。
             mergeFailures += 1;
             if (mergeFailures >= 2) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "ci_failed",
                 `merge call failed under ready verdict: ${outcome.error}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             continue; // 1 回目は次ポーリングで再評価
           }
@@ -991,11 +1008,13 @@ export class Orchestrator {
               readinessFailures += 1;
               mergeFailures = 0;
               if (readinessFailures >= 5) {
-                return await this.stopSession(
+                const ctrl = await this.stopSession(
                   session,
                   "exception",
                   `merge readiness check failed 5x: ${outcome.error}`,
                 );
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               backoffMultiplier = Math.min(2 ** readinessFailures, 8);
               continue;
@@ -1004,11 +1023,13 @@ export class Orchestrator {
             if (outcome.kind === "merge_failed") {
               mergeFailures += 1;
               if (mergeFailures >= 2) {
-                return await this.stopSession(
+                const ctrl = await this.stopSession(
                   session,
                   "ci_failed",
                   `merge call failed under ready verdict: ${outcome.error}`,
                 );
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               continue;
             }
@@ -1036,17 +1057,21 @@ export class Orchestrator {
                 timeout !== undefined &&
                 this.elapsedMinutesSinceMonitorStart(session.id) > timeout
               ) {
-                return await this.stopSession(session, "exception", "monitor timeout");
+                const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               continue;
             }
             autoRestartCount += 1;
             if (autoRestartCount > 3) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "looppilot_stopped",
                 `auto-restart limit exceeded (${autoRestartCount}x): ${verdict.stopReason}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             // A real restart event breaks any prior readiness-failure streak: errors before
             // and after the restarted review are not consecutive within the new attempt.
@@ -1062,11 +1087,13 @@ export class Orchestrator {
             try {
               await this.git.postComment(prNumber, "/restart-review");
             } catch (err) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "exception",
                 `/restart-review comment failed: ${errMsg(err)}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             // ES-409 Finding 3: persist attempt count and pending reason AFTER a confirmed
             // post. A pre-post crash leaves autoRestartAttempts unchanged and
@@ -1094,18 +1121,22 @@ export class Orchestrator {
                 timeout !== undefined &&
                 this.elapsedMinutesSinceMonitorStart(session.id) > timeout
               ) {
-                return await this.stopSession(session, "exception", "monitor timeout");
+                const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               continue;
             }
             quotaRetryCount += 1;
             quotaResumedNotified = false;
             if (quotaRetryCount > 6) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "looppilot_stopped",
                 `quota retry limit exceeded (${quotaRetryCount}x): ${verdict.stopReason}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             if (quotaRetryCount === 1) {
               await this.notifier.notify({
@@ -1145,11 +1176,13 @@ export class Orchestrator {
             try {
               await this.git.postComment(prNumber, "/restart-review");
             } catch (err) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "exception",
                 `/restart-review comment failed: ${errMsg(err)}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             // Finding 4: persist the pending reason after a confirmed post so
             // the next poll (and any process-restart recovery) recognises the
@@ -1161,23 +1194,35 @@ export class Orchestrator {
             continue;
           }
           // human_required / null → HALT
-          return await this.stopSession(
-            session,
-            "looppilot_stopped",
-            verdict.stopReason ?? "looppilot stopped (no reason)",
-          );
+          {
+            const ctrl = await this.stopSession(
+              session,
+              "looppilot_stopped",
+              verdict.stopReason ?? "looppilot stopped (no reason)",
+            );
+            if (ctrl.control === "halt") return HALT;
+            continue;
+          }
         }
-        case "pr_closed":
-          return await this.stopSession(session, "pr_closed", null);
-        case "corrupted":
-          return await this.stopSession(
+        case "pr_closed": {
+          const ctrl = await this.stopSession(session, "pr_closed", null);
+          if (ctrl.control === "halt") return HALT;
+          continue;
+        }
+        case "corrupted": {
+          const ctrl = await this.stopSession(
             session,
             "monitor_never_engaged",
             "looppilot-state comment present but corrupted",
           );
+          if (ctrl.control === "halt") return HALT;
+          continue;
+        }
         case "not_engaged": {
           if (this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes) {
-            return await this.stopSession(session, "monitor_never_engaged", null);
+            const ctrl = await this.stopSession(session, "monitor_never_engaged", null);
+            if (ctrl.control === "halt") return HALT;
+            continue;
           }
           continue;
         }
@@ -1195,7 +1240,9 @@ export class Orchestrator {
           }
           const timeout = this.config.safety.monitorTimeoutMinutes;
           if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
-            return await this.stopSession(session, "exception", "monitor timeout");
+            const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+            if (ctrl.control === "halt") return HALT;
+            continue;
           }
           continue;
         }
@@ -1217,11 +1264,13 @@ export class Orchestrator {
           try {
             recoveryResult = await this.recovery.attemptRecovery(recoveryCtx);
           } catch (err) {
-            return await this.stopSession(
+            const ctrl = await this.stopSession(
               session,
               "workflow_setup_failed",
               `workflow recovery error: ${errMsg(err)}`,
             );
+            if (ctrl.control === "halt") return HALT;
+            continue;
           }
           if (recoveryResult.kind === "interrupted") {
             if (recoveryResult.costUsd > 0) {
@@ -1257,7 +1306,9 @@ export class Orchestrator {
               // that never re-engaged (Finding 3):
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
-                return await this.stopSession(session, "exception", "monitor timeout");
+                const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               // Only fall back to the not-engaged guard while no live state comment
               // exists, so an ignored /restart-review cannot poll forever — but a
@@ -1267,7 +1318,9 @@ export class Orchestrator {
                 !verdict.hasStateComment &&
                 this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes
               ) {
-                return await this.stopSession(session, "monitor_never_engaged", null);
+                const ctrl = await this.stopSession(session, "monitor_never_engaged", null);
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
             }
             continue;
@@ -1280,11 +1333,15 @@ export class Orchestrator {
             const refreshed = this.store.getSession(session.id);
             this.store.updateSession(session.id, { costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd });
           }
-          return await this.stopSession(
-            session,
-            "workflow_setup_failed",
-            detail,
-          );
+          {
+            const ctrl = await this.stopSession(
+              session,
+              "workflow_setup_failed",
+              detail,
+            );
+            if (ctrl.control === "halt") return HALT;
+            continue;
+          }
         }
       }
     }
@@ -1317,19 +1374,22 @@ export class Orchestrator {
         case "ci_pending":
         case "unknown":
           return { kind: "continue" };
-        case "ci_failed":
-          await this.stopSession(session, "ci_failed", null);
-          return { kind: "halt" };
-        case "conflict":
-          await this.stopSession(session, "merge_conflict", null);
-          return { kind: "halt" };
-        case "blocked":
-          await this.stopSession(
+        case "ci_failed": {
+          const ctrl = await this.stopSession(session, "ci_failed", null);
+          return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
+        }
+        case "conflict": {
+          const ctrl = await this.stopSession(session, "merge_conflict", null);
+          return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
+        }
+        case "blocked": {
+          const ctrl = await this.stopSession(
             session,
             "ci_failed",
             "merge blocked by branch protection: required reviews/rulesets (mergeStateStatus=BLOCKED with green checks)",
           );
-          return { kind: "halt" };
+          return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
+        }
       }
     }
     try {
@@ -1367,7 +1427,57 @@ export class Orchestrator {
     reason: FailureReason,
     detail: string | null,
     extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber">> = {},
-  ): Promise<{ control: "halt" }> {
+  ): Promise<RunControl> {
+    // --- Recovery gate (ES-450) ---
+    if (reason !== "cost_exceeded" && this.recoveryTurn !== null && this.planner !== null) {
+      const fresh = this.store.getSession(session.id);
+      if (!fresh.recoveryAttempted) {
+        this.store.updateSession(session.id, { recoveryAttempted: 1 });
+        await this.notifier.notify({
+          kind: "recovery_started",
+          identifier: session.linearIdentifier,
+          reason,
+        });
+        let result;
+        try {
+          result = await executeRecoveryTurn(
+            this.recoveryTurn,
+            fresh,
+            reason,
+            detail,
+          );
+        } catch (err) {
+          this.log(`recovery: exception: ${err instanceof Error ? err.message : String(err)}`);
+          result = { kind: "escalated" as const, action: "escalate" as const };
+        }
+        const actionStr = "action" in result ? result.action : "escalate";
+        this.store.updateSession(session.id, { recoveryAction: actionStr });
+        if (result.kind === "recovered") {
+          const recoveryCost = result.costUsd;
+          if (recoveryCost > 0) {
+            const refreshed = this.store.getSession(session.id);
+            this.store.updateSession(session.id, {
+              costUsd: (refreshed.costUsd ?? 0) + recoveryCost,
+            });
+          }
+          await this.notifier.notify({
+            kind: "recovery_succeeded",
+            identifier: session.linearIdentifier,
+            action: result.action,
+          });
+          this.store.updateSession(session.id, {
+            state: "in_review",
+            monitorStartedAt: this.clock(),
+            failureReason: null,
+            stopDetail: null,
+            endedAt: null,
+          });
+          return CONTINUE;
+        }
+        // escalated / failed → fall through to normal stop
+      }
+    }
+    // --- Original stop logic (unchanged) ---
     this.store.updateSession(session.id, {
       state: "stopped",
       failureReason: reason,
