@@ -28,7 +28,7 @@ export interface RecoveryAction {
 export type RecoveryTurnResult =
   | { kind: "recovered"; action: RecoveryActionKind; costUsd: number }
   | { kind: "escalated"; action: RecoveryActionKind }
-  | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number }
+  | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number; preserveWorktree?: boolean }
   | { kind: "interrupted"; costUsd?: number }
   | { kind: "continued"; action: RecoveryActionKind };
 
@@ -260,6 +260,7 @@ async function executeFixCode(
             action: "fix_code",
             message: `interrupted recovery: git status failed (exit ${statusResult.code})`,
             costUsd: outcome.costUsd,
+            preserveWorktree: true,
           };
         }
         if (statusResult.stdout.trim() !== "") {
@@ -271,6 +272,7 @@ async function executeFixCode(
               action: "fix_code",
               message: `interrupted recovery WIP commit failed (add): ${addResult.stderr.trim() || `exit ${addResult.code}`}`,
               costUsd: outcome.costUsd,
+              preserveWorktree: true,
             };
           }
           const commitResult = await runner.run(
@@ -283,6 +285,7 @@ async function executeFixCode(
               action: "fix_code",
               message: `interrupted recovery WIP commit failed (commit): ${commitResult.stderr.trim() || `exit ${commitResult.code}`}`,
               costUsd: outcome.costUsd,
+              preserveWorktree: true,
             };
           }
         }
@@ -302,6 +305,7 @@ async function executeFixCode(
             action: "fix_code",
             message: `interrupted recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}`,
             costUsd: outcome.costUsd,
+            preserveWorktree: true,
           };
         }
       }
@@ -313,10 +317,10 @@ async function executeFixCode(
   // Verify commits
   const statusResult = await runner.run("git", ["-C", worktreePath, "status", "--porcelain"], { cwd: worktreePath });
   if (statusResult.code !== 0) {
-    return { kind: "failed", action: "fix_code", message: `git status exited ${statusResult.code}`, costUsd: outcome.costUsd };
+    return { kind: "failed", action: "fix_code", message: `git status exited ${statusResult.code}`, costUsd: outcome.costUsd, preserveWorktree: true };
   }
   if (statusResult.stdout.trim() !== "") {
-    return { kind: "failed", action: "fix_code", message: "recovery fix agent left uncommitted changes", costUsd: outcome.costUsd };
+    return { kind: "failed", action: "fix_code", message: "recovery fix agent left uncommitted changes", costUsd: outcome.costUsd, preserveWorktree: true };
   }
   const logResult = await runner.run("git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"], { cwd: worktreePath });
   if (logResult.stdout.trim() === "") {
@@ -326,7 +330,7 @@ async function executeFixCode(
   // Push
   const pushResult = await runner.run("git", ["push", "origin", `HEAD:${branch}`], { cwd: worktreePath });
   if (pushResult.code !== 0) {
-    return { kind: "failed", action: "fix_code", message: `recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}`, costUsd: outcome.costUsd };
+    return { kind: "failed", action: "fix_code", message: `recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}`, costUsd: outcome.costUsd, preserveWorktree: true };
   }
 
   // Post /restart-review if PR exists

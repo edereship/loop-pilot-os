@@ -25,7 +25,7 @@ import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
 import { executeRecoveryTurn } from "./recovery-turn.js";
-import type { RecoveryTurnDeps } from "./recovery-turn.js";
+import type { RecoveryTurnDeps, RecoveryActionKind } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
@@ -183,6 +183,14 @@ export class Orchestrator {
         stripRecoveryFailedSuffix(session.stopDetail),
       );
       if (ctrl.control === "halt") return HALT;
+      // If recovery re-activated the session to in_review, resume monitoring it.
+      // Without this, the session would sit idle until the next daemon restart
+      // because the active-session pass (step 2) already ran (ES-450 Finding 1).
+      const refreshed = this.store.getSession(session.id);
+      if (refreshed.state === "in_review" && refreshed.prNumber !== null) {
+        const monCtrl = await this.adoptAndMonitor(refreshed, refreshed.prNumber, refreshed.monitorStartedAt);
+        if (monCtrl.control === "halt") return HALT;
+      }
     }
 
     return CONTINUE;
@@ -422,7 +430,30 @@ export class Orchestrator {
           this.resetAndAdopt(session.id);
           return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
         }
-        // human_required / null → LoopPilot has not yet restarted; skip
+        // human_required / null → LoopPilot has not yet restarted.
+        // If a prior Codex recovery action failed (indicated by the
+        // "(recovery failed: ...)" suffix in stopDetail and recovery_attempted=0),
+        // retry the recovery by re-entering stopSession so transient failures
+        // (e.g. failed push or /restart-review post) don't leave the PR
+        // stopped and unmonitored across daemon restarts (ES-450 Finding 5).
+        if (
+          !session.recoveryAttempted &&
+          session.stopDetail !== null &&
+          session.stopDetail.includes("(recovery failed:")
+        ) {
+          this.store.updateSession(session.id, { runId: this.runId });
+          const retryCtrl = await this.stopSession(
+            session,
+            session.failureReason as FailureReason,
+            stripRecoveryFailedSuffix(session.stopDetail),
+          );
+          if (retryCtrl.control === "halt") return HALT;
+          const retried = this.store.getSession(session.id);
+          if (retried.state === "in_review" && retried.prNumber !== null) {
+            return await this.adoptAndMonitor(retried, retried.prNumber, retried.monitorStartedAt);
+          }
+          return retryCtrl;
+        }
         return CONTINUE;
       }
       case "pr_closed":
@@ -1556,6 +1587,11 @@ export class Orchestrator {
       reason === "workflow_setup_failed" &&
       detail !== null &&
       detail.includes("fix agent exceeded cost limit");
+    // Mark terminal conditions so stoppedSessionsWithFailedRecovery does not pick
+    // them up on every daemon start (ES-450 Finding 4).
+    if (isWorkflowCostExhaustion) {
+      this.store.updateSession(session.id, { recoveryAttempted: 1 });
+    }
     if (reason !== "cost_exceeded" && reason !== "pr_closed" && !isWorkflowCostExhaustion && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
       if (!fresh.recoveryAttempted && fresh.prNumber !== null) {
@@ -1570,15 +1606,26 @@ export class Orchestrator {
         // here: if Codex escalates or the recovery action fails the ticket must stay in its
         // current state rather than getting stuck In Review with a stopped session. The
         // transition is deferred to the 'recovered' path below (restart_review action only).
+        let handoffLabelFailed = false;
         if (reason === "handoff_failed") {
           const prNum = fresh.prNumber;
           try {
             await retry(3, () => this.git.addLabel(prNum, this.config.looppilot.gateLabel));
           } catch (err) {
             this.log(`recovery: handoff_failed retry addLabel failed: ${err instanceof Error ? err.message : String(err)}`);
+            // Label is a prerequisite for /restart-review — without it LoopPilot ignores
+            // the restart. Abort recovery so the session is stopped immediately instead of
+            // flipping to in_review where it polls until monitor_never_engaged (Finding 2).
+            handoffLabelFailed = true;
           }
         }
         let result;
+        if (handoffLabelFailed) {
+          // Skip recovery — fall through to normal stop. Use 'failed' (not 'escalated')
+          // so recoveryAttempted stays 0 and the next daemon start can retry after the
+          // transient API error resolves (ES-450 Finding 2).
+          result = { kind: "failed" as const, action: "escalate" as RecoveryActionKind, message: "handoff label retry failed" };
+        } else {
         try {
           result = await executeRecoveryTurn(
             this.recoveryTurn,
@@ -1589,6 +1636,7 @@ export class Orchestrator {
         } catch (err) {
           this.log(`recovery: exception: ${err instanceof Error ? err.message : String(err)}`);
           result = { kind: "escalated" as const, action: "escalate" as const };
+        }
         }
         // Operator interrupted during recovery analysis: propagate like other interrupts.
         // recoveryAttempted is NOT marked so the next run can retry recovery.
@@ -1688,6 +1736,13 @@ export class Orchestrator {
             effectiveDetail = effectiveDetail
               ? `${effectiveDetail} (recovery failed: ${result.message})`
               : `recovery failed: ${result.message}`;
+          }
+          // When local work exists that would be destroyed by the retry's
+          // reset --hard, mark recovery as attempted so
+          // stoppedSessionsWithFailedRecovery does not retry and discard
+          // dirty edits or unpushed commits (ES-450 Finding 3).
+          if (result.preserveWorktree) {
+            this.store.updateSession(session.id, { recoveryAttempted: 1 });
           }
         }
         // escalated / failed → fall through to normal stop

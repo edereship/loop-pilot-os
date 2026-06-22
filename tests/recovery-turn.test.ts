@@ -393,6 +393,7 @@ describe("executeRecoveryTurn", () => {
       action: "fix_code",
       message: expect.stringContaining("WIP commit failed"),
       costUsd: 0.15,
+      preserveWorktree: true,
     });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeUndefined();
@@ -419,6 +420,7 @@ describe("executeRecoveryTurn", () => {
       action: "fix_code",
       message: expect.stringContaining("WIP commit failed"),
       costUsd: 0.12,
+      preserveWorktree: true,
     });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeUndefined();
@@ -443,6 +445,7 @@ describe("executeRecoveryTurn", () => {
       action: "fix_code",
       message: expect.stringContaining("git status failed"),
       costUsd: 0.18,
+      preserveWorktree: true,
     });
     // No push should happen after a status failure
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
@@ -490,6 +493,7 @@ describe("executeRecoveryTurn", () => {
       action: "fix_code",
       message: expect.stringContaining("recovery push failed"),
       costUsd: 0.4,
+      preserveWorktree: true,
     });
   });
 
@@ -558,6 +562,7 @@ describe("executeRecoveryTurn", () => {
       action: "fix_code",
       message: expect.stringContaining("interrupted recovery push failed"),
       costUsd: 0.2,
+      preserveWorktree: true,
     });
   });
 
