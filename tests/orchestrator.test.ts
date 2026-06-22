@@ -3031,7 +3031,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
 
   // ES-450 Finding (iteration 8): failed abandon must not record recovery_action so
   // stoppedSessionsWithPr can pick the session up again on the next daemon start.
-  it("failed abandon does not set recoveryAction, allowing startup re-recovery", async () => {
+  // ES-450 Finding 2 (iteration 10): failed cleanup must also leave recoveryAttempted=0
+  // so a future recovery path can retry the cleanup rather than skipping executeRecoveryTurn.
+  it("failed abandon does not set recoveryAction or recoveryAttempted, allowing retry", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner });
@@ -3055,9 +3057,139 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
     expect(s.state).toBe("stopped");
-    expect(s.recoveryAttempted).toBe(1);
+    // recoveryAttempted must stay 0 for failed cleanup — the gate is not consumed so a
+    // future recovery path can retry (ES-450 Finding 2).
+    expect(s.recoveryAttempted).toBe(0);
     // recoveryAction must NOT be 'abandon' — the cleanup did not complete, so startup
     // recovery must be able to pick this session up via stoppedSessionsWithPr.
     expect(s.recoveryAction).toBeNull();
+  });
+
+  // ES-450 Finding 1 (iteration 10): stale guard must fire on the poll immediately
+  // after done-path recovery so a stale ci_failed/merge_conflict verdict does not
+  // trigger a second stopSession with recoveryAttempted already set.
+  it("ci_failed recovery stale guard fires once then merge succeeds on next poll", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    // done verdict repeated — FakeMonitor keeps returning the last element
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      // Poll 1: ci_failed → recovery fires. Poll 2: stale guard skips tryMerge.
+      // Poll 3: ready → merge.
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nFix it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Run npm install"}' },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("fix_code");
+    // Readiness was called exactly twice: once for ci_failed (poll 1) and once for
+    // ready (poll 3). The stale guard on poll 2 must skip tryMerge entirely.
+    expect(h.monitor.readinessCalls).toHaveLength(2);
+  });
+
+  // ES-450 Finding 1 (iteration 10): same stale guard for merge_conflict + rebase.
+  it("merge_conflict recovery stale guard fires once then merge succeeds", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "conflict" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nRebase" },
+      { kind: "completed", text: '{"action":"rebase"}' },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("rebase")) return { code: 0 };
+      return { code: 0 };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 0 });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("rebase");
+    // Stale guard must skip tryMerge on poll 2 — readiness called only twice.
+    expect(h.monitor.readinessCalls).toHaveLength(2);
+  });
+
+  // ES-450 Finding 3 (iteration 10): when recovery fails after doing useful work,
+  // stopDetail must carry the recovery failure message so operators can diagnose.
+  it("failed fix_code recovery includes recovery failure message in stopDetail", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "completed", costUsd: 0.4, summary: "fixed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' },
+    ];
+    // Agent makes commits but push fails — recovery returns { kind: "failed", message: "recovery push failed: ..." }
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 1, stderr: "rejected" });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // stopDetail must include the recovery failure message (ES-450 Finding 3).
+    expect(s.stopDetail).toContain("recovery failed:");
+    expect(s.stopDetail).toContain("recovery push failed");
+    // The halted notification detail must also carry the recovery failure message.
+    const haltedEvent = h.notifier.events.find((e) => e.kind === "halted");
+    expect(haltedEvent).toBeDefined();
+    expect((haltedEvent as { kind: "halted"; reason: string; detail: string }).detail).toContain("recovery failed:");
   });
 });

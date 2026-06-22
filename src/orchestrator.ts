@@ -967,8 +967,13 @@ export class Orchestrator {
       backoffMultiplier = 1;
       // Clear the pending-restart record when LoopPilot transitions away from stopped — that
       // confirms the /restart-review was consumed and the restart is no longer in flight.
+      // Exception: "ci_failed" and "merge_conflict" are done-path recovery markers, not
+      // LoopPilot stop reasons. LoopPilot never emits these as stopReason, so they must
+      // survive until the done-case stale guard consumes them (ES-450 Finding 1).
       if (verdict.kind !== "stopped") {
-        if (pendingRestartReason !== undefined) {
+        if (pendingRestartReason !== undefined &&
+            pendingRestartReason !== "ci_failed" &&
+            pendingRestartReason !== "merge_conflict") {
           pendingRestartReason = undefined;
           this.store.updateSession(session.id, { pendingRestartReason: null });
         }
@@ -984,6 +989,14 @@ export class Orchestrator {
         case "merged":
           return CONTINUE; // DONE へ
         case "done": {
+          // Stale guard: if done-path recovery just posted /restart-review for a
+          // merge-readiness failure, give one poll of grace before re-attempting
+          // the merge so the fix can propagate (ES-450 Finding 1).
+          if (pendingRestartReason !== undefined) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
           const outcome = await this.tryMerge(session, prNumber);
           if (outcome.kind === "merged") return CONTINUE;
           if (outcome.kind === "halt") return HALT;
@@ -1024,6 +1037,12 @@ export class Orchestrator {
           }
           // outcome.kind === "continue"（readiness が ci_pending/unknown 等）
           mergeFailures = 0; // ready 連続を断ち切る事象が起きたらリセット
+          // Reload pendingRestartReason so the stale guard fires on the next poll if
+          // done-path recovery was applied (ES-450 Finding 1).
+          {
+            const recoveredForPending = this.store.getSession(session.id);
+            pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
+          }
           continue;
         }
         case "stopped": {
@@ -1032,8 +1051,14 @@ export class Orchestrator {
             // Workflow completed (no_findings) — treat same as done for merge streak.
             // Also clear any pending restart since LoopPilot completed successfully.
             if (pendingRestartReason !== undefined) {
+              const prr = pendingRestartReason;
               pendingRestartReason = undefined;
               this.store.updateSession(session.id, { pendingRestartReason: null });
+              // Stale guard: if done-path recovery set this marker, give one grace poll
+              // before re-attempting the merge so the fix can propagate (ES-450 Finding 1).
+              if (prr === "ci_failed" || prr === "merge_conflict") {
+                continue;
+              }
             }
             const outcome = await this.tryMerge(session, prNumber);
             if (outcome.kind === "merged") return CONTINUE;
@@ -1070,6 +1095,12 @@ export class Orchestrator {
               continue;
             }
             mergeFailures = 0;
+            // Reload pendingRestartReason so the stale guard fires on the next poll if
+            // done-path recovery was applied (ES-450 Finding 1).
+            {
+              const recoveredForPending = this.store.getSession(session.id);
+              pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
+            }
             continue;
           }
           if (category === "auto_restart") {
@@ -1482,6 +1513,8 @@ export class Orchestrator {
     extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber" | "workflowHandledErrorCount">> = {},
   ): Promise<RunControl> {
     let patch = extraPatch;
+    // Effective stop detail — may be augmented with recovery failure message (Finding 3).
+    let effectiveDetail = detail;
     // --- Recovery gate (ES-450) ---
     // pr_closed is terminal — the PR is gone, so fix_code/rebase/restart_review would
     // post comments or push to a closed PR then flip the session back to in_review where
@@ -1517,8 +1550,12 @@ export class Orchestrator {
           await this.haltForInterrupt();
           return HALT;
         }
-        // Mark recovery attempted for all non-interrupted outcomes.
-        this.store.updateSession(session.id, { recoveryAttempted: 1 });
+        // Mark recovery attempted for all non-interrupted, non-failed outcomes.
+        // For 'failed', the cleanup did not complete — leave recoveryAttempted=0 so a
+        // future recovery path can retry the cleanup (ES-450 Finding 2).
+        if (result.kind !== "failed") {
+          this.store.updateSession(session.id, { recoveryAttempted: 1 });
+        }
         // Abandon completed cleanup and wants the loop to continue to next task.
         if (result.kind === "continued") {
           this.store.updateSession(session.id, { recoveryAction: result.action });
@@ -1560,12 +1597,14 @@ export class Orchestrator {
           // pendingRestartReason must match the raw verdict.stopReason used by the stale guard;
           // for exhaustion details like "auto-restart limit exceeded (4x): workflow_crashed" we
           // extract just the trailing stop reason rather than storing the full synthesized message.
+          // For done-path stops (ci_failed, merge_conflict) detail is null — fall back to reason
+          // so the done-case stale guard can detect and consume it (ES-450 Finding 1).
           if (result.action === "restart_review" || result.action === "fix_code" || result.action === "rebase") {
             const rawReason = detail !== null && (
               detail.startsWith("auto-restart limit exceeded") ||
               detail.startsWith("quota retry limit exceeded")
             ) ? extractExhaustedStopReason(detail) : detail;
-            recoveryUpdate.pendingRestartReason = rawReason;
+            recoveryUpdate.pendingRestartReason = rawReason ?? reason;
           }
           // handoff_failed recovery: retry the side-effects that failed during the original
           // handoff so the gate label and Linear state are correct before we flip to in_review.
@@ -1593,10 +1632,18 @@ export class Orchestrator {
           this.store.updateSession(session.id, recoveryUpdate);
           return CONTINUE;
         }
-        // failed: preserve any recovery agent cost before falling through to normal stop.
-        if (result.kind === "failed" && result.costUsd !== undefined && result.costUsd > 0) {
-          const freshened = this.store.getSession(session.id);
-          patch = { ...patch, costUsd: (freshened.costUsd ?? 0) + result.costUsd };
+        // failed: preserve any recovery agent cost and carry the failure message forward so
+        // operators see what the recovery attempt tried and why it failed (ES-450 Finding 3).
+        if (result.kind === "failed") {
+          if (result.costUsd !== undefined && result.costUsd > 0) {
+            const freshened = this.store.getSession(session.id);
+            patch = { ...patch, costUsd: (freshened.costUsd ?? 0) + result.costUsd };
+          }
+          if (result.message) {
+            effectiveDetail = effectiveDetail
+              ? `${effectiveDetail} (recovery failed: ${result.message})`
+              : `recovery failed: ${result.message}`;
+          }
         }
         // escalated / failed → fall through to normal stop
       }
@@ -1605,11 +1652,11 @@ export class Orchestrator {
     this.store.updateSession(session.id, {
       state: "stopped",
       failureReason: reason,
-      stopDetail: detail,
+      stopDetail: effectiveDetail,
       endedAt: this.clock(),
       ...patch,
     });
-    const haltDetail = `${session.linearIdentifier} stopped (${reason})${detail ? `: ${detail}` : ""}`;
+    const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     this.store.setRunState(this.runId, "halted", haltDetail);
     this.log(haltDetail);
