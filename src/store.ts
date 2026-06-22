@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS task_session (
   workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
   workflow_handled_error_count INTEGER NOT NULL DEFAULT 0,
   auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
-  pending_restart_reason TEXT
+  pending_restart_reason TEXT,
+  recovery_attempted INTEGER NOT NULL DEFAULT 0,
+  recovery_action TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_session_active ON task_session(state)
   WHERE state NOT IN ('merged','stopped');
@@ -111,6 +113,8 @@ interface RawSessionRow {
   workflow_handled_error_count: number;
   auto_restart_attempts: number;
   pending_restart_reason: string | null;
+  recovery_attempted: number;
+  recovery_action: string | null;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -136,6 +140,8 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     workflowHandledErrorCount: r.workflow_handled_error_count,
     autoRestartAttempts: r.auto_restart_attempts,
     pendingRestartReason: r.pending_restart_reason,
+    recoveryAttempted: r.recovery_attempted,
+    recoveryAction: r.recovery_action,
   };
 }
 
@@ -157,6 +163,8 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   workflowHandledErrorCount: "workflow_handled_error_count",
   autoRestartAttempts: "auto_restart_attempts",
   pendingRestartReason: "pending_restart_reason",
+  recoveryAttempted: "recovery_attempted",
+  recoveryAction: "recovery_action",
 };
 
 export class SqliteStore {
@@ -219,6 +227,16 @@ export class SqliteStore {
     }
     if (!columns.has("select_rationale")) {
       this.db.exec(`ALTER TABLE task_session ADD COLUMN select_rationale TEXT`);
+    }
+    if (!columns.has("recovery_attempted")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN recovery_attempted INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!columns.has("recovery_action")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN recovery_action TEXT`,
+      );
     }
 
     const runColumns = new Set(
@@ -395,6 +413,8 @@ export class SqliteStore {
         | "workflowHandledErrorCount"
         | "autoRestartAttempts"
         | "pendingRestartReason"
+        | "recoveryAttempted"
+        | "recoveryAction"
       >
     >,
   ): void {

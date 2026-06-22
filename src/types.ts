@@ -70,6 +70,8 @@ export interface TaskSessionRow {
   workflowHandledErrorCount: number; // errorCommentCount at the time of the last successful fix (guard counter)
   autoRestartAttempts: number;       // number of /restart-review comments posted (durable cap counter)
   pendingRestartReason: string | null; // stopReason for which the last /restart-review was posted, or null if none pending
+  recoveryAttempted: number;    // 0 or 1 — whether Codex recovery was attempted
+  recoveryAction: string | null; // action chosen by Codex (fix_code/rebase/restart_review/escalate/abandon)
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -153,7 +155,9 @@ export type NotifyEvent =
   | { kind: "quota_waiting"; detail: string }             // 初回 Codex quota exhausted
   | { kind: "quota_resumed"; detail: string }             // Codex quota 回復
   | { kind: "paused"; target: PauseTarget; detail: string }
-  | { kind: "resumed"; target: PauseTarget; detail: string };
+  | { kind: "resumed"; target: PauseTarget; detail: string }
+  | { kind: "recovery_started"; identifier: string; reason: string }
+  | { kind: "recovery_succeeded"; identifier: string; action: string };
 export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */

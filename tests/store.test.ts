@@ -695,6 +695,44 @@ describe("select_rationale column", () => {
   });
 });
 
+describe("recovery columns (ES-450)", () => {
+  it("recovery columns: recovery_attempted defaults to 0 and recovery_action defaults to null", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "test",
+      branch: "b",
+      worktreePath: "/wt/ty-1",
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    expect(session.recoveryAttempted).toBe(0);
+    expect(session.recoveryAction).toBeNull();
+  });
+
+  it("updateSession can set recoveryAttempted and recoveryAction", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "test",
+      branch: "b",
+      worktreePath: "/wt/ty-1",
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    store.updateSession(session.id, { recoveryAttempted: 1, recoveryAction: "fix_code" });
+    const updated = store.getSession(session.id);
+    expect(updated.recoveryAttempted).toBe(1);
+    expect(updated.recoveryAction).toBe("fix_code");
+  });
+});
+
 describe("lastMergedWithPr", () => {
   it("returns null when no merged sessions", () => {
     const store = new SqliteStore(":memory:");
