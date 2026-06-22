@@ -120,7 +120,7 @@ export function buildRecoveryPrompt(ctx: RecoveryPromptContext): string {
     '    "instruction": "<instruction for the implementing agent (required for fix_code, optional for others)>" }',
     "",
     "Actions:",
-    "- fix_code: provide an instruction for the agent to fix the code in the worktree, push, and restart review",
+    "- fix_code: provide an instruction for the agent to fix the code in the worktree and commit only; the orchestrator will push and restart review",
     "- rebase: rebase the branch onto the default branch to resolve conflicts",
     "- restart_review: post /restart-review to retry the review workflow",
     "- escalate: stop and notify humans (use when recovery is unlikely to help)",
@@ -244,6 +244,7 @@ async function executeFixCode(
       // later worktree reset to origin/<branch>. Without this, uncommitted changes would be
       // silently discarded on the next recovery attempt (recoveryAttempted is not set for
       // interrupted outcomes, so the next run resets the worktree and retries from scratch).
+      let hasPushableCommits = false;
       try {
         const statusResult = await runner.run(
           "git", ["-C", worktreePath, "status", "--porcelain"],
@@ -261,11 +262,20 @@ async function executeFixCode(
           "git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"],
           { cwd: worktreePath },
         );
-        if (logResult.code === 0 && logResult.stdout.trim() !== "") {
-          await runner.run("git", ["push", "origin", `HEAD:${branch}`], { cwd: worktreePath });
-        }
+        hasPushableCommits = logResult.code === 0 && logResult.stdout.trim() !== "";
       } catch {
-        // Best-effort: ignore errors, session will be halted
+        // Best-effort: if status/commit check fails, skip the push
+      }
+      if (hasPushableCommits) {
+        const pushResult = await runner.run("git", ["push", "origin", `HEAD:${branch}`], { cwd: worktreePath });
+        if (pushResult.code !== 0) {
+          return {
+            kind: "failed",
+            action: "fix_code",
+            message: `interrupted recovery push failed: ${pushResult.stderr.trim() || `exit ${pushResult.code}`}`,
+            costUsd: outcome.costUsd,
+          };
+        }
       }
       return { kind: "interrupted", costUsd: outcome.costUsd };
     }
@@ -296,7 +306,7 @@ async function executeFixCode(
     try {
       await git.postComment(session.prNumber, "/restart-review");
     } catch (err) {
-      return { kind: "failed", action: "fix_code", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
+      return { kind: "failed", action: "fix_code", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}`, costUsd: outcome.costUsd };
     }
   }
 
@@ -372,9 +382,13 @@ async function executeAbandon(
 ): Promise<RecoveryTurnResult> {
   const { runner, source, git, config, log } = deps;
   // Close PR — a non-zero exit means the PR may remain open; fail before reverting the ticket.
+  // Do not pass --delete-branch: if the branch is checked out in a linked worktree that flag
+  // causes gh to fail (local branch deletion is blocked), aborting before the ticket revert
+  // even though GitHub may have already closed the PR. Branch cleanup is handled separately
+  // by the discardWorktree call below.
   if (session.prNumber !== null) {
     const closeResult = await runner.run(
-      "gh", ["pr", "close", String(session.prNumber), "--delete-branch", "-R", config.repo.remote],
+      "gh", ["pr", "close", String(session.prNumber), "-R", config.repo.remote],
       { cwd: config.repo.path },
     );
     if (closeResult.code !== 0) {

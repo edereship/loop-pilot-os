@@ -446,4 +446,79 @@ describe("executeRecoveryTurn", () => {
     const discardCall = git.calls.find((c) => c.method === "discardWorktree");
     expect(discardCall).toBeUndefined();
   });
+
+  // Finding 1: buildRecoveryPrompt does not tell the fix agent to push or restart review
+  it("buildRecoveryPrompt: fix_code description instructs agent to commit only, not push", () => {
+    const prompt = buildRecoveryPrompt({
+      session: fakeSession(),
+      reason: "ci_failed" as FailureReason,
+      detail: null,
+    });
+    expect(prompt).toContain("fix_code");
+    expect(prompt).not.toContain("push, and restart review");
+    expect(prompt).toContain("commit only");
+  });
+
+  // Finding 2: interrupted push fails → failed result with costUsd (not interrupted)
+  it("fix_code: agent interrupted with ahead commits and push fails → failed with costUsd", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "interrupted", costUsd: 0.2 }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" }; // commits ahead
+      return { code: 0, stdout: "" };
+    });
+    runner.on(["git", "push"], { code: 1, stderr: "rejected by remote" });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({
+      kind: "failed",
+      action: "fix_code",
+      message: expect.stringContaining("interrupted recovery push failed"),
+      costUsd: 0.2,
+    });
+  });
+
+  // Finding 3: abandon close does not pass --delete-branch
+  it("abandon: gh pr close is called without --delete-branch", async () => {
+    const { deps, planner, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"abandon"}' }];
+    runner.on(["gh", "pr", "close"], { code: 0 });
+
+    const session = fakeSession({ prNumber: 42, linearIssueId: "issue-1" });
+    await executeRecoveryTurn(deps, session, "monitor_never_engaged", null);
+
+    const closeCall = runner.calls.find((c) => c.cmd === "gh" && c.args.includes("close"));
+    expect(closeCall).toBeDefined();
+    expect(closeCall!.args).not.toContain("--delete-branch");
+  });
+
+  // Finding 4: restart-review failure after successful push → failed with costUsd
+  it("fix_code: restart-review fails after successful push → failed result includes costUsd", async () => {
+    const { deps, planner, agent, runner, git } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "fixed" }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "" };
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    git.failNext("postComment");
+
+    const session = fakeSession({ prNumber: 42 });
+    const result = await executeRecoveryTurn(deps, session, "ci_failed", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({
+      kind: "failed",
+      action: "fix_code",
+      message: expect.stringContaining("restart-review"),
+      costUsd: 0.5,
+    });
+  });
 });
