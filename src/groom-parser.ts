@@ -5,13 +5,13 @@ const prioritySchema = z.union([z.literal(1), z.literal(2), z.literal(3), z.lite
 const memoryCategorySchema = z.enum(["pm_decisions", "impl_results", "product_knowledge"]);
 
 const groomActionSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("reprioritize"), issueId: z.string(), priority: prioritySchema, rationale: z.string() }),
-  z.object({ type: z.literal("update"), issueId: z.string(), title: z.string().optional(), description: z.string().optional(), rationale: z.string() }),
-  z.object({ type: z.literal("create"), title: z.string(), description: z.string(), priority: prioritySchema, rationale: z.string() }),
-  z.object({ type: z.literal("split"), issueId: z.string(), subtasks: z.array(z.object({ title: z.string(), description: z.string() })), rationale: z.string() }),
-  z.object({ type: z.literal("close"), issueId: z.string(), rationale: z.string() }),
-  z.object({ type: z.literal("label"), issueId: z.string(), add: z.array(z.string()).optional(), remove: z.array(z.string()).optional(), rationale: z.string() }),
-  z.object({ type: z.literal("update_memory"), category: memoryCategorySchema, content: z.string(), rationale: z.string() }),
+  z.object({ type: z.literal("reprioritize"), issueId: z.string(), priority: prioritySchema, rationale: z.string() }).strict(),
+  z.object({ type: z.literal("update"), issueId: z.string(), title: z.string().optional(), description: z.string().optional(), rationale: z.string() }).strict(),
+  z.object({ type: z.literal("create"), title: z.string(), description: z.string(), priority: prioritySchema, rationale: z.string() }).strict(),
+  z.object({ type: z.literal("split"), issueId: z.string(), subtasks: z.array(z.object({ title: z.string(), description: z.string() }).strict()), rationale: z.string() }).strict(),
+  z.object({ type: z.literal("close"), issueId: z.string(), rationale: z.string() }).strict(),
+  z.object({ type: z.literal("label"), issueId: z.string(), add: z.array(z.string()).optional(), remove: z.array(z.string()).optional(), rationale: z.string() }).strict(),
+  z.object({ type: z.literal("update_memory"), category: memoryCategorySchema, content: z.string(), rationale: z.string() }).strict(),
 ]);
 
 const groomOutputSchema = z.object({
@@ -67,16 +67,17 @@ function* extractJsonCandidates(text: string): Generator<string> {
   }
 
   // Tier 3: multi-line unfenced JSON object.
-  // Scan forward for the outermost '{' so nested action objects don't shadow it.
+  // Scan backward from the last '}'–terminated line so that, when earlier lines also
+  // start with '{' (e.g. explanatory text containing braces), we try the last
+  // candidate first and fall through to outer/earlier ones on parse failure.
   let endLine = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (lines[i].trimEnd().endsWith("}")) { endLine = i; break; }
   }
   if (endLine !== -1) {
-    for (let startLine = 0; startLine <= endLine; startLine++) {
+    for (let startLine = endLine; startLine >= 0; startLine--) {
       if (lines[startLine].trimStart().startsWith("{")) {
         yield lines.slice(startLine, endLine + 1).join("\n");
-        break;
       }
     }
   }

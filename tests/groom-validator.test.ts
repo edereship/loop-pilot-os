@@ -338,8 +338,8 @@ describe("validateGroomActions", () => {
     });
   });
 
-  // ---- Rule 8: memory size limit ----
-  describe("Rule 8: memory size limit", () => {
+  // ---- Rule 8: memory content validity ----
+  describe("Rule 8: memory content validity", () => {
     it("rejects update_memory when content exceeds maxCharsPerFile", () => {
       const results = validateGroomActions(
         [action("update_memory", { content: "x".repeat(8001) })],
@@ -355,6 +355,24 @@ describe("validateGroomActions", () => {
         makeCtx({ maxCharsPerFile: 8000 }),
       );
       expect(results[0].result).toBe("valid");
+    });
+
+    it("rejects update_memory with empty content", () => {
+      const results = validateGroomActions(
+        [action("update_memory", { content: "" })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
+    });
+
+    it("rejects update_memory with whitespace-only content", () => {
+      const results = validateGroomActions(
+        [action("update_memory", { content: "   \n\t  " })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
     });
   });
 

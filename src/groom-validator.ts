@@ -79,8 +79,11 @@ export function validateGroomActions(
       }
     }
 
-    // Rule 8: memory size limit
+    // Rule 8: memory content validity
     if (a.type === "update_memory") {
+      if (a.content.trim() === "") {
+        return { action: a, result: "rejected", reason: "empty memory content" };
+      }
       if (a.content.length > ctx.maxCharsPerFile) {
         return { action: a, result: "rejected", reason: `memory content exceeds ${ctx.maxCharsPerFile} chars` };
       }

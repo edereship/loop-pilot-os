@@ -170,6 +170,31 @@ describe("parseGroomOutput", () => {
     expect(result.kind).toBe("parse_error");
   });
 
+  it("returns parse_error when an action has an unknown extra field", () => {
+    const json = JSON.stringify({
+      actions: [{ type: "update", issueId: "ES-1", title: "T", descripton: "misspelled", rationale: "r" }],
+      summary: "s",
+    });
+    const result = parseGroomOutput(`\`\`\`json\n${json}\n\`\`\``);
+    expect(result.kind).toBe("parse_error");
+  });
+
+  it("falls back to last multi-line unfenced JSON when an earlier line starts with '{'", () => {
+    // Earlier explanatory text contains a brace-starting line; the real JSON follows.
+    const output = [
+      "{ preliminary: note }",
+      "Here is the final answer.",
+      "{",
+      '  "actions": [],',
+      '  "summary": "correct answer"',
+      "}",
+    ].join("\n");
+    const result = parseGroomOutput(output);
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") throw new Error("unreachable");
+    expect(result.value.summary).toBe("correct answer");
+  });
+
   it("preserves raw text in parse_error result", () => {
     const raw = "totally not json at all";
     const result = parseGroomOutput(raw);
