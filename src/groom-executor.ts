@@ -45,8 +45,9 @@ async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<vo
         });
         childIds.push(id);
       }
+      const splitNote = `→ split into ${childIds.join(", ")}`;
       await linearClient.updateIssue(action.issueId, {
-        description: `→ split into ${childIds.join(", ")}`,
+        description: `${parent.description}\n\n${splitNote}`,
       });
       await linearClient.closeIssue(action.issueId, action.rationale);
       break;

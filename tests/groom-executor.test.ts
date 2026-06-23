@@ -41,9 +41,9 @@ class StubLinearClient {
   async removeLabels(issueId: string, names: string[]): Promise<void> {
     this.record("removeLabels", [issueId, names]);
   }
-  async getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[] }> {
+  async getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }> {
     this.record("getIssueDetails", [issueId]);
-    return { priority: 2, labelIds: ["l-parent-1"] };
+    return { priority: 2, labelIds: ["l-parent-1"], description: "Original description" };
   }
   async postComment(issueId: string, body: string): Promise<void> {
     this.record("postComment", [issueId, body]);
@@ -146,6 +146,11 @@ describe("executeGroomActions — split", () => {
     expect(methods[3]).toBe("updateIssue");
     // 5. closeIssue (parent auto-close)
     expect(methods[4]).toBe("closeIssue");
+
+    // description must contain both the original text and the split note
+    const updateCall = client.calls.find((c) => c.method === "updateIssue");
+    expect((updateCall?.args[1] as { description: string }).description).toContain("Original description");
+    expect((updateCall?.args[1] as { description: string }).description).toContain("→ split into");
   });
 
   it("split inherits parent labels on subtasks via extraLabelIds", async () => {
