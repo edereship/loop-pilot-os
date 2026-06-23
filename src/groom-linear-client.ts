@@ -114,7 +114,8 @@ export class GroomLinearClient {
 
   async createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string> {
     const { extraLabelIds, ...rest } = fields;
-    const labelIds = [this.optInLabelId, ...(extraLabelIds ?? [])];
+    const dedupedExtras = (extraLabelIds ?? []).filter((id) => id !== this.optInLabelId);
+    const labelIds = [this.optInLabelId, ...dedupedExtras];
     const data = await graphql<{ issueCreate: { success: boolean; issue: { id: string; identifier: string } | null } }>(
       this.fetchFn, this.apiKey, ISSUE_CREATE_MUTATION, {
         ...rest,

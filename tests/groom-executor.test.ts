@@ -153,6 +153,24 @@ describe("executeGroomActions — split", () => {
     expect((updateCall?.args[1] as { description: string }).description).toContain("→ split into");
   });
 
+  it("split with empty parent description does not produce leading blank lines", async () => {
+    // Override stub to return empty description
+    client.getIssueDetails = async (issueId: string) => {
+      client.calls.push({ method: "getIssueDetails", args: [issueId] });
+      return { priority: 2, labelIds: [], description: "" };
+    };
+    const action: GroomAction = {
+      type: "split", issueId: "ES-1",
+      subtasks: [{ title: "Sub A", description: "A" }],
+      rationale: "split",
+    };
+    await executeGroomActions([action], ctx());
+    const updateCall = client.calls.find((c) => c.method === "updateIssue");
+    const desc = (updateCall?.args[1] as { description: string }).description;
+    expect(desc).not.toMatch(/^\n/);
+    expect(desc).toContain("→ split into");
+  });
+
   it("split inherits parent labels on subtasks via extraLabelIds", async () => {
     const action: GroomAction = {
       type: "split", issueId: "ES-1",
@@ -164,6 +182,15 @@ describe("executeGroomActions — split", () => {
     // createIssue should receive extraLabelIds from parent
     const createCall = client.calls.find((c) => c.method === "createIssue");
     expect(createCall?.args[0]).toMatchObject({ extraLabelIds: ["l-parent-1"] });
+  });
+});
+
+describe("executeGroomActions — exhaustive switch", () => {
+  it("records failure for unknown action type (exhaustive switch)", async () => {
+    const unknown = { type: "unknown", rationale: "test" } as unknown as GroomAction;
+    const results = await executeGroomActions([unknown], ctx());
+    expect(results[0].outcome).toBe("failed");
+    expect(results[0].error).toMatch(/Unknown groom action type/);
   });
 });
 
