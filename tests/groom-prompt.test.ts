@@ -49,6 +49,7 @@ function makeGroomArgs(overrides: Partial<GroomPromptArgs> = {}): GroomPromptArg
     memory: { pmDecisions: null, implResults: null, productKnowledge: null },
     board: fullBoard(),
     boardBudgetChars: 10000,
+    memoryBudgetChars: 10000,
     digest: [],
     codebaseSummary: null,
     optInLabel: "looppilot",
@@ -97,6 +98,25 @@ describe("formatBoard", () => {
     const out = formatBoard(board);
     expect(out).toContain("- ES-510 [High] WIP (in_progress)");
     expect(out).not.toContain("PR #");
+  });
+
+  it("formats in-progress tickets with labels when present", () => {
+    const board = emptyBoard();
+    board.inProgress = [
+      inProgress({ identifier: "ES-500", title: "Refactor DB", priority: 1, status: "in_review", prNumber: 42, labels: ["backend", "urgent"] }),
+    ];
+    const out = formatBoard(board);
+    expect(out).toContain("- ES-500 [Urgent] Refactor DB (in_review, PR #42) [labels: backend, urgent]");
+  });
+
+  it("omits labels bracket for in-progress tickets when labels array is empty", () => {
+    const board = emptyBoard();
+    board.inProgress = [
+      inProgress({ identifier: "ES-510", title: "WIP", priority: 2, status: "in_progress", prNumber: null, labels: [] }),
+    ];
+    const out = formatBoard(board);
+    expect(out).toContain("- ES-510 [High] WIP (in_progress)");
+    expect(out).not.toContain("[labels:");
   });
 
   it("formats done tickets with merged date", () => {
@@ -470,5 +490,56 @@ describe("buildGroomPrompt — update_memory full replacement", () => {
     // The prompt must convey that content overwrites everything — not just appends
     expect(out).toContain("まるごと置き換える");
     expect(out).toContain("保持したい情報はすべて含めてください");
+  });
+});
+
+describe("buildGroomPrompt — memory injection budget", () => {
+  it("includes memory verbatim when total block fits within memoryBudgetChars", () => {
+    const args = makeGroomArgs({
+      memory: {
+        pmDecisions: "Decision: use Postgres",
+        implResults: "Result: auth module done",
+        productKnowledge: "Knowledge: users prefer dark mode",
+      },
+      memoryBudgetChars: 10000,
+    });
+    const out = buildGroomPrompt(args);
+    expect(out).toContain("Decision: use Postgres");
+    expect(out).toContain("Result: auth module done");
+    expect(out).toContain("Knowledge: users prefer dark mode");
+  });
+
+  it("truncates memory block when total size exceeds memoryBudgetChars", () => {
+    const longText = "x".repeat(3000);
+    const args = makeGroomArgs({
+      memory: {
+        pmDecisions: longText,
+        implResults: longText,
+        productKnowledge: longText,
+      },
+      memoryBudgetChars: 200,
+    });
+    const out = buildGroomPrompt(args);
+    // Memory section header must still be present
+    expect(out).toContain("# 横断メモリ");
+    // Truncation marker must appear
+    expect(out).toContain("[...省略...]");
+    // The three 3000-char values together would vastly exceed 200 — ensure the block is bounded
+    const memStart = out.indexOf("# 横断メモリ");
+    const memEnd = out.indexOf("[...省略...]") + "[...省略...]".length;
+    const memBlock = out.slice(memStart, memEnd);
+    // budget (200) + marker overhead must be far less than 9000 chars of raw content
+    expect(memBlock.length).toBeLessThan(300);
+  });
+
+  it("does not append truncation marker when memory fits exactly within budget", () => {
+    const content = "Short decision";
+    const args = makeGroomArgs({
+      memory: { pmDecisions: content, implResults: null, productKnowledge: null },
+      memoryBudgetChars: 10000,
+    });
+    const out = buildGroomPrompt(args);
+    expect(out).not.toContain("[...省略...]");
+    expect(out).toContain(content);
   });
 });

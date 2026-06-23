@@ -338,6 +338,8 @@ export interface GroomPromptArgs {
   };
   board: BoardState;
   boardBudgetChars: number;
+  /** Max chars for the combined memory block injected into the prompt (memory.inject_budget_chars). */
+  memoryBudgetChars: number;
   digest: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
   codebaseSummary: string | null;
   optInLabel: string;

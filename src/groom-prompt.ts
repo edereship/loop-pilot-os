@@ -17,7 +17,8 @@ function formatEligibleLine(t: BoardTicket): string {
 
 function formatInProgressLine(t: InProgressTicket): string {
   const prPart = t.prNumber !== null ? `, PR #${t.prNumber}` : "";
-  return `- ${t.identifier} [${priorityLabel(t.priority)}] ${t.title} (${t.status}${prPart})`;
+  const labelPart = t.labels.length > 0 ? ` [labels: ${t.labels.join(", ")}]` : "";
+  return `- ${t.identifier} [${priorityLabel(t.priority)}] ${t.title} (${t.status}${prPart})${labelPart}`;
 }
 
 function formatDoneLine(t: DoneTicket): string {
@@ -182,7 +183,7 @@ function buildGroomInstructions(optInLabel: string, maxMemoryChars: number, know
 }
 
 export function buildGroomPrompt(args: GroomPromptArgs): string {
-  const { specContent, goal, memory, board, boardBudgetChars, digest, codebaseSummary, optInLabel, maxMemoryChars, knownLabels } = args;
+  const { specContent, goal, memory, board, boardBudgetChars, memoryBudgetChars, digest, codebaseSummary, optInLabel, maxMemoryChars, knownLabels } = args;
 
   const blocks: string[] = [];
 
@@ -213,7 +214,11 @@ export function buildGroomPrompt(args: GroomPromptArgs): string {
     memoryParts.push(["## Product Knowledge", "", memory.productKnowledge].join("\n"));
   }
   if (memoryParts.length > 0) {
-    blocks.push(["# 横断メモリ", "", ...memoryParts].join("\n\n"));
+    let memoryBlock = ["# 横断メモリ", "", ...memoryParts].join("\n\n");
+    if (memoryBlock.length > memoryBudgetChars) {
+      memoryBlock = memoryBlock.slice(0, memoryBudgetChars) + "\n[...省略...]";
+    }
+    blocks.push(memoryBlock);
   }
 
   // 4. Ticket board
