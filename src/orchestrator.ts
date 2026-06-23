@@ -2082,7 +2082,9 @@ export class Orchestrator {
         if (pushRes.code !== 0) {
           // Roll back the local commit so the branch does not stay ahead of origin;
           // fetchDefaultBranch's git reset --hard would silently discard it (ES-452 Finding 3).
-          await this.runner.run("git", ["reset", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+          // Use --hard to also clean the worktree; --mixed (the default) would leave the
+          // memory files modified, causing the next startup's clean-worktree preflight to fail.
+          await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
           this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
         }
       }

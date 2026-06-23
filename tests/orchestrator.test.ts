@@ -2006,7 +2006,7 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
     h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
     h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
     h.memoryRunner.on(["git", "push", "origin", "HEAD:main"], { code: 1, stderr: "remote: Permission denied" });
-    h.memoryRunner.on(["git", "reset", "HEAD~1"], { code: 0 });
+    h.memoryRunner.on(["git", "reset", "--hard", "HEAD~1"], { code: 0 });
 
     h.orch.requestStop();
     await h.orch.run();
@@ -2015,6 +2015,7 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
       (c) => c.cmd === "git" && c.args[0] === "reset" && c.args.includes("HEAD~1"),
     );
     expect(resetCall).toBeDefined();
+    expect(resetCall?.args).toContain("--hard");
     expect(h.store.latestRun()!.state).toBe("halted");
   });
 });
