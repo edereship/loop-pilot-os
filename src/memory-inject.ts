@@ -34,7 +34,9 @@ export function buildMemoryBlock(
   // so the final block never exceeds budgetChars.
   const markersLen = active.length * MARKER.length;
   const overhead = overheadWithoutMarkers + markersLen;
-  const contentBudget = Math.max(0, budgetChars - overhead);
+  const contentBudget = budgetChars - overhead;
+  // If even the structural skeleton (headers + markers) doesn't fit, omit the block entirely.
+  if (contentBudget <= 0) return "";
   const perCategory = Math.floor(contentBudget / active.length);
 
   const parts = active.map((e) => {

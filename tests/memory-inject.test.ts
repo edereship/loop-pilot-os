@@ -121,6 +121,27 @@ describe("buildMemoryBlock", () => {
     expect(result.length).toBeLessThanOrEqual(6000);
   });
 
+  it("returns empty string when budget is smaller than structural overhead (ES-454 Finding 1)", () => {
+    // overhead for two full category labels: mainHeader(11) + sep(2) + catHeaders(27+22) + markers(22) = 84
+    // budget of 50 < 84, so the block must be omitted entirely
+    const result = buildMemoryBlock(
+      [
+        { label: "Implementation Results", content: "x" },
+        { label: "Product Knowledge", content: "y" },
+      ],
+      50,
+    );
+    expect(result).toBe("");
+  });
+
+  it("returns empty string when budget exactly equals structural overhead (ES-454 Finding 1)", () => {
+    // For one 1-char label: overhead = mainHeader(11) + catHeader(6) + marker(11) = 28
+    // With 50 chars of content, the no-truncation path is bypassed (17+50=67 > 28),
+    // so we enter the truncation path where contentBudget = 28-28 = 0 → omit block.
+    const result = buildMemoryBlock([{ label: "A", content: "x".repeat(50) }], 28);
+    expect(result).toBe("");
+  });
+
   it("is deterministic — same inputs produce same output", () => {
     const entries = [
       { label: "A", content: "content-a" },

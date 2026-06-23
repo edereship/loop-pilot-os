@@ -802,11 +802,9 @@ export class Orchestrator {
       }
     }
 
-    let planMem: ReturnType<typeof readMemoryAll> = { pmDecisions: null, implResults: null, productKnowledge: null };
-    try {
-      planMem = readMemoryAll(worktreePath);
-    } catch (err) {
-      this.log(`plan: memory read failed (non-fatal): ${errMsg(err)}`);
+    const planMem = readMemoryAll(worktreePath);
+    if (planMem.readErrors) {
+      this.log(`plan: memory read failed (non-fatal): ${planMem.readErrors.join("; ")}`);
     }
 
     const prompt = buildPlanPrompt({
@@ -923,11 +921,9 @@ export class Orchestrator {
       this.log(`select: codebase summary generation failed (non-fatal): ${errMsg(err)}`);
     }
 
-    let selectMem: ReturnType<typeof readMemoryAll> = { pmDecisions: null, implResults: null, productKnowledge: null };
-    try {
-      selectMem = readMemoryAll(this.config.repo.path);
-    } catch (err) {
-      this.log(`select: memory read failed (non-fatal): ${errMsg(err)}`);
+    const selectMem = readMemoryAll(this.config.repo.path);
+    if (selectMem.readErrors) {
+      this.log(`select: memory read failed (non-fatal): ${selectMem.readErrors.join("; ")}`);
     }
 
     const prompt = buildSelectPrompt({
@@ -1023,11 +1019,9 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
       }
     }
-    let mem: ReturnType<typeof readMemoryAll> = { pmDecisions: null, implResults: null, productKnowledge: null };
-    try {
-      mem = readMemoryAll(worktreePath);
-    } catch (err) {
-      this.log(`implement: memory read failed (non-fatal): ${errMsg(err)}`);
+    const mem = readMemoryAll(worktreePath);
+    if (mem.readErrors) {
+      this.log(`implement: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
     }
 
     const prompt = this.buildPrompt({
