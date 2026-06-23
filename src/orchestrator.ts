@@ -208,7 +208,7 @@ export class Orchestrator {
     // If the process crashed mid-abandon (after the marker was written but before gh pr close
     // ran), the session is still in_review. Skip the poll and force the abandon cleanup path
     // regardless of the PR's current open/closed state (ES-450 Finding 1).
-    if (session.stopDetail === "abandon_in_progress") {
+    if (session.stopDetail !== null && session.stopDetail.startsWith("abandon_in_progress")) {
       this.store.updateSession(session.id, { runId: this.runId });
       return await this.stopSession(session, "pr_closed", null);
     }
@@ -304,6 +304,15 @@ export class Orchestrator {
       );
     }
     if (prNumber !== null) {
+      // If the session's stop_detail marks an abandon in progress (onAbandonStarting wrote
+      // it before the crash), force the abandon cleanup path regardless of the open PR state.
+      // Without this, recoverByOpenPr would adopt the PR into monitoring, bypassing the
+      // chosen abandon and letting LoopPilot re-engage on a ticket that was being abandoned
+      // (ES-450 Finding 3).
+      if (session.stopDetail !== null && session.stopDetail.startsWith("abandon_in_progress")) {
+        this.store.updateSession(session.id, { runId: this.runId, prNumber });
+        return await this.stopSession(session, "pr_closed", null);
+      }
       // 既存のオープン PR を採用。monitorStartedAt は既存値 ?? clock()。
       const monitorStartedAt = session.monitorStartedAt ?? this.clock();
       this.store.updateSession(session.id, {
@@ -398,15 +407,21 @@ export class Orchestrator {
       // A transient poll error means we have no verdict to compare against the exhaustion
       // detail. If the session's stopDetail indicates a terminal counter exhaustion, do not
       // revive it — we cannot confirm the stop reason changed, so preserve the terminal HALT.
-      if (
-        session.stopDetail !== null &&
-        (session.stopDetail.startsWith("auto-restart limit exceeded") ||
-          session.stopDetail.startsWith("quota retry limit exceeded"))
-      ) {
-        this.log(
-          `recovery: skipping exhausted stopped session PR #${prNumber} (poll error): ${session.stopDetail}`,
+      // extractInnerStopDetail unwraps "abandon_in_progress:<original>" so that a failed
+      // abandon over an exhausted session still triggers the exhaustion guard (ES-450 Finding 4).
+      if (session.stopDetail !== null) {
+        const innerDetailForPollError = extractInnerStopDetail(
+          stripRecoveryFailedSuffix(session.stopDetail) ?? "",
         );
-        return CONTINUE;
+        if (
+          innerDetailForPollError.startsWith("auto-restart limit exceeded") ||
+          innerDetailForPollError.startsWith("quota retry limit exceeded")
+        ) {
+          this.log(
+            `recovery: skipping exhausted stopped session PR #${prNumber} (poll error): ${session.stopDetail}`,
+          );
+          return CONTINUE;
+        }
       }
       this.resetAndAdopt(session.id);
       return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
@@ -426,15 +441,20 @@ export class Orchestrator {
           // Compare against the current verdict.stopReason so that a different new stop
           // reason (e.g. test_failure after workflow_crashed was exhausted) gets a fresh
           // restart budget rather than being silently skipped.
+          // extractInnerStopDetail unwraps "abandon_in_progress:<original>" so that a failed
+          // abandon over an exhausted session still honours the cap (ES-450 Finding 4).
+          const rawDetailForExhaustion = extractInnerStopDetail(
+            stripRecoveryFailedSuffix(session.stopDetail) ?? "",
+          );
           if (
             (recoveryCategory === "auto_restart" &&
               session.stopDetail !== null &&
-              session.stopDetail.startsWith("auto-restart limit exceeded") &&
-              extractExhaustedStopReason(stripRecoveryFailedSuffix(session.stopDetail) ?? "") === verdict.stopReason) ||
+              rawDetailForExhaustion.startsWith("auto-restart limit exceeded") &&
+              extractExhaustedStopReason(rawDetailForExhaustion) === verdict.stopReason) ||
             (recoveryCategory === "quota_wait" &&
               session.stopDetail !== null &&
-              session.stopDetail.startsWith("quota retry limit exceeded") &&
-              extractExhaustedStopReason(stripRecoveryFailedSuffix(session.stopDetail) ?? "") === verdict.stopReason)
+              rawDetailForExhaustion.startsWith("quota retry limit exceeded") &&
+              extractExhaustedStopReason(rawDetailForExhaustion) === verdict.stopReason)
           ) {
             // Before skipping, retry if a prior Codex recovery failed (e.g. transient
             // /restart-review post failure). Without this the failed recovery is never
@@ -493,22 +513,21 @@ export class Orchestrator {
         return CONTINUE;
       }
       case "pr_closed": {
-        // If a prior abandon recovery closed the PR but failed at the ticket revert to Todo,
-        // retry the transition now. The PR is already closed so only the ticket cleanup remains.
-        // Leave for the next daemon start on transient failure (no state update on error).
+        // If a prior abandon recovery closed the PR but failed at branch cleanup or ticket
+        // revert, retry the full abandon cleanup. isPartialAbandon in stopSession detects
+        // the abandon_in_progress sentinel or recovery-failed marker and re-enters executeAbandon,
+        // which tolerates "already closed" / "already deleted" gracefully (ES-450 Finding 1).
         if (
           !session.recoveryAttempted &&
           session.stopDetail !== null &&
-          session.stopDetail.includes("(recovery failed: ticket revert to Todo failed:")
+          (session.stopDetail.startsWith("abandon_in_progress") ||
+            session.stopDetail.startsWith("recovery failed: ") ||
+            session.stopDetail.includes(" (recovery failed: "))
         ) {
-          try {
-            this.store.updateSession(session.id, { runId: this.runId });
-            await this.source.transition(session.linearIssueId, "todo");
-            this.store.updateSession(session.id, { recoveryAttempted: 1, recoveryAction: "abandon" });
-            this.log(`recovery: retried abandon ticket revert for session ${session.id} → todo`);
-          } catch (err) {
-            this.log(`recovery: abandon ticket revert retry failed: ${errMsg(err)}`);
-          }
+          this.store.updateSession(session.id, { runId: this.runId });
+          const retryCtrl = await this.stopSession(session, "pr_closed", null);
+          if (retryCtrl.control === "halt") return HALT;
+          return retryCtrl;
         }
         return CONTINUE;
       }
@@ -1677,7 +1696,10 @@ export class Orchestrator {
       // abandon (crash mid-abandon with stopDetail="abandon_in_progress") left the ticket
       // in a dirty state — recovery can complete the cleanup (ES-450 Finding 4).
       const isPartialAbandon = reason === "pr_closed" && (
-        fresh.stopDetail === "abandon_in_progress" ||
+        // startsWith covers both the plain "abandon_in_progress" sentinel and the compound
+        // "abandon_in_progress:<original>" form used when a failed abandon preserves the
+        // original exhaustion detail (ES-450 Finding 4).
+        (fresh.stopDetail !== null && fresh.stopDetail.startsWith("abandon_in_progress")) ||
         // A prior recovery attempt ran but failed mid-abandon (e.g. ticket revert failed after
         // the PR and branch were already cleaned up). For pr_closed sessions the only path where
         // recovery can run is via isPartialAbandon itself, so a "recovery failed:" marker in
@@ -1695,8 +1717,20 @@ export class Orchestrator {
         });
         // Persist crash-recovery marker before the PR close step inside executeAbandon so
         // a mid-abandon crash is detectable on the next daemon start (ES-450 Finding 4).
+        // Capture the current effectiveDetail so we can embed an exhaustion detail in the
+        // compound marker — without this, the next recoverStoppedByLooppilot startup would
+        // not recognise the terminal cap and would reset/adopt the session (ES-450 Finding 4).
+        const capturedDetailForMarker = effectiveDetail;
         const onAbandonStarting = () => {
-          this.store.updateSession(session.id, { stopDetail: "abandon_in_progress" });
+          const innerForMarker = extractInnerStopDetail(capturedDetailForMarker ?? "");
+          const isExhaustedDetail =
+            innerForMarker.startsWith("auto-restart limit exceeded") ||
+            innerForMarker.startsWith("quota retry limit exceeded");
+          this.store.updateSession(session.id, {
+            stopDetail: isExhaustedDetail
+              ? `abandon_in_progress:${innerForMarker}`
+              : "abandon_in_progress",
+          });
         };
         // Gate label handling for handoff_failed is now inside executeRecoveryTurn (after
         // parseRecoveryAction), so abandon/escalate can proceed even when the label API is
@@ -1869,8 +1903,18 @@ export class Orchestrator {
           // recovery detects it and resumes only cleanup (branch delete / ticket revert)
           // rather than re-entering Codex and potentially choosing fix_code or
           // restart_review against an already-closed PR (ES-450 Finding 2).
+          // Embed the original exhaustion detail in the compound marker so the exhaustion
+          // cap in recoverStoppedByLooppilot is still honoured on the next daemon start —
+          // without this the cap is lost and the session gets a fresh restart budget
+          // (ES-450 Finding 4).
           if (result.action === "abandon") {
-            effectiveDetail = "abandon_in_progress";
+            const innerForFailed = extractInnerStopDetail(effectiveDetail ?? "");
+            const isExhaustedFailed =
+              innerForFailed.startsWith("auto-restart limit exceeded") ||
+              innerForFailed.startsWith("quota retry limit exceeded");
+            effectiveDetail = isExhaustedFailed
+              ? `abandon_in_progress:${innerForFailed}`
+              : "abandon_in_progress";
           }
           if (result.message) {
             effectiveDetail = effectiveDetail
@@ -1884,6 +1928,12 @@ export class Orchestrator {
           if (result.preserveWorktree || result.nonRetryable) {
             this.store.updateSession(session.id, { recoveryAttempted: 1 });
           }
+          // Do not persist workflowHandledErrorCount in the stopped row when recovery
+          // fails. A later restart_review retry does not clear it from recoveryUpdate,
+          // so the next workflow_failed poll would see errorCommentCount already handled
+          // and skip the fix entirely (ES-450 Finding 2).
+          const { workflowHandledErrorCount: _omit, ...patchWithoutCount } = patch;
+          patch = patchWithoutCount;
         }
         // escalated / failed → fall through to normal stop
       }
@@ -2012,6 +2062,17 @@ async function retry(times: number, fn: () => Promise<void>): Promise<void> {
 function extractExhaustedStopReason(stopDetail: string): string {
   const idx = stopDetail.lastIndexOf(": ");
   return idx === -1 ? "" : stopDetail.slice(idx + 2);
+}
+
+/**
+ * Extracts the embedded original stop detail from a compound abandon_in_progress marker.
+ * "abandon_in_progress:<original>" → "<original>", any other value → unchanged.
+ * Used to recover the exhaustion detail for the restart-cap guard when a failed abandon
+ * encoded the terminal stop reason inside the in-progress sentinel (ES-450 Finding 4).
+ */
+function extractInnerStopDetail(s: string): string {
+  const PREFIX = "abandon_in_progress:";
+  return s.startsWith(PREFIX) ? s.slice(PREFIX.length) : s;
 }
 
 /**

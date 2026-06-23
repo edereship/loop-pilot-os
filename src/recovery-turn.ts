@@ -416,6 +416,12 @@ async function executeFixCode(
     return { kind: "failed", action: "fix_code", message: "recovery fix agent left uncommitted changes", costUsd: outcome.costUsd, preserveWorktree: true };
   }
   const logResult = await runner.run("git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"], { cwd: worktreePath });
+  if (logResult.code !== 0) {
+    // Treat non-zero exit the same as the cost/error path above: we cannot confirm the
+    // worktree is clean, so preserve to avoid discarding commits on the next reset.
+    // The earlier cost/error path uses the same logic (ES-450 Finding 5).
+    return { kind: "failed", action: "fix_code", message: `git log exited ${logResult.code}`, costUsd: outcome.costUsd, preserveWorktree: true };
+  }
   if (logResult.stdout.trim() === "") {
     return { kind: "failed", action: "fix_code", message: "recovery fix agent made no commits", costUsd: outcome.costUsd, nonRetryable: true };
   }
