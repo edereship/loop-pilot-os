@@ -1823,15 +1823,14 @@ export class Orchestrator {
               this.log(`recovery: handoff_failed post-recovery transition(in_review) failed: ${handoffErr}`);
             }
             if (handoffErr !== null) {
-              // Build failure detail and fall through to stop — recoveryAttempted stays 0
-              // so the next startup picks this up and retries (ES-450 Finding 4).
+              // Build failure detail with a sentinel encoding the completed action so the
+              // next retry skips Codex and directly retries only the transition — avoids
+              // duplicate mutations or a different recovery choice (ES-450 Finding 1).
               if (recoveryCost > 0) {
                 const freshened2 = this.store.getSession(session.id);
                 patch = { ...patch, costUsd: (freshened2.costUsd ?? 0) + recoveryCost };
               }
-              effectiveDetail = effectiveDetail
-                ? `${effectiveDetail} (recovery failed: linear transition(in_review) failed: ${handoffErr})`
-                : `recovery failed: linear transition(in_review) failed: ${handoffErr}`;
+              effectiveDetail = `handoff_transition_pending:${result.action} (recovery failed: linear transition(in_review) failed: ${handoffErr})`;
             } else {
               await this.notifier.notify({
                 kind: "recovery_succeeded",
@@ -1865,6 +1864,13 @@ export class Orchestrator {
           // stripRecoveryFailedSuffix and is still matched by stoppedSessionsWithFailedRecovery.
           if (result.restartCommentOnly) {
             effectiveDetail = "fix_pushed_restart_pending";
+          }
+          // For failed abandons, preserve the abandon_in_progress sentinel so the next
+          // recovery detects it and resumes only cleanup (branch delete / ticket revert)
+          // rather than re-entering Codex and potentially choosing fix_code or
+          // restart_review against an already-closed PR (ES-450 Finding 2).
+          if (result.action === "abandon") {
+            effectiveDetail = "abandon_in_progress";
           }
           if (result.message) {
             effectiveDetail = effectiveDetail

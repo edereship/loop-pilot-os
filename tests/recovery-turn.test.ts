@@ -643,4 +643,85 @@ describe("executeRecoveryTurn", () => {
     expect(result).toEqual<RecoveryTurnResult>({ kind: "recovered", action: "restart_review", costUsd: 0 });
     expect(git.calls.some((c) => c.method === "postComment")).toBe(true);
   });
+
+  // ES-450 Finding 4: rebase succeeds but restart-review comment fails → restartCommentOnly sentinel.
+  it("rebase: push succeeds but restart-review comment fails → failed result with restartCommentOnly", async () => {
+    const { deps, planner, runner, git } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"rebase"}' }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("rebase")) return { code: 0 };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    git.failNext("postComment");
+
+    const session = fakeSession({ prNumber: 42 });
+    const result = await executeRecoveryTurn(deps, session, "merge_conflict", null);
+
+    expect(result).toEqual<RecoveryTurnResult>({
+      kind: "failed",
+      action: "rebase",
+      message: expect.stringContaining("restart-review"),
+      restartCommentOnly: true,
+    });
+  });
+
+  // ES-450 Finding 3: git log exits non-zero during cost_exceeded/error path → preserveWorktree.
+  it("fix_code: agent cost_exceeded with git log failing → preserveWorktree set", async () => {
+    const { deps, planner, agent, runner } = makeDeps();
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
+    agent.outcomes = [{ kind: "cost_exceeded", costUsd: 1.9 }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      if (args.includes("status")) return { code: 0, stdout: "" }; // clean status
+      if (args.includes("log")) return { code: 128, stderr: "fatal: not a git repo" }; // log fails
+      return { code: 0, stdout: "" };
+    });
+
+    const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
+
+    expect(result).toMatchObject<Partial<RecoveryTurnResult>>({
+      kind: "failed",
+      action: "fix_code",
+      preserveWorktree: true,
+    });
+    // Should NOT be nonRetryable — we can't confirm no commits exist
+    expect((result as { nonRetryable?: boolean }).nonRetryable).toBeFalsy();
+  });
+
+  // ES-450 Finding 2: abandon_in_progress prefix matches failed-cleanup sentinel.
+  it("abandon_in_progress prefix: partial-cleanup sentinel bypasses Codex and resumes abandon", async () => {
+    const { deps, runner } = makeDeps();
+    // No planner outcomes queued — Codex must NOT be called.
+    runner.on(["gh", "pr", "close"], { code: 1, stderr: "PR already closed" });
+    runner.on(["git", "push"], { code: 0 });
+
+    const session = fakeSession({
+      prNumber: 42,
+      stopDetail: "abandon_in_progress (recovery failed: remote branch delete failed: network error)",
+    });
+    const result = await executeRecoveryTurn(deps, session, "ci_failed", "abandon_in_progress");
+
+    // Must go through abandon cleanup, not Codex
+    expect(result).toMatchObject<Partial<RecoveryTurnResult>>({ kind: "continued", action: "abandon" });
+    const closeCall = runner.calls.find((c) => c.cmd === "gh" && c.args.includes("close"));
+    expect(closeCall).toBeDefined();
+  });
+
+  // ES-450 Finding 1: handoff_transition_pending sentinel → skip Codex and return recovered.
+  it("handoff_transition_pending: bypasses Codex and signals recovered to retry transition", async () => {
+    const { deps } = makeDeps();
+    // No planner outcomes queued — Codex must NOT be called.
+
+    const session = fakeSession({
+      prNumber: 42,
+      stopDetail: "handoff_transition_pending:restart_review (recovery failed: linear transition(in_review) failed: 503)",
+    });
+    const result = await executeRecoveryTurn(deps, session, "handoff_failed", "handoff_transition_pending:restart_review");
+
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "recovered", action: "restart_review", costUsd: 0 });
+  });
 });

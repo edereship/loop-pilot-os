@@ -167,9 +167,10 @@ export async function executeRecoveryTurn(
   const { planner, agent, git, runner, source, config, log } = deps;
 
   // If the prior recovery turn persisted the crash-recovery marker before closing the PR,
-  // the action is deterministically abandon — skip re-planning to prevent Codex from
-  // choosing fix_code or restart_review and reactivating the session (ES-450 Finding 1).
-  if (session.stopDetail === "abandon_in_progress") {
+  // or if a prior abandon failed mid-cleanup (PR already closed), the action is
+  // deterministically abandon — skip re-planning to prevent Codex from choosing fix_code
+  // or restart_review against an already-closed PR (ES-450 Finding 1, Finding 2).
+  if (session.stopDetail !== null && session.stopDetail.startsWith("abandon_in_progress")) {
     log("recovery: abort crash detected, resuming abandon cleanup");
     return await executeAbandon(deps, session, onAbandonStarting);
   }
@@ -180,6 +181,15 @@ export async function executeRecoveryTurn(
   if (session.stopDetail !== null && session.stopDetail.startsWith("fix_pushed_restart_pending")) {
     log("recovery: fix already pushed, retrying restart-review comment");
     return await executeRestartReview(deps, session);
+  }
+
+  // If a prior handoff_failed recovery succeeded (label added, /restart-review posted) but
+  // transition(in_review) failed, skip Codex and signal recovered so stopSession retries
+  // only the transition (ES-450 Finding 1).
+  if (session.stopDetail !== null && session.stopDetail.startsWith("handoff_transition_pending:")) {
+    const action = session.stopDetail.slice("handoff_transition_pending:".length).split(" ")[0] as RecoveryActionKind;
+    log(`recovery: handoff transition pending for action=${action}, retrying transition`);
+    return { kind: "recovered", action, costUsd: 0 };
   }
 
   // 1. Call Codex to analyze the situation
@@ -377,7 +387,10 @@ async function executeFixCode(
           "git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"],
           { cwd: worktreePath },
         );
-        if (logResult.code === 0 && logResult.stdout.trim() !== "") {
+        // Treat a non-zero exit from git log the same as having unpushed commits:
+        // we cannot confirm the worktree is clean, so preserve to avoid discarding
+        // work on the next reset (ES-450 Finding 3).
+        if (logResult.code !== 0 || logResult.stdout.trim() !== "") {
           preserveWorktree = true;
         }
       }
@@ -479,7 +492,10 @@ async function executeRebase(
     try {
       await git.postComment(session.prNumber, "/restart-review");
     } catch (err) {
-      return { kind: "failed", action: "rebase", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}` };
+      // Rebase was already pushed — only the restart comment is outstanding. Signal this
+      // via restartCommentOnly so stopSession encodes the sentinel in stop_detail, letting
+      // the next recovery bypass Codex and retry only the comment (ES-450 Finding 4).
+      return { kind: "failed", action: "rebase", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}`, restartCommentOnly: true };
     }
   }
 
