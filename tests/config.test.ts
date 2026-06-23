@@ -644,4 +644,23 @@ describe("loadConfig", () => {
     const config = loadConfig(fixture("config-select-diff-budget.toml"), fullEnv);
     expect(config.safety.selectDiffBudgetChars).toBe(10000);
   });
+
+  // ES-451: v3 groom/memory config defaults
+  it("defaults groom and memory config when sections are omitted", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.groom.enabled).toBe(true);
+    expect(config.safety.groomTimeoutMinutes).toBe(10);
+    expect(config.safety.groomBoardBudgetChars).toBe(10000);
+    expect(config.memory.maxCharsPerFile).toBe(8000);
+    expect(config.memory.injectBudgetChars).toBe(6000);
+  });
+
+  it("reads explicit [groom] and [memory] values", () => {
+    const config = loadConfig(fixture("config-groom-memory.toml"), fullEnv);
+    expect(config.groom.enabled).toBe(false);
+    expect(config.safety.groomTimeoutMinutes).toBe(5);
+    expect(config.safety.groomBoardBudgetChars).toBe(20000);
+    expect(config.memory.maxCharsPerFile).toBe(4000);
+    expect(config.memory.injectBudgetChars).toBe(3000);
+  });
 });

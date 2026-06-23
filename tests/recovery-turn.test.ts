@@ -161,10 +161,13 @@ function makeConfig(): Config {
       sessionHardTimeoutMinutes: 120, maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2, codexTimeoutMinutes: 30,
       selectDiffBudgetChars: 6000, selectCodebaseSummaryBudgetChars: 5000,
+      groomTimeoutMinutes: 10, groomBoardBudgetChars: 10000,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
     looppilot: { gateLabel: "loop-pilot" },
     notify: { progress: false },
+    groom: { enabled: true },
+    memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
     digest: { recentMergedCount: 5, enabled: true },
   } as unknown as Config;
 }

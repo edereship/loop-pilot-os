@@ -58,6 +58,8 @@ not_engaged_guard_minutes = 30   # 常時オン
 session_hard_timeout_minutes = 120  # 任意。既定120。hung（無進捗・無支出）claude を切る hard backstop
 # select_diff_budget_chars = 6000  # PM選別ターンに渡す直前PRの full diff 予算（文字数）。超過時は per-file head で機械 truncate
 # select_codebase_summary_budget_chars = 5000  # PM選別ターンに渡すコードベースサマリ予算（文字数）。大規模リポではトランケーション
+# groom_timeout_minutes = 10     # GROOM フェーズの Codex タイムアウト（既定10分）
+# groom_board_budget_chars = 10000  # GROOM に渡すチケット盤面の文字数予算（既定10000）
 
 [loop]
 monitor_poll_seconds = 60
@@ -70,3 +72,10 @@ recent_merged_count = 5
 [notify]
 # Slack Webhook は環境変数 SLACK_WEBHOOK_URL（未設定ならコンソールのみ）
 # progress = false              # true にすると各チケットの着手/完了を Slack にも通知（既定 false）
+
+[groom]
+# enabled = true                # false にすると GROOM フェーズをスキップ（既定 true）
+
+[memory]
+# max_chars_per_file = 8000     # 横断メモリ 1 ファイルあたりの最大文字数（既定 8000）
+# inject_budget_chars = 6000    # SELECT/PLAN プロンプトへのメモリ注入文字数予算（既定 6000）

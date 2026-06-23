@@ -6,6 +6,8 @@ import type {
   FailureReason,
   TaskSessionRow,
   PauseMeta,
+  GroomLogRow,
+  GroomOutcome,
 } from "./types.js";
 
 // ---- カーネル §4 のスキーマ（一字一句） ----
@@ -54,6 +56,20 @@ CREATE TABLE IF NOT EXISTS notification_intent (
   delivered_console INTEGER NOT NULL DEFAULT 0,
   delivered_slack INTEGER NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS groom_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES run(id),
+  loop_index INTEGER NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  summary TEXT,
+  actions_requested INTEGER NOT NULL DEFAULT 0,
+  actions_executed INTEGER NOT NULL DEFAULT 0,
+  actions_rejected INTEGER NOT NULL DEFAULT 0,
+  action_details TEXT,
+  outcome TEXT CHECK (outcome IN ('completed','skipped','error')),
+  error_detail TEXT
 );
 CREATE TABLE IF NOT EXISTS run_lock (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -142,6 +158,37 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     pendingRestartReason: r.pending_restart_reason,
     recoveryAttempted: r.recovery_attempted,
     recoveryAction: r.recovery_action,
+  };
+}
+
+interface RawGroomLogRow {
+  id: number;
+  run_id: number;
+  loop_index: number;
+  started_at: string;
+  ended_at: string | null;
+  summary: string | null;
+  actions_requested: number;
+  actions_executed: number;
+  actions_rejected: number;
+  action_details: string | null;
+  outcome: string | null;
+  error_detail: string | null;
+}
+function toGroomLogRow(r: RawGroomLogRow): GroomLogRow {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    loopIndex: r.loop_index,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    summary: r.summary,
+    actionsRequested: r.actions_requested,
+    actionsExecuted: r.actions_executed,
+    actionsRejected: r.actions_rejected,
+    actionDetails: r.action_details,
+    outcome: r.outcome as GroomOutcome | null,
+    errorDetail: r.error_detail,
   };
 }
 
@@ -671,5 +718,73 @@ export class SqliteStore {
     this.db
       .prepare(`DELETE FROM run_lock WHERE id = 1 AND pid = ?`)
       .run(pid);
+  }
+
+  // ---- groom_log (ES-451) ----
+  insertGroomLog(s: {
+    runId: number;
+    loopIndex: number;
+    startedAt: string;
+  }): GroomLogRow {
+    const info = this.db
+      .prepare(
+        `INSERT INTO groom_log (run_id, loop_index, started_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(s.runId, s.loopIndex, s.startedAt);
+    return this.getGroomLog(Number(info.lastInsertRowid));
+  }
+
+  getGroomLog(id: number): GroomLogRow {
+    const row = this.db
+      .prepare(`SELECT * FROM groom_log WHERE id = ?`)
+      .get(id) as RawGroomLogRow | undefined;
+    if (row === undefined) {
+      throw new Error(`groom_log not found: id=${id}`);
+    }
+    return toGroomLogRow(row);
+  }
+
+  updateGroomLog(
+    id: number,
+    patch: Partial<Pick<GroomLogRow,
+      | "endedAt"
+      | "summary"
+      | "actionsRequested"
+      | "actionsExecuted"
+      | "actionsRejected"
+      | "actionDetails"
+      | "outcome"
+      | "errorDetail"
+    >>,
+  ): void {
+    const COLUMN_MAP: Record<string, string> = {
+      endedAt: "ended_at",
+      summary: "summary",
+      actionsRequested: "actions_requested",
+      actionsExecuted: "actions_executed",
+      actionsRejected: "actions_rejected",
+      actionDetails: "action_details",
+      outcome: "outcome",
+      errorDetail: "error_detail",
+    };
+    const setClauses: string[] = [];
+    const values: Array<string | number | null> = [];
+    for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
+      const column = COLUMN_MAP[key as string];
+      if (column === undefined) continue;
+      const raw = patch[key];
+      if (raw === undefined) continue;
+      setClauses.push(`${column} = ?`);
+      values.push(raw as string | number | null);
+    }
+    if (setClauses.length === 0) return;
+    values.push(id);
+    const info = this.db
+      .prepare(`UPDATE groom_log SET ${setClauses.join(", ")} WHERE id = ?`)
+      .run(...values);
+    if (info.changes !== 1) {
+      throw new Error(`updateGroomLog affected ${info.changes} rows for id=${id}`);
+    }
   }
 }

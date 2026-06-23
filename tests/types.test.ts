@@ -27,6 +27,11 @@ import type {
   WorkflowRecovery,
   PauseTarget,
   PauseMeta,
+  GroomAction,
+  GroomOutput,
+  MemoryCategory,
+  GroomLogRow,
+  GroomOutcome,
 } from "../src/types.js";
 
 // 仕様 §7「状態語彙」: 各ユニオンのメンバを satisfies で固定する。
@@ -466,5 +471,125 @@ describe("PauseMeta / RunState / NotifyEvent type extensions", () => {
     };
     expect(paused.kind).toBe("paused");
     expect(resumed.kind).toBe("resumed");
+  });
+});
+
+describe("v3 GROOM 型（A3 / B2）", () => {
+  it("GroomAction は type で 7 バリアントを判別できる", () => {
+    const actions = [
+      { type: "reprioritize", issueId: "ES-1", priority: 2 as const, rationale: "urgent" },
+      { type: "update", issueId: "ES-2", title: "new title", rationale: "clarify" },
+      { type: "create", title: "new task", description: "details", priority: 3 as const, rationale: "gap" },
+      { type: "split", issueId: "ES-3", subtasks: [{ title: "sub1", description: "d1" }], rationale: "too big" },
+      { type: "close", issueId: "ES-4", rationale: "duplicate" },
+      { type: "label", issueId: "ES-5", add: ["bug"], remove: ["feature"], rationale: "reclassify" },
+      { type: "update_memory", category: "pm_decisions" as const, content: "decided X", rationale: "record" },
+    ] as const satisfies readonly GroomAction[];
+
+    const ensureExhaustive = (a: GroomAction): string => {
+      switch (a.type) {
+        case "reprioritize": return `reprioritize:${a.priority}`;
+        case "update": return `update:${a.issueId}`;
+        case "create": return `create:${a.title}`;
+        case "split": return `split:${a.subtasks.length}`;
+        case "close": return `close:${a.issueId}`;
+        case "label": return `label:${a.issueId}`;
+        case "update_memory": return `memory:${a.category}`;
+        default: { const never: never = a; return never; }
+      }
+    };
+    expect(actions.map(ensureExhaustive)).toHaveLength(7);
+  });
+
+  it("GroomAction.update は title/description をオプショナルで持つ", () => {
+    const titleOnly: GroomAction = { type: "update", issueId: "ES-1", title: "t", rationale: "r" };
+    const descOnly: GroomAction = { type: "update", issueId: "ES-1", description: "d", rationale: "r" };
+    expect(titleOnly.type).toBe("update");
+    expect(descOnly.type).toBe("update");
+  });
+
+  it("GroomAction.label は add/remove をオプショナルで持つ", () => {
+    const addOnly: GroomAction = { type: "label", issueId: "ES-1", add: ["bug"], rationale: "r" };
+    const removeOnly: GroomAction = { type: "label", issueId: "ES-1", remove: ["wip"], rationale: "r" };
+    expect(addOnly.type).toBe("label");
+    expect(removeOnly.type).toBe("label");
+  });
+
+  it("GroomOutput は actions 配列 + summary を持つ", () => {
+    const output: GroomOutput = {
+      actions: [
+        { type: "close", issueId: "ES-1", rationale: "done" },
+      ],
+      summary: "Closed 1 duplicate",
+    };
+    expect(output.actions).toHaveLength(1);
+    expect(output.summary).toBe("Closed 1 duplicate");
+  });
+
+  it("MemoryCategory は pm_decisions/impl_results/product_knowledge の 3 値である", () => {
+    const all = [
+      "pm_decisions",
+      "impl_results",
+      "product_knowledge",
+    ] as const satisfies readonly MemoryCategory[];
+    const ensureExhaustive = (c: MemoryCategory): string => {
+      switch (c) {
+        case "pm_decisions": return c;
+        case "impl_results": return c;
+        case "product_knowledge": return c;
+        default: { const never: never = c; return never; }
+      }
+    };
+    expect(all.map(ensureExhaustive)).toHaveLength(3);
+  });
+
+  it("GroomOutcome は completed/skipped/error の 3 値である", () => {
+    const all = [
+      "completed", "skipped", "error",
+    ] as const satisfies readonly GroomOutcome[];
+    const ensureExhaustive = (o: GroomOutcome): string => {
+      switch (o) {
+        case "completed": return o;
+        case "skipped": return o;
+        case "error": return o;
+        default: { const never: never = o; return never; }
+      }
+    };
+    expect(all.map(ensureExhaustive)).toHaveLength(3);
+  });
+
+  it("GroomLogRow は groom_log テーブルの全カラムに対応する", () => {
+    const row: GroomLogRow = {
+      id: 1,
+      runId: 1,
+      loopIndex: 0,
+      startedAt: "2026-06-23T00:00:00.000Z",
+      endedAt: "2026-06-23T00:01:00.000Z",
+      summary: "Reprioritized 2 tickets",
+      actionsRequested: 3,
+      actionsExecuted: 2,
+      actionsRejected: 1,
+      actionDetails: '[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}]',
+      outcome: "completed",
+      errorDetail: null,
+    };
+    expect(row.outcome).toBe("completed");
+    expect(row.errorDetail).toBeNull();
+
+    const minimal: GroomLogRow = {
+      id: 2,
+      runId: 1,
+      loopIndex: 1,
+      startedAt: "2026-06-23T00:02:00.000Z",
+      endedAt: null,
+      summary: null,
+      actionsRequested: 0,
+      actionsExecuted: 0,
+      actionsRejected: 0,
+      actionDetails: null,
+      outcome: "skipped",
+      errorDetail: null,
+    };
+    expect(minimal.endedAt).toBeNull();
   });
 });

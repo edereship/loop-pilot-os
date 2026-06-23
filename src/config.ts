@@ -63,6 +63,8 @@ const rawSchema = z.object({
     codex_timeout_minutes: z.number().positive().default(30),
     select_diff_budget_chars: z.number().int().positive().default(6000),
     select_codebase_summary_budget_chars: z.number().int().positive().default(5000),
+    groom_timeout_minutes: z.number().positive().default(10),
+    groom_board_budget_chars: z.number().int().positive().default(10000),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -74,6 +76,13 @@ const rawSchema = z.object({
   }).strict(),
   notify: z.object({
     progress: z.boolean().default(false),
+  }).strict().optional(),
+  groom: z.object({
+    enabled: z.boolean().default(true),
+  }).strict().optional(),
+  memory: z.object({
+    max_chars_per_file: z.number().int().positive().default(8000),
+    inject_budget_chars: z.number().int().positive().default(6000),
   }).strict().optional(),
   rate_limit: z.object({
     reprobe_minutes: z.number().positive().default(15),
@@ -134,6 +143,8 @@ export interface Config {
     codexTimeoutMinutes: number;
     selectDiffBudgetChars: number;
     selectCodebaseSummaryBudgetChars: number;
+    groomTimeoutMinutes: number;
+    groomBoardBudgetChars: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -145,6 +156,13 @@ export interface Config {
   };
   notify: {
     progress: boolean;
+  };
+  groom: {
+    enabled: boolean;
+  };
+  memory: {
+    maxCharsPerFile: number;
+    injectBudgetChars: number;
   };
   rateLimit: {
     reprobeMinutes: number;
@@ -635,6 +653,8 @@ export function loadConfig(
       codexTimeoutMinutes: raw.safety.codex_timeout_minutes,
       selectDiffBudgetChars: raw.safety.select_diff_budget_chars,
       selectCodebaseSummaryBudgetChars: raw.safety.select_codebase_summary_budget_chars,
+      groomTimeoutMinutes: raw.safety.groom_timeout_minutes,
+      groomBoardBudgetChars: raw.safety.groom_board_budget_chars,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
@@ -646,6 +666,13 @@ export function loadConfig(
     },
     notify: {
       progress: raw.notify?.progress ?? false,
+    },
+    groom: {
+      enabled: raw.groom?.enabled ?? true,
+    },
+    memory: {
+      maxCharsPerFile: raw.memory?.max_chars_per_file ?? 8000,
+      injectBudgetChars: raw.memory?.inject_budget_chars ?? 6000,
     },
     rateLimit: {
       reprobeMinutes: raw.rate_limit?.reprobe_minutes ?? 15,

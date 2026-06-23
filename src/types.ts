@@ -261,6 +261,41 @@ export interface ParsedSelection {
   rationale: string;
 }
 
+// ---- v3 GROOM フェーズ + 横断メモリ（A3 / B2） ----
+
+export type MemoryCategory = "pm_decisions" | "impl_results" | "product_knowledge";
+
+export type GroomAction =
+  | { type: "reprioritize"; issueId: string; priority: 1 | 2 | 3 | 4; rationale: string }
+  | { type: "update"; issueId: string; title?: string; description?: string; rationale: string }
+  | { type: "create"; title: string; description: string; priority: 1 | 2 | 3 | 4; rationale: string }
+  | { type: "split"; issueId: string; subtasks: { title: string; description: string }[]; rationale: string }
+  | { type: "close"; issueId: string; rationale: string }
+  | { type: "label"; issueId: string; add?: string[]; remove?: string[]; rationale: string }
+  | { type: "update_memory"; category: MemoryCategory; content: string; rationale: string };
+
+export interface GroomOutput {
+  actions: GroomAction[];
+  summary: string;
+}
+
+export type GroomOutcome = "completed" | "skipped" | "error";
+
+export interface GroomLogRow {
+  id: number;
+  runId: number;
+  loopIndex: number;
+  startedAt: string;
+  endedAt: string | null;
+  summary: string | null;
+  actionsRequested: number;
+  actionsExecuted: number;
+  actionsRejected: number;
+  actionDetails: string | null;
+  outcome: GroomOutcome | null;
+  errorDetail: string | null;
+}
+
 // ---- 実行コマンド抽象（git/gh/claude 共通） ----
 export interface CommandResult { code: number; stdout: string; stderr: string; }
 export interface RunOptions {
