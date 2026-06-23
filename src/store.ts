@@ -192,7 +192,17 @@ function toGroomLogRow(r: RawGroomLogRow): GroomLogRow {
   };
 }
 
-// ---- updateSession の patch キー → DB 列名の対応（部分更新の SET 句生成に使う） ----
+// ---- patch キー → DB 列名の対応（部分更新の SET 句生成に使う） ----
+const GROOM_LOG_PATCH_COLUMNS: Record<string, string> = {
+  endedAt: "ended_at",
+  summary: "summary",
+  actionsRequested: "actions_requested",
+  actionsExecuted: "actions_executed",
+  actionsRejected: "actions_rejected",
+  actionDetails: "action_details",
+  outcome: "outcome",
+  errorDetail: "error_detail",
+};
 const SESSION_PATCH_COLUMNS: Record<string, string> = {
   state: "state",
   worktreePath: "worktree_path",
@@ -758,21 +768,13 @@ export class SqliteStore {
       | "errorDetail"
     >>,
   ): void {
-    const COLUMN_MAP: Record<string, string> = {
-      endedAt: "ended_at",
-      summary: "summary",
-      actionsRequested: "actions_requested",
-      actionsExecuted: "actions_executed",
-      actionsRejected: "actions_rejected",
-      actionDetails: "action_details",
-      outcome: "outcome",
-      errorDetail: "error_detail",
-    };
     const setClauses: string[] = [];
     const values: Array<string | number | null> = [];
     for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
-      const column = COLUMN_MAP[key as string];
-      if (column === undefined) continue;
+      const column = GROOM_LOG_PATCH_COLUMNS[key as string];
+      if (column === undefined) {
+        throw new Error(`updateGroomLog: unknown patch key "${String(key)}"`);
+      }
       const raw = patch[key];
       if (raw === undefined) continue;
       setClauses.push(`${column} = ?`);
