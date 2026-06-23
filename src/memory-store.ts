@@ -1,9 +1,7 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
-import type { MemoryCategory } from "./types.js";
+import type { MemoryCategory, CommandRunner } from "./types.js";
 import type { SqliteStore } from "./store.js";
-import type { CommandRunner } from "./types.js";
 
 export const MEMORY_DIR = "docs/memory";
 
@@ -63,36 +61,25 @@ export function initialize(
   const dir = path.join(repoPath, MEMORY_DIR);
   mkdirSync(dir, { recursive: true });
 
-  const categories: MemoryCategory[] = [
-    "pm_decisions",
-    "impl_results",
-    "product_knowledge",
-  ];
-
   const implAlreadyExists = existsSync(
     path.join(dir, CATEGORY_FILES.impl_results),
   );
 
-  for (const cat of categories) {
+  for (const cat of Object.keys(CATEGORY_FILES) as MemoryCategory[]) {
     const filePath = path.join(dir, CATEGORY_FILES[cat]);
     if (existsSync(filePath)) continue;
-    writeFileSync(filePath, CATEGORY_HEADERS[cat], "utf-8");
-  }
-
-  if (!implAlreadyExists) {
-    const sessions = store.recentSessionSummaries(recentCount);
-    if (sessions.length > 0) {
-      const lines = sessions.map((s) => {
-        const cost = s.costUsd !== null ? `$${s.costUsd.toFixed(2)}` : "n/a";
-        return `- ${s.linearIdentifier}: ${s.issueTitle} — ${s.state} (${cost})`;
-      });
-      const content = `# Implementation Results\n\n${lines.join("\n")}\n`;
-      writeFileSync(
-        path.join(dir, CATEGORY_FILES.impl_results),
-        content,
-        "utf-8",
-      );
+    if (cat === "impl_results" && !implAlreadyExists) {
+      const sessions = store.recentSessionSummaries(recentCount);
+      if (sessions.length > 0) {
+        const lines = sessions.map((s) => {
+          const cost = s.costUsd !== null ? `$${s.costUsd.toFixed(2)}` : "n/a";
+          return `- ${s.linearIdentifier}: ${s.issueTitle} — ${s.state} (${cost})`;
+        });
+        writeFileSync(filePath, `# Implementation Results\n\n${lines.join("\n")}\n`, "utf-8");
+        continue;
+      }
     }
+    writeFileSync(filePath, CATEGORY_HEADERS[cat], "utf-8");
   }
 }
 
@@ -100,8 +87,10 @@ export async function commitIfChanged(
   runner: CommandRunner,
   repoPath: string,
 ): Promise<boolean> {
-  // Stage first so untracked files (from initialize) are included
-  await runner.run("git", ["add", MEMORY_DIR + "/"], { cwd: repoPath });
+  const add = await runner.run("git", ["add", MEMORY_DIR + "/"], { cwd: repoPath });
+  if (add.code !== 0) {
+    throw new Error(`git add failed (code ${add.code}): ${add.stderr}`);
+  }
   const diff = await runner.run(
     "git",
     ["diff", "--cached", "--quiet", "--", MEMORY_DIR + "/"],
@@ -109,10 +98,13 @@ export async function commitIfChanged(
   );
   if (diff.code === 0) return false;
 
-  await runner.run(
+  const commit = await runner.run(
     "git",
     ["commit", "-m", "chore: persist cross-task memory on halt", "--", MEMORY_DIR + "/"],
     { cwd: repoPath },
   );
+  if (commit.code !== 0) {
+    throw new Error(`git commit failed (code ${commit.code}): ${commit.stderr}`);
+  }
   return true;
 }

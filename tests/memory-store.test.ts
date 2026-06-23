@@ -157,6 +157,8 @@ describe("initialize", () => {
     expect(content).toContain("stopped");
     expect(content).toContain("ES-100");
     expect(content).toContain("merged");
+    // Most recent (ES-101, ended later) must appear before older (ES-100)
+    expect(content.indexOf("ES-101")).toBeLessThan(content.indexOf("ES-100"));
   });
 
   it("does not bootstrap impl-results when file already exists", () => {
@@ -196,6 +198,22 @@ describe("commitIfChanged", () => {
     expect(commitCall).toBeDefined();
     expect(commitCall!.args).toContain("chore: persist cross-task memory on halt");
     expect(commitCall!.opts.cwd).toBe("/repo");
+  });
+
+  it("throws when git add fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 128, stderr: "fatal: pathspec error" });
+
+    await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
+  });
+
+  it("throws when git commit fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 0 });
+    runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    runner.on(["git", "commit", "-m"], { code: 1, stderr: "error: author identity unknown" });
+
+    await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git commit failed/);
   });
 
   it("skips commit when no changes", async () => {
