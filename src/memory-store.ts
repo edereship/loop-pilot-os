@@ -1,7 +1,8 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { MemoryCategory } from "./types.js";
+import type { SqliteStore } from "./store.js";
 
 export const MEMORY_DIR = "docs/memory";
 
@@ -45,4 +46,51 @@ export function readAll(repoPath: string): {
     implResults: readCategory(repoPath, "impl_results"),
     productKnowledge: readCategory(repoPath, "product_knowledge"),
   };
+}
+
+const CATEGORY_HEADERS: Record<MemoryCategory, string> = {
+  pm_decisions: "# PM Decisions\n",
+  impl_results: "# Implementation Results\n",
+  product_knowledge: "# Product Knowledge\n",
+};
+
+export function initialize(
+  repoPath: string,
+  store: SqliteStore,
+  recentCount: number,
+): void {
+  const dir = path.join(repoPath, MEMORY_DIR);
+  mkdirSync(dir, { recursive: true });
+
+  const categories: MemoryCategory[] = [
+    "pm_decisions",
+    "impl_results",
+    "product_knowledge",
+  ];
+
+  const implAlreadyExists = existsSync(
+    path.join(dir, CATEGORY_FILES.impl_results),
+  );
+
+  for (const cat of categories) {
+    const filePath = path.join(dir, CATEGORY_FILES[cat]);
+    if (existsSync(filePath)) continue;
+    writeFileSync(filePath, CATEGORY_HEADERS[cat], "utf-8");
+  }
+
+  if (!implAlreadyExists) {
+    const sessions = store.recentSessionSummaries(recentCount);
+    if (sessions.length > 0) {
+      const lines = sessions.map((s) => {
+        const cost = s.costUsd !== null ? `$${s.costUsd.toFixed(2)}` : "n/a";
+        return `- ${s.linearIdentifier}: ${s.issueTitle} — ${s.state} (${cost})`;
+      });
+      const content = `# Implementation Results\n\n${lines.join("\n")}\n`;
+      writeFileSync(
+        path.join(dir, CATEGORY_FILES.impl_results),
+        content,
+        "utf-8",
+      );
+    }
+  }
 }

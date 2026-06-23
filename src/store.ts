@@ -606,6 +606,36 @@ export class SqliteStore {
     }));
   }
 
+  recentSessionSummaries(
+    n: number,
+  ): Array<{
+    linearIdentifier: string;
+    issueTitle: string;
+    state: "merged" | "stopped";
+    costUsd: number | null;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT linear_identifier, issue_title, state, cost_usd
+         FROM task_session
+         WHERE state IN ('merged', 'stopped')
+         ORDER BY ended_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(n) as Array<{
+      linear_identifier: string;
+      issue_title: string;
+      state: "merged" | "stopped";
+      cost_usd: number | null;
+    }>;
+    return rows.map((r) => ({
+      linearIdentifier: r.linear_identifier,
+      issueTitle: r.issue_title,
+      state: r.state,
+      costUsd: r.cost_usd,
+    }));
+  }
+
   lastMergedWithPr(): TaskSessionRow | null {
     const row = this.db
       .prepare(

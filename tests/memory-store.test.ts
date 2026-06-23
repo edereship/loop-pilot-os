@@ -6,9 +6,11 @@ import {
   readCategory,
   writeCategory,
   readAll,
+  initialize,
   MEMORY_DIR,
   CATEGORY_FILES,
 } from "../src/memory-store.js";
+import { SqliteStore } from "../src/store.js";
 
 let tmpRepo: string;
 
@@ -19,6 +21,26 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(tmpRepo, { recursive: true, force: true });
 });
+
+// Store helpers for initialize tests
+let openStores: SqliteStore[] = [];
+afterEach(() => {
+  for (const s of openStores) s.close();
+  openStores = [];
+});
+function newStore(): SqliteStore {
+  const s = new SqliteStore(":memory:");
+  openStores.push(s);
+  return s;
+}
+function makeClock(start = "2026-06-06T00:00:00.000Z"): () => string {
+  let t = Date.parse(start);
+  return () => {
+    const iso = new Date(t).toISOString();
+    t += 1000;
+    return iso;
+  };
+}
 
 describe("readCategory", () => {
   it("returns null when file does not exist", () => {
@@ -79,5 +101,78 @@ describe("readAll", () => {
       implResults: "results",
       productKnowledge: "knowledge",
     });
+  });
+});
+
+describe("initialize", () => {
+  it("creates docs/memory/ and empty header files", () => {
+    const store = newStore();
+    store.createRun(10, "2026-01-01T00:00:00.000Z");
+    initialize(tmpRepo, store, 5);
+
+    const pm = readCategory(tmpRepo, "pm_decisions");
+    const impl = readCategory(tmpRepo, "impl_results");
+    const prod = readCategory(tmpRepo, "product_knowledge");
+    expect(pm).toBe("# PM Decisions\n");
+    expect(impl).toBe("# Implementation Results\n");
+    expect(prod).toBe("# Product Knowledge\n");
+  });
+
+  it("does not overwrite existing files", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.pm_decisions), "existing content");
+
+    const store = newStore();
+    store.createRun(10, "2026-01-01T00:00:00.000Z");
+    initialize(tmpRepo, store, 5);
+
+    expect(readCategory(tmpRepo, "pm_decisions")).toBe("existing content");
+  });
+
+  it("bootstraps impl-results from DB when file is new", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const runId = store.createRun(10, clock()).id;
+
+    const s1 = store.createSession({
+      runId, linearIssueId: "uuid-1", linearIdentifier: "ES-100",
+      issueTitle: "Add auth", branch: "b1", worktreePath: "/w1", now: clock(),
+    });
+    store.updateSession(s1.id, { state: "merged", costUsd: 2.5, endedAt: clock() });
+
+    const s2 = store.createSession({
+      runId, linearIssueId: "uuid-2", linearIdentifier: "ES-101",
+      issueTitle: "Fix bug", branch: "b2", worktreePath: "/w2", now: clock(),
+    });
+    store.updateSession(s2.id, { state: "stopped", costUsd: 0.3, failureReason: "exception", endedAt: clock() });
+
+    initialize(tmpRepo, store, 10);
+
+    const content = readCategory(tmpRepo, "impl_results")!;
+    expect(content).toContain("ES-101");
+    expect(content).toContain("Fix bug");
+    expect(content).toContain("stopped");
+    expect(content).toContain("ES-100");
+    expect(content).toContain("merged");
+  });
+
+  it("does not bootstrap impl-results when file already exists", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "manual content");
+
+    const store = newStore();
+    const clock = makeClock();
+    const runId = store.createRun(10, clock()).id;
+    const s = store.createSession({
+      runId, linearIssueId: "uuid-1", linearIdentifier: "ES-999",
+      issueTitle: "Some task", branch: "b1", worktreePath: "/w1", now: clock(),
+    });
+    store.updateSession(s.id, { state: "merged", costUsd: 1.0, endedAt: clock() });
+
+    initialize(tmpRepo, store, 10);
+
+    expect(readCategory(tmpRepo, "impl_results")).toBe("manual content");
   });
 });

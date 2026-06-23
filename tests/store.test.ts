@@ -957,3 +957,38 @@ describe("groom_log (ES-451)", () => {
     expect(() => store.getGroomLog(999)).toThrow(/groom_log not found/);
   });
 });
+
+describe("recentSessionSummaries", () => {
+  it("returns merged and stopped sessions ordered by ended_at DESC", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const runId = store.createRun(10, clock()).id;
+
+    // Create 3 sessions: merged, stopped, implementing (active)
+    const s1 = seedSession(store, runId, clock(), { linearIdentifier: "ES-1", issueTitle: "Task 1" });
+    store.updateSession(s1.id, { state: "merged", costUsd: 1.5, endedAt: clock() });
+
+    const s2 = seedSession(store, runId, clock(), { linearIdentifier: "ES-2", issueTitle: "Task 2" });
+    store.updateSession(s2.id, { state: "stopped", costUsd: 0.8, failureReason: "exception", endedAt: clock() });
+
+    const s3 = seedSession(store, runId, clock(), { linearIdentifier: "ES-3", issueTitle: "Task 3" });
+    store.updateSession(s3.id, { state: "implementing" });
+
+    const result = store.recentSessionSummaries(10);
+    expect(result).toHaveLength(2);
+    // Most recent first (s2 ended after s1)
+    expect(result[0]).toEqual({ linearIdentifier: "ES-2", issueTitle: "Task 2", state: "stopped", costUsd: 0.8 });
+    expect(result[1]).toEqual({ linearIdentifier: "ES-1", issueTitle: "Task 1", state: "merged", costUsd: 1.5 });
+  });
+
+  it("respects the limit", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const runId = store.createRun(10, clock()).id;
+    for (let i = 0; i < 5; i++) {
+      const s = seedSession(store, runId, clock(), { linearIdentifier: `ES-${i}` });
+      store.updateSession(s.id, { state: "merged", costUsd: i * 0.5, endedAt: clock() });
+    }
+    expect(store.recentSessionSummaries(3)).toHaveLength(3);
+  });
+});
