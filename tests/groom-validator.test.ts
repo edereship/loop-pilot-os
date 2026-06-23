@@ -282,6 +282,60 @@ describe("validateGroomActions", () => {
       );
       expect(results[0].result).toBe("valid");
     });
+
+    it("rejects split with a blank subtask title", () => {
+      const results = validateGroomActions(
+        [action("split", { subtasks: [{ title: "", description: "desc" }] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
+    });
+
+    it("rejects split with a whitespace-only subtask title", () => {
+      const results = validateGroomActions(
+        [action("split", { subtasks: [{ title: "  ", description: "desc" }] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
+    });
+
+    it("rejects split with a blank subtask description", () => {
+      const results = validateGroomActions(
+        [action("split", { subtasks: [{ title: "Sub", description: "" }] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
+    });
+
+    it("rejects label with a blank entry in add array", () => {
+      const results = validateGroomActions(
+        [action("label", { add: [""] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
+    });
+
+    it("rejects label with a whitespace-only entry in add array", () => {
+      const results = validateGroomActions(
+        [action("label", { add: ["  "] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
+    });
+
+    it("rejects label with a blank entry in remove array", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", remove: [""] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty");
+    });
   });
 
   // ---- Rule 8: memory size limit ----

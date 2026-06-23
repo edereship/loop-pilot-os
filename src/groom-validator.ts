@@ -62,11 +62,21 @@ export function validateGroomActions(
     if (a.type === "update" && a.title === undefined && a.description === undefined) {
       return { action: a, result: "rejected", reason: "update must set at least title or description" };
     }
-    if (a.type === "label" && !a.add?.length && !a.remove?.length) {
-      return { action: a, result: "rejected", reason: "label must have at least one add or remove" };
+    if (a.type === "label") {
+      if (!a.add?.length && !a.remove?.length) {
+        return { action: a, result: "rejected", reason: "label must have at least one add or remove" };
+      }
+      if (a.add?.some((l) => l.trim() === "")) return { action: a, result: "rejected", reason: "empty label name" };
+      if (a.remove?.some((l) => l.trim() === "")) return { action: a, result: "rejected", reason: "empty label name" };
     }
-    if (a.type === "split" && a.subtasks.length === 0) {
-      return { action: a, result: "rejected", reason: "split must have at least one subtask" };
+    if (a.type === "split") {
+      if (a.subtasks.length === 0) {
+        return { action: a, result: "rejected", reason: "split must have at least one subtask" };
+      }
+      for (const subtask of a.subtasks) {
+        if (subtask.title.trim() === "") return { action: a, result: "rejected", reason: "empty subtask title" };
+        if (subtask.description.trim() === "") return { action: a, result: "rejected", reason: "empty subtask description" };
+      }
     }
 
     // Rule 8: memory size limit

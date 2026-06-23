@@ -27,53 +27,57 @@ export function parseGroomOutput(codexOutput: string): GroomParseResult {
   const trimmed = codexOutput.trim();
   if (trimmed.length === 0) return { kind: "parse_error", raw: codexOutput };
 
-  const jsonStr = extractJson(trimmed);
-  if (jsonStr === null) return { kind: "parse_error", raw: codexOutput };
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonStr);
-  } catch {
-    return { kind: "parse_error", raw: codexOutput };
+  for (const candidate of extractJsonCandidates(trimmed)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    const result = groomOutputSchema.safeParse(parsed);
+    if (result.success) return { kind: "ok", value: result.data as GroomOutput };
   }
 
-  const result = groomOutputSchema.safeParse(parsed);
-  if (!result.success) return { kind: "parse_error", raw: codexOutput };
-
-  return { kind: "ok", value: result.data as GroomOutput };
+  return { kind: "parse_error", raw: codexOutput };
 }
 
-function extractJson(text: string): string | null {
-  // Tier 1: fenced ```json blocks (last one wins)
+// Yields JSON string candidates in priority order. parseGroomOutput tries each
+// in sequence and stops at the first that parses and validates against the schema.
+function* extractJsonCandidates(text: string): Generator<string> {
+  // Tier 1: fenced ```json blocks (last one wins); no further tiers tried.
   const fencePattern = /```json\s*\n([\s\S]*?)\n\s*```/g;
   let lastFenceMatch: string | null = null;
   let m: RegExpExecArray | null;
   while ((m = fencePattern.exec(text)) !== null) {
     lastFenceMatch = m[1];
   }
-  if (lastFenceMatch !== null) return lastFenceMatch;
+  if (lastFenceMatch !== null) { yield lastFenceMatch; return; }
 
-  // Tier 2: single-line raw JSON object (last one wins)
   const lines = text.split("\n");
+
+  // Tier 2: single-line raw JSON object (last one wins).
+  // Yields a candidate but does NOT stop — a nested action line also matches
+  // this pattern, so we fall through to Tier 3 when schema validation fails.
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (line.startsWith("{") && line.endsWith("}")) {
-      return line;
+      yield line;
+      break;
     }
   }
 
-  // Tier 3: multi-line unfenced JSON object
+  // Tier 3: multi-line unfenced JSON object.
+  // Scan forward for the outermost '{' so nested action objects don't shadow it.
   let endLine = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (lines[i].trimEnd().endsWith("}")) { endLine = i; break; }
   }
   if (endLine !== -1) {
-    for (let startLine = endLine; startLine >= 0; startLine--) {
+    for (let startLine = 0; startLine <= endLine; startLine++) {
       if (lines[startLine].trimStart().startsWith("{")) {
-        return lines.slice(startLine, endLine + 1).join("\n");
+        yield lines.slice(startLine, endLine + 1).join("\n");
+        break;
       }
     }
   }
-
-  return null;
 }

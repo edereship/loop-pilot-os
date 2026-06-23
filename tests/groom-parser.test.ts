@@ -62,6 +62,24 @@ describe("parseGroomOutput", () => {
     expect(result.value.summary).toBe("No changes needed");
   });
 
+  it("falls back to a multi-line unfenced JSON object with nested action objects", () => {
+    const output = [
+      "Some analysis.",
+      "{",
+      '  "actions": [',
+      '    { "type": "close", "issueId": "ES-1", "rationale": "done" }',
+      '  ],',
+      '  "summary": "Closed ES-1"',
+      "}",
+    ].join("\n");
+    const result = parseGroomOutput(output);
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") throw new Error("unreachable");
+    expect(result.value.summary).toBe("Closed ES-1");
+    expect(result.value.actions).toHaveLength(1);
+    expect(result.value.actions[0].type).toBe("close");
+  });
+
   it("parses all 7 action types correctly", () => {
     const actions = [
       { type: "reprioritize", issueId: "ES-1", priority: 1, rationale: "r" },
