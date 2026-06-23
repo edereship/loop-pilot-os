@@ -23,7 +23,7 @@ import { loadSpecContent } from "./spec-reader.js";
 import { Orchestrator, type RunOutcome } from "./orchestrator.js";
 import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
-import { initialize as initMemoryStore } from "./memory-store.js";
+import { initialize as initMemoryStore, commitIfChanged } from "./memory-store.js";
 import { AgentWorkflowRecovery } from "./workflow-recovery.js";
 import { CodexPlanner, type CodexRateLimitOpts } from "./codex-planner.js";
 import { generateCodebaseSummary } from "./codebase-summary.js";
@@ -112,10 +112,6 @@ async function runLoop(configPath: string): Promise<number> {
       return EXIT_PREFLIGHT;
     }
 
-    // Initialize memory store (creates docs/memory/ and header files if absent,
-    // bootstraps impl-results.md from prior session history on first run).
-    initMemoryStore(config.repo.path, store, config.digest.recentMergedCount);
-
     // Linear の team/project/4状態/オプトインラベルを ID へ解決。
     // config の camelCase 状態名 → TicketState キーへ写像して渡す。
     const stateNames: Record<TicketState, string> = {
@@ -135,6 +131,14 @@ async function runLoop(configPath: string): Promise<number> {
       setupRequest,
       globalThis.fetch,
     );
+
+    // Initialize memory store after Linear setup so a failed connection does not
+    // leave docs/memory/ files uncommitted in the working tree (ES-452 Finding 2).
+    // Commit immediately to keep the working tree clean on any subsequent early-exit path.
+    initMemoryStore(config.repo.path, store, config.digest.recentMergedCount);
+    await commitIfChanged(runner, config.repo.path).catch((err: unknown) => {
+      logLine(`warning: failed to commit initial memory files: ${err instanceof Error ? err.message : String(err)}`);
+    });
 
     const source = new LinearTaskSource({
       apiKey: config.linearApiKey,

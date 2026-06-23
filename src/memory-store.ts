@@ -61,14 +61,19 @@ export function initialize(
   const dir = path.join(repoPath, MEMORY_DIR);
   mkdirSync(dir, { recursive: true });
 
-  const implAlreadyExists = existsSync(
-    path.join(dir, CATEGORY_FILES.impl_results),
-  );
+  const implPath = path.join(dir, CATEGORY_FILES.impl_results);
+  const implExists = existsSync(implPath);
+  // A header-only file means the first run had no sessions yet; treat it as
+  // un-bootstrapped so DB sessions from a completed run can still populate it
+  // on the next startup (ES-452 Finding 3).
+  const implIsHeaderOnly = implExists &&
+    readFileSync(implPath, "utf-8") === CATEGORY_HEADERS.impl_results;
+  const implNeedsBootstrap = !implExists || implIsHeaderOnly;
 
   for (const cat of Object.keys(CATEGORY_FILES) as MemoryCategory[]) {
     const filePath = path.join(dir, CATEGORY_FILES[cat]);
-    if (existsSync(filePath)) continue;
-    if (cat === "impl_results" && !implAlreadyExists) {
+    if (existsSync(filePath) && !(cat === "impl_results" && implIsHeaderOnly)) continue;
+    if (cat === "impl_results" && implNeedsBootstrap) {
       const sessions = store.recentSessionSummaries(recentCount);
       if (sessions.length > 0) {
         const lines = sessions.map((s) => {
@@ -79,7 +84,9 @@ export function initialize(
         continue;
       }
     }
-    writeFileSync(filePath, CATEGORY_HEADERS[cat], "utf-8");
+    if (!existsSync(filePath)) {
+      writeFileSync(filePath, CATEGORY_HEADERS[cat], "utf-8");
+    }
   }
 }
 
@@ -104,9 +111,13 @@ export async function commitIfChanged(
     { cwd: repoPath },
   );
   if (commit.code !== 0) {
-    // Best-effort unstage to avoid leaving staged memory changes that block the
-    // next startup's clean-worktree preflight.
+    // Unstage changes so the index stays clean.
     await runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+    // Restore tracked files to HEAD and remove newly created untracked files so the
+    // working tree stays clean and the next startup's clean-worktree preflight does
+    // not fail (ES-452 Finding 4). Both steps are best-effort.
+    await runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+    await runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     throw new Error(`git commit failed (code ${commit.code}): ${commit.stderr}`);
   }
   return true;

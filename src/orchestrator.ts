@@ -2006,7 +2006,19 @@ export class Orchestrator {
   /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
   private async commitMemoryBeforeHalt(): Promise<void> {
     try {
-      await commitIfChanged(this.runner, this.config.repo.path);
+      const committed = await commitIfChanged(this.runner, this.config.repo.path);
+      if (committed) {
+        // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch
+        // on the next run's PM-select phase (ES-452 Finding 1). Best-effort: warn on failure.
+        const push = await this.runner.run(
+          "git",
+          ["push", "origin", `HEAD:${this.config.repo.defaultBranch}`],
+          { cwd: this.config.repo.path },
+        );
+        if (push.code !== 0) {
+          this.log(`warning: failed to push memory commit: ${push.stderr.trim()}`);
+        }
+      }
     } catch {
       this.log("warning: failed to commit memory on halt");
     }

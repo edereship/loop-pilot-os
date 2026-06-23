@@ -179,6 +179,43 @@ describe("initialize", () => {
 
     expect(readCategory(tmpRepo, "impl_results")).toBe("manual content");
   });
+
+  it("bootstraps impl-results from DB when file exists with header only (ES-452 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    // Simulate a first run that created the header file but had no sessions to populate it.
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n");
+
+    const store = newStore();
+    const clock = makeClock();
+    const runId = store.createRun(10, clock()).id;
+    const s = store.createSession({
+      runId, linearIssueId: "uuid-1", linearIdentifier: "ES-200",
+      issueTitle: "Header test task", branch: "b1", worktreePath: "/w1", now: clock(),
+    });
+    store.updateSession(s.id, { state: "merged", costUsd: 1.5, endedAt: clock() });
+
+    initialize(tmpRepo, store, 10);
+
+    const content = readCategory(tmpRepo, "impl_results")!;
+    expect(content).toContain("ES-200");
+    expect(content).toContain("Header test task");
+    expect(content).toContain("merged");
+  });
+
+  it("leaves header-only impl-results unchanged when DB has no sessions (ES-452 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n");
+
+    const store = newStore();
+    store.createRun(10, "2026-01-01T00:00:00.000Z");
+
+    initialize(tmpRepo, store, 5);
+
+    // No sessions in DB — header-only file should remain unchanged.
+    expect(readCategory(tmpRepo, "impl_results")).toBe("# Implementation Results\n");
+  });
 });
 
 describe("commitIfChanged", () => {
@@ -230,6 +267,30 @@ describe("commitIfChanged", () => {
     );
     expect(resetCall).toBeDefined();
     expect(resetCall!.args).toContain("docs/memory/");
+  });
+
+  it("restores working tree after git commit fails (ES-452 Finding 4)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 0 });
+    runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    runner.on(["git", "commit", "-m"], { code: 1, stderr: "error: author identity unknown" });
+    runner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+    runner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+
+    await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git commit failed/);
+
+    const checkoutCall = runner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD"),
+    );
+    expect(checkoutCall).toBeDefined();
+    expect(checkoutCall!.args).toContain("docs/memory/");
+
+    const cleanCall = runner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "clean",
+    );
+    expect(cleanCall).toBeDefined();
+    expect(cleanCall!.args).toContain("docs/memory/");
   });
 
   it("skips commit when no changes", async () => {
