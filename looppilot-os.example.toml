@@ -78,4 +78,4 @@ recent_merged_count = 5
 
 [memory]
 # max_chars_per_file = 8000     # 横断メモリ 1 ファイルあたりの最大文字数（既定 8000）
-# inject_budget_chars = 6000    # SELECT/PLAN プロンプトへのメモリ注入文字数予算（既定 6000）
+# inject_budget_chars = 6000    # GROOM/SELECT/PLAN プロンプトへのメモリ注入文字数予算（既定 6000）

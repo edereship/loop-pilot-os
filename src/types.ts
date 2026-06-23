@@ -265,6 +265,7 @@ export interface ParsedSelection {
 
 export type MemoryCategory = "pm_decisions" | "impl_results" | "product_knowledge";
 
+// update/label/split の「少なくとも1フィールド必須」はランタイム検証で担保（ES-453 Validator）
 export type GroomAction =
   | { type: "reprioritize"; issueId: string; priority: 1 | 2 | 3 | 4; rationale: string }
   | { type: "update"; issueId: string; title?: string; description?: string; rationale: string }

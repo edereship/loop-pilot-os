@@ -931,6 +931,27 @@ describe("groom_log (ES-451)", () => {
     expect(updated.errorDetail).toBe("Codex timeout after 10 minutes");
   });
 
+  it("updateGroomLog with empty patch is a no-op", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-23T00:00:00.000Z");
+    const row = store.insertGroomLog({
+      runId: run.id,
+      loopIndex: 0,
+      startedAt: "2026-06-23T00:01:00.000Z",
+    });
+    store.updateGroomLog(row.id, {});
+    const unchanged = store.getGroomLog(row.id);
+    expect(unchanged.outcome).toBeNull();
+    expect(unchanged.endedAt).toBeNull();
+  });
+
+  it("updateGroomLog throws for non-existent id", () => {
+    const store = newStore();
+    expect(() => store.updateGroomLog(999, { outcome: "completed" })).toThrow(
+      /updateGroomLog affected 0 rows/,
+    );
+  });
+
   it("getGroomLog throws for unknown id", () => {
     const store = newStore();
     expect(() => store.getGroomLog(999)).toThrow(/groom_log not found/);
