@@ -20,6 +20,7 @@ import type {
   PlanOutcome,
   PauseMeta,
   PrDiffSummary,
+  CommandRunner,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
@@ -28,6 +29,7 @@ import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
+import { commitIfChanged, initialize as initializeMemory, MEMORY_DIR } from "./memory-store.js";
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -49,6 +51,7 @@ export interface OrchestratorDeps {
   planner: PlanRunner | null;
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   recoveryTurn: RecoveryTurnDeps | null;
+  runner: CommandRunner;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -76,6 +79,7 @@ export class Orchestrator {
   private readonly planner: PlanRunner | null;
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   private readonly recoveryTurn: RecoveryTurnDeps | null;
+  private readonly runner: CommandRunner;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -97,6 +101,7 @@ export class Orchestrator {
     this.planner = deps.planner;
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
     this.recoveryTurn = deps.recoveryTurn;
+    this.runner = deps.runner;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -112,6 +117,44 @@ export class Orchestrator {
       return "lock_rejected";
     }
     try {
+      // Initialize memory store under the run lock so that a concurrent rejected run
+      // cannot race on the shared git index. Fetch and rebase before creating the bootstrap
+      // commit so the push is fast-forward and not discarded by fetchDefaultBranch's
+      // git reset --hard on the next PM-select phase (ES-452 Finding 2). All steps are
+      // best-effort; failures are warned and skipped.
+      try {
+        const repoPath = this.config.repo.path;
+        const defaultBranch = this.config.repo.defaultBranch;
+        await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
+        const bootstrapRebaseRes = await this.runner.run(
+          "git",
+          ["rebase", "--autostash", `origin/${defaultBranch}`],
+          { cwd: repoPath },
+        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
+        if (bootstrapRebaseRes.code !== 0) {
+          await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
+        }
+        initializeMemory(repoPath, this.store, this.config.digest.recentMergedCount);
+        const initCommitted = await commitIfChanged(this.runner, repoPath).catch(() => false as const);
+        if (initCommitted) {
+          const initPushRes = await this.runner.run(
+            "git",
+            ["push", "origin", `HEAD:${defaultBranch}`],
+            { cwd: repoPath },
+          ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+          if (initPushRes.code !== 0) {
+            // Roll back the local commit so the branch does not stay ahead of origin.
+            // Use --hard to also clean the worktree; --mixed (the default) leaves the memory
+            // files modified, causing the next startup's clean-worktree preflight to fail
+            // (ES-452 Finding 1 — same pattern as commitMemoryBeforeHalt).
+            await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+            this.log(`warning: failed to push initial memory commit (rolled back): ${initPushRes.stderr.trim()}`);
+          }
+        }
+      } catch (err: unknown) {
+        this.log(`warning: failed to initialize memory: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
       const taskCap = this.config.safety.maxTasksPerRun;
       const run = this.store.createRun(taskCap, this.clock());
       this.runId = run.id;
@@ -577,6 +620,7 @@ export class Orchestrator {
       if (started >= this.config.safety.maxTasksPerRun) {
         const detail = `task cap reached: ${started}/${this.config.safety.maxTasksPerRun}`;
         await this.notifier.notify({ kind: "halted", reason: "task_cap", detail });
+        await this.commitMemoryBeforeHalt();
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
@@ -594,6 +638,7 @@ export class Orchestrator {
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
+        await this.commitMemoryBeforeHalt();
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
@@ -702,6 +747,7 @@ export class Orchestrator {
       // ① prepareWorktree 失敗：セッション行なしで HALT（claim_failed を Run.halt_reason へ）
       const detail = `claim_failed: prepareWorktree for ${issue.identifier}: ${errMsg(err)}`;
       await this.notifier.notify({ kind: "halted", reason: "claim_failed", detail });
+      await this.commitMemoryBeforeHalt();
       this.store.setRunState(this.runId, "halted", detail);
       this.log(detail);
       return HALT;
@@ -1951,6 +1997,7 @@ export class Orchestrator {
     });
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
+    await this.commitMemoryBeforeHalt();
     this.store.setRunState(this.runId, "halted", haltDetail);
     this.log(haltDetail);
     return HALT;
@@ -1994,12 +2041,67 @@ export class Orchestrator {
     return CONTINUE;
   }
 
+  /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
+  private async commitMemoryBeforeHalt(): Promise<void> {
+    try {
+      const repoPath = this.config.repo.path;
+      const defaultBranch = this.config.repo.defaultBranch;
+      await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
+      // Use --autostash so that dirty docs/memory files are stashed before rebasing
+      // (ES-452 Finding 4). If the rebase fails despite that, abort immediately to
+      // prevent staging conflict markers in the memory commit (ES-452 Finding 3).
+      const rebaseRes = await this.runner.run(
+        "git",
+        ["rebase", "--autostash", `origin/${defaultBranch}`],
+        { cwd: repoPath },
+      ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
+      if (rebaseRes.code !== 0) {
+        await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
+        this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
+        return;
+      }
+      // Even when rebase exits 0, the autostash pop may leave conflict markers in the
+      // working tree. Detect unmerged files and skip the commit to avoid staging conflict
+      // markers as memory content (ES-452 Finding 2).
+      const unmergedRes = await this.runner.run(
+        "git", ["ls-files", "--unmerged", "--", MEMORY_DIR + "/"],
+        { cwd: repoPath },
+      ).catch(() => ({ code: 0, stdout: "", stderr: "" }));
+      if (unmergedRes.stdout.trim().length > 0) {
+        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
+        return;
+      }
+      const committed = await commitIfChanged(this.runner, repoPath);
+      if (committed) {
+        // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch
+        // on the next run's PM-select phase (ES-452 Finding 1). Best-effort: warn on failure.
+        const pushRes = await this.runner.run(
+          "git",
+          ["push", "origin", `HEAD:${defaultBranch}`],
+          { cwd: repoPath },
+        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+        if (pushRes.code !== 0) {
+          // Roll back the local commit so the branch does not stay ahead of origin;
+          // fetchDefaultBranch's git reset --hard would silently discard it (ES-452 Finding 3).
+          // Use --hard to also clean the worktree; --mixed (the default) would leave the
+          // memory files modified, causing the next startup's clean-worktree preflight to fail.
+          await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+          this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
+        }
+      }
+    } catch {
+      this.log("warning: failed to commit memory on halt");
+    }
+  }
+
   /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。
    *  Idempotent: if the run is already halted (e.g. interruptablePause already
    *  called this), the second call is a no-op — no duplicate notification. */
   private async haltForInterrupt(): Promise<void> {
     const run = this.store.getRun(this.runId);
     if (run.state === "halted") return;
+    await this.commitMemoryBeforeHalt();
     const detail = "user_interrupt: stop requested; halting at safe point";
     this.store.setRunState(this.runId, "halted", detail);
     // 他の全 stopSession 経路と同様に await（通知を main の store.close() 前に確実に配信し、

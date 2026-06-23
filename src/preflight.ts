@@ -1034,7 +1034,18 @@ async function checkBranchProtection(
       return;
     }
     let parsed: {
-      required_pull_request_reviews?: { required_approving_review_count?: number };
+      required_pull_request_reviews?: {
+        required_approving_review_count?: number;
+        bypass_pull_request_allowances?: {
+          users?: Array<{ login: string }>;
+          teams?: Array<{ slug: string }>;
+          apps?: Array<{ slug: string }>;
+        };
+      };
+      required_status_checks?: {
+        contexts?: string[];
+        checks?: Array<{ context: string }>;
+      } | null;
       restrictions?: {
         users?: Array<{ login: string }>;
         teams?: Array<{ slug: string }>;
@@ -1054,6 +1065,24 @@ async function checkBranchProtection(
           "ループに人間レビュアーが不在のためマージ不能になります（required_approving_review_count を 0 にしてください）",
       );
     }
+    // When required_pull_request_reviews is set and restrictions == null, every actor
+    // must go through a PR — UNLESS they appear in bypass_pull_request_allowances.users.
+    // Team and app entries in bypass_pull_request_allowances cannot be verified at preflight
+    // time (membership is not queryable), so we fail closed: only an explicit user entry for
+    // the authenticated actor counts as a bypass (ES-452 Finding 2).
+    if (parsed.required_pull_request_reviews != null && parsed.restrictions == null) {
+      const allowances = parsed.required_pull_request_reviews.bypass_pull_request_allowances;
+      const bypassUsers = (allowances?.users ?? []).map((u) => u.login);
+      const login = await resolveAuthenticatedLogin(runner, opts);
+      if (login == null || !bypassUsers.includes(login)) {
+        errors.push(
+          `gh: ブランチ '${branch}' は pull request を必須としています（required_pull_request_reviews）が、` +
+            "push 制限（restrictions）がないため直接プッシュできません。" +
+            "メモリコミットが永続化されないため、restrictions に認証ユーザーを追加するか " +
+            "required_pull_request_reviews を無効にしてください",
+        );
+      }
+    }
     // restrictions が設定されている場合、push/merge できる identity が allowlist に限定される。
     // カーネル §9.4 の NG 条件は「restrictions に認証ユーザー不在」。
     // 認証ユーザー（=push 権限保持者）が許可リストに含まれていれば restrictions があっても OK。
@@ -1066,6 +1095,21 @@ async function checkBranchProtection(
             "認証ユーザー名を解決できず許可リストとの照合ができません（gh api user --jq .login を確認してください）",
         );
       } else {
+        // When required_pull_request_reviews is also set, direct push is only allowed if
+        // the user is in bypass_pull_request_allowances — restrictions alone is not enough
+        // (ES-452 Finding 4).
+        if (parsed.required_pull_request_reviews != null) {
+          const bypassUsers = (
+            parsed.required_pull_request_reviews.bypass_pull_request_allowances?.users ?? []
+          ).map((u) => u.login);
+          if (!bypassUsers.includes(login)) {
+            errors.push(
+              `gh: ブランチ '${branch}' は required_pull_request_reviews が設定されていますが、` +
+                `認証ユーザー '${login}' が bypass_pull_request_allowances に含まれていないため直接プッシュできません。` +
+                `bypass_pull_request_allowances に '${login}' を追加するか、required_pull_request_reviews を無効にしてください`,
+            );
+          }
+        }
         const allowedUsers = (parsed.restrictions.users ?? []).map((u) => u.login);
         if (!allowedUsers.includes(login)) {
           errors.push(
@@ -1073,6 +1117,42 @@ async function checkBranchProtection(
               "この identity からはマージできません。restrictions.users に '" + login + "' を追加してください",
           );
         }
+      }
+    }
+    // required_status_checks blocks direct pushes because the memory commit has no CI
+    // status attached (ES-452 Finding 5).
+    if (parsed.required_status_checks != null) {
+      const contexts = parsed.required_status_checks.contexts ?? [];
+      const checks = parsed.required_status_checks.checks ?? [];
+      if (contexts.length > 0 || checks.length > 0) {
+        errors.push(
+          `gh: ブランチ '${branch}' は必須ステータスチェックが設定されています（required_status_checks）。` +
+            "メモリコミットは CI を経由しないため直接プッシュがブロックされます。" +
+            "required_status_checks を無効にしてください",
+        );
+      }
+    }
+    // required_signatures requires all commits to be signed; the memory commit is unsigned
+    // so the push would be rejected. GitHub exposes this setting through a separate endpoint
+    // — it is NOT included in the GET /branches/{branch}/protection response (ES-452 Finding 3).
+    const sigRes = await runner.run(
+      "gh",
+      ["api", `repos/${repoSlug}/branches/${branch}/protection/required_signatures`],
+      opts,
+    );
+    if (!isHttp404(sigRes) && !isFeatureUnavailable403(sigRes) && sigRes.code === 0) {
+      let sigData: { enabled?: boolean };
+      try {
+        sigData = JSON.parse(sigRes.stdout);
+      } catch {
+        sigData = {};
+      }
+      if (sigData.enabled) {
+        errors.push(
+          `gh: ブランチ '${branch}' はコミット署名必須が設定されています（required_signatures）。` +
+            "メモリコミットは署名されないため直接プッシュがブロックされます。" +
+            "required_signatures を無効にしてください",
+        );
       }
     }
   } catch (e) {
@@ -1096,6 +1176,22 @@ async function resolveAuthenticatedLogin(
   }
 }
 
+// 認証ユーザーの数値 ID を解決する（ruleset bypass_actors の actor_id 照合に使う）。
+// 失敗時は null を返す。
+async function resolveAuthenticatedId(
+  runner: CommandRunner,
+  opts: { cwd: string },
+): Promise<number | null> {
+  try {
+    const r = await runner.run("gh", ["api", "user", "--jq", ".id"], opts);
+    if (r.code !== 0) return null;
+    const id = parseInt(r.stdout.trim(), 10);
+    return isNaN(id) ? null : id;
+  } catch {
+    return null;
+  }
+}
+
 // ---- §9.4 rulesets ----
 async function checkRulesets(
   runner: CommandRunner,
@@ -1112,7 +1208,11 @@ async function checkRulesets(
       errors.push(`gh: ブランチルールセットを取得できません（${r.stderr.trim()}）`);
       return;
     }
-    let rules: Array<{ type?: string; parameters?: { required_approving_review_count?: number } }>;
+    let rules: Array<{
+      type?: string;
+      ruleset_id?: number;
+      parameters?: { required_approving_review_count?: number };
+    }>;
     try {
       rules = JSON.parse(r.stdout);
     } catch {
@@ -1120,6 +1220,14 @@ async function checkRulesets(
       return;
     }
     if (!Array.isArray(rules)) return;
+    // Lazy-resolve the authenticated user's numeric ID — at most one API call per
+    // checkRulesets invocation (ES-452 Finding 6).
+    let resolvedUserId: number | null | undefined = undefined;
+    const getUserId = async (): Promise<number | null> => {
+      if (resolvedUserId !== undefined) return resolvedUserId;
+      resolvedUserId = await resolveAuthenticatedId(runner, opts);
+      return resolvedUserId;
+    };
     for (const rule of rules) {
       if (rule.type === "pull_request") {
         const count = rule.parameters?.required_approving_review_count ?? 0;
@@ -1128,11 +1236,90 @@ async function checkRulesets(
             `gh: ブランチ '${branch}' のルールセット pull_request ルールが必須承認レビュー数 ${count} を要求しています。` +
               "ループに人間レビュアーが不在のためマージ不能になります",
           );
+        } else {
+          // The pull_request rule blocks direct push even with 0 required approvals.
+          // Check if the authenticated user is in the ruleset's bypass_actors with
+          // bypass_mode "always" — if so, direct push is permitted (ES-452 Finding 6).
+          let hasBypass = false;
+          if (rule.ruleset_id != null) {
+            const userId = await getUserId();
+            hasBypass = await checkRulesetBypassActors(runner, repoSlug, rule.ruleset_id, userId, opts);
+          }
+          if (!hasBypass) {
+            errors.push(
+              `gh: ブランチ '${branch}' のルールセット pull_request ルールが設定されています。` +
+                "必須承認レビュー数が 0 であっても直接プッシュはブロックされるためメモリコミットが永続化されません。" +
+                "このルールを削除するか、bypass list を設定して直接プッシュを許可してください",
+            );
+          }
+        }
+      } else if (rule.type === "required_status_checks") {
+        // required_status_checks blocks direct pushes — no CI status is attached to the
+        // memory commit (ES-452 Finding 3). Check bypass_actors first.
+        let hasBypass = false;
+        if (rule.ruleset_id != null) {
+          const userId = await getUserId();
+          hasBypass = await checkRulesetBypassActors(runner, repoSlug, rule.ruleset_id, userId, opts);
+        }
+        if (!hasBypass) {
+          errors.push(
+            `gh: ブランチ '${branch}' のルールセット required_status_checks ルールが設定されています。` +
+              "メモリコミットは CI を経由しないため直接プッシュがブロックされます。" +
+              "このルールを削除するか、bypass list を設定して直接プッシュを許可してください",
+          );
+        }
+      } else if (rule.type === "required_signatures") {
+        // required_signatures ruleset requires commits to be signed; the unsigned memory
+        // commit would be rejected on push (ES-452 Finding 4). Check bypass_actors first.
+        let hasBypass = false;
+        if (rule.ruleset_id != null) {
+          const userId = await getUserId();
+          hasBypass = await checkRulesetBypassActors(runner, repoSlug, rule.ruleset_id, userId, opts);
+        }
+        if (!hasBypass) {
+          errors.push(
+            `gh: ブランチ '${branch}' のルールセット required_signatures ルールが設定されています。` +
+              "メモリコミットは署名されないため直接プッシュがブロックされます。" +
+              "このルールを削除するか、bypass list を設定して直接プッシュを許可してください",
+          );
         }
       }
     }
   } catch (e) {
     errors.push(`gh: ブランチルールセット確認に失敗しました（${(e as Error).message}）`);
+  }
+}
+
+// ルールセットの bypass_actors に有効なバイパス主体が含まれるか確認する。
+// User タイプは actor_id === userId で照合し、それ以外のタイプ（Integration、OrganizationAdmin、
+// RepositoryRole、Team、DeployKey）はプリフライト時に所属確認できないため存在すれば許可とみなす。
+// bypass_mode は "always" と "exempt" の両方を受け付ける（ES-452 Finding 4）。
+// 失敗時は false を返す（フェイルクローズ）。
+async function checkRulesetBypassActors(
+  runner: CommandRunner,
+  repoSlug: string,
+  rulesetId: number,
+  userId: number | null,
+  opts: { cwd: string },
+): Promise<boolean> {
+  try {
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/rulesets/${rulesetId}`], opts);
+    if (r.code !== 0) return false;
+    const ruleset: {
+      bypass_actors?: Array<{ actor_id?: number; actor_type?: string; bypass_mode?: string }>;
+    } = JSON.parse(r.stdout);
+    const validModes = new Set(["always", "exempt"]);
+    return (ruleset.bypass_actors ?? []).some((a) => {
+      if (!validModes.has(a.bypass_mode ?? "")) return false;
+      if (a.actor_type === "User") {
+        return userId != null && a.actor_id === userId;
+      }
+      // Non-User actor types (Integration, OrganizationAdmin, RepositoryRole, Team, DeployKey):
+      // membership cannot be verified at preflight time — fail closed (ES-452 Finding 5).
+      return false;
+    });
+  } catch {
+    return false;
   }
 }
 

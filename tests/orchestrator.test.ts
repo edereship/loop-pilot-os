@@ -77,6 +77,7 @@ interface Harness {
   logs: string[];
   promptArgs: PromptArgs[];
   recoveryRunner: FakeCommandRunner;
+  memoryRunner: FakeCommandRunner;
 }
 
 function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Harness {
@@ -111,6 +112,12 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   recoveryRunner.on(["git", "push"], { code: 0 });
   recoveryRunner.on(["gh"], { code: 0 });
   const planner = opts?.planner ?? null;
+  const memoryRunner = new FakeCommandRunner();
+  memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
+  memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+  memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
+  memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   const orch = new Orchestrator({
     config,
     source,
@@ -136,8 +143,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
       config,
       log,
     } : null,
+    runner: memoryRunner,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner };
+  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner };
 }
 
 describe("Orchestrator 正常系 — 1チケット完走（仕様 §5 SELECT→CLAIM→IMPLEMENT→HANDOFF→MONITOR→DONE）", () => {
@@ -619,6 +627,11 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       return `PROMPT for ${args.issue.identifier}`;
     };
     const recovery = new FakeWorkflowRecovery();
+    const inlineMemoryRunner1 = new FakeCommandRunner();
+    inlineMemoryRunner1.on(["git", "fetch", "origin", "main"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config,
       source,
@@ -636,6 +649,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       planner: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
+      runner: inlineMemoryRunner1,
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -1902,6 +1916,173 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
   });
 });
 
+describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
+  it("commits memory files on halt when changes exist", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Override memory runner to simulate changes (add already stubbed in harness)
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    // Call requestStop before run() so HALT fires at first safe point (loop entry),
+    // no source/agent/git setup needed.
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("skips memory commit on halt when no changes", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Default stub returns code 0 (no changes) — already set in harness
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeUndefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("skips memory commit and aborts rebase when rebase fails on halt (ES-452 Findings 3 & 4)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Override: rebase fails, simulating conflicts between local memory edits and remote
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+    // Memory has changes, but commit must NOT be called because rebase failed
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeUndefined();
+    const abortCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "rebase" && c.args.includes("--abort"),
+    );
+    expect(abortCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("skips memory commit when autostash pop leaves conflicts after successful rebase (ES-452 Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase exits 0 (success), but autostash pop left unmerged files
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], {
+      code: 0,
+      stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
+    });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    // Even though diff shows changes, commit must NOT be called
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeUndefined();
+    const checkoutCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD"),
+    );
+    expect(checkoutCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("rolls back unpushed memory commit when push fails on halt (ES-452 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+    h.memoryRunner.on(["git", "push", "origin", "HEAD:main"], { code: 1, stderr: "remote: Permission denied" });
+    h.memoryRunner.on(["git", "reset", "--hard", "HEAD~1"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const resetCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args.includes("HEAD~1"),
+    );
+    expect(resetCall).toBeDefined();
+    expect(resetCall?.args).toContain("--hard");
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+});
+
+describe("Orchestrator bootstrap memory commit — ES-452 Finding 1", () => {
+  it("uses --hard reset to roll back bootstrap commit when push fails", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Bootstrap sees changes (diff returns code 1)
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+    h.memoryRunner.on(["git", "push", "origin", "HEAD:main"], { code: 1, stderr: "error: push rejected" });
+    h.memoryRunner.on(["git", "reset", "--hard", "HEAD~1"], { code: 0 });
+
+    // Stop immediately so the test does not need a full task queue
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const resetCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args.includes("HEAD~1"),
+    );
+    // At least one reset must have occurred (bootstrap path)
+    expect(resetCalls.length).toBeGreaterThan(0);
+    // Every reset to HEAD~1 must use --hard so the working tree is cleaned
+    expect(resetCalls.every((c) => c.args.includes("--hard"))).toBe(true);
+  });
+});
+
+describe("Orchestrator HALT memory commit — non-interrupt halt paths — ES-452 Finding 2", () => {
+  it("commits memory on task_cap halt when changes exist", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // Simulate memory file changes during the run
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    await h.orch.run(); // completes 1 task then hits task_cap → halts
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.store.latestRun()!.haltReason).toContain("task cap reached");
+  });
+
+  it("commits memory on select_failed halt when changes exist", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.failNext("getAllEligible", new Error("Linear HTTP 503"));
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.store.latestRun()!.haltReason).toContain("select_failed");
+  });
+});
+
 // 二重起動: ロック拒否は戻り値で通知し、main が古い Run の状態から誤った exit code を導かないようにする
 describe("Orchestrator 二重起動 — run lock 拒否（Fix 1）", () => {
   it("別の生存プロセスがロックを保持しているとき run() は 'lock_rejected' を返し、Run 行を作らず通知も送らない", async () => {
@@ -2089,6 +2270,11 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const monitor = new FakeMonitor();
     const notifier = new FakeNotifier();
     const logs: string[] = [];
+    const inlineMemoryRunner2 = new FakeCommandRunner();
+    inlineMemoryRunner2.on(["git", "fetch", "origin", "main"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config: specConfig,
       source,
@@ -2106,6 +2292,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       planner,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
+      runner: inlineMemoryRunner2,
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -2614,12 +2801,18 @@ describe("Orchestrator.interruptablePause", () => {
         orchRef.requestStop();
       }
     };
+    const inlineMemoryRunner3 = new FakeCommandRunner();
+    inlineMemoryRunner3.on(["git", "fetch", "origin", "main"], { code: 0 });
+    inlineMemoryRunner3.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    inlineMemoryRunner3.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config, source, agent, git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
+      runner: inlineMemoryRunner3,
     });
     orchRef = orch;
 

@@ -223,6 +223,7 @@ async function runLoop(configPath: string): Promise<number> {
       recovery,
       planner: codexPlanner,
       codebaseSummaryGenerator,
+      runner,
       recoveryTurn: {
         planner: codexPlanner,
         agent,

@@ -8,6 +8,7 @@ import {
   FakeMonitor,
   FakeNotifier,
   FakeWorkflowRecovery,
+  FakeCommandRunner,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
@@ -98,6 +99,9 @@ function makeHarness(config: Config): Harness {
     return `PROMPT for ${args.issue.identifier}`;
   };
   const recovery = new FakeWorkflowRecovery();
+  const memoryRunner = new FakeCommandRunner();
+  memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   const orch = new Orchestrator({
     config,
     source,
@@ -115,6 +119,7 @@ function makeHarness(config: Config): Harness {
     planner: null,
     codebaseSummaryGenerator: async () => "",
     recoveryTurn: null,
+    runner: memoryRunner,
   });
   return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }

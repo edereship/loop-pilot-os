@@ -71,6 +71,8 @@ function passingRunner(): FakeCommandRunner {
   r.on(["gh", "api", "user", "--jq", ".login"], { code: 0, stdout: "the-bot\n", stderr: "" });
   // §9.4: ブランチ保護なし → 404
   r.on(["gh", "api", "repos/owner/name/branches/main/protection"], { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" });
+  // §9.4: required_signatures 設定なし → 404（保護が存在する場合に呼ばれる別エンドポイント）
+  r.on(["gh", "api", "repos/owner/name/branches/main/protection/required_signatures"], { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" });
   // §9.4: rulesets 空配列（保護なし）
   r.on(["gh", "api", "repos/owner/name/rules/branches/main"], { code: 0, stdout: "[]\n", stderr: "" });
   // §9.5: gate_label がリポラベルに存在
@@ -225,6 +227,268 @@ describe("runPreflight", () => {
     });
     const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.some((e) => e.includes("ルールセット") && e.includes("2"))).toBe(true);
+  });
+
+  it("required_pull_request_reviews が設定されていて restrictions が null なら直接プッシュ不可として NG（ES-452 Finding 5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: { required_approving_review_count: 0 },
+        restrictions: null,
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("required_pull_request_reviews") && e.includes("restrictions"))).toBe(true);
+  });
+
+  it("rulesets の pull_request ルールで required_approving_review_count=0 でも直接プッシュ不可として NG（ES-452 Finding 5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "pull_request", parameters: { required_approving_review_count: 0 } }]),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("pull_request ルール") && e.includes("直接プッシュ"))).toBe(true);
+  });
+
+  it("required_pull_request_reviews + restrictions あり + bypass_pull_request_allowances に認証ユーザー不在 → NG（ES-452 Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: { required_approving_review_count: 0 },
+        restrictions: { users: [{ login: "the-bot" }], teams: [], apps: [] },
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("bypass_pull_request_allowances") && e.includes("the-bot"))).toBe(true);
+  });
+
+  it("required_pull_request_reviews + restrictions あり + bypass_pull_request_allowances に認証ユーザーあり → OK（ES-452 Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: {
+          required_approving_review_count: 0,
+          bypass_pull_request_allowances: { users: [{ login: "the-bot" }], teams: [], apps: [] },
+        },
+        restrictions: { users: [{ login: "the-bot" }], teams: [], apps: [] },
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("bypass_pull_request_allowances") || e.includes("restrictions"))).toEqual([]);
+  });
+
+  it("required_status_checks が設定されていれば直接プッシュ不可として NG（ES-452 Finding 5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_status_checks: { contexts: ["ci/tests"], checks: [] },
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("required_status_checks") && e.includes("直接プッシュ"))).toBe(true);
+  });
+
+  it("required_signatures が有効なら直接プッシュ不可として NG（ES-452 Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({}),
+      stderr: "",
+    });
+    // required_signatures は GET /branches/{branch}/protection ではなく専用エンドポイントで確認する
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection/required_signatures"], {
+      code: 0,
+      stdout: JSON.stringify({ enabled: true }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("required_signatures") && e.includes("直接プッシュ"))).toBe(true);
+  });
+
+  it("ルールセット pull_request ルール（count=0）に bypass_actors として認証ユーザーが含まれていれば OK（ES-452 Finding 6）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "pull_request", ruleset_id: 42, parameters: { required_approving_review_count: 0 } }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "123\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/42"], {
+      code: 0,
+      stdout: JSON.stringify({
+        bypass_actors: [{ actor_id: 123, actor_type: "User", bypass_mode: "always" }],
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("pull_request ルール"))).toEqual([]);
+  });
+
+  it("ルールセット pull_request ルール（count=0）の bypass_actors に認証ユーザーが不在なら NG（ES-452 Finding 6）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "pull_request", ruleset_id: 42, parameters: { required_approving_review_count: 0 } }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "999\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/42"], {
+      code: 0,
+      stdout: JSON.stringify({
+        bypass_actors: [{ actor_id: 123, actor_type: "User", bypass_mode: "always" }],
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("pull_request ルール") && e.includes("直接プッシュ"))).toBe(true);
+  });
+
+  it("required_pull_request_reviews + restrictions=null + bypass_pull_request_allowances に認証ユーザーあり → OK（ES-452 Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: {
+          required_approving_review_count: 0,
+          bypass_pull_request_allowances: { users: [{ login: "the-bot" }], teams: [], apps: [] },
+        },
+        restrictions: null,
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("required_pull_request_reviews") && e.includes("restrictions"))).toEqual([]);
+  });
+
+  it("required_pull_request_reviews + restrictions=null + team bypass のみで認証ユーザー不在 → NG（ES-452 Finding 2）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: {
+          required_approving_review_count: 0,
+          bypass_pull_request_allowances: { users: [], teams: [{ slug: "devs" }], apps: [] },
+        },
+        restrictions: null,
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    // チームバイパスはプリフライト時に所属確認できないためフェイルクローズ
+    expect(errors.some((e) => e.includes("required_pull_request_reviews") && e.includes("restrictions"))).toBe(true);
+  });
+
+  it("ルールセット required_status_checks ルールが存在しバイパスなし → NG（ES-452 Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "required_status_checks", ruleset_id: 99 }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "123\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/99"], {
+      code: 0,
+      stdout: JSON.stringify({ bypass_actors: [] }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("required_status_checks") && e.includes("ルールセット"))).toBe(true);
+  });
+
+  it("ルールセット required_status_checks ルールが存在しユーザーバイパスあり → OK（ES-452 Finding 3）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "required_status_checks", ruleset_id: 99 }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "123\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/99"], {
+      code: 0,
+      stdout: JSON.stringify({ bypass_actors: [{ actor_id: 123, actor_type: "User", bypass_mode: "always" }] }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("required_status_checks") && e.includes("ルールセット"))).toEqual([]);
+  });
+
+  it("ルールセット required_signatures ルールが存在しバイパスなし → NG（ES-452 Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "required_signatures", ruleset_id: 77 }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "123\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/77"], {
+      code: 0,
+      stdout: JSON.stringify({ bypass_actors: [] }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("required_signatures") && e.includes("ルールセット"))).toBe(true);
+  });
+
+  it("ルールセット required_signatures ルールが存在しユーザーバイパスあり → OK（ES-452 Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "required_signatures", ruleset_id: 77 }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "123\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/77"], {
+      code: 0,
+      stdout: JSON.stringify({ bypass_actors: [{ actor_id: 123, actor_type: "User", bypass_mode: "always" }] }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("required_signatures") && e.includes("ルールセット"))).toEqual([]);
+  });
+
+  it("ルールセット pull_request ルール（count=0）に OrganizationAdmin バイパスのみで認証ユーザー不在 → NG（ES-452 Finding 5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "pull_request", ruleset_id: 42, parameters: { required_approving_review_count: 0 } }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "123\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/42"], {
+      code: 0,
+      stdout: JSON.stringify({ bypass_actors: [{ actor_type: "OrganizationAdmin", bypass_mode: "always" }] }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    // 非 User バイパスはプリフライト時に所属確認できないためフェイルクローズ
+    expect(errors.some((e) => e.includes("pull_request ルール") && e.includes("直接プッシュ"))).toBe(true);
+  });
+
+  it("ルールセット pull_request ルール（count=0）に bypass_mode=exempt のバイパスがあれば OK（ES-452 Finding 4）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "pull_request", ruleset_id: 42, parameters: { required_approving_review_count: 0 } }]),
+      stderr: "",
+    });
+    r.on(["gh", "api", "user", "--jq", ".id"], { code: 0, stdout: "123\n", stderr: "" });
+    r.on(["gh", "api", "repos/owner/name/rulesets/42"], {
+      code: 0,
+      stdout: JSON.stringify({ bypass_actors: [{ actor_id: 123, actor_type: "User", bypass_mode: "exempt" }] }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.includes("pull_request ルール"))).toEqual([]);
   });
 
   it("gate_label がリポに無ければ NG（仕様 §9.5）", async () => {
