@@ -118,6 +118,17 @@ describe("readAll", () => {
     });
   });
 
+  it("returns heading-only markdown that is not the seeded header (ES-454 Finding 2)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, CATEGORY_FILES.pm_decisions),
+      "# PM Decisions\n\n## Prefer ES-123 next\n",
+    );
+    const result = readAll(tmpRepo);
+    expect(result.pmDecisions).toBe("# PM Decisions\n\n## Prefer ES-123 next\n");
+  });
+
   it("returns content when file has content beyond the heading (ES-454 Finding 3)", () => {
     const dir = path.join(tmpRepo, MEMORY_DIR);
     mkdirSync(dir, { recursive: true });

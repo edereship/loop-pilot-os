@@ -3434,10 +3434,18 @@ describe("Orchestrator memory read non-fatal (ES-454 Finding 4)", () => {
   });
 
   it("IMPLEMENT proceeds when readMemoryAll throws (ES-454 Finding 4)", async () => {
-    const repoPath = makeBadMemoryRepo();
-    const config = { ...makeConfig({ maxTasksPerRun: 1 }), repo: { ...makeConfig().repo, path: repoPath } } as Config;
+    // IMPLEMENT now reads memory from worktreePath, so bad memory must be there.
+    const badWorktreePath = mkdtempSync(path.join(tmpdir(), "orch-mem-wt-test-"));
+    tmpRepos.push(badWorktreePath);
+    const wtMemDir = path.join(badWorktreePath, "docs", "memory");
+    mkdirSync(wtMemDir, { recursive: true });
+    // pm-decisions.md is a directory → readFileSync will throw EISDIR
+    mkdirSync(path.join(wtMemDir, "pm-decisions.md"));
+
+    const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: badWorktreePath });
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
 

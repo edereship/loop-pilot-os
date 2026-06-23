@@ -35,13 +35,6 @@ export function writeCategory(
   writeFileSync(filePath, content, "utf-8");
 }
 
-function hasNonHeadingContent(content: string): boolean {
-  return content.split("\n").some((line) => {
-    const trimmed = line.trim();
-    return trimmed.length > 0 && !trimmed.startsWith("#");
-  });
-}
-
 export function readAll(repoPath: string): {
   pmDecisions: string | null;
   implResults: string | null;
@@ -49,7 +42,11 @@ export function readAll(repoPath: string): {
 } {
   const get = (cat: MemoryCategory): string | null => {
     const content = readCategory(repoPath, cat);
-    return content !== null && hasNonHeadingContent(content) ? content : null;
+    // Treat only the known seeded header as "empty". Any other content — including
+    // heading-only markdown like "# Decision\n## Prefer X" — is real memory that
+    // GROOM wrote and should be injected into prompts.
+    if (content === null || content === CATEGORY_HEADERS[cat]) return null;
+    return content;
   };
   return {
     pmDecisions: get("pm_decisions"),

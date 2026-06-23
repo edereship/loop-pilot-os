@@ -804,7 +804,7 @@ export class Orchestrator {
 
     let planMem: ReturnType<typeof readMemoryAll> = { pmDecisions: null, implResults: null, productKnowledge: null };
     try {
-      planMem = readMemoryAll(this.config.repo.path);
+      planMem = readMemoryAll(worktreePath);
     } catch (err) {
       this.log(`plan: memory read failed (non-fatal): ${errMsg(err)}`);
     }
@@ -1025,7 +1025,7 @@ export class Orchestrator {
     }
     let mem: ReturnType<typeof readMemoryAll> = { pmDecisions: null, implResults: null, productKnowledge: null };
     try {
-      mem = readMemoryAll(this.config.repo.path);
+      mem = readMemoryAll(worktreePath);
     } catch (err) {
       this.log(`implement: memory read failed (non-fatal): ${errMsg(err)}`);
     }

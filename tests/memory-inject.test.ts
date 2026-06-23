@@ -105,6 +105,22 @@ describe("buildMemoryBlock", () => {
     expect(result).not.toContain("省略");
   });
 
+  it("does not truncate when uneven categories together fit within budget (ES-454 Finding 1)", () => {
+    const result = buildMemoryBlock(
+      [
+        { label: "A", content: "a" },
+        { label: "B", content: "b".repeat(5900) },
+      ],
+      6000,
+    );
+    // overheadWithoutMarkers = mainHeader(11) + sep(2) + catHeaders(12) = 25
+    // totalContent = 1 + 5900 = 5901; 25 + 5901 = 5926 ≤ 6000 → no truncation
+    expect(result).toContain("a");
+    expect(result).toContain("b".repeat(5900));
+    expect(result).not.toContain("省略");
+    expect(result.length).toBeLessThanOrEqual(6000);
+  });
+
   it("is deterministic — same inputs produce same output", () => {
     const entries = [
       { label: "A", content: "content-a" },
