@@ -1,0 +1,92 @@
+import type { FetchFn } from "./task-source.js";
+import type { TicketState } from "./types.js";
+
+const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
+
+const ISSUE_UPDATE_MUTATION = `mutation IssueUpdate($id: String!, $priority: Int, $title: String, $description: String, $stateId: String, $projectId: String, $teamId: String, $labelIds: [String!]) {
+  issueUpdate(id: $id, input: { priority: $priority, title: $title, description: $description, stateId: $stateId, projectId: $projectId, teamId: $teamId, labelIds: $labelIds }) { success }
+}`;
+
+const COMMENT_CREATE_MUTATION = `mutation CommentCreate($issueId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, body: $body }) { success }
+}`;
+
+interface GraphQLResponse<T> {
+  data?: T;
+  errors?: Array<{ message: string }>;
+}
+
+async function graphql<T>(
+  fetchFn: FetchFn,
+  apiKey: string,
+  query: string,
+  variables: Record<string, unknown>,
+): Promise<T> {
+  const res = await fetchFn(LINEAR_GRAPHQL_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: apiKey },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Linear HTTP ${res.status}`);
+  const body = (await res.json()) as GraphQLResponse<T>;
+  if (body.errors?.length) throw new Error(`Linear GraphQL error: ${body.errors.map((e) => e.message).join("; ")}`);
+  if (body.data === undefined) throw new Error("Linear GraphQL error: response had no data");
+  return body.data;
+}
+
+export interface GroomLinearClientOptions {
+  apiKey: string;
+  projectId: string;
+  teamId: string;
+  stateIds: Record<TicketState, string>;
+  optInLabelId: string;
+  labelMap: Map<string, string>; // name → id
+  fetchFn: FetchFn;
+}
+
+export class GroomLinearClient {
+  private readonly apiKey: string;
+  private readonly projectId: string;
+  private readonly teamId: string;
+  private readonly stateIds: Record<TicketState, string>;
+  private readonly optInLabelId: string;
+  private readonly labelMap: Map<string, string>;
+  private readonly fetchFn: FetchFn;
+
+  constructor(opts: GroomLinearClientOptions) {
+    this.apiKey = opts.apiKey;
+    this.projectId = opts.projectId;
+    this.teamId = opts.teamId;
+    this.stateIds = opts.stateIds;
+    this.optInLabelId = opts.optInLabelId;
+    this.labelMap = opts.labelMap;
+    this.fetchFn = opts.fetchFn;
+  }
+
+  private async issueUpdate(id: string, input: Record<string, unknown>): Promise<void> {
+    const data = await graphql<{ issueUpdate: { success: boolean } }>(
+      this.fetchFn, this.apiKey, ISSUE_UPDATE_MUTATION, { id, ...input },
+    );
+    if (!data.issueUpdate.success) throw new Error(`issueUpdate failed for ${id}`);
+  }
+
+  async postComment(issueId: string, body: string): Promise<void> {
+    const data = await graphql<{ commentCreate: { success: boolean } }>(
+      this.fetchFn, this.apiKey, COMMENT_CREATE_MUTATION, { issueId, body },
+    );
+    if (!data.commentCreate.success) throw new Error(`commentCreate failed for ${issueId}`);
+  }
+
+  async updatePriority(issueId: string, priority: number): Promise<void> {
+    await this.issueUpdate(issueId, { priority });
+  }
+
+  async updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void> {
+    await this.issueUpdate(issueId, fields);
+  }
+
+  async closeIssue(issueId: string, rationale: string): Promise<void> {
+    await this.issueUpdate(issueId, { stateId: this.stateIds.done });
+    await this.postComment(issueId, `🧹 Closed by GROOM\n\n**Reason**: ${rationale}`);
+  }
+}
