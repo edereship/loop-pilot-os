@@ -118,17 +118,29 @@ export class Orchestrator {
     }
     try {
       // Initialize memory store under the run lock so that a concurrent rejected run
-      // cannot race on the shared git index (ES-452 Finding 2). Push the initial commit
-      // so it survives the git reset --hard in fetchDefaultBranch on the next PM-select
-      // phase (ES-452 Finding 1). All steps are best-effort; failures are warned and skipped.
+      // cannot race on the shared git index. Fetch and rebase before creating the bootstrap
+      // commit so the push is fast-forward and not discarded by fetchDefaultBranch's
+      // git reset --hard on the next PM-select phase (ES-452 Finding 2). All steps are
+      // best-effort; failures are warned and skipped.
       try {
-        initializeMemory(this.config.repo.path, this.store, this.config.digest.recentMergedCount);
-        const initCommitted = await commitIfChanged(this.runner, this.config.repo.path).catch(() => false as const);
+        const repoPath = this.config.repo.path;
+        const defaultBranch = this.config.repo.defaultBranch;
+        await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
+        const bootstrapRebaseRes = await this.runner.run(
+          "git",
+          ["rebase", "--autostash", `origin/${defaultBranch}`],
+          { cwd: repoPath },
+        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
+        if (bootstrapRebaseRes.code !== 0) {
+          await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
+        }
+        initializeMemory(repoPath, this.store, this.config.digest.recentMergedCount);
+        const initCommitted = await commitIfChanged(this.runner, repoPath).catch(() => false as const);
         if (initCommitted) {
           const initPushRes = await this.runner.run(
             "git",
-            ["push", "origin", `HEAD:${this.config.repo.defaultBranch}`],
-            { cwd: this.config.repo.path },
+            ["push", "origin", `HEAD:${defaultBranch}`],
+            { cwd: repoPath },
           ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
           if (initPushRes.code !== 0) {
             this.log(`warning: failed to push initial memory commit: ${initPushRes.stderr.trim()}`);
@@ -2029,11 +2041,20 @@ export class Orchestrator {
     try {
       const repoPath = this.config.repo.path;
       const defaultBranch = this.config.repo.defaultBranch;
-      // Fetch and rebase onto the latest remote state before committing so the push is
-      // fast-forward even when a PR was merged during this run and the remote branch has
-      // advanced past the local HEAD (ES-452 Finding 5). Best-effort.
       await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["rebase", `origin/${defaultBranch}`], { cwd: repoPath }).catch(() => {});
+      // Use --autostash so that dirty docs/memory files are stashed before rebasing
+      // (ES-452 Finding 4). If the rebase fails despite that, abort immediately to
+      // prevent staging conflict markers in the memory commit (ES-452 Finding 3).
+      const rebaseRes = await this.runner.run(
+        "git",
+        ["rebase", "--autostash", `origin/${defaultBranch}`],
+        { cwd: repoPath },
+      ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
+      if (rebaseRes.code !== 0) {
+        await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
+        this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
+        return;
+      }
       const committed = await commitIfChanged(this.runner, repoPath);
       if (committed) {
         // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch

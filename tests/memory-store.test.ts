@@ -240,8 +240,23 @@ describe("commitIfChanged", () => {
   it("throws when git add fails", async () => {
     const runner = new FakeCommandRunner();
     runner.on(["git", "add", "docs/memory/"], { code: 128, stderr: "fatal: pathspec error" });
+    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
 
     await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
+  });
+
+  it("cleans up untracked memory files when git add fails (ES-452 Finding 1)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 128, stderr: "fatal: unable to lock index" });
+    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+
+    await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
+
+    const cleanCall = runner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd"),
+    );
+    expect(cleanCall).toBeDefined();
+    expect(cleanCall!.args).toContain("docs/memory/");
   });
 
   it("throws when git commit fails", async () => {

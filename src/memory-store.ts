@@ -96,6 +96,9 @@ export async function commitIfChanged(
 ): Promise<boolean> {
   const add = await runner.run("git", ["add", MEMORY_DIR + "/"], { cwd: repoPath });
   if (add.code !== 0) {
+    // Remove newly created untracked files so the clean-worktree preflight on the
+    // next startup does not fail due to leftover bootstrap files (ES-452 Finding 1).
+    await runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     throw new Error(`git add failed (code ${add.code}): ${add.stderr}`);
   }
   const diff = await runner.run(

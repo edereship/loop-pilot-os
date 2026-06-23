@@ -113,6 +113,8 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   recoveryRunner.on(["gh"], { code: 0 });
   const planner = opts?.planner ?? null;
   const memoryRunner = new FakeCommandRunner();
+  memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
+  memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
   memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   const orch = new Orchestrator({
@@ -625,6 +627,8 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
     };
     const recovery = new FakeWorkflowRecovery();
     const inlineMemoryRunner1 = new FakeCommandRunner();
+    inlineMemoryRunner1.on(["git", "fetch", "origin", "main"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     inlineMemoryRunner1.on(["git", "add", "docs/memory/"], { code: 0 });
     inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
@@ -1945,6 +1949,29 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
     expect(commitCall).toBeUndefined();
     expect(h.store.latestRun()!.state).toBe("halted");
   });
+
+  it("skips memory commit and aborts rebase when rebase fails on halt (ES-452 Findings 3 & 4)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Override: rebase fails, simulating conflicts between local memory edits and remote
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+    // Memory has changes, but commit must NOT be called because rebase failed
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeUndefined();
+    const abortCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "rebase" && c.args.includes("--abort"),
+    );
+    expect(abortCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
 });
 
 describe("Orchestrator HALT memory commit — non-interrupt halt paths — ES-452 Finding 2", () => {
@@ -2174,6 +2201,8 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const notifier = new FakeNotifier();
     const logs: string[] = [];
     const inlineMemoryRunner2 = new FakeCommandRunner();
+    inlineMemoryRunner2.on(["git", "fetch", "origin", "main"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     inlineMemoryRunner2.on(["git", "add", "docs/memory/"], { code: 0 });
     inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
@@ -2703,6 +2732,8 @@ describe("Orchestrator.interruptablePause", () => {
       }
     };
     const inlineMemoryRunner3 = new FakeCommandRunner();
+    inlineMemoryRunner3.on(["git", "fetch", "origin", "main"], { code: 0 });
+    inlineMemoryRunner3.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     inlineMemoryRunner3.on(["git", "add", "docs/memory/"], { code: 0 });
     inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({

@@ -227,6 +227,31 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("ルールセット") && e.includes("2"))).toBe(true);
   });
 
+  it("required_pull_request_reviews が設定されていて restrictions が null なら直接プッシュ不可として NG（ES-452 Finding 5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/branches/main/protection"], {
+      code: 0,
+      stdout: JSON.stringify({
+        required_pull_request_reviews: { required_approving_review_count: 0 },
+        restrictions: null,
+      }),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("required_pull_request_reviews") && e.includes("restrictions"))).toBe(true);
+  });
+
+  it("rulesets の pull_request ルールで required_approving_review_count=0 でも直接プッシュ不可として NG（ES-452 Finding 5）", async () => {
+    const r = passingRunner();
+    r.on(["gh", "api", "repos/owner/name/rules/branches/main"], {
+      code: 0,
+      stdout: JSON.stringify([{ type: "pull_request", parameters: { required_approving_review_count: 0 } }]),
+      stderr: "",
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("pull_request ルール") && e.includes("直接プッシュ"))).toBe(true);
+  });
+
   it("gate_label がリポに無ければ NG（仕様 §9.5）", async () => {
     const r = passingRunner();
     r.on(["gh", "api", "repos/owner/name/labels", "--paginate", "--jq", ".[].name"], { code: 0, stdout: "bug\nai-ok\n", stderr: "" });

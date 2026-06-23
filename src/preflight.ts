@@ -1054,6 +1054,17 @@ async function checkBranchProtection(
           "ループに人間レビュアーが不在のためマージ不能になります（required_approving_review_count を 0 にしてください）",
       );
     }
+    // When required_pull_request_reviews is set and there is no push-restrictions bypass
+    // list (restrictions == null), every user must go through a PR — direct git push is
+    // rejected. Memory commits cannot be persisted in this configuration (ES-452 Finding 5).
+    if (parsed.required_pull_request_reviews != null && parsed.restrictions == null) {
+      errors.push(
+        `gh: ブランチ '${branch}' は pull request を必須としています（required_pull_request_reviews）が、` +
+          "push 制限（restrictions）がないため直接プッシュできません。" +
+          "メモリコミットが永続化されないため、restrictions に認証ユーザーを追加するか " +
+          "required_pull_request_reviews を無効にしてください",
+      );
+    }
     // restrictions が設定されている場合、push/merge できる identity が allowlist に限定される。
     // カーネル §9.4 の NG 条件は「restrictions に認証ユーザー不在」。
     // 認証ユーザー（=push 権限保持者）が許可リストに含まれていれば restrictions があっても OK。
@@ -1127,6 +1138,14 @@ async function checkRulesets(
           errors.push(
             `gh: ブランチ '${branch}' のルールセット pull_request ルールが必須承認レビュー数 ${count} を要求しています。` +
               "ループに人間レビュアーが不在のためマージ不能になります",
+          );
+        } else {
+          // The pull_request rule blocks direct push even with 0 required approvals;
+          // memory commits cannot be persisted via git push (ES-452 Finding 5).
+          errors.push(
+            `gh: ブランチ '${branch}' のルールセット pull_request ルールが設定されています。` +
+              "必須承認レビュー数が 0 であっても直接プッシュはブロックされるためメモリコミットが永続化されません。" +
+              "このルールを削除するか、bypass list を設定して直接プッシュを許可してください",
           );
         }
       }
