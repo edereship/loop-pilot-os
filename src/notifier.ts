@@ -30,6 +30,10 @@ export function formatNotifyEvent(event: NotifyEvent): string {
       return `⏸️ LoopPilot OS 一時停止 (${event.target}): ${event.detail}`;
     case "resumed":
       return `▶️ LoopPilot OS 再開 (${event.target}): ${event.detail}`;
+    case "recovery_started":
+      return `🔄 リカバリー開始: ${event.identifier} (${event.reason})`;
+    case "recovery_succeeded":
+      return `✅ リカバリー成功: ${event.identifier} (${event.action})`;
   }
 }
 

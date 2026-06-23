@@ -9,6 +9,7 @@ import {
   FakeNotifier,
   FakeWorkflowRecovery,
   FakePlanRunner,
+  FakeCommandRunner,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
@@ -75,6 +76,7 @@ interface Harness {
   sleepCalls: number[];
   logs: string[];
   promptArgs: PromptArgs[];
+  recoveryRunner: FakeCommandRunner;
 }
 
 function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Harness {
@@ -101,6 +103,14 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   };
   const recovery = new FakeWorkflowRecovery();
   const codebaseSummaryGenerator = async () => "3 files, 100 lines total\n\nsrc/a.ts (40L)\nsrc/b.ts (30L)\nsrc/c.ts (30L)";
+  const recoveryRunner = new FakeCommandRunner();
+  // Stub common git operations for recovery
+  recoveryRunner.on(["git", "-C"], (_args, _opts) => {
+    return { code: 0, stdout: "" };
+  });
+  recoveryRunner.on(["git", "push"], { code: 0 });
+  recoveryRunner.on(["gh"], { code: 0 });
+  const planner = opts?.planner ?? null;
   const orch = new Orchestrator({
     config,
     source,
@@ -115,10 +125,19 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
     sleep,
     log,
     recovery,
-    planner: opts?.planner ?? null,
+    planner,
     codebaseSummaryGenerator,
+    recoveryTurn: planner !== null ? {
+      planner,
+      agent,
+      git,
+      runner: recoveryRunner,
+      source,
+      config,
+      log,
+    } : null,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs };
+  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner };
 }
 
 describe("Orchestrator 正常系 — 1チケット完走（仕様 §5 SELECT→CLAIM→IMPLEMENT→HANDOFF→MONITOR→DONE）", () => {
@@ -616,6 +635,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       recovery,
       planner: null,
       codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -2085,6 +2105,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       recovery: new FakeWorkflowRecovery(),
       planner,
       codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -2598,6 +2619,7 @@ describe("Orchestrator.interruptablePause", () => {
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
       codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
     });
     orchRef = orch;
 
@@ -2628,5 +2650,546 @@ describe("Orchestrator.interruptablePause", () => {
     expect(halted.pauseMeta).toBeNull();
 
     store.close();
+  });
+});
+
+describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
+  it("ci_failed triggers recovery -> fix_code -> session resumes monitoring and merges", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // Recovery fix agent outcome
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    // Monitor: done(ci_failed) triggers stopSession -> recovery succeeds -> back to monitoring
+    // After recovery: done(ready) -> merged
+    h.monitor.verdicts = [
+      { kind: "done" },   // 1st poll: tryMerge -> ci_failed -> recovery gate
+      { kind: "done" },   // 2nd poll: after recovery, tryMerge -> ready -> merged
+    ];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    // Plan phase outcome (for initial PLAN)
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nFix it" },
+      // Recovery Codex outcome: fix_code
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Run npm install"}' },
+    ];
+    // Stub git operations for recovery (FakeCommandRunner for log specifically)
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("fix_code");
+    expect(s.state).toBe("merged");
+    // Cost includes recovery agent cost
+    expect(s.costUsd).toBeCloseTo(1.5);
+    // recovery_started and recovery_succeeded notifications
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(1);
+    const recoverySucceeded = h.notifier.events.filter((e) => e.kind === "recovery_succeeded");
+    expect(recoverySucceeded).toHaveLength(1);
+  });
+
+  it("cost_exceeded skips recovery entirely", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, maxCostUsdPerSession: 0.5 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // PLAN outcome
+    planner.outcomes = [{ kind: "completed", text: "## Goal\nDo it" }];
+    h.agent.outcomes = [{ kind: "cost_exceeded", costUsd: 0.6 }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("cost_exceeded");
+    expect(s.recoveryAttempted).toBe(0);
+    // No recovery notifications
+    const recoveryEvents = h.notifier.events.filter(
+      (e) => e.kind === "recovery_started" || e.kind === "recovery_succeeded",
+    );
+    expect(recoveryEvents).toHaveLength(0);
+  });
+
+  it("recovery escalation -> no recovery, just halt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    // Monitor: human_required stop (not auto_restart category) -> triggers stopSession
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: null },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery: codex says escalate
+      { kind: "completed", text: '{"action":"escalate"}' },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("escalate");
+  });
+
+  it("second stop after recovery attempted -> no recovery, just halt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // Recovery fix agent outcome (for restart_review recovery)
+    ];
+    // Monitor: merge_conflict -> recovery succeeds with restart_review -> back to monitoring
+    // Then: pr_closed -> stopSession again, but recoveryAttempted is already 1, so no second recovery
+    h.monitor.verdicts = [
+      { kind: "done" },     // 1st: tryMerge -> conflict -> recovery (restart_review)
+      { kind: "pr_closed" }, // 2nd: stopSession -> recoveryAttempted=1, skip recovery -> halt
+    ];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "conflict" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery: restart_review (simple, no agent cost)
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Final state is stopped from pr_closed (second stop, no recovery)
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("pr_closed");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("restart_review");
+  });
+
+  it("recovery with no planner -> skips recovery entirely", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config); // no planner
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: null }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("looppilot_stopped");
+    expect(s.recoveryAttempted).toBe(0);
+    // No recovery notifications
+    const recoveryEvents = h.notifier.events.filter(
+      (e) => e.kind === "recovery_started" || e.kind === "recovery_succeeded",
+    );
+    expect(recoveryEvents).toHaveLength(0);
+  });
+
+  it("recovery codex exception -> falls through to normal stop", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "stopped", stopReason: null }];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery codex call: throws (no outcome queued -> FakePlanRunner throws)
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAttempted).toBe(1);
+    // Exception during recovery -> escalated action
+    expect(s.recoveryAction).toBe("escalate");
+    // Log contains recovery codex exception
+    expect(h.logs.some((l) => l.includes("recovery: codex exception"))).toBe(true);
+  });
+
+  // Finding 1: an interrupt during recovery must not consume the recoveryAttempted flag
+  it("recovery interrupted → recoveryAttempted stays 0, session stays in_review, run halted", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery Codex is interrupted before choosing an action
+      { kind: "interrupted" },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Interrupt must NOT consume the recovery gate — next run can retry
+    expect(s.recoveryAttempted).toBe(0);
+    // Session was not stopped (interrupt halts the run before stopSession completes)
+    expect(s.state).toBe("in_review");
+    // Run is halted
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  // ES-450 Finding 2: after auto-restart cap exceeded + recovery succeeds, pendingRestartReason
+  // must be reloaded so the stale guard fires on the next poll instead of re-exhausting the counter.
+  it("auto-restart limit exceeded + recovery fix_code → pendingRestartReason reloaded, stale guard fires next poll", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // Recovery fix agent: succeeds
+      { kind: "completed", costUsd: 0.5, summary: "fixed" },
+    ];
+    // 4 consecutive stopped verdicts with DIFFERENT stop reasons bypass the stale guard,
+    // hitting the auto-restart cap on poll 4. Recovery sets pendingRestartReason = "test_failure".
+    // Poll 5: "test_failure" → stale guard fires (only with the fix; without fix the counter
+    //         is re-incremented, recoveryAttempted blocks recovery, and the session stops).
+    // Poll 6: merged.
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "workflow_crashed" },    // auto_restart #1
+      { kind: "stopped", stopReason: "action_timeout" },      // auto_restart #2
+      { kind: "stopped", stopReason: "max_turns_exceeded" },  // auto_restart #3
+      { kind: "stopped", stopReason: "test_failure" },        // cap exceeded → recovery fires
+      { kind: "stopped", stopReason: "test_failure" },        // stale guard (pendingRestartReason reloaded)
+      { kind: "merged" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nDo it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the test failure"}' },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Stale guard fires at poll 5, then merges at poll 6
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("fix_code");
+  });
+
+  // Finding 2: after an abandon recovery the abandoned ticket must not be immediately reselected
+  it("abandon recovery: abandoned ticket excluded from subsequent SELECT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    // Single issue so selectWithPm is skipped (eligible.length===1), keeping planner outcomes simple
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nDo the work" }, // PLAN phase
+      { kind: "completed", text: '{"action":"abandon"}' },  // Recovery Codex chooses abandon
+    ];
+    // Stop after the second SELECT so the loop doesn't run indefinitely.
+    // eligibleCalls is populated inside origGetAllEligible; we don't push here to avoid duplicates.
+    let selectCount = 0;
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      selectCount += 1;
+      if (selectCount >= 2) h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // Second SELECT must include issue-A in the exclude list (abandoned ticket blocked)
+    expect(h.source.eligibleCalls.length).toBeGreaterThanOrEqual(2);
+    const secondSelectExcluded = h.source.eligibleCalls[1];
+    expect(secondSelectExcluded).toContain("issue-A");
+  });
+
+  // ES-450 Finding (iteration 8): pr_closed is terminal — recovery must not run even when
+  // recoveryTurn is configured and recoveryAttempted is still 0.
+  it("pr_closed with planner configured → no recovery, stops with pr_closed", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    // Monitor: pr_closed immediately (before any recovery attempt)
+    h.monitor.verdicts = [{ kind: "pr_closed" }];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // No second outcome queued — recovery must NOT call the planner
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("pr_closed");
+    // Recovery must be skipped — recoveryAttempted stays 0 (the pr_closed gate fires first)
+    expect(s.recoveryAttempted).toBe(0);
+    // No recovery notifications
+    const recoveryEvents = h.notifier.events.filter(
+      (e) => e.kind === "recovery_started" || e.kind === "recovery_succeeded",
+    );
+    expect(recoveryEvents).toHaveLength(0);
+  });
+
+  // ES-450 Finding 1 (iteration 9): when handoff_failed recovery succeeds, addLabel and
+  // transition(in_review) must be retried before flipping to in_review so the gate label is
+  // present and LoopPilot can engage — without the retry the PR lacks the label and the run
+  // later stops as monitor_never_engaged instead of recovering the transient handoff failure.
+  it("handoff_failed recovery retries addLabel and transition(in_review) before flipping to in_review", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    // Force PR creation to #100
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    // addLabel fails for the initial handoff (3 retries) but succeeds on recovery retry.
+    let addLabelCalls = 0;
+    h.git.addLabel = async (prNumber: number, label: string): Promise<void> => {
+      h.git.calls.push({ method: "addLabel", args: [prNumber, label] });
+      addLabelCalls++;
+      if (addLabelCalls <= 3) throw new Error("gh: label not found");
+      // 4th+ call (from recovery retry) succeeds
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nDo the thing" },
+      // Recovery codex chooses restart_review
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+    // After recovery flips to in_review, monitor immediately merges
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.recoveryAction).toBe("restart_review");
+    // addLabel was retried in the recovery path (calls > 3 initial failures)
+    expect(addLabelCalls).toBeGreaterThan(3);
+    // transition(in_review) was retried during recovery before the session flipped
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "in_review" });
+    // Session fully recovered and merged
+    expect(s.state).toBe("merged");
+  });
+
+  // ES-450 Finding (iteration 8): failed abandon must not record recovery_action so
+  // stoppedSessionsWithPr can pick the session up again on the next daemon start.
+  // ES-450 Finding 2 (iteration 10): failed cleanup must also leave recoveryAttempted=0
+  // so a future recovery path can retry the cleanup rather than skipping executeRecoveryTurn.
+  it("failed abandon does not set recoveryAction or recoveryAttempted, allowing retry", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      { kind: "completed", text: '{"action":"abandon"}' },
+    ];
+    // Make gh pr close fail so abandon returns { kind: "failed" }
+    h.recoveryRunner.on(["gh", "pr", "close"], { code: 1, stderr: "PR not found" });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    // recoveryAttempted must stay 0 for failed cleanup — the gate is not consumed so a
+    // future recovery path can retry (ES-450 Finding 2).
+    expect(s.recoveryAttempted).toBe(0);
+    // recoveryAction must NOT be 'abandon' — the cleanup did not complete, so startup
+    // recovery must be able to pick this session up via stoppedSessionsWithPr.
+    expect(s.recoveryAction).toBeNull();
+  });
+
+  // ES-450 Finding 1 (iteration 10): stale guard must fire on the poll immediately
+  // after done-path recovery so a stale ci_failed/merge_conflict verdict does not
+  // trigger a second stopSession with recoveryAttempted already set.
+  it("ci_failed recovery stale guard fires once then merge succeeds on next poll", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    // done verdict repeated — FakeMonitor keeps returning the last element
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      // Poll 1: ci_failed → recovery fires. Poll 2: stale guard skips tryMerge.
+      // Poll 3: ready → merge.
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nFix it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Run npm install"}' },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("fix_code");
+    // Readiness was called exactly twice: once for ci_failed (poll 1) and once for
+    // ready (poll 3). The stale guard on poll 2 must skip tryMerge entirely.
+    expect(h.monitor.readinessCalls).toHaveLength(2);
+  });
+
+  // ES-450 Finding 1 (iteration 10): same stale guard for merge_conflict + rebase.
+  it("merge_conflict recovery stale guard fires once then merge succeeds", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.readiness = new Map();
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "conflict" };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan\nRebase" },
+      { kind: "completed", text: '{"action":"rebase"}' },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("rebase")) return { code: 0 };
+      return { code: 0 };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 0 });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryAction).toBe("rebase");
+    // Stale guard must skip tryMerge on poll 2 — readiness called only twice.
+    expect(h.monitor.readinessCalls).toHaveLength(2);
+  });
+
+  // ES-450 Finding 3 (iteration 10): when recovery fails after doing useful work,
+  // stopDetail must carry the recovery failure message so operators can diagnose.
+  it("failed fix_code recovery includes recovery failure message in stopDetail", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "completed", costUsd: 0.4, summary: "fixed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' },
+    ];
+    // Agent makes commits but push fails — recovery returns { kind: "failed", message: "recovery push failed: ..." }
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 1, stderr: "rejected" });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // stopDetail must include the recovery failure message (ES-450 Finding 3).
+    expect(s.stopDetail).toContain("recovery failed:");
+    expect(s.stopDetail).toContain("recovery push failed");
+    // The halted notification detail must also carry the recovery failure message.
+    const haltedEvent = h.notifier.events.find((e) => e.kind === "halted");
+    expect(haltedEvent).toBeDefined();
+    expect((haltedEvent as { kind: "halted"; reason: string; detail: string }).detail).toContain("recovery failed:");
   });
 });

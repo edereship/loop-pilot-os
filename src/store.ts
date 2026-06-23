@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS task_session (
   workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
   workflow_handled_error_count INTEGER NOT NULL DEFAULT 0,
   auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
-  pending_restart_reason TEXT
+  pending_restart_reason TEXT,
+  recovery_attempted INTEGER NOT NULL DEFAULT 0,
+  recovery_action TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_session_active ON task_session(state)
   WHERE state NOT IN ('merged','stopped');
@@ -111,6 +113,8 @@ interface RawSessionRow {
   workflow_handled_error_count: number;
   auto_restart_attempts: number;
   pending_restart_reason: string | null;
+  recovery_attempted: number;
+  recovery_action: string | null;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -136,6 +140,8 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     workflowHandledErrorCount: r.workflow_handled_error_count,
     autoRestartAttempts: r.auto_restart_attempts,
     pendingRestartReason: r.pending_restart_reason,
+    recoveryAttempted: r.recovery_attempted,
+    recoveryAction: r.recovery_action,
   };
 }
 
@@ -157,6 +163,8 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   workflowHandledErrorCount: "workflow_handled_error_count",
   autoRestartAttempts: "auto_restart_attempts",
   pendingRestartReason: "pending_restart_reason",
+  recoveryAttempted: "recovery_attempted",
+  recoveryAction: "recovery_action",
 };
 
 export class SqliteStore {
@@ -219,6 +227,16 @@ export class SqliteStore {
     }
     if (!columns.has("select_rationale")) {
       this.db.exec(`ALTER TABLE task_session ADD COLUMN select_rationale TEXT`);
+    }
+    if (!columns.has("recovery_attempted")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN recovery_attempted INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!columns.has("recovery_action")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN recovery_action TEXT`,
+      );
     }
 
     const runColumns = new Set(
@@ -395,6 +413,8 @@ export class SqliteStore {
         | "workflowHandledErrorCount"
         | "autoRestartAttempts"
         | "pendingRestartReason"
+        | "recoveryAttempted"
+        | "recoveryAction"
       >
     >,
   ): void {
@@ -441,10 +461,39 @@ export class SqliteStore {
       .prepare(
         `SELECT * FROM task_session
          WHERE state = 'stopped' AND failure_reason = ? AND pr_number IS NOT NULL
+           AND (recovery_action IS NULL OR recovery_action != 'abandon')
            AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
          ORDER BY id ASC`,
       )
       .all(failureReason) as RawSessionRow[];
+    return rows.map(toSessionRow);
+  }
+
+  /**
+   * Stopped sessions with a PR where Codex recovery was attempted but its action failed.
+   * Requires the recovery-failure marker in stop_detail so that historical sessions whose
+   * recovery_attempted defaulted to 0 during migration are not retried (ES-450 Finding 4).
+   * Excludes cost_exceeded (terminal) and looppilot_stopped (handled by stoppedSessionsWithPr).
+   * pr_closed is NOT excluded: a partial abandon that failed at ticket revert leaves
+   * failure_reason='pr_closed' with a recovery-failed stop_detail and recovery_attempted=0;
+   * the stop_detail LIKE filter below limits inclusion to only sessions with recovery markers,
+   * and isPartialAbandon in stopSession detects these for retry (ES-450 Finding 3).
+   */
+  stoppedSessionsWithFailedRecovery(): TaskSessionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM task_session
+         WHERE state = 'stopped'
+           AND pr_number IS NOT NULL
+           AND recovery_attempted = 0
+           AND failure_reason NOT IN ('cost_exceeded', 'looppilot_stopped')
+           AND (recovery_action IS NULL OR recovery_action != 'abandon')
+           AND (stop_detail LIKE '%(recovery failed:%' OR stop_detail LIKE 'recovery failed:%'
+                OR stop_detail LIKE 'abandon_in_progress%')
+           AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
+         ORDER BY id ASC`,
+      )
+      .all() as RawSessionRow[];
     return rows.map(toSessionRow);
   }
 
@@ -455,6 +504,16 @@ export class SqliteStore {
          WHERE state NOT IN ('merged','stopped')`,
       )
       .all() as Array<{ id: string }>;
+    return rows.map((r) => r.id);
+  }
+
+  abandonedIssueIds(runId: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT linear_issue_id AS id FROM task_session
+         WHERE state = 'stopped' AND recovery_action = 'abandon' AND run_id = ?`,
+      )
+      .all(runId) as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }
 

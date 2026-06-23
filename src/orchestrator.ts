@@ -24,6 +24,8 @@ import type {
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
+import { executeRecoveryTurn } from "./recovery-turn.js";
+import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
@@ -46,6 +48,7 @@ export interface OrchestratorDeps {
   recovery: WorkflowRecovery;
   planner: PlanRunner | null;
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
+  recoveryTurn: RecoveryTurnDeps | null;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -72,6 +75,7 @@ export class Orchestrator {
   private readonly recovery: WorkflowRecovery;
   private readonly planner: PlanRunner | null;
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
+  private readonly recoveryTurn: RecoveryTurnDeps | null;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -92,6 +96,7 @@ export class Orchestrator {
     this.recovery = deps.recovery;
     this.planner = deps.planner;
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
+    this.recoveryTurn = deps.recoveryTurn;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -157,6 +162,13 @@ export class Orchestrator {
         ctrl = await this.recoverByOpenPr(session);
       }
       if (ctrl.control === "halt") return HALT;
+      // If recovery re-activated the session to in_review, resume monitoring so
+      // it doesn't sit idle until the next daemon restart (ES-450 Finding 4).
+      const refreshed = this.store.getSession(session.id);
+      if (refreshed.state === "in_review" && refreshed.prNumber !== null) {
+        const monCtrl = await this.adoptAndMonitor(refreshed, refreshed.prNumber, refreshed.monitorStartedAt);
+        if (monCtrl.control === "halt") return HALT;
+      }
     }
 
     // 3) stopped(looppilot_stopped) + PR ありのセッション回復（ES-411）
@@ -165,11 +177,41 @@ export class Orchestrator {
       if (ctrl.control === "halt") return HALT;
     }
 
+    // 4) Stopped sessions where Codex recovery ran but its action failed (e.g. transient
+    // /restart-review post failure). recovery_attempted=0 means recovery was not completed
+    // successfully — retry it now so the PR is not left unmonitored (ES-450 Finding 3).
+    for (const session of this.store.stoppedSessionsWithFailedRecovery()) {
+      this.store.updateSession(session.id, { runId: this.runId });
+      // Strip the "(recovery failed: ...)" suffix stopSession appended so the re-entered
+      // recovery prompt sees the original detail rather than the accumulated failure chain.
+      const ctrl = await this.stopSession(
+        session,
+        session.failureReason as FailureReason,
+        stripRecoveryFailedSuffix(session.stopDetail),
+      );
+      if (ctrl.control === "halt") return HALT;
+      // If recovery re-activated the session to in_review, resume monitoring it.
+      // Without this, the session would sit idle until the next daemon restart
+      // because the active-session pass (step 2) already ran (ES-450 Finding 1).
+      const refreshed = this.store.getSession(session.id);
+      if (refreshed.state === "in_review" && refreshed.prNumber !== null) {
+        const monCtrl = await this.adoptAndMonitor(refreshed, refreshed.prNumber, refreshed.monitorStartedAt);
+        if (monCtrl.control === "halt") return HALT;
+      }
+    }
+
     return CONTINUE;
   }
 
   /** in_review + PR の回復（カーネル §8）。poll の verdict で分岐する。 */
   private async recoverInReview(session: TaskSessionRow, prNumber: number): Promise<RunControl> {
+    // If the process crashed mid-abandon (after the marker was written but before gh pr close
+    // ran), the session is still in_review. Skip the poll and force the abandon cleanup path
+    // regardless of the PR's current open/closed state (ES-450 Finding 1).
+    if (session.stopDetail !== null && session.stopDetail.startsWith("abandon_in_progress")) {
+      this.store.updateSession(session.id, { runId: this.runId });
+      return await this.stopSession(session, "pr_closed", null);
+    }
     let verdict: MonitorVerdict;
     try {
       verdict = await this.monitor.poll(prNumber);
@@ -201,11 +243,18 @@ export class Orchestrator {
           return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
         }
         this.store.updateSession(session.id, { runId: this.runId });
-        return await this.stopSession(
+        const stopCtrl = await this.stopSession(
           session,
           "looppilot_stopped",
           verdict.stopReason ?? "looppilot stopped (no reason)",
         );
+        if (stopCtrl.control === "halt") return HALT;
+        // If recovery re-activated the session to in_review, resume monitoring it.
+        const refreshed = this.store.getSession(session.id);
+        if (refreshed.state === "in_review" && refreshed.prNumber !== null) {
+          return await this.adoptAndMonitor(refreshed, refreshed.prNumber, refreshed.monitorStartedAt);
+        }
+        return stopCtrl;
       }
       // done / in_progress / corrupted / not_engaged = open 扱い → 採用して MONITOR 再開
       case "done":
@@ -233,8 +282,10 @@ export class Orchestrator {
     const fresh = this.store.getSession(session.id);
     const ctrl = await this.monitorSession(fresh, prNumber);
     if (ctrl.control === "halt") return HALT;
-    // merged 到達 → DONE 後段
-    await this.recoverDone(fresh);
+    // merged 到達 → DONE 後段（abandon で stopped になった場合はスキップ）
+    if (this.store.getSession(fresh.id).state !== "stopped") {
+      await this.recoverDone(fresh);
+    }
     return CONTINUE;
   }
 
@@ -253,6 +304,15 @@ export class Orchestrator {
       );
     }
     if (prNumber !== null) {
+      // If the session's stop_detail marks an abandon in progress (onAbandonStarting wrote
+      // it before the crash), force the abandon cleanup path regardless of the open PR state.
+      // Without this, recoverByOpenPr would adopt the PR into monitoring, bypassing the
+      // chosen abandon and letting LoopPilot re-engage on a ticket that was being abandoned
+      // (ES-450 Finding 3).
+      if (session.stopDetail !== null && session.stopDetail.startsWith("abandon_in_progress")) {
+        this.store.updateSession(session.id, { runId: this.runId, prNumber });
+        return await this.stopSession(session, "pr_closed", null);
+      }
       // 既存のオープン PR を採用。monitorStartedAt は既存値 ?? clock()。
       const monitorStartedAt = session.monitorStartedAt ?? this.clock();
       this.store.updateSession(session.id, {
@@ -347,15 +407,21 @@ export class Orchestrator {
       // A transient poll error means we have no verdict to compare against the exhaustion
       // detail. If the session's stopDetail indicates a terminal counter exhaustion, do not
       // revive it — we cannot confirm the stop reason changed, so preserve the terminal HALT.
-      if (
-        session.stopDetail !== null &&
-        (session.stopDetail.startsWith("auto-restart limit exceeded") ||
-          session.stopDetail.startsWith("quota retry limit exceeded"))
-      ) {
-        this.log(
-          `recovery: skipping exhausted stopped session PR #${prNumber} (poll error): ${session.stopDetail}`,
+      // extractInnerStopDetail unwraps "abandon_in_progress:<original>" so that a failed
+      // abandon over an exhausted session still triggers the exhaustion guard (ES-450 Finding 4).
+      if (session.stopDetail !== null) {
+        const innerDetailForPollError = extractInnerStopDetail(
+          stripRecoveryFailedSuffix(session.stopDetail) ?? "",
         );
-        return CONTINUE;
+        if (
+          innerDetailForPollError.startsWith("auto-restart limit exceeded") ||
+          innerDetailForPollError.startsWith("quota retry limit exceeded")
+        ) {
+          this.log(
+            `recovery: skipping exhausted stopped session PR #${prNumber} (poll error): ${session.stopDetail}`,
+          );
+          return CONTINUE;
+        }
       }
       this.resetAndAdopt(session.id);
       return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
@@ -375,16 +441,43 @@ export class Orchestrator {
           // Compare against the current verdict.stopReason so that a different new stop
           // reason (e.g. test_failure after workflow_crashed was exhausted) gets a fresh
           // restart budget rather than being silently skipped.
+          // extractInnerStopDetail unwraps "abandon_in_progress:<original>" so that a failed
+          // abandon over an exhausted session still honours the cap (ES-450 Finding 4).
+          const rawDetailForExhaustion = extractInnerStopDetail(
+            stripRecoveryFailedSuffix(session.stopDetail) ?? "",
+          );
           if (
             (recoveryCategory === "auto_restart" &&
               session.stopDetail !== null &&
-              session.stopDetail.startsWith("auto-restart limit exceeded") &&
-              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason) ||
+              rawDetailForExhaustion.startsWith("auto-restart limit exceeded") &&
+              extractExhaustedStopReason(rawDetailForExhaustion) === verdict.stopReason) ||
             (recoveryCategory === "quota_wait" &&
               session.stopDetail !== null &&
-              session.stopDetail.startsWith("quota retry limit exceeded") &&
-              extractExhaustedStopReason(session.stopDetail) === verdict.stopReason)
+              rawDetailForExhaustion.startsWith("quota retry limit exceeded") &&
+              extractExhaustedStopReason(rawDetailForExhaustion) === verdict.stopReason)
           ) {
+            // Before skipping, retry if a prior Codex recovery failed (e.g. transient
+            // /restart-review post failure). Without this the failed recovery is never
+            // retried: this guard returns before the retry block below and
+            // stoppedSessionsWithFailedRecovery excludes looppilot_stopped (ES-450 Finding 2).
+            if (
+              !session.recoveryAttempted &&
+              session.stopDetail !== null &&
+              session.stopDetail.includes("(recovery failed:")
+            ) {
+              this.store.updateSession(session.id, { runId: this.runId });
+              const retryCtrl = await this.stopSession(
+                session,
+                session.failureReason as FailureReason,
+                stripRecoveryFailedSuffix(session.stopDetail),
+              );
+              if (retryCtrl.control === "halt") return HALT;
+              const retried = this.store.getSession(session.id);
+              if (retried.state === "in_review" && retried.prNumber !== null) {
+                return await this.adoptAndMonitor(retried, retried.prNumber, retried.monitorStartedAt);
+              }
+              return retryCtrl;
+            }
             this.log(
               `recovery: skipping exhausted stopped session PR #${prNumber}: ${session.stopDetail}`,
             );
@@ -393,11 +486,51 @@ export class Orchestrator {
           this.resetAndAdopt(session.id);
           return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
         }
-        // human_required / null → LoopPilot has not yet restarted; skip
+        // human_required / null → LoopPilot has not yet restarted.
+        // If a prior Codex recovery action failed (indicated by the
+        // "(recovery failed: ...)" suffix in stopDetail and recovery_attempted=0),
+        // retry the recovery by re-entering stopSession so transient failures
+        // (e.g. failed push or /restart-review post) don't leave the PR
+        // stopped and unmonitored across daemon restarts (ES-450 Finding 5).
+        if (
+          !session.recoveryAttempted &&
+          session.stopDetail !== null &&
+          session.stopDetail.includes("(recovery failed:")
+        ) {
+          this.store.updateSession(session.id, { runId: this.runId });
+          const retryCtrl = await this.stopSession(
+            session,
+            session.failureReason as FailureReason,
+            stripRecoveryFailedSuffix(session.stopDetail),
+          );
+          if (retryCtrl.control === "halt") return HALT;
+          const retried = this.store.getSession(session.id);
+          if (retried.state === "in_review" && retried.prNumber !== null) {
+            return await this.adoptAndMonitor(retried, retried.prNumber, retried.monitorStartedAt);
+          }
+          return retryCtrl;
+        }
         return CONTINUE;
       }
-      case "pr_closed":
+      case "pr_closed": {
+        // If a prior abandon recovery closed the PR but failed at branch cleanup or ticket
+        // revert, retry the full abandon cleanup. isPartialAbandon in stopSession detects
+        // the abandon_in_progress sentinel or recovery-failed marker and re-enters executeAbandon,
+        // which tolerates "already closed" / "already deleted" gracefully (ES-450 Finding 1).
+        if (
+          !session.recoveryAttempted &&
+          session.stopDetail !== null &&
+          (session.stopDetail.startsWith("abandon_in_progress") ||
+            session.stopDetail.startsWith("recovery failed: ") ||
+            session.stopDetail.includes(" (recovery failed: "))
+        ) {
+          this.store.updateSession(session.id, { runId: this.runId });
+          const retryCtrl = await this.stopSession(session, "pr_closed", null);
+          if (retryCtrl.control === "halt") return HALT;
+          return retryCtrl;
+        }
         return CONTINUE;
+      }
       case "merged":
         this.resetAndAdopt(session.id);
         await this.recoverDone(session);
@@ -454,7 +587,10 @@ export class Orchestrator {
       // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
       let eligible: EligibleIssue[];
       try {
-        eligible = await this.source.getAllEligible(this.store.activeIssueIds());
+        eligible = await this.source.getAllEligible([
+          ...this.store.activeIssueIds(),
+          ...this.store.abandonedIssueIds(this.runId),
+        ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
@@ -495,7 +631,10 @@ export class Orchestrator {
 
       // 3) CLAIM
       const claim = await this.claim(issue);
-      if (claim.control === "halt") return;
+      if (!("session" in claim)) {
+        if (claim.control === "halt") return;
+        continue; // recovery CONTINUE → retry from SELECT
+      }
       const session = claim.session;
 
       // Record PM selection rationale (§1.6)
@@ -523,15 +662,31 @@ export class Orchestrator {
 
       // 6) HANDOFF (was 5)
       const handoff = await this.handoff(session, issue);
-      if (handoff.control === "halt") return;
+      if (!("prNumber" in handoff)) {
+        if (handoff.control === "halt") return;
+        // Recovery CONTINUE: if the session was recovered to in_review (e.g. handoff_failed
+        // after a PR was already created), resume MONITOR with the recovered PR number.
+        const recoveredSession = this.store.getSession(session.id);
+        if (recoveredSession.state === "in_review" && recoveredSession.prNumber !== null) {
+          const mon = await this.monitorSession(recoveredSession, recoveredSession.prNumber);
+          if (mon.control === "halt") return;
+          // Skip done() if abandon recovery stopped the session during monitor
+          if (this.store.getSession(recoveredSession.id).state !== "stopped") {
+            await this.done(recoveredSession, issue);
+          }
+        }
+        continue; // recovery CONTINUE → retry from SELECT
+      }
       const prNumber = handoff.prNumber;
 
       // 7) MONITOR (was 6)
       const mon = await this.monitorSession(session, prNumber);
       if (mon.control === "halt") return;
 
-      // 8) DONE (was 7)
-      await this.done(session, issue);
+      // 8) DONE (was 7): skip if abandon recovery stopped the session during monitor
+      if (this.store.getSession(session.id).state !== "stopped") {
+        await this.done(session, issue);
+      }
       // ループ継続（SELECT へ）
     }
   }
@@ -539,7 +694,7 @@ export class Orchestrator {
   // ---- CLAIM（仕様 §5.2） ----
   private async claim(
     issue: EligibleIssue,
-  ): Promise<{ control: "halt" } | { control: "continue"; session: TaskSessionRow }> {
+  ): Promise<RunControl | { control: "continue"; session: TaskSessionRow }> {
     let claimResult;
     try {
       claimResult = await this.git.prepareWorktree(issue);
@@ -566,8 +721,8 @@ export class Orchestrator {
       // ② transition 失敗：discardWorktree + stopped(claim_failed) + ticket→Todo（best-effort）→ HALT
       await bestEffort(() => this.git.discardWorktree(claimResult.branch, claimResult.worktreePath));
       await bestEffort(() => this.source.transition(issue.id, "todo"));
-      const ctrl = await this.stopSession(session, "claim_failed", `transition(in_progress) failed: ${errMsg(err)}`);
-      return ctrl;
+      return await this.stopSession(session, "claim_failed", `transition(in_progress) failed: ${errMsg(err)}`);
+
     }
     if (this.config.notify.progress) {
       await this.notifier.notify({
@@ -850,7 +1005,7 @@ export class Orchestrator {
   private async handoff(
     session: TaskSessionRow,
     issue: EligibleIssue,
-  ): Promise<{ control: "halt" } | { control: "continue"; prNumber: number }> {
+  ): Promise<RunControl | { control: "continue"; prNumber: number }> {
     this.store.updateSession(session.id, { state: "handing_off" });
     const worktreePath = session.worktreePath as string;
     let prNumber: number;
@@ -898,6 +1053,10 @@ export class Orchestrator {
     let quotaResumedNotified = false;
     let firstPoll = true;
     while (true) {
+      // ES-450 Finding 2: if recovery abandoned the session, exit the monitor loop so the
+      // outer loop can proceed to SELECT the next task instead of continuing to poll a
+      // closed PR and eventually halting the run.
+      if (this.store.getSession(session.id).state === "stopped") return CONTINUE;
       if (!firstPoll && this.interrupted) {
         await this.haltForInterrupt();
         return HALT;
@@ -913,7 +1072,12 @@ export class Orchestrator {
         pollFailures += 1;
         mergeFailures = 0;
         if (pollFailures >= 5) {
-          return await this.stopSession(session, "exception", `monitor poll failed 5x: ${errMsg(err)}`);
+          const ctrl = await this.stopSession(session, "exception", `monitor poll failed 5x: ${errMsg(err)}`);
+          if (ctrl.control === "halt") return HALT;
+          // ES-450 Finding 1: reset streak so recovery gets a full fresh window.
+          pollFailures = 0;
+          backoffMultiplier = 1;
+          continue;
         }
         backoffMultiplier = Math.min(backoffMultiplier * 2, 8);
         continue;
@@ -922,8 +1086,16 @@ export class Orchestrator {
       backoffMultiplier = 1;
       // Clear the pending-restart record when LoopPilot transitions away from stopped — that
       // confirms the /restart-review was consumed and the restart is no longer in flight.
-      if (verdict.kind !== "stopped") {
-        if (pendingRestartReason !== undefined) {
+      // Exception: "ci_failed" and "merge_conflict" are done-path recovery markers, not
+      // LoopPilot stop reasons. LoopPilot never emits these as stopReason, so they must
+      // survive until the done-case stale guard consumes them (ES-450 Finding 1).
+      // Exception: "workflow_failed" preserves pendingRestartReason so the workflow_failed
+      // case below can give a one-poll grace period for stale error comments after a
+      // Codex-recovery /restart-review (ES-450 Finding 4).
+      if (verdict.kind !== "stopped" && verdict.kind !== "workflow_failed") {
+        if (pendingRestartReason !== undefined &&
+            pendingRestartReason !== "ci_failed" &&
+            pendingRestartReason !== "merge_conflict") {
           pendingRestartReason = undefined;
           this.store.updateSession(session.id, { pendingRestartReason: null });
         }
@@ -939,6 +1111,14 @@ export class Orchestrator {
         case "merged":
           return CONTINUE; // DONE へ
         case "done": {
+          // Stale guard: if done-path recovery just posted /restart-review for a
+          // merge-readiness failure, give one poll of grace before re-attempting
+          // the merge so the fix can propagate (ES-450 Finding 1).
+          if (pendingRestartReason !== undefined) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
           const outcome = await this.tryMerge(session, prNumber);
           if (outcome.kind === "merged") return CONTINUE;
           if (outcome.kind === "halt") return HALT;
@@ -948,11 +1128,14 @@ export class Orchestrator {
             readinessFailures += 1;
             mergeFailures = 0; // done+ready 以外の評価 → ready ストリーク断絶
             if (readinessFailures >= 5) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "exception",
                 `merge readiness check failed 5x: ${outcome.error}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              readinessFailures = 0; // ES-450 Finding 1: reset after recovery
+              continue;
             }
             // 直前の poll 成功で backoffMultiplier は 1 に戻っているため、連続失敗数から導出（×2..×8）。
             backoffMultiplier = Math.min(2 ** readinessFailures, 8);
@@ -963,16 +1146,29 @@ export class Orchestrator {
             // ready verdict のまま mergePr が throw。2 連続で fail-closed（カーネル §7.6）。
             mergeFailures += 1;
             if (mergeFailures >= 2) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "ci_failed",
                 `merge call failed under ready verdict: ${outcome.error}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              mergeFailures = 0; // ES-450 Finding 1: reset after recovery
+              continue;
             }
             continue; // 1 回目は次ポーリングで再評価
           }
           // outcome.kind === "continue"（readiness が ci_pending/unknown 等）
           mergeFailures = 0; // ready 連続を断ち切る事象が起きたらリセット
+          // Reload pendingRestartReason so the stale guard fires on the next poll if
+          // done-path recovery was applied (ES-450 Finding 1).
+          // Also reload autoRestartCount: recovery resets autoRestartAttempts in the DB
+          // but the local counter would otherwise retain its pre-recovery value, causing
+          // the cap to trip on the next auto-restartable stop (ES-450 Finding 3).
+          {
+            const recoveredForPending = this.store.getSession(session.id);
+            pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
+            autoRestartCount = recoveredForPending.autoRestartAttempts;
+          }
           continue;
         }
         case "stopped": {
@@ -981,8 +1177,14 @@ export class Orchestrator {
             // Workflow completed (no_findings) — treat same as done for merge streak.
             // Also clear any pending restart since LoopPilot completed successfully.
             if (pendingRestartReason !== undefined) {
+              const prr = pendingRestartReason;
               pendingRestartReason = undefined;
               this.store.updateSession(session.id, { pendingRestartReason: null });
+              // Stale guard: if done-path recovery set this marker, give one grace poll
+              // before re-attempting the merge so the fix can propagate (ES-450 Finding 1).
+              if (prr === "ci_failed" || prr === "merge_conflict") {
+                continue;
+              }
             }
             const outcome = await this.tryMerge(session, prNumber);
             if (outcome.kind === "merged") return CONTINUE;
@@ -991,11 +1193,14 @@ export class Orchestrator {
               readinessFailures += 1;
               mergeFailures = 0;
               if (readinessFailures >= 5) {
-                return await this.stopSession(
+                const ctrl = await this.stopSession(
                   session,
                   "exception",
                   `merge readiness check failed 5x: ${outcome.error}`,
                 );
+                if (ctrl.control === "halt") return HALT;
+                readinessFailures = 0; // ES-450 Finding 1: reset after recovery
+                continue;
               }
               backoffMultiplier = Math.min(2 ** readinessFailures, 8);
               continue;
@@ -1004,15 +1209,24 @@ export class Orchestrator {
             if (outcome.kind === "merge_failed") {
               mergeFailures += 1;
               if (mergeFailures >= 2) {
-                return await this.stopSession(
+                const ctrl = await this.stopSession(
                   session,
                   "ci_failed",
                   `merge call failed under ready verdict: ${outcome.error}`,
                 );
+                if (ctrl.control === "halt") return HALT;
+                mergeFailures = 0; // ES-450 Finding 1: reset after recovery
+                continue;
               }
               continue;
             }
             mergeFailures = 0;
+            // Reload pendingRestartReason so the stale guard fires on the next poll if
+            // done-path recovery was applied (ES-450 Finding 1).
+            {
+              const recoveredForPending = this.store.getSession(session.id);
+              pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
+            }
             continue;
           }
           if (category === "auto_restart") {
@@ -1036,17 +1250,28 @@ export class Orchestrator {
                 timeout !== undefined &&
                 this.elapsedMinutesSinceMonitorStart(session.id) > timeout
               ) {
-                return await this.stopSession(session, "exception", "monitor timeout");
+                const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               continue;
             }
             autoRestartCount += 1;
             if (autoRestartCount > 3) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "looppilot_stopped",
                 `auto-restart limit exceeded (${autoRestartCount}x): ${verdict.stopReason}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              // Reload so the stale guard fires on the next poll if recovery posted /restart-review.
+              // Also reload autoRestartCount: recovery may have reset it in the DB (Finding 2b).
+              {
+                const recoveredState = this.store.getSession(session.id);
+                pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
+                autoRestartCount = recoveredState.autoRestartAttempts;
+              }
+              continue;
             }
             // A real restart event breaks any prior readiness-failure streak: errors before
             // and after the restarted review are not consecutive within the new attempt.
@@ -1062,11 +1287,13 @@ export class Orchestrator {
             try {
               await this.git.postComment(prNumber, "/restart-review");
             } catch (err) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "exception",
                 `/restart-review comment failed: ${errMsg(err)}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             // ES-409 Finding 3: persist attempt count and pending reason AFTER a confirmed
             // post. A pre-post crash leaves autoRestartAttempts unchanged and
@@ -1094,18 +1321,30 @@ export class Orchestrator {
                 timeout !== undefined &&
                 this.elapsedMinutesSinceMonitorStart(session.id) > timeout
               ) {
-                return await this.stopSession(session, "exception", "monitor timeout");
+                const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               continue;
             }
             quotaRetryCount += 1;
             quotaResumedNotified = false;
             if (quotaRetryCount > 6) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "looppilot_stopped",
                 `quota retry limit exceeded (${quotaRetryCount}x): ${verdict.stopReason}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              // Reload so the stale guard fires on the next poll if recovery posted /restart-review.
+              // Also reload autoRestartCount: recovery resets autoRestartAttempts in the DB
+              // but the local counter would otherwise retain its pre-recovery value (ES-450 Finding 3).
+              {
+                const quotaRecoveredState = this.store.getSession(session.id);
+                pendingRestartReason = quotaRecoveredState.pendingRestartReason ?? undefined;
+                autoRestartCount = quotaRecoveredState.autoRestartAttempts;
+              }
+              continue;
             }
             if (quotaRetryCount === 1) {
               await this.notifier.notify({
@@ -1145,11 +1384,13 @@ export class Orchestrator {
             try {
               await this.git.postComment(prNumber, "/restart-review");
             } catch (err) {
-              return await this.stopSession(
+              const ctrl = await this.stopSession(
                 session,
                 "exception",
                 `/restart-review comment failed: ${errMsg(err)}`,
               );
+              if (ctrl.control === "halt") return HALT;
+              continue;
             }
             // Finding 4: persist the pending reason after a confirmed post so
             // the next poll (and any process-restart recovery) recognises the
@@ -1161,23 +1402,56 @@ export class Orchestrator {
             continue;
           }
           // human_required / null → HALT
-          return await this.stopSession(
-            session,
-            "looppilot_stopped",
-            verdict.stopReason ?? "looppilot stopped (no reason)",
-          );
+          // Stale check: if ES-450 recovery already posted /restart-review for this exact
+          // stop reason, give one poll of grace before the restart is consumed (Finding 6).
+          if (pendingRestartReason !== undefined &&
+              pendingRestartReason === (verdict.stopReason ?? "looppilot stopped (no reason)")) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
+          {
+            const ctrl = await this.stopSession(
+              session,
+              "looppilot_stopped",
+              verdict.stopReason ?? "looppilot stopped (no reason)",
+            );
+            if (ctrl.control === "halt") return HALT;
+            // Recovery succeeded: reload pendingRestartReason so next poll gives grace.
+            // Also reload autoRestartCount: recovery resets autoRestartAttempts in the DB
+            // but the local counter would otherwise retain its pre-recovery value (ES-450 Finding 3).
+            const recoveredState = this.store.getSession(session.id);
+            pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
+            autoRestartCount = recoveredState.autoRestartAttempts;
+            continue;
+          }
         }
-        case "pr_closed":
-          return await this.stopSession(session, "pr_closed", null);
-        case "corrupted":
-          return await this.stopSession(
+        case "pr_closed": {
+          const ctrl = await this.stopSession(session, "pr_closed", null);
+          if (ctrl.control === "halt") return HALT;
+          continue;
+        }
+        case "corrupted": {
+          // Stale guard: if recovery already posted /restart-review, give one poll grace
+          // before treating a transient corrupted read as a hard stop (Finding 3).
+          if (pendingRestartReason !== undefined) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
+          const ctrl = await this.stopSession(
             session,
             "monitor_never_engaged",
             "looppilot-state comment present but corrupted",
           );
+          if (ctrl.control === "halt") return HALT;
+          continue;
+        }
         case "not_engaged": {
           if (this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes) {
-            return await this.stopSession(session, "monitor_never_engaged", null);
+            const ctrl = await this.stopSession(session, "monitor_never_engaged", null);
+            if (ctrl.control === "halt") return HALT;
+            continue;
           }
           continue;
         }
@@ -1195,11 +1469,24 @@ export class Orchestrator {
           }
           const timeout = this.config.safety.monitorTimeoutMinutes;
           if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
-            return await this.stopSession(session, "exception", "monitor timeout");
+            const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+            if (ctrl.control === "halt") return HALT;
+            continue;
           }
           continue;
         }
         case "workflow_failed": {
+          // Stale-error grace: if a /restart-review was posted in the previous recovery
+          // turn (by Codex recovery or auto_restart), skip one poll so LoopPilot has a
+          // chance to process the restart before AgentWorkflowRecovery sees the still-
+          // visible workflow_failed comment and triggers another fix agent. Without this,
+          // recoveryAttempted=1 causes the session to halt immediately after a successful
+          // /restart-review on a workflow_setup_failed recovery (ES-450 Finding 4).
+          if (pendingRestartReason !== undefined) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
           const current = this.store.getSession(session.id);
           const recoveryCtx: RecoveryContext = {
             worktreePath: session.worktreePath as string,
@@ -1217,11 +1504,14 @@ export class Orchestrator {
           try {
             recoveryResult = await this.recovery.attemptRecovery(recoveryCtx);
           } catch (err) {
-            return await this.stopSession(
+            const ctrl = await this.stopSession(
               session,
               "workflow_setup_failed",
               `workflow recovery error: ${errMsg(err)}`,
+              { workflowHandledErrorCount: verdict.errorCommentCount },
             );
+            if (ctrl.control === "halt") return HALT;
+            continue;
           }
           if (recoveryResult.kind === "interrupted") {
             if (recoveryResult.costUsd > 0) {
@@ -1257,7 +1547,9 @@ export class Orchestrator {
               // that never re-engaged (Finding 3):
               const timeout = this.config.safety.monitorTimeoutMinutes;
               if (timeout !== undefined && this.elapsedMinutesSinceMonitorStart(session.id) > timeout) {
-                return await this.stopSession(session, "exception", "monitor timeout");
+                const ctrl = await this.stopSession(session, "exception", "monitor timeout");
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
               // Only fall back to the not-engaged guard while no live state comment
               // exists, so an ignored /restart-review cannot poll forever — but a
@@ -1267,7 +1559,9 @@ export class Orchestrator {
                 !verdict.hasStateComment &&
                 this.elapsedMinutesSinceMonitorStart(session.id) > this.config.safety.notEngagedGuardMinutes
               ) {
-                return await this.stopSession(session, "monitor_never_engaged", null);
+                const ctrl = await this.stopSession(session, "monitor_never_engaged", null);
+                if (ctrl.control === "halt") return HALT;
+                continue;
               }
             }
             continue;
@@ -1280,11 +1574,16 @@ export class Orchestrator {
             const refreshed = this.store.getSession(session.id);
             this.store.updateSession(session.id, { costUsd: (refreshed.costUsd ?? 0) + recoveryResult.costUsd });
           }
-          return await this.stopSession(
-            session,
-            "workflow_setup_failed",
-            detail,
-          );
+          {
+            const ctrl = await this.stopSession(
+              session,
+              "workflow_setup_failed",
+              detail,
+              { workflowHandledErrorCount: verdict.errorCommentCount },
+            );
+            if (ctrl.control === "halt") return HALT;
+            continue;
+          }
         }
       }
     }
@@ -1317,19 +1616,22 @@ export class Orchestrator {
         case "ci_pending":
         case "unknown":
           return { kind: "continue" };
-        case "ci_failed":
-          await this.stopSession(session, "ci_failed", null);
-          return { kind: "halt" };
-        case "conflict":
-          await this.stopSession(session, "merge_conflict", null);
-          return { kind: "halt" };
-        case "blocked":
-          await this.stopSession(
+        case "ci_failed": {
+          const ctrl = await this.stopSession(session, "ci_failed", null);
+          return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
+        }
+        case "conflict": {
+          const ctrl = await this.stopSession(session, "merge_conflict", null);
+          return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
+        }
+        case "blocked": {
+          const ctrl = await this.stopSession(
             session,
             "ci_failed",
             "merge blocked by branch protection: required reviews/rulesets (mergeStateStatus=BLOCKED with green checks)",
           );
-          return { kind: "halt" };
+          return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
+        }
       }
     }
     try {
@@ -1366,16 +1668,288 @@ export class Orchestrator {
     session: TaskSessionRow,
     reason: FailureReason,
     detail: string | null,
-    extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber">> = {},
-  ): Promise<{ control: "halt" }> {
+    extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber" | "workflowHandledErrorCount">> = {},
+  ): Promise<RunControl> {
+    let patch = extraPatch;
+    // Effective stop detail — may be augmented with recovery failure message (Finding 3).
+    let effectiveDetail = detail;
+    // --- Recovery gate (ES-450) ---
+    // pr_closed is terminal — the PR is gone, so fix_code/rebase/restart_review would
+    // post comments or push to a closed PR then flip the session back to in_review where
+    // it will not be monitored again. Only escalate/abandon apply, and retrying them on
+    // every daemon start is not useful. Skip recovery entirely for this reason.
+    // workflow_setup_failed with "fix agent exceeded cost limit" detail is also terminal:
+    // AgentWorkflowRecovery already hit the cost cap, so another fix agent would exceed it
+    // again immediately. Treat this the same as cost_exceeded (ES-450 Finding 1).
+    const isWorkflowCostExhaustion =
+      reason === "workflow_setup_failed" &&
+      detail !== null &&
+      detail.includes("fix agent exceeded cost limit");
+    // Mark terminal conditions so stoppedSessionsWithFailedRecovery does not pick
+    // them up on every daemon start (ES-450 Finding 4).
+    if (isWorkflowCostExhaustion) {
+      this.store.updateSession(session.id, { recoveryAttempted: 1 });
+    }
+    if (reason !== "cost_exceeded" && !isWorkflowCostExhaustion && this.recoveryTurn !== null && this.planner !== null) {
+      const fresh = this.store.getSession(session.id);
+      // pr_closed is normally terminal (no PR to push to / restart). Exception: a partial
+      // abandon (crash mid-abandon with stopDetail="abandon_in_progress") left the ticket
+      // in a dirty state — recovery can complete the cleanup (ES-450 Finding 4).
+      const isPartialAbandon = reason === "pr_closed" && (
+        // startsWith covers both the plain "abandon_in_progress" sentinel and the compound
+        // "abandon_in_progress:<original>" form used when a failed abandon preserves the
+        // original exhaustion detail (ES-450 Finding 4).
+        (fresh.stopDetail !== null && fresh.stopDetail.startsWith("abandon_in_progress")) ||
+        // A prior recovery attempt ran but failed mid-abandon (e.g. ticket revert failed after
+        // the PR and branch were already cleaned up). For pr_closed sessions the only path where
+        // recovery can run is via isPartialAbandon itself, so a "recovery failed:" marker in
+        // stop_detail safely identifies retryable failed abandon cleanups. These sessions are
+        // fed back here by stoppedSessionsWithFailedRecovery (ES-450 Finding 3).
+        (fresh.stopDetail !== null &&
+         (fresh.stopDetail.startsWith("recovery failed: ") ||
+          fresh.stopDetail.includes(" (recovery failed: ")))
+      );
+      if ((reason !== "pr_closed" || isPartialAbandon) && !fresh.recoveryAttempted && fresh.prNumber !== null) {
+        await this.notifier.notify({
+          kind: "recovery_started",
+          identifier: session.linearIdentifier,
+          reason,
+        });
+        // Persist crash-recovery marker before the PR close step inside executeAbandon so
+        // a mid-abandon crash is detectable on the next daemon start (ES-450 Finding 4).
+        // Capture the current effectiveDetail so we can embed an exhaustion detail in the
+        // compound marker — without this, the next recoverStoppedByLooppilot startup would
+        // not recognise the terminal cap and would reset/adopt the session (ES-450 Finding 4).
+        const capturedDetailForMarker = effectiveDetail;
+        const onAbandonStarting = () => {
+          const innerForMarker = extractInnerStopDetail(capturedDetailForMarker ?? "");
+          const isExhaustedDetail =
+            innerForMarker.startsWith("auto-restart limit exceeded") ||
+            innerForMarker.startsWith("quota retry limit exceeded");
+          this.store.updateSession(session.id, {
+            stopDetail: isExhaustedDetail
+              ? `abandon_in_progress:${innerForMarker}`
+              : "abandon_in_progress",
+          });
+        };
+        // Gate label handling for handoff_failed is now inside executeRecoveryTurn (after
+        // parseRecoveryAction), so abandon/escalate can proceed even when the label API is
+        // broken (ES-450 Finding 5).
+        let result;
+        try {
+          result = await executeRecoveryTurn(
+            this.recoveryTurn,
+            fresh,
+            reason,
+            detail,
+            onAbandonStarting,
+          );
+        } catch (err) {
+          this.log(`recovery: exception: ${err instanceof Error ? err.message : String(err)}`);
+          result = { kind: "escalated" as const, action: "escalate" as const };
+        }
+        // Operator interrupted during recovery analysis: propagate like other interrupts.
+        // recoveryAttempted is NOT marked so the next run can retry recovery.
+        if (result.kind === "interrupted") {
+          if (result.costUsd !== undefined && result.costUsd > 0) {
+            const freshened = this.store.getSession(session.id);
+            this.store.updateSession(session.id, { costUsd: (freshened.costUsd ?? 0) + result.costUsd });
+          }
+          await this.haltForInterrupt();
+          return HALT;
+        }
+        // Mark recovery attempted for all non-interrupted, non-failed outcomes.
+        // For 'failed', the cleanup did not complete — leave recoveryAttempted=0 so a
+        // future recovery path can retry the cleanup (ES-450 Finding 2).
+        // For 'recovered', defer the write to recoveryUpdate so the gate is consumed
+        // atomically with the state→in_review transition — a crash between this write
+        // and that update would leave the row stopped with recoveryAttempted=1 and
+        // no active session (ES-450 Finding 2).
+        if (result.kind !== "failed" && result.kind !== "recovered") {
+          this.store.updateSession(session.id, { recoveryAttempted: 1 });
+        }
+        // Abandon completed cleanup and wants the loop to continue to next task.
+        if (result.kind === "continued") {
+          this.store.updateSession(session.id, { recoveryAction: result.action });
+          this.store.updateSession(session.id, {
+            state: "stopped",
+            failureReason: reason,
+            stopDetail: detail,
+            endedAt: this.clock(),
+          });
+          return CONTINUE;
+        }
+        // Only record the recovery action for non-failed outcomes. A failed abandon must
+        // not write recovery_action='abandon' — that would cause stoppedSessionsWithPr to
+        // exclude the session on the next daemon start, leaving an un-abandoned PR/ticket
+        // with no active session and no way to retry cleanup.
+        if (result.kind !== "failed") {
+          this.store.updateSession(session.id, { recoveryAction: result.action });
+        }
+        if (result.kind === "recovered") {
+          const recoveryCost = result.costUsd;
+          const refreshed = this.store.getSession(session.id);
+          // recoveryAttempted is included here (not in the earlier gate) so a crash between
+          // the recovery action and this atomic update cannot leave the row stopped with
+          // recoveryAttempted=1 and no active session (ES-450 Finding 2).
+          const recoveryUpdate: Partial<TaskSessionRow> = {
+            state: "in_review",
+            monitorStartedAt: this.clock(),
+            failureReason: null,
+            stopDetail: null,
+            endedAt: null,
+            autoRestartAttempts: 0,
+            recoveryAttempted: 1,
+          };
+          if (recoveryCost > 0) {
+            recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
+          }
+          // Only carry workflowHandledErrorCount for actions that actually changed the branch.
+          // restart_review does not fix the error, so the same workflow_failed comment stays;
+          // carrying the count would cause AgentWorkflowRecovery to see errorCommentCount <=
+          // handledErrorCount and skip the fix on the next poll, masking the setup failure.
+          if (patch.workflowHandledErrorCount !== undefined &&
+              (result.action === "fix_code" || result.action === "rebase")) {
+            recoveryUpdate.workflowHandledErrorCount = patch.workflowHandledErrorCount;
+          }
+          // Track restart_review, fix_code, and rebase as pending so monitor gives grace on
+          // the next stale stop before the /restart-review comment is consumed (ES-450 Finding 3).
+          // pendingRestartReason must match the raw verdict.stopReason used by the stale guard;
+          // for exhaustion details like "auto-restart limit exceeded (4x): workflow_crashed" we
+          // extract just the trailing stop reason rather than storing the full synthesized message.
+          // For done-path stops (ci_failed, merge_conflict) detail is null — fall back to reason
+          // so the done-case stale guard can detect and consume it (ES-450 Finding 1).
+          if (result.action === "restart_review" || result.action === "fix_code" || result.action === "rebase") {
+            let pendingReason: string;
+            if (reason === "ci_failed" || reason === "merge_conflict") {
+              // Done-path stops: always use reason so the monitor's preservation
+              // logic (which keeps exact "ci_failed"/"merge_conflict" markers
+              // through non-stopped verdicts) works correctly even when detail
+              // carries extra context like branch-protection details (ES-450 Finding 3).
+              pendingReason = reason;
+            } else if (detail !== null && (
+              detail.startsWith("auto-restart limit exceeded") ||
+              detail.startsWith("quota retry limit exceeded")
+            )) {
+              pendingReason = extractExhaustedStopReason(detail);
+            } else {
+              pendingReason = detail ?? reason;
+            }
+            recoveryUpdate.pendingRestartReason = pendingReason;
+          }
+          // handoff_failed + any action that restarts review: transition the Linear ticket
+          // to In Review now that recovery is confirmed to succeed. fix_code and rebase also
+          // push changes and post /restart-review, so they need the same transition.
+          // Deferred from the pre-recovery block so the ticket stays in its prior state on
+          // escalation or failure (ES-450 Finding 5).
+          // If the transition fails, do NOT reactivate — fall through to normal stop so the
+          // next startup can retry the transition (ES-450 Finding 4).
+          if (reason === "handoff_failed" && (
+            result.action === "restart_review" ||
+            result.action === "fix_code" ||
+            result.action === "rebase"
+          )) {
+            let handoffErr: string | null = null;
+            try {
+              await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
+            } catch (err) {
+              handoffErr = err instanceof Error ? err.message : String(err);
+              this.log(`recovery: handoff_failed post-recovery transition(in_review) failed: ${handoffErr}`);
+            }
+            if (handoffErr !== null) {
+              // Build failure detail with a sentinel encoding the completed action so the
+              // next retry skips Codex and directly retries only the transition — avoids
+              // duplicate mutations or a different recovery choice (ES-450 Finding 1).
+              if (recoveryCost > 0) {
+                const freshened2 = this.store.getSession(session.id);
+                patch = { ...patch, costUsd: (freshened2.costUsd ?? 0) + recoveryCost };
+              }
+              effectiveDetail = `handoff_transition_pending:${result.action} (recovery failed: linear transition(in_review) failed: ${handoffErr})`;
+            } else {
+              this.store.updateSession(session.id, recoveryUpdate);
+              await this.notifier.notify({
+                kind: "recovery_succeeded",
+                identifier: session.linearIdentifier,
+                action: result.action,
+              });
+              return CONTINUE;
+            }
+          } else {
+            this.store.updateSession(session.id, recoveryUpdate);
+            await this.notifier.notify({
+              kind: "recovery_succeeded",
+              identifier: session.linearIdentifier,
+              action: result.action,
+            });
+            return CONTINUE;
+          }
+        }
+        // failed: preserve any recovery agent cost and carry the failure message forward so
+        // operators see what the recovery attempt tried and why it failed (ES-450 Finding 3).
+        if (result.kind === "failed") {
+          if (result.costUsd !== undefined && result.costUsd > 0) {
+            const freshened = this.store.getSession(session.id);
+            patch = { ...patch, costUsd: (freshened.costUsd ?? 0) + result.costUsd };
+          }
+          // When the fix was pushed but /restart-review failed, encode a sentinel so the
+          // next recovery turn can detect that only the comment remains and bypass Codex
+          // (ES-450 Finding 5). Set this before the message append so the compound detail
+          // becomes "fix_pushed_restart_pending (recovery failed: ...)", which survives
+          // stripRecoveryFailedSuffix and is still matched by stoppedSessionsWithFailedRecovery.
+          if (result.restartCommentOnly) {
+            effectiveDetail = "fix_pushed_restart_pending";
+          }
+          // For failed abandons, preserve the abandon_in_progress sentinel so the next
+          // recovery detects it and resumes only cleanup (branch delete / ticket revert)
+          // rather than re-entering Codex and potentially choosing fix_code or
+          // restart_review against an already-closed PR (ES-450 Finding 2).
+          // Embed the original exhaustion detail in the compound marker so the exhaustion
+          // cap in recoverStoppedByLooppilot is still honoured on the next daemon start —
+          // without this the cap is lost and the session gets a fresh restart budget
+          // (ES-450 Finding 4).
+          if (result.action === "abandon") {
+            const innerForFailed = extractInnerStopDetail(effectiveDetail ?? "");
+            const isExhaustedFailed =
+              innerForFailed.startsWith("auto-restart limit exceeded") ||
+              innerForFailed.startsWith("quota retry limit exceeded");
+            effectiveDetail = isExhaustedFailed
+              ? `abandon_in_progress:${innerForFailed}`
+              : "abandon_in_progress";
+          }
+          if (result.message) {
+            effectiveDetail = effectiveDetail
+              ? `${effectiveDetail} (recovery failed: ${result.message})`
+              : `recovery failed: ${result.message}`;
+          }
+          // When local work exists that would be destroyed by a retry, or when the
+          // failure is substantively non-retryable (cost cap, no commits, rebase
+          // conflict), mark recovery as attempted so stoppedSessionsWithFailedRecovery
+          // does not queue it again (ES-450 Finding 1/3).
+          if (result.preserveWorktree || result.nonRetryable) {
+            this.store.updateSession(session.id, { recoveryAttempted: 1 });
+          }
+          // Do not persist workflowHandledErrorCount in the stopped row when recovery
+          // fails — except when the fix was already pushed (restartCommentOnly). In that
+          // case only the /restart-review comment failed; the error is handled and keeping
+          // the count prevents AgentWorkflowRecovery from running another fix agent on top
+          // of the already-pushed change (ES-450 Finding 2).
+          if (!result.restartCommentOnly) {
+            const { workflowHandledErrorCount: _omit, ...patchWithoutCount } = patch;
+            patch = patchWithoutCount;
+          }
+        }
+        // escalated / failed → fall through to normal stop
+      }
+    }
+    // --- Original stop logic (unchanged) ---
     this.store.updateSession(session.id, {
       state: "stopped",
       failureReason: reason,
-      stopDetail: detail,
+      stopDetail: effectiveDetail,
       endedAt: this.clock(),
-      ...extraPatch,
+      ...patch,
     });
-    const haltDetail = `${session.linearIdentifier} stopped (${reason})${detail ? `: ${detail}` : ""}`;
+    const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     this.store.setRunState(this.runId, "halted", haltDetail);
     this.log(haltDetail);
@@ -1491,6 +2065,30 @@ async function retry(times: number, fn: () => Promise<void>): Promise<void> {
 function extractExhaustedStopReason(stopDetail: string): string {
   const idx = stopDetail.lastIndexOf(": ");
   return idx === -1 ? "" : stopDetail.slice(idx + 2);
+}
+
+/**
+ * Extracts the embedded original stop detail from a compound abandon_in_progress marker.
+ * "abandon_in_progress:<original>" → "<original>", any other value → unchanged.
+ * Used to recover the exhaustion detail for the restart-cap guard when a failed abandon
+ * encoded the terminal stop reason inside the in-progress sentinel (ES-450 Finding 4).
+ */
+function extractInnerStopDetail(s: string): string {
+  const PREFIX = "abandon_in_progress:";
+  return s.startsWith(PREFIX) ? s.slice(PREFIX.length) : s;
+}
+
+/**
+ * Removes the " (recovery failed: ...)" suffix appended by stopSession's failed path so
+ * that a re-entered recovery attempt receives the original stop detail rather than the
+ * accumulated failure chain (ES-450 Finding 3).
+ */
+function stripRecoveryFailedSuffix(detail: string | null): string | null {
+  if (detail === null) return null;
+  const idx = detail.lastIndexOf(" (recovery failed: ");
+  if (idx >= 0) return detail.slice(0, idx) || null;
+  if (detail.startsWith("recovery failed: ")) return null;
+  return detail;
 }
 
 function reconstructIssue(session: TaskSessionRow): EligibleIssue {
