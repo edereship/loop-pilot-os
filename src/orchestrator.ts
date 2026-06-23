@@ -582,6 +582,7 @@ export class Orchestrator {
       if (started >= this.config.safety.maxTasksPerRun) {
         const detail = `task cap reached: ${started}/${this.config.safety.maxTasksPerRun}`;
         await this.notifier.notify({ kind: "halted", reason: "task_cap", detail });
+        await this.commitMemoryBeforeHalt();
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
@@ -599,6 +600,7 @@ export class Orchestrator {
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
+        await this.commitMemoryBeforeHalt();
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
@@ -707,6 +709,7 @@ export class Orchestrator {
       // ① prepareWorktree 失敗：セッション行なしで HALT（claim_failed を Run.halt_reason へ）
       const detail = `claim_failed: prepareWorktree for ${issue.identifier}: ${errMsg(err)}`;
       await this.notifier.notify({ kind: "halted", reason: "claim_failed", detail });
+      await this.commitMemoryBeforeHalt();
       this.store.setRunState(this.runId, "halted", detail);
       this.log(detail);
       return HALT;
@@ -1956,6 +1959,7 @@ export class Orchestrator {
     });
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
+    await this.commitMemoryBeforeHalt();
     this.store.setRunState(this.runId, "halted", haltDetail);
     this.log(haltDetail);
     return HALT;
@@ -1999,17 +2003,22 @@ export class Orchestrator {
     return CONTINUE;
   }
 
+  /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
+  private async commitMemoryBeforeHalt(): Promise<void> {
+    try {
+      await commitIfChanged(this.runner, this.config.repo.path);
+    } catch {
+      this.log("warning: failed to commit memory on halt");
+    }
+  }
+
   /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。
    *  Idempotent: if the run is already halted (e.g. interruptablePause already
    *  called this), the second call is a no-op — no duplicate notification. */
   private async haltForInterrupt(): Promise<void> {
     const run = this.store.getRun(this.runId);
     if (run.state === "halted") return;
-    try {
-      await commitIfChanged(this.runner, this.config.repo.path);
-    } catch {
-      this.log("warning: failed to commit memory on halt");
-    }
+    await this.commitMemoryBeforeHalt();
     const detail = "user_interrupt: stop requested; halting at safe point";
     this.store.setRunState(this.runId, "halted", detail);
     // 他の全 stopSession 経路と同様に await（通知を main の store.close() 前に確実に配信し、

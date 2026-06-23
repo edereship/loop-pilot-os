@@ -1947,6 +1947,45 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
   });
 });
 
+describe("Orchestrator HALT memory commit — non-interrupt halt paths — ES-452 Finding 2", () => {
+  it("commits memory on task_cap halt when changes exist", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // Simulate memory file changes during the run
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    await h.orch.run(); // completes 1 task then hits task_cap → halts
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.store.latestRun()!.haltReason).toContain("task cap reached");
+  });
+
+  it("commits memory on select_failed halt when changes exist", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.failNext("getAllEligible", new Error("Linear HTTP 503"));
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.store.latestRun()!.haltReason).toContain("select_failed");
+  });
+});
+
 // 二重起動: ロック拒否は戻り値で通知し、main が古い Run の状態から誤った exit code を導かないようにする
 describe("Orchestrator 二重起動 — run lock 拒否（Fix 1）", () => {
   it("別の生存プロセスがロックを保持しているとき run() は 'lock_rejected' を返し、Run 行を作らず通知も送らない", async () => {

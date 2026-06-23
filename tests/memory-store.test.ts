@@ -216,6 +216,22 @@ describe("commitIfChanged", () => {
     await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git commit failed/);
   });
 
+  it("unstages staged changes when git commit fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 0 });
+    runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    runner.on(["git", "commit", "-m"], { code: 1, stderr: "error: author identity unknown" });
+    runner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+
+    await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git commit failed/);
+
+    const resetCall = runner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "reset",
+    );
+    expect(resetCall).toBeDefined();
+    expect(resetCall!.args).toContain("docs/memory/");
+  });
+
   it("skips commit when no changes", async () => {
     const runner = new FakeCommandRunner();
     runner.on(["git", "add", "docs/memory/"], { code: 0 });

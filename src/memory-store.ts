@@ -104,6 +104,9 @@ export async function commitIfChanged(
     { cwd: repoPath },
   );
   if (commit.code !== 0) {
+    // Best-effort unstage to avoid leaving staged memory changes that block the
+    // next startup's clean-worktree preflight.
+    await runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     throw new Error(`git commit failed (code ${commit.code}): ${commit.stderr}`);
   }
   return true;
