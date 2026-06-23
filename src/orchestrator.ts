@@ -205,6 +205,13 @@ export class Orchestrator {
 
   /** in_review + PR の回復（カーネル §8）。poll の verdict で分岐する。 */
   private async recoverInReview(session: TaskSessionRow, prNumber: number): Promise<RunControl> {
+    // If the process crashed mid-abandon (after the marker was written but before gh pr close
+    // ran), the session is still in_review. Skip the poll and force the abandon cleanup path
+    // regardless of the PR's current open/closed state (ES-450 Finding 1).
+    if (session.stopDetail === "abandon_in_progress") {
+      this.store.updateSession(session.id, { runId: this.runId });
+      return await this.stopSession(session, "pr_closed", null);
+    }
     let verdict: MonitorVerdict;
     try {
       verdict = await this.monitor.poll(prNumber);
@@ -1656,7 +1663,17 @@ export class Orchestrator {
       // pr_closed is normally terminal (no PR to push to / restart). Exception: a partial
       // abandon (crash mid-abandon with stopDetail="abandon_in_progress") left the ticket
       // in a dirty state — recovery can complete the cleanup (ES-450 Finding 4).
-      const isPartialAbandon = reason === "pr_closed" && fresh.stopDetail === "abandon_in_progress";
+      const isPartialAbandon = reason === "pr_closed" && (
+        fresh.stopDetail === "abandon_in_progress" ||
+        // A prior recovery attempt ran but failed mid-abandon (e.g. ticket revert failed after
+        // the PR and branch were already cleaned up). For pr_closed sessions the only path where
+        // recovery can run is via isPartialAbandon itself, so a "recovery failed:" marker in
+        // stop_detail safely identifies retryable failed abandon cleanups. These sessions are
+        // fed back here by stoppedSessionsWithFailedRecovery (ES-450 Finding 3).
+        (fresh.stopDetail !== null &&
+         (fresh.stopDetail.startsWith("recovery failed: ") ||
+          fresh.stopDetail.includes(" (recovery failed: ")))
+      );
       if ((reason !== "pr_closed" || isPartialAbandon) && !fresh.recoveryAttempted && fresh.prNumber !== null) {
         await this.notifier.notify({
           kind: "recovery_started",

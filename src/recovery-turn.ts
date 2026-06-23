@@ -532,7 +532,7 @@ async function executeAbandon(
     );
     if (deleteResult.code !== 0) {
       const stderr = deleteResult.stderr.trim();
-      if (!/remote ref does not exist|not found/i.test(stderr)) {
+      if (!/remote ref does not exist/i.test(stderr)) {
         log(`recovery: abandon remote branch delete failed (non-benign): ${stderr}`);
         return { kind: "failed", action: "abandon", message: `remote branch delete failed: ${stderr}` };
       }
