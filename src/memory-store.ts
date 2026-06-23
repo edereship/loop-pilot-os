@@ -111,7 +111,7 @@ export async function commitIfChanged(
 
   await runner.run(
     "git",
-    ["commit", "-m", "chore: persist cross-task memory on halt"],
+    ["commit", "-m", "chore: persist cross-task memory on halt", "--", MEMORY_DIR + "/"],
     { cwd: repoPath },
   );
   return true;
