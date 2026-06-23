@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SqliteStore } from "../src/store.js";
-import type { TaskSessionRow } from "../src/types.js";
+import type { TaskSessionRow, GroomLogRow } from "../src/types.js";
 
 // テスト間で開いたストアを確実に閉じる（:memory: でもハンドルを解放する）
 let openStores: SqliteStore[] = [];
@@ -860,5 +860,100 @@ describe("lastMergedWithPr", () => {
     store.updateSession(s1.id, { state: "merged", endedAt: "2026-01-01T00:01:00.000Z" });
 
     expect(store.lastMergedWithPr()).toBeNull();
+  });
+});
+
+describe("groom_log (ES-451)", () => {
+  it("insertGroomLog creates a row and returns it with auto-incremented id", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-23T00:00:00.000Z");
+    const row = store.insertGroomLog({
+      runId: run.id,
+      loopIndex: 0,
+      startedAt: "2026-06-23T00:01:00.000Z",
+    });
+    expect(row.id).toBe(1);
+    expect(row.runId).toBe(run.id);
+    expect(row.loopIndex).toBe(0);
+    expect(row.startedAt).toBe("2026-06-23T00:01:00.000Z");
+    expect(row.endedAt).toBeNull();
+    expect(row.summary).toBeNull();
+    expect(row.actionsRequested).toBe(0);
+    expect(row.actionsExecuted).toBe(0);
+    expect(row.actionsRejected).toBe(0);
+    expect(row.actionDetails).toBeNull();
+    expect(row.outcome).toBeNull();
+    expect(row.errorDetail).toBeNull();
+  });
+
+  it("updateGroomLog updates outcome and counters", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-23T00:00:00.000Z");
+    const row = store.insertGroomLog({
+      runId: run.id,
+      loopIndex: 1,
+      startedAt: "2026-06-23T00:02:00.000Z",
+    });
+    store.updateGroomLog(row.id, {
+      endedAt: "2026-06-23T00:03:00.000Z",
+      summary: "Reprioritized 2 tickets",
+      actionsRequested: 3,
+      actionsExecuted: 2,
+      actionsRejected: 1,
+      actionDetails: '[{"type":"reprioritize"}]',
+      outcome: "completed",
+    });
+    const updated = store.getGroomLog(row.id);
+    expect(updated.endedAt).toBe("2026-06-23T00:03:00.000Z");
+    expect(updated.summary).toBe("Reprioritized 2 tickets");
+    expect(updated.actionsRequested).toBe(3);
+    expect(updated.actionsExecuted).toBe(2);
+    expect(updated.actionsRejected).toBe(1);
+    expect(updated.outcome).toBe("completed");
+    expect(updated.errorDetail).toBeNull();
+  });
+
+  it("updateGroomLog records error detail on failure", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-23T00:00:00.000Z");
+    const row = store.insertGroomLog({
+      runId: run.id,
+      loopIndex: 0,
+      startedAt: "2026-06-23T00:01:00.000Z",
+    });
+    store.updateGroomLog(row.id, {
+      endedAt: "2026-06-23T00:01:30.000Z",
+      outcome: "error",
+      errorDetail: "Codex timeout after 10 minutes",
+    });
+    const updated = store.getGroomLog(row.id);
+    expect(updated.outcome).toBe("error");
+    expect(updated.errorDetail).toBe("Codex timeout after 10 minutes");
+  });
+
+  it("updateGroomLog with empty patch is a no-op", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-23T00:00:00.000Z");
+    const row = store.insertGroomLog({
+      runId: run.id,
+      loopIndex: 0,
+      startedAt: "2026-06-23T00:01:00.000Z",
+    });
+    store.updateGroomLog(row.id, {});
+    const unchanged = store.getGroomLog(row.id);
+    expect(unchanged.outcome).toBeNull();
+    expect(unchanged.endedAt).toBeNull();
+  });
+
+  it("updateGroomLog throws for non-existent id", () => {
+    const store = newStore();
+    expect(() => store.updateGroomLog(999, { outcome: "completed" })).toThrow(
+      /updateGroomLog affected 0 rows/,
+    );
+  });
+
+  it("getGroomLog throws for unknown id", () => {
+    const store = newStore();
+    expect(() => store.getGroomLog(999)).toThrow(/groom_log not found/);
   });
 });
