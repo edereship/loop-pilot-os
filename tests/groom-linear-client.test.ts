@@ -109,3 +109,89 @@ describe("GroomLinearClient.closeIssue", () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+const ISSUE_CREATE_MUTATION_MARKER = "issueCreate";
+
+describe("GroomLinearClient.createIssue", () => {
+  it("sends issueCreate with auto-set project/team/state/optInLabel", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueCreate: { success: true, issue: { id: "new-1", identifier: "ES-99" } } } } },
+    ]);
+    const result = await makeClient(fetchFn).createIssue({ title: "New ticket", description: "Details", priority: 3 });
+    expect(result).toBe("ES-99");
+    expect(calls[0].query).toContain(ISSUE_CREATE_MUTATION_MARKER);
+    expect(calls[0].variables).toMatchObject({
+      title: "New ticket",
+      description: "Details",
+      priority: 3,
+      projectId: "proj-1",
+      teamId: "team-1",
+      stateId: "state-todo",
+      labelIds: ["label-optin"],
+    });
+  });
+
+  it("includes extraLabelIds merged with optInLabel", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueCreate: { success: true, issue: { id: "new-2", identifier: "ES-100" } } } } },
+    ]);
+    await makeClient(fetchFn).createIssue({ title: "T", description: "D", priority: 2, extraLabelIds: ["label-extra"] });
+    expect(calls[0].variables).toMatchObject({
+      labelIds: ["label-optin", "label-extra"],
+    });
+  });
+
+  it("throws on success=false", async () => {
+    const { fetchFn } = makeFetch([
+      { body: { data: { issueCreate: { success: false, issue: null } } } },
+    ]);
+    await expect(makeClient(fetchFn).createIssue({ title: "T", description: "D", priority: 2 })).rejects.toThrow(/issueCreate failed/i);
+  });
+});
+
+describe("GroomLinearClient.addLabels", () => {
+  it("resolves label names to IDs from cache and sends issueAddLabel", async () => {
+    const labels = new Map([["bug", "label-bug"], ["urgent", "label-urgent"]]);
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueAddLabel: { success: true } } } },
+      { body: { data: { issueAddLabel: { success: true } } } },
+    ]);
+    await makeClient(fetchFn, labels).addLabels("issue-1", ["bug", "urgent"]);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].variables).toEqual({ id: "issue-1", labelId: "label-bug" });
+    expect(calls[1].variables).toEqual({ id: "issue-1", labelId: "label-urgent" });
+  });
+
+  it("throws when label name is not in cache", async () => {
+    const { fetchFn } = makeFetch([]);
+    await expect(makeClient(fetchFn).addLabels("issue-1", ["nonexistent"])).rejects.toThrow(/nonexistent/i);
+  });
+});
+
+describe("GroomLinearClient.removeLabels", () => {
+  it("resolves label names and sends issueRemoveLabel", async () => {
+    const labels = new Map([["bug", "label-bug"]]);
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueRemoveLabel: { success: true } } } },
+    ]);
+    await makeClient(fetchFn, labels).removeLabels("issue-1", ["bug"]);
+    expect(calls[0].variables).toEqual({ id: "issue-1", labelId: "label-bug" });
+  });
+});
+
+describe("GroomLinearClient.getIssueDetails", () => {
+  it("returns priority, label IDs, and description for an issue", async () => {
+    const { fetchFn } = makeFetch([
+      { body: { data: { issue: { priority: 2, description: "Some desc", labels: { nodes: [{ id: "l-1" }, { id: "l-2" }] } } } } },
+    ]);
+    const details = await makeClient(fetchFn).getIssueDetails("issue-1");
+    expect(details).toEqual({ priority: 2, labelIds: ["l-1", "l-2"], description: "Some desc" });
+  });
+
+  it("throws on GraphQL error", async () => {
+    const { fetchFn } = makeFetch([
+      { body: { errors: [{ message: "not found" }] } },
+    ]);
+    await expect(makeClient(fetchFn).getIssueDetails("bad")).rejects.toThrow(/Linear GraphQL error/i);
+  });
+});
