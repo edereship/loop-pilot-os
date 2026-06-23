@@ -1,4 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Orchestrator } from "../src/orchestrator.js";
 import { SqliteStore } from "../src/store.js";
 import {
@@ -3385,5 +3388,64 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const haltedEvent = h.notifier.events.find((e) => e.kind === "halted");
     expect(haltedEvent).toBeDefined();
     expect((haltedEvent as { kind: "halted"; reason: string; detail: string }).detail).toContain("recovery failed:");
+  });
+});
+
+describe("Orchestrator memory read non-fatal (ES-454 Finding 4)", () => {
+  const tmpRepos: string[] = [];
+  afterEach(() => {
+    for (const d of tmpRepos.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function makeBadMemoryRepo(): string {
+    const repoPath = mkdtempSync(path.join(tmpdir(), "orch-mem-test-"));
+    tmpRepos.push(repoPath);
+    // Create the memory directory and make one file a directory so readFileSync throws EISDIR
+    const memDir = path.join(repoPath, "docs", "memory");
+    mkdirSync(memDir, { recursive: true });
+    // pm-decisions.md is a directory → readFileSync will throw EISDIR
+    mkdirSync(path.join(memDir, "pm-decisions.md"));
+    return repoPath;
+  }
+
+  it("SELECT proceeds when readMemoryAll throws (ES-454 Finding 4)", async () => {
+    const repoPath = makeBadMemoryRepo();
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      // SELECT call
+      { kind: "completed" as const, text: '```json\n{"identifier":"TY-1","rationale":"ok"}\n```' },
+    ];
+    const config = { ...makeConfig({ maxTasksPerRun: 1 }), repo: { ...makeConfig().repo, path: repoPath } } as Config;
+    const h = makeHarness(config, { planner });
+    h.source.queue = [
+      issue("issue-A", "TY-1"),
+      issue("issue-B", "TY-2"),
+    ];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Run completed normally despite memory read failure
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s).toBeDefined();
+    expect(["merged", "stopped"]).toContain(s!.state);
+    expect(h.logs.some((l) => l.includes("memory read failed"))).toBe(true);
+  });
+
+  it("IMPLEMENT proceeds when readMemoryAll throws (ES-454 Finding 4)", async () => {
+    const repoPath = makeBadMemoryRepo();
+    const config = { ...makeConfig({ maxTasksPerRun: 1 }), repo: { ...makeConfig().repo, path: repoPath } } as Config;
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s).toBeDefined();
+    expect(["merged", "stopped"]).toContain(s!.state);
+    expect(h.logs.some((l) => l.includes("memory read failed"))).toBe(true);
   });
 });

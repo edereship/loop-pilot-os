@@ -53,12 +53,14 @@ describe("buildMemoryBlock", () => {
       ],
       6000,
     );
-    // Per-category budget = 3000. Both should be truncated.
-    expect(result).toContain("a".repeat(3000));
-    expect(result).not.toContain("a".repeat(3001));
-    expect(result).toContain("b".repeat(3000));
-    expect(result).not.toContain("b".repeat(3001));
+    // Structural overhead for two 1-char labels: mainHeader(11) + sep(2) + catHeaders(12) + markers(22) = 47
+    // Content budget = 6000 - 47 = 5953; per-category = floor(5953/2) = 2976
+    expect(result).toContain("a".repeat(2976));
+    expect(result).not.toContain("a".repeat(2977));
+    expect(result).toContain("b".repeat(2976));
+    expect(result).not.toContain("b".repeat(2977));
     expect(result).toContain("[...省略...]");
+    expect(result.length).toBeLessThanOrEqual(6000);
   });
 
   it("gives full budget to single active category", () => {
@@ -67,7 +69,8 @@ describe("buildMemoryBlock", () => {
       [{ label: "A", content: longContent }],
       6000,
     );
-    // Single category gets entire 6000 budget — 5000 fits without truncation
+    // Structural overhead for one 1-char label: mainHeader(11) + catHeader(6) + marker(11) = 28
+    // Content budget = 6000 - 28 = 5972; 5000 fits without truncation
     expect(result).toContain(longContent);
     expect(result).not.toContain("省略");
   });
@@ -78,9 +81,12 @@ describe("buildMemoryBlock", () => {
       [{ label: "A", content: longContent }],
       6000,
     );
-    expect(result).toContain("x".repeat(6000));
-    expect(result).not.toContain("x".repeat(6001));
+    // Structural overhead: mainHeader(11) + catHeader(6) + marker(11) = 28
+    // Content budget = 6000 - 28 = 5972
+    expect(result).toContain("x".repeat(5972));
+    expect(result).not.toContain("x".repeat(5973));
     expect(result).toContain("[...省略...]");
+    expect(result.length).toBeLessThanOrEqual(6000);
   });
 
   it("skips empty entries and distributes budget among active ones", () => {
@@ -92,7 +98,7 @@ describe("buildMemoryBlock", () => {
       ],
       6000,
     );
-    // Only 1 active category → gets full 6000 budget → 5000 fits
+    // Only 1 active category "B" → content budget = 6000 - 28 = 5972 → 5000 fits
     expect(result).not.toContain("## A");
     expect(result).toContain("## B");
     expect(result).toContain(longContent);

@@ -1,12 +1,18 @@
 import type { EligibleIssue, SpecContent, PlanBrief, BriefSections } from "./types.js";
+import { buildMemoryBlock } from "./memory-inject.js";
 
 export interface PlanPromptArgs {
   issue: EligibleIssue;
   specContent: SpecContent | null;
+  memory?: {
+    implResults?: string;
+    productKnowledge?: string;
+  } | null;
+  memoryBudgetChars?: number;
 }
 
 export function buildPlanPrompt(args: PlanPromptArgs): string {
-  const { issue, specContent } = args;
+  const { issue, specContent, memory, memoryBudgetChars } = args;
   const blocks: string[] = [];
 
   blocks.push(
@@ -31,6 +37,15 @@ export function buildPlanPrompt(args: PlanPromptArgs): string {
       );
       blocks.push(["# Domain Specifications", "", ...sections].join("\n\n"));
     }
+  }
+
+  if (memory) {
+    const entries = [
+      ...(memory.implResults ? [{ label: "Implementation Results", content: memory.implResults }] : []),
+      ...(memory.productKnowledge ? [{ label: "Product Knowledge", content: memory.productKnowledge }] : []),
+    ];
+    const block = buildMemoryBlock(entries, memoryBudgetChars ?? 6000);
+    if (block.length > 0) blocks.push(block);
   }
 
   const description = issue.description.trim().length > 0 ? issue.description : "(no description)";

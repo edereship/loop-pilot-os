@@ -402,8 +402,11 @@ describe("buildPrompt — B2 Memory Injection", () => {
         memoryBudgetChars: 6000,
       }),
     );
-    expect(out).toContain("i".repeat(3000));
-    expect(out).not.toContain("i".repeat(3001));
+    // Structural overhead for "Implementation Results" (22) + "Product Knowledge" (17):
+    // mainHeader(11) + sep(2) + catHeaders(27+22) + markers(22) = 84
+    // contentBudget = 6000 - 84 = 5916; perCategory = floor(5916/2) = 2958
+    expect(out).toContain("i".repeat(2958));
+    expect(out).not.toContain("i".repeat(2959));
     expect(out).toContain("[...省略...]");
   });
 

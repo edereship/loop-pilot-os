@@ -35,15 +35,26 @@ export function writeCategory(
   writeFileSync(filePath, content, "utf-8");
 }
 
+function hasNonHeadingContent(content: string): boolean {
+  return content.split("\n").some((line) => {
+    const trimmed = line.trim();
+    return trimmed.length > 0 && !trimmed.startsWith("#");
+  });
+}
+
 export function readAll(repoPath: string): {
   pmDecisions: string | null;
   implResults: string | null;
   productKnowledge: string | null;
 } {
+  const get = (cat: MemoryCategory): string | null => {
+    const content = readCategory(repoPath, cat);
+    return content !== null && hasNonHeadingContent(content) ? content : null;
+  };
   return {
-    pmDecisions: readCategory(repoPath, "pm_decisions"),
-    implResults: readCategory(repoPath, "impl_results"),
-    productKnowledge: readCategory(repoPath, "product_knowledge"),
+    pmDecisions: get("pm_decisions"),
+    implResults: get("impl_results"),
+    productKnowledge: get("product_knowledge"),
   };
 }
 

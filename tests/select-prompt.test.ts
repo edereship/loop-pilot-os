@@ -303,8 +303,11 @@ describe("buildSelectPrompt", () => {
       memoryBudgetChars: 6000,
     };
     const prompt = buildSelectPrompt(args);
-    expect(prompt).toContain("d".repeat(3000));
-    expect(prompt).not.toContain("d".repeat(3001));
+    // Structural overhead for "PM Decisions" (12) + "Implementation Results" (22):
+    // mainHeader(11) + sep(2) + catHeaders(17+27) + markers(22) = 79
+    // contentBudget = 6000 - 79 = 5921; perCategory = floor(5921/2) = 2960
+    expect(prompt).toContain("d".repeat(2960));
+    expect(prompt).not.toContain("d".repeat(2961));
     expect(prompt).toContain("[...省略...]");
   });
 

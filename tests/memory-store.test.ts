@@ -104,6 +104,27 @@ describe("readAll", () => {
       productKnowledge: "knowledge",
     });
   });
+
+  it("returns null for header-only files (ES-454 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.pm_decisions), "# PM Decisions\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.product_knowledge), "# Product Knowledge\n");
+    expect(readAll(tmpRepo)).toEqual({
+      pmDecisions: null,
+      implResults: null,
+      productKnowledge: null,
+    });
+  });
+
+  it("returns content when file has content beyond the heading (ES-454 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n\n- ES-100: done\n");
+    const result = readAll(tmpRepo);
+    expect(result.implResults).toBe("# Implementation Results\n\n- ES-100: done\n");
+  });
 });
 
 describe("initialize", () => {
