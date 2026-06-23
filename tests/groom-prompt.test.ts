@@ -17,7 +17,7 @@ function done(overrides: Partial<DoneTicket> = {}): DoneTicket {
 }
 
 function blocked(overrides: Partial<BlockedTicket> = {}): BlockedTicket {
-  return { identifier: "ES-498", title: "Deploy infra", blockedBy: "ES-497", ...overrides };
+  return { identifier: "ES-498", title: "Deploy infra", priority: 2, labels: [], blockedBy: "ES-497", ...overrides };
 }
 
 function emptyBoard(): BoardState {
@@ -53,6 +53,7 @@ function makeGroomArgs(overrides: Partial<GroomPromptArgs> = {}): GroomPromptArg
     codebaseSummary: null,
     optInLabel: "looppilot",
     maxMemoryChars: 8000,
+    knownLabels: [],
     ...overrides,
   };
 }
@@ -106,12 +107,19 @@ describe("formatBoard", () => {
     expect(out).toContain("- ES-499 Setup CI (merged, 2026-06-22)");
   });
 
-  it("formats blocked tickets with blocker identifier", () => {
+  it("formats blocked tickets with priority, title, blocker identifier, and labels", () => {
     const board = emptyBoard();
-    board.blocked = [blocked({ identifier: "ES-498", title: "Deploy infra", blockedBy: "ES-497" })];
+    board.blocked = [blocked({ identifier: "ES-498", title: "Deploy infra", priority: 2, labels: [], blockedBy: "ES-497" })];
     const out = formatBoard(board);
     expect(out).toContain("## Blocked");
-    expect(out).toContain("- ES-498 Deploy infra (blocked by ES-497)");
+    expect(out).toContain("- ES-498 [High] Deploy infra (blocked by ES-497)");
+  });
+
+  it("formats blocked tickets with labels when present", () => {
+    const board = emptyBoard();
+    board.blocked = [blocked({ identifier: "ES-498", title: "Deploy infra", priority: 1, labels: ["infra", "backend"], blockedBy: "ES-497" })];
+    const out = formatBoard(board);
+    expect(out).toContain("- ES-498 [Urgent] Deploy infra (blocked by ES-497) [labels: infra, backend]");
   });
 
   it("omits empty sections entirely", () => {
@@ -437,5 +445,30 @@ describe("buildGroomPrompt — edge cases", () => {
     expect(out).not.toContain("要求");
     expect(out).not.toContain("プロダクトのゴール");
     expect(out).toContain("GROOM 指示");
+  });
+});
+
+describe("buildGroomPrompt — knownLabels", () => {
+  it("lists known labels in label action description", () => {
+    const args = makeGroomArgs({ knownLabels: ["bug", "feature", "looppilot"] });
+    const out = buildGroomPrompt(args);
+    expect(out).toContain('"bug"');
+    expect(out).toContain('"feature"');
+    expect(out).toContain('"looppilot"');
+  });
+
+  it("shows no-labels-available message when knownLabels is empty", () => {
+    const args = makeGroomArgs({ knownLabels: [] });
+    const out = buildGroomPrompt(args);
+    expect(out).toContain("利用可能なラベルは存在しない");
+  });
+});
+
+describe("buildGroomPrompt — update_memory full replacement", () => {
+  it("states that content replaces the entire category", () => {
+    const out = buildGroomPrompt(makeGroomArgs());
+    // The prompt must convey that content overwrites everything — not just appends
+    expect(out).toContain("まるごと置き換える");
+    expect(out).toContain("保持したい情報はすべて含めてください");
   });
 });

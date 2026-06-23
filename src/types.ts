@@ -317,9 +317,7 @@ export interface DoneTicket {
   mergedAt: string;
 }
 
-export interface BlockedTicket {
-  identifier: string;
-  title: string;
+export interface BlockedTicket extends BoardTicket {
   blockedBy: string;
 }
 
@@ -344,6 +342,7 @@ export interface GroomPromptArgs {
   codebaseSummary: string | null;
   optInLabel: string;
   maxMemoryChars: number;
+  knownLabels: string[];
 }
 
 // ---- 実行コマンド抽象（git/gh/claude 共通） ----

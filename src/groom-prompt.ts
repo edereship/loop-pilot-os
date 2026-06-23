@@ -25,7 +25,8 @@ function formatDoneLine(t: DoneTicket): string {
 }
 
 function formatBlockedLine(t: BlockedTicket): string {
-  return `- ${t.identifier} ${t.title} (blocked by ${t.blockedBy})`;
+  const labelPart = t.labels.length > 0 ? ` [labels: ${t.labels.join(", ")}]` : "";
+  return `- ${t.identifier} [${priorityLabel(t.priority)}] ${t.title} (blocked by ${t.blockedBy})${labelPart}`;
 }
 
 export function formatBoard(board: BoardState): string {
@@ -99,7 +100,10 @@ function truncateToOneLine(text: string): string {
     : firstLine;
 }
 
-function buildGroomInstructions(optInLabel: string, maxMemoryChars: number): string {
+function buildGroomInstructions(optInLabel: string, maxMemoryChars: number, knownLabels: string[]): string {
+  const knownLabelLine = knownLabels.length > 0
+    ? `   - add/remove に使えるラベルは既知ラベルのみ: ${knownLabels.map((l) => `"${l}"`).join(", ")}`
+    : "   - 現在利用可能なラベルは存在しないため label アクションは使用不可";
   return [
     "# GROOM 指示",
     "",
@@ -141,10 +145,11 @@ function buildGroomInstructions(optInLabel: string, maxMemoryChars: number): str
     "   - remove?: 削除するラベル名の配列",
     "   - rationale: 変更理由",
     "   - ※ add または remove の少なくとも一方は必須",
+    knownLabelLine,
     "",
     "7. **update_memory** — 横断メモリを更新する",
     "   - category: \"pm_decisions\" | \"impl_results\" | \"product_knowledge\"",
-    `   - content: 新しい内容（${maxMemoryChars} 文字以内）`,
+    `   - content: 対象カテゴリの内容をまるごと置き換える完全な文字列（既存の内容はすべて上書きされます。保持したい情報はすべて含めてください。${maxMemoryChars} 文字以内）`,
     "   - rationale: 更新理由",
     "",
     "## 制約",
@@ -177,7 +182,7 @@ function buildGroomInstructions(optInLabel: string, maxMemoryChars: number): str
 }
 
 export function buildGroomPrompt(args: GroomPromptArgs): string {
-  const { specContent, goal, memory, board, boardBudgetChars, digest, codebaseSummary, optInLabel, maxMemoryChars } = args;
+  const { specContent, goal, memory, board, boardBudgetChars, digest, codebaseSummary, optInLabel, maxMemoryChars, knownLabels } = args;
 
   const blocks: string[] = [];
 
@@ -232,7 +237,7 @@ export function buildGroomPrompt(args: GroomPromptArgs): string {
   }
 
   // 7. GROOM instructions
-  blocks.push(buildGroomInstructions(optInLabel, maxMemoryChars));
+  blocks.push(buildGroomInstructions(optInLabel, maxMemoryChars, knownLabels));
 
   return blocks.join("\n\n");
 }
