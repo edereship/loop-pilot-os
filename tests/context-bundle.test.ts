@@ -342,3 +342,102 @@ describe("buildPrompt — B1-b digest 格下げ", () => {
     expect(idxSecond).toBeLessThan(idxThird);
   });
 });
+
+// ---- B2: Memory Injection（ES-454） ----
+
+describe("buildPrompt — B2 Memory Injection", () => {
+  it("injects memory section with impl-results and product-knowledge", () => {
+    const out = buildPrompt(
+      makeArgs({
+        memory: {
+          implResults: "ES-100: auth done",
+          productKnowledge: "domain info here",
+        },
+        memoryBudgetChars: 6000,
+      }),
+    );
+    expect(out).toContain("# 横断メモリ");
+    expect(out).toContain("ES-100: auth done");
+    expect(out).toContain("domain info here");
+  });
+
+  it("omits memory section when memory is null", () => {
+    const out = buildPrompt(makeArgs({ memory: null, memoryBudgetChars: 6000 }));
+    expect(out).not.toContain("横断メモリ");
+  });
+
+  it("omits memory section when memory is undefined (default)", () => {
+    const out = buildPrompt(makeArgs());
+    expect(out).not.toContain("横断メモリ");
+  });
+
+  it("omits memory section when all category strings are empty", () => {
+    const out = buildPrompt(
+      makeArgs({
+        memory: { implResults: "", productKnowledge: "" },
+        memoryBudgetChars: 6000,
+      }),
+    );
+    expect(out).not.toContain("横断メモリ");
+  });
+
+  it("includes only non-empty categories", () => {
+    const out = buildPrompt(
+      makeArgs({
+        memory: { implResults: "some results", productKnowledge: undefined },
+        memoryBudgetChars: 6000,
+      }),
+    );
+    expect(out).toContain("Implementation Results");
+    expect(out).toContain("some results");
+    expect(out).not.toContain("Product Knowledge");
+  });
+
+  it("truncates when content exceeds inject_budget_chars", () => {
+    const longImpl = "i".repeat(4000);
+    const longProd = "p".repeat(4000);
+    const out = buildPrompt(
+      makeArgs({
+        memory: { implResults: longImpl, productKnowledge: longProd },
+        memoryBudgetChars: 6000,
+      }),
+    );
+    expect(out).toContain("i".repeat(3000));
+    expect(out).not.toContain("i".repeat(3001));
+    expect(out).toContain("[...省略...]");
+  });
+
+  it("v2 block order: 要求 → 要件定義 → 横断メモリ → チケット → 作業規則", () => {
+    const out = buildPrompt(
+      makeV2Args({
+        memory: { implResults: "impl data" },
+        memoryBudgetChars: 6000,
+      }),
+    );
+    const idxSpec = out.indexOf("# 要件定義");
+    const idxMemory = out.indexOf("# 横断メモリ");
+    const idxTicket = out.indexOf("# 担当チケット");
+    expect(idxSpec).toBeGreaterThanOrEqual(0);
+    expect(idxMemory).toBeGreaterThanOrEqual(0);
+    expect(idxTicket).toBeGreaterThanOrEqual(0);
+    expect(idxSpec).toBeLessThan(idxMemory);
+    expect(idxMemory).toBeLessThan(idxTicket);
+  });
+
+  it("v1 block order: ゴール → 横断メモリ → チケット → 作業規則", () => {
+    const out = buildPrompt(
+      makeArgs({
+        memory: { implResults: "impl data" },
+        memoryBudgetChars: 6000,
+      }),
+    );
+    const idxGoal = out.indexOf("# プロダクトのゴール");
+    const idxMemory = out.indexOf("# 横断メモリ");
+    const idxTicket = out.indexOf("# 担当チケット");
+    expect(idxGoal).toBeGreaterThanOrEqual(0);
+    expect(idxMemory).toBeGreaterThanOrEqual(0);
+    expect(idxTicket).toBeGreaterThanOrEqual(0);
+    expect(idxGoal).toBeLessThan(idxMemory);
+    expect(idxMemory).toBeLessThan(idxTicket);
+  });
+});

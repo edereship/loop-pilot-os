@@ -29,7 +29,7 @@ import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
-import { commitIfChanged, initialize as initializeMemory, MEMORY_DIR } from "./memory-store.js";
+import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, MEMORY_DIR } from "./memory-store.js";
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -908,6 +908,7 @@ export class Orchestrator {
       this.log(`select: codebase summary generation failed (non-fatal): ${errMsg(err)}`);
     }
 
+    const selectMem = readMemoryAll(this.config.repo.path);
     const prompt = buildSelectPrompt({
       goal: this.config.product.goal ?? null,
       specContent,
@@ -917,6 +918,11 @@ export class Orchestrator {
       lastPrDiff,
       diffBudgetChars: this.config.safety.selectDiffBudgetChars,
       codebaseSummary,
+      memory: {
+        pmDecisions: selectMem.pmDecisions ?? undefined,
+        implResults: selectMem.implResults ?? undefined,
+      },
+      memoryBudgetChars: this.config.memory.injectBudgetChars,
     });
 
     let outcome: PlanOutcome;
@@ -996,12 +1002,18 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
       }
     }
+    const mem = readMemoryAll(this.config.repo.path);
     const prompt = this.buildPrompt({
       goal: this.config.product.goal ?? null,
       specContent,
       issue,
       digest,
       planBrief,
+      memory: {
+        implResults: mem.implResults ?? undefined,
+        productKnowledge: mem.productKnowledge ?? undefined,
+      },
+      memoryBudgetChars: this.config.memory.injectBudgetChars,
     });
     let outcome: AgentOutcome;
     try {
