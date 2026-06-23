@@ -1142,9 +1142,13 @@ export class Orchestrator {
           mergeFailures = 0; // ready 連続を断ち切る事象が起きたらリセット
           // Reload pendingRestartReason so the stale guard fires on the next poll if
           // done-path recovery was applied (ES-450 Finding 1).
+          // Also reload autoRestartCount: recovery resets autoRestartAttempts in the DB
+          // but the local counter would otherwise retain its pre-recovery value, causing
+          // the cap to trip on the next auto-restartable stop (ES-450 Finding 3).
           {
             const recoveredForPending = this.store.getSession(session.id);
             pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
+            autoRestartCount = recoveredForPending.autoRestartAttempts;
           }
           continue;
         }
@@ -1314,7 +1318,13 @@ export class Orchestrator {
               );
               if (ctrl.control === "halt") return HALT;
               // Reload so the stale guard fires on the next poll if recovery posted /restart-review.
-              pendingRestartReason = this.store.getSession(session.id).pendingRestartReason ?? undefined;
+              // Also reload autoRestartCount: recovery resets autoRestartAttempts in the DB
+              // but the local counter would otherwise retain its pre-recovery value (ES-450 Finding 3).
+              {
+                const quotaRecoveredState = this.store.getSession(session.id);
+                pendingRestartReason = quotaRecoveredState.pendingRestartReason ?? undefined;
+                autoRestartCount = quotaRecoveredState.autoRestartAttempts;
+              }
               continue;
             }
             if (quotaRetryCount === 1) {
@@ -1389,8 +1399,11 @@ export class Orchestrator {
             );
             if (ctrl.control === "halt") return HALT;
             // Recovery succeeded: reload pendingRestartReason so next poll gives grace.
+            // Also reload autoRestartCount: recovery resets autoRestartAttempts in the DB
+            // but the local counter would otherwise retain its pre-recovery value (ES-450 Finding 3).
             const recoveredState = this.store.getSession(session.id);
             pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
+            autoRestartCount = recoveredState.autoRestartAttempts;
             continue;
           }
         }
@@ -1714,7 +1727,11 @@ export class Orchestrator {
         // Mark recovery attempted for all non-interrupted, non-failed outcomes.
         // For 'failed', the cleanup did not complete — leave recoveryAttempted=0 so a
         // future recovery path can retry the cleanup (ES-450 Finding 2).
-        if (result.kind !== "failed") {
+        // For 'recovered', defer the write to recoveryUpdate so the gate is consumed
+        // atomically with the state→in_review transition — a crash between this write
+        // and that update would leave the row stopped with recoveryAttempted=1 and
+        // no active session (ES-450 Finding 2).
+        if (result.kind !== "failed" && result.kind !== "recovered") {
           this.store.updateSession(session.id, { recoveryAttempted: 1 });
         }
         // Abandon completed cleanup and wants the loop to continue to next task.
@@ -1738,6 +1755,9 @@ export class Orchestrator {
         if (result.kind === "recovered") {
           const recoveryCost = result.costUsd;
           const refreshed = this.store.getSession(session.id);
+          // recoveryAttempted is included here (not in the earlier gate) so a crash between
+          // the recovery action and this atomic update cannot leave the row stopped with
+          // recoveryAttempted=1 and no active session (ES-450 Finding 2).
           const recoveryUpdate: Partial<TaskSessionRow> = {
             state: "in_review",
             monitorStartedAt: this.clock(),
@@ -1745,6 +1765,7 @@ export class Orchestrator {
             stopDetail: null,
             endedAt: null,
             autoRestartAttempts: 0,
+            recoveryAttempted: 1,
           };
           if (recoveryCost > 0) {
             recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
@@ -1787,24 +1808,48 @@ export class Orchestrator {
           // push changes and post /restart-review, so they need the same transition.
           // Deferred from the pre-recovery block so the ticket stays in its prior state on
           // escalation or failure (ES-450 Finding 5).
+          // If the transition fails, do NOT reactivate — fall through to normal stop so the
+          // next startup can retry the transition (ES-450 Finding 4).
           if (reason === "handoff_failed" && (
             result.action === "restart_review" ||
             result.action === "fix_code" ||
             result.action === "rebase"
           )) {
+            let handoffErr: string | null = null;
             try {
               await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
             } catch (err) {
-              this.log(`recovery: handoff_failed post-recovery transition(in_review) failed: ${err instanceof Error ? err.message : String(err)}`);
+              handoffErr = err instanceof Error ? err.message : String(err);
+              this.log(`recovery: handoff_failed post-recovery transition(in_review) failed: ${handoffErr}`);
             }
+            if (handoffErr !== null) {
+              // Build failure detail and fall through to stop — recoveryAttempted stays 0
+              // so the next startup picks this up and retries (ES-450 Finding 4).
+              if (recoveryCost > 0) {
+                const freshened2 = this.store.getSession(session.id);
+                patch = { ...patch, costUsd: (freshened2.costUsd ?? 0) + recoveryCost };
+              }
+              effectiveDetail = effectiveDetail
+                ? `${effectiveDetail} (recovery failed: linear transition(in_review) failed: ${handoffErr})`
+                : `recovery failed: linear transition(in_review) failed: ${handoffErr}`;
+            } else {
+              await this.notifier.notify({
+                kind: "recovery_succeeded",
+                identifier: session.linearIdentifier,
+                action: result.action,
+              });
+              this.store.updateSession(session.id, recoveryUpdate);
+              return CONTINUE;
+            }
+          } else {
+            await this.notifier.notify({
+              kind: "recovery_succeeded",
+              identifier: session.linearIdentifier,
+              action: result.action,
+            });
+            this.store.updateSession(session.id, recoveryUpdate);
+            return CONTINUE;
           }
-          await this.notifier.notify({
-            kind: "recovery_succeeded",
-            identifier: session.linearIdentifier,
-            action: result.action,
-          });
-          this.store.updateSession(session.id, recoveryUpdate);
-          return CONTINUE;
         }
         // failed: preserve any recovery agent cost and carry the failure message forward so
         // operators see what the recovery attempt tried and why it failed (ES-450 Finding 3).
@@ -1812,6 +1857,14 @@ export class Orchestrator {
           if (result.costUsd !== undefined && result.costUsd > 0) {
             const freshened = this.store.getSession(session.id);
             patch = { ...patch, costUsd: (freshened.costUsd ?? 0) + result.costUsd };
+          }
+          // When the fix was pushed but /restart-review failed, encode a sentinel so the
+          // next recovery turn can detect that only the comment remains and bypass Codex
+          // (ES-450 Finding 5). Set this before the message append so the compound detail
+          // becomes "fix_pushed_restart_pending (recovery failed: ...)", which survives
+          // stripRecoveryFailedSuffix and is still matched by stoppedSessionsWithFailedRecovery.
+          if (result.restartCommentOnly) {
+            effectiveDetail = "fix_pushed_restart_pending";
           }
           if (result.message) {
             effectiveDetail = effectiveDetail

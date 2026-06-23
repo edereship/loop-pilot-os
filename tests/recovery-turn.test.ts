@@ -585,8 +585,9 @@ describe("executeRecoveryTurn", () => {
     expect(closeCall!.args).not.toContain("--delete-branch");
   });
 
-  // Finding 4: restart-review failure after successful push → failed with costUsd
-  it("fix_code: restart-review fails after successful push → failed result includes costUsd", async () => {
+  // Finding 4 (ES-450 Finding 5): restart-review failure after successful push → failed with
+  // costUsd and restartCommentOnly so the next retry posts only the comment (ES-450 Finding 5).
+  it("fix_code: restart-review fails after successful push → failed result includes costUsd and restartCommentOnly", async () => {
     const { deps, planner, agent, runner, git } = makeDeps();
     planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix"}' }];
     agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "fixed" }];
@@ -608,6 +609,38 @@ describe("executeRecoveryTurn", () => {
       action: "fix_code",
       message: expect.stringContaining("restart-review"),
       costUsd: 0.5,
+      restartCommentOnly: true,
     });
+  });
+
+  // ES-450 Finding 1: abandon_in_progress in stopDetail → skip Codex and force abandon.
+  it("abandon_in_progress: bypasses Codex and executes abandon cleanup directly", async () => {
+    const { deps, runner } = makeDeps();
+    // No planner outcomes queued — Codex must NOT be called.
+    runner.on(["gh", "pr", "close"], { code: 0 });
+    runner.on(["git", "push"], { code: 0 });
+
+    const session = fakeSession({ prNumber: 42, stopDetail: "abandon_in_progress" });
+    const result = await executeRecoveryTurn(deps, session, "pr_closed", null);
+
+    expect(result).toMatchObject<Partial<RecoveryTurnResult>>({ kind: "continued", action: "abandon" });
+    // Confirm the abandon cleanup (gh pr close) was executed
+    const closeCall = runner.calls.find((c) => c.cmd === "gh" && c.args.includes("close"));
+    expect(closeCall).toBeDefined();
+  });
+
+  // ES-450 Finding 5: fix_pushed_restart_pending sentinel → skip Codex and retry restart comment.
+  it("fix_pushed_restart_pending: bypasses Codex and retries restart-review comment", async () => {
+    const { deps, git } = makeDeps();
+    // No planner outcomes queued — Codex must NOT be called.
+
+    const session = fakeSession({
+      prNumber: 42,
+      stopDetail: "fix_pushed_restart_pending (recovery failed: recovery restart-review failed: timeout)",
+    });
+    const result = await executeRecoveryTurn(deps, session, "ci_failed", "fix_pushed_restart_pending");
+
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "recovered", action: "restart_review", costUsd: 0 });
+    expect(git.calls.some((c) => c.method === "postComment")).toBe(true);
   });
 });

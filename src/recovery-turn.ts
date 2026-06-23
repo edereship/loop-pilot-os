@@ -28,7 +28,7 @@ export interface RecoveryAction {
 export type RecoveryTurnResult =
   | { kind: "recovered"; action: RecoveryActionKind; costUsd: number }
   | { kind: "escalated"; action: RecoveryActionKind }
-  | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number; preserveWorktree?: boolean; nonRetryable?: boolean }
+  | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number; preserveWorktree?: boolean; nonRetryable?: boolean; restartCommentOnly?: boolean }
   | { kind: "interrupted"; costUsd?: number }
   | { kind: "continued"; action: RecoveryActionKind };
 
@@ -165,6 +165,22 @@ export async function executeRecoveryTurn(
   onAbandonStarting?: () => void,
 ): Promise<RecoveryTurnResult> {
   const { planner, agent, git, runner, source, config, log } = deps;
+
+  // If the prior recovery turn persisted the crash-recovery marker before closing the PR,
+  // the action is deterministically abandon — skip re-planning to prevent Codex from
+  // choosing fix_code or restart_review and reactivating the session (ES-450 Finding 1).
+  if (session.stopDetail === "abandon_in_progress") {
+    log("recovery: abort crash detected, resuming abandon cleanup");
+    return await executeAbandon(deps, session, onAbandonStarting);
+  }
+
+  // If a prior fix_code pushed the commit but failed to post /restart-review, skip
+  // re-planning and retry only the comment (ES-450 Finding 5). The sentinel survives
+  // stripRecoveryFailedSuffix and is detectable here via the unstripped stop_detail.
+  if (session.stopDetail !== null && session.stopDetail.startsWith("fix_pushed_restart_pending")) {
+    log("recovery: fix already pushed, retrying restart-review comment");
+    return await executeRestartReview(deps, session);
+  }
 
   // 1. Call Codex to analyze the situation
   const prompt = buildRecoveryPrompt({ session, reason, detail });
@@ -402,7 +418,10 @@ async function executeFixCode(
     try {
       await git.postComment(session.prNumber, "/restart-review");
     } catch (err) {
-      return { kind: "failed", action: "fix_code", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}`, costUsd: outcome.costUsd };
+      // Fix was already pushed — only the restart comment is outstanding. Signal this
+      // via restartCommentOnly so stopSession can encode the sentinel in stop_detail,
+      // letting the next recovery bypass Codex and retry only the comment (ES-450 Finding 5).
+      return { kind: "failed", action: "fix_code", message: `recovery restart-review failed: ${err instanceof Error ? err.message : String(err)}`, costUsd: outcome.costUsd, restartCommentOnly: true };
     }
   }
 
