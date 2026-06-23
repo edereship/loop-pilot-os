@@ -1866,21 +1866,21 @@ export class Orchestrator {
               }
               effectiveDetail = `handoff_transition_pending:${result.action} (recovery failed: linear transition(in_review) failed: ${handoffErr})`;
             } else {
+              this.store.updateSession(session.id, recoveryUpdate);
               await this.notifier.notify({
                 kind: "recovery_succeeded",
                 identifier: session.linearIdentifier,
                 action: result.action,
               });
-              this.store.updateSession(session.id, recoveryUpdate);
               return CONTINUE;
             }
           } else {
+            this.store.updateSession(session.id, recoveryUpdate);
             await this.notifier.notify({
               kind: "recovery_succeeded",
               identifier: session.linearIdentifier,
               action: result.action,
             });
-            this.store.updateSession(session.id, recoveryUpdate);
             return CONTINUE;
           }
         }
@@ -1929,11 +1929,14 @@ export class Orchestrator {
             this.store.updateSession(session.id, { recoveryAttempted: 1 });
           }
           // Do not persist workflowHandledErrorCount in the stopped row when recovery
-          // fails. A later restart_review retry does not clear it from recoveryUpdate,
-          // so the next workflow_failed poll would see errorCommentCount already handled
-          // and skip the fix entirely (ES-450 Finding 2).
-          const { workflowHandledErrorCount: _omit, ...patchWithoutCount } = patch;
-          patch = patchWithoutCount;
+          // fails — except when the fix was already pushed (restartCommentOnly). In that
+          // case only the /restart-review comment failed; the error is handled and keeping
+          // the count prevents AgentWorkflowRecovery from running another fix agent on top
+          // of the already-pushed change (ES-450 Finding 2).
+          if (!result.restartCommentOnly) {
+            const { workflowHandledErrorCount: _omit, ...patchWithoutCount } = patch;
+            patch = patchWithoutCount;
+          }
         }
         // escalated / failed → fall through to normal stop
       }

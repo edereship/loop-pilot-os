@@ -488,7 +488,8 @@ export class SqliteStore {
            AND recovery_attempted = 0
            AND failure_reason NOT IN ('cost_exceeded', 'looppilot_stopped')
            AND (recovery_action IS NULL OR recovery_action != 'abandon')
-           AND (stop_detail LIKE '%(recovery failed:%' OR stop_detail LIKE 'recovery failed:%')
+           AND (stop_detail LIKE '%(recovery failed:%' OR stop_detail LIKE 'recovery failed:%'
+                OR stop_detail LIKE 'abandon_in_progress%')
            AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
          ORDER BY id ASC`,
       )
