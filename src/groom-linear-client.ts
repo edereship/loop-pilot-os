@@ -149,13 +149,13 @@ export class GroomLinearClient {
   }
 
   async getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }> {
-    const data = await graphql<{ issue: { priority: number; description: string; labels: { nodes: Array<{ id: string }> } } }>(
+    const data = await graphql<{ issue: { priority: number; description: string | null; labels: { nodes: Array<{ id: string }> } } }>(
       this.fetchFn, this.apiKey, ISSUE_DETAILS_QUERY, { id: issueId },
     );
     return {
       priority: data.issue.priority,
       labelIds: data.issue.labels.nodes.map((n) => n.id),
-      description: data.issue.description,
+      description: data.issue.description ?? "",
     };
   }
 }

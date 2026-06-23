@@ -188,6 +188,14 @@ describe("GroomLinearClient.getIssueDetails", () => {
     expect(details).toEqual({ priority: 2, labelIds: ["l-1", "l-2"], description: "Some desc" });
   });
 
+  it("normalizes null description to empty string", async () => {
+    const { fetchFn } = makeFetch([
+      { body: { data: { issue: { priority: 3, description: null, labels: { nodes: [] } } } } },
+    ]);
+    const details = await makeClient(fetchFn).getIssueDetails("issue-1");
+    expect(details.description).toBe("");
+  });
+
   it("throws on GraphQL error", async () => {
     const { fetchFn } = makeFetch([
       { body: { errors: [{ message: "not found" }] } },
