@@ -143,9 +143,11 @@ export class Orchestrator {
             { cwd: repoPath },
           ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
           if (initPushRes.code !== 0) {
-            // Roll back the local commit so the branch does not stay ahead of origin
-            // (ES-452 Finding 3 — same pattern as commitMemoryBeforeHalt).
-            await this.runner.run("git", ["reset", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+            // Roll back the local commit so the branch does not stay ahead of origin.
+            // Use --hard to also clean the worktree; --mixed (the default) leaves the memory
+            // files modified, causing the next startup's clean-worktree preflight to fail
+            // (ES-452 Finding 1 — same pattern as commitMemoryBeforeHalt).
+            await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
             this.log(`warning: failed to push initial memory commit (rolled back): ${initPushRes.stderr.trim()}`);
           }
         }

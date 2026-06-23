@@ -1046,7 +1046,6 @@ async function checkBranchProtection(
         contexts?: string[];
         checks?: Array<{ context: string }>;
       } | null;
-      required_signatures?: { enabled?: boolean };
       restrictions?: {
         users?: Array<{ login: string }>;
         teams?: Array<{ slug: string }>;
@@ -1067,25 +1066,21 @@ async function checkBranchProtection(
       );
     }
     // When required_pull_request_reviews is set and restrictions == null, every actor
-    // must go through a PR — UNLESS they appear in bypass_pull_request_allowances.
-    // GitHub allows specific users, teams, or apps to bypass the PR requirement even
-    // without a push-restrictions list (ES-452 Finding 2).
+    // must go through a PR — UNLESS they appear in bypass_pull_request_allowances.users.
+    // Team and app entries in bypass_pull_request_allowances cannot be verified at preflight
+    // time (membership is not queryable), so we fail closed: only an explicit user entry for
+    // the authenticated actor counts as a bypass (ES-452 Finding 2).
     if (parsed.required_pull_request_reviews != null && parsed.restrictions == null) {
       const allowances = parsed.required_pull_request_reviews.bypass_pull_request_allowances;
       const bypassUsers = (allowances?.users ?? []).map((u) => u.login);
-      const hasTeamOrAppBypass =
-        (allowances?.teams ?? []).length > 0 || (allowances?.apps ?? []).length > 0;
-      if (!hasTeamOrAppBypass) {
-        // Teams and apps bypass cannot be verified at preflight time; only check user entries.
-        const login = await resolveAuthenticatedLogin(runner, opts);
-        if (login == null || !bypassUsers.includes(login)) {
-          errors.push(
-            `gh: ブランチ '${branch}' は pull request を必須としています（required_pull_request_reviews）が、` +
-              "push 制限（restrictions）がないため直接プッシュできません。" +
-              "メモリコミットが永続化されないため、restrictions に認証ユーザーを追加するか " +
-              "required_pull_request_reviews を無効にしてください",
-          );
-        }
+      const login = await resolveAuthenticatedLogin(runner, opts);
+      if (login == null || !bypassUsers.includes(login)) {
+        errors.push(
+          `gh: ブランチ '${branch}' は pull request を必須としています（required_pull_request_reviews）が、` +
+            "push 制限（restrictions）がないため直接プッシュできません。" +
+            "メモリコミットが永続化されないため、restrictions に認証ユーザーを追加するか " +
+            "required_pull_request_reviews を無効にしてください",
+        );
       }
     }
     // restrictions が設定されている場合、push/merge できる identity が allowlist に限定される。
@@ -1138,13 +1133,27 @@ async function checkBranchProtection(
       }
     }
     // required_signatures requires all commits to be signed; the memory commit is unsigned
-    // so the push would be rejected (ES-452 Finding 5).
-    if (parsed.required_signatures?.enabled) {
-      errors.push(
-        `gh: ブランチ '${branch}' はコミット署名必須が設定されています（required_signatures）。` +
-          "メモリコミットは署名されないため直接プッシュがブロックされます。" +
-          "required_signatures を無効にしてください",
-      );
+    // so the push would be rejected. GitHub exposes this setting through a separate endpoint
+    // — it is NOT included in the GET /branches/{branch}/protection response (ES-452 Finding 3).
+    const sigRes = await runner.run(
+      "gh",
+      ["api", `repos/${repoSlug}/branches/${branch}/protection/required_signatures`],
+      opts,
+    );
+    if (!isHttp404(sigRes) && !isFeatureUnavailable403(sigRes) && sigRes.code === 0) {
+      let sigData: { enabled?: boolean };
+      try {
+        sigData = JSON.parse(sigRes.stdout);
+      } catch {
+        sigData = {};
+      }
+      if (sigData.enabled) {
+        errors.push(
+          `gh: ブランチ '${branch}' はコミット署名必須が設定されています（required_signatures）。` +
+            "メモリコミットは署名されないため直接プッシュがブロックされます。" +
+            "required_signatures を無効にしてください",
+        );
+      }
     }
   } catch (e) {
     errors.push(`gh: ブランチ保護確認に失敗しました（${(e as Error).message}）`);
@@ -1259,6 +1268,21 @@ async function checkRulesets(
               "このルールを削除するか、bypass list を設定して直接プッシュを許可してください",
           );
         }
+      } else if (rule.type === "required_signatures") {
+        // required_signatures ruleset requires commits to be signed; the unsigned memory
+        // commit would be rejected on push (ES-452 Finding 4). Check bypass_actors first.
+        let hasBypass = false;
+        if (rule.ruleset_id != null) {
+          const userId = await getUserId();
+          hasBypass = await checkRulesetBypassActors(runner, repoSlug, rule.ruleset_id, userId, opts);
+        }
+        if (!hasBypass) {
+          errors.push(
+            `gh: ブランチ '${branch}' のルールセット required_signatures ルールが設定されています。` +
+              "メモリコミットは署名されないため直接プッシュがブロックされます。" +
+              "このルールを削除するか、bypass list を設定して直接プッシュを許可してください",
+          );
+        }
       }
     }
   } catch (e) {
@@ -1291,8 +1315,8 @@ async function checkRulesetBypassActors(
         return userId != null && a.actor_id === userId;
       }
       // Non-User actor types (Integration, OrganizationAdmin, RepositoryRole, Team, DeployKey):
-      // membership cannot be verified at preflight time; any such entry is treated as a bypass.
-      return a.actor_type != null;
+      // membership cannot be verified at preflight time — fail closed (ES-452 Finding 5).
+      return false;
     });
   } catch {
     return false;

@@ -2020,6 +2020,30 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
   });
 });
 
+describe("Orchestrator bootstrap memory commit — ES-452 Finding 1", () => {
+  it("uses --hard reset to roll back bootstrap commit when push fails", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Bootstrap sees changes (diff returns code 1)
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+    h.memoryRunner.on(["git", "push", "origin", "HEAD:main"], { code: 1, stderr: "error: push rejected" });
+    h.memoryRunner.on(["git", "reset", "--hard", "HEAD~1"], { code: 0 });
+
+    // Stop immediately so the test does not need a full task queue
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const resetCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args.includes("HEAD~1"),
+    );
+    // At least one reset must have occurred (bootstrap path)
+    expect(resetCalls.length).toBeGreaterThan(0);
+    // Every reset to HEAD~1 must use --hard so the working tree is cleaned
+    expect(resetCalls.every((c) => c.args.includes("--hard"))).toBe(true);
+  });
+});
+
 describe("Orchestrator HALT memory commit — non-interrupt halt paths — ES-452 Finding 2", () => {
   it("commits memory on task_cap halt when changes exist", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
