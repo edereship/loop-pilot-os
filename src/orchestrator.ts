@@ -25,7 +25,7 @@ import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
 import { executeRecoveryTurn } from "./recovery-turn.js";
-import type { RecoveryTurnDeps, RecoveryActionKind } from "./recovery-turn.js";
+import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 
@@ -1235,7 +1235,12 @@ export class Orchestrator {
               );
               if (ctrl.control === "halt") return HALT;
               // Reload so the stale guard fires on the next poll if recovery posted /restart-review.
-              pendingRestartReason = this.store.getSession(session.id).pendingRestartReason ?? undefined;
+              // Also reload autoRestartCount: recovery may have reset it in the DB (Finding 2b).
+              {
+                const recoveredState = this.store.getSession(session.id);
+                pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
+                autoRestartCount = recoveredState.autoRestartAttempts;
+              }
               continue;
             }
             // A real restart event breaks any prior readiness-failure streak: errors before
@@ -1388,6 +1393,13 @@ export class Orchestrator {
           continue;
         }
         case "corrupted": {
+          // Stale guard: if recovery already posted /restart-review, give one poll grace
+          // before treating a transient corrupted read as a hard stop (Finding 3).
+          if (pendingRestartReason !== undefined) {
+            pendingRestartReason = undefined;
+            this.store.updateSession(session.id, { pendingRestartReason: null });
+            continue;
+          }
           const ctrl = await this.stopSession(
             session,
             "monitor_never_engaged",
@@ -1639,51 +1651,38 @@ export class Orchestrator {
     if (isWorkflowCostExhaustion) {
       this.store.updateSession(session.id, { recoveryAttempted: 1 });
     }
-    if (reason !== "cost_exceeded" && reason !== "pr_closed" && !isWorkflowCostExhaustion && this.recoveryTurn !== null && this.planner !== null) {
+    if (reason !== "cost_exceeded" && !isWorkflowCostExhaustion && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
-      if (!fresh.recoveryAttempted && fresh.prNumber !== null) {
+      // pr_closed is normally terminal (no PR to push to / restart). Exception: a partial
+      // abandon (crash mid-abandon with stopDetail="abandon_in_progress") left the ticket
+      // in a dirty state — recovery can complete the cleanup (ES-450 Finding 4).
+      const isPartialAbandon = reason === "pr_closed" && fresh.stopDetail === "abandon_in_progress";
+      if ((reason !== "pr_closed" || isPartialAbandon) && !fresh.recoveryAttempted && fresh.prNumber !== null) {
         await this.notifier.notify({
           kind: "recovery_started",
           identifier: session.linearIdentifier,
           reason,
         });
-        // handoff_failed recovery: add the gate label before dispatching so it is in place
-        // when /restart-review is posted — without it LoopPilot ignores the restart command
-        // (ES-450 Finding 2). Do NOT pre-emptively transition the Linear ticket to In Review
-        // here: if Codex escalates or the recovery action fails the ticket must stay in its
-        // current state rather than getting stuck In Review with a stopped session. The
-        // transition is deferred to the 'recovered' path below (restart_review action only).
-        let handoffLabelFailed = false;
-        if (reason === "handoff_failed") {
-          const prNum = fresh.prNumber;
-          try {
-            await retry(3, () => this.git.addLabel(prNum, this.config.looppilot.gateLabel));
-          } catch (err) {
-            this.log(`recovery: handoff_failed retry addLabel failed: ${err instanceof Error ? err.message : String(err)}`);
-            // Label is a prerequisite for /restart-review — without it LoopPilot ignores
-            // the restart. Abort recovery so the session is stopped immediately instead of
-            // flipping to in_review where it polls until monitor_never_engaged (Finding 2).
-            handoffLabelFailed = true;
-          }
-        }
+        // Persist crash-recovery marker before the PR close step inside executeAbandon so
+        // a mid-abandon crash is detectable on the next daemon start (ES-450 Finding 4).
+        const onAbandonStarting = () => {
+          this.store.updateSession(session.id, { stopDetail: "abandon_in_progress" });
+        };
+        // Gate label handling for handoff_failed is now inside executeRecoveryTurn (after
+        // parseRecoveryAction), so abandon/escalate can proceed even when the label API is
+        // broken (ES-450 Finding 5).
         let result;
-        if (handoffLabelFailed) {
-          // Skip recovery — fall through to normal stop. Use 'failed' (not 'escalated')
-          // so recoveryAttempted stays 0 and the next daemon start can retry after the
-          // transient API error resolves (ES-450 Finding 2).
-          result = { kind: "failed" as const, action: "escalate" as RecoveryActionKind, message: "handoff label retry failed" };
-        } else {
         try {
           result = await executeRecoveryTurn(
             this.recoveryTurn,
             fresh,
             reason,
             detail,
+            onAbandonStarting,
           );
         } catch (err) {
           this.log(`recovery: exception: ${err instanceof Error ? err.message : String(err)}`);
           result = { kind: "escalated" as const, action: "escalate" as const };
-        }
         }
         // Operator interrupted during recovery analysis: propagate like other interrupts.
         // recoveryAttempted is NOT marked so the next run can retry recovery.
@@ -1728,6 +1727,7 @@ export class Orchestrator {
             failureReason: null,
             stopDetail: null,
             endedAt: null,
+            autoRestartAttempts: 0,
           };
           if (recoveryCost > 0) {
             recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
@@ -1801,11 +1801,11 @@ export class Orchestrator {
               ? `${effectiveDetail} (recovery failed: ${result.message})`
               : `recovery failed: ${result.message}`;
           }
-          // When local work exists that would be destroyed by the retry's
-          // reset --hard, mark recovery as attempted so
-          // stoppedSessionsWithFailedRecovery does not retry and discard
-          // dirty edits or unpushed commits (ES-450 Finding 3).
-          if (result.preserveWorktree) {
+          // When local work exists that would be destroyed by a retry, or when the
+          // failure is substantively non-retryable (cost cap, no commits, rebase
+          // conflict), mark recovery as attempted so stoppedSessionsWithFailedRecovery
+          // does not queue it again (ES-450 Finding 1/3).
+          if (result.preserveWorktree || result.nonRetryable) {
             this.store.updateSession(session.id, { recoveryAttempted: 1 });
           }
         }

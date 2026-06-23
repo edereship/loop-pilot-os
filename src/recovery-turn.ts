@@ -28,7 +28,7 @@ export interface RecoveryAction {
 export type RecoveryTurnResult =
   | { kind: "recovered"; action: RecoveryActionKind; costUsd: number }
   | { kind: "escalated"; action: RecoveryActionKind }
-  | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number; preserveWorktree?: boolean }
+  | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number; preserveWorktree?: boolean; nonRetryable?: boolean }
   | { kind: "interrupted"; costUsd?: number }
   | { kind: "continued"; action: RecoveryActionKind };
 
@@ -162,6 +162,7 @@ export async function executeRecoveryTurn(
   session: TaskSessionRow,
   reason: FailureReason,
   detail: string | null,
+  onAbandonStarting?: () => void,
 ): Promise<RecoveryTurnResult> {
   const { planner, agent, git, runner, source, config, log } = deps;
 
@@ -191,13 +192,37 @@ export async function executeRecoveryTurn(
   const parsed = parseRecoveryAction(codexText);
   log(`recovery: codex chose action=${parsed.action}`);
 
+  // For handoff_failed: add the gate label after Codex decides the action, so
+  // abandon/escalate can still be chosen when the label API is broken (ES-450 Finding 5).
+  // Done before dispatch so the label is present when /restart-review is posted.
+  if (
+    reason === "handoff_failed" &&
+    session.prNumber !== null &&
+    (parsed.action === "restart_review" || parsed.action === "fix_code" || parsed.action === "rebase")
+  ) {
+    let labelErr: string | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await git.addLabel(session.prNumber, config.looppilot.gateLabel);
+        labelErr = null;
+        break;
+      } catch (err) {
+        labelErr = err instanceof Error ? err.message : String(err);
+      }
+    }
+    if (labelErr !== null) {
+      log(`recovery: handoff_failed label add failed: ${labelErr}`);
+      return { kind: "failed", action: parsed.action, message: `handoff label add failed: ${labelErr}` };
+    }
+  }
+
   // 3. Dispatch
   switch (parsed.action) {
     case "escalate":
       return { kind: "escalated", action: "escalate" };
 
     case "abandon":
-      return await executeAbandon(deps, session);
+      return await executeAbandon(deps, session, onAbandonStarting);
 
     case "restart_review":
       return await executeRestartReview(deps, session);
@@ -349,6 +374,7 @@ async function executeFixCode(
       message: `recovery fix agent: ${outcome.kind}`,
       costUsd: outcome.costUsd,
       ...(preserveWorktree ? { preserveWorktree: true } : {}),
+      ...(outcome.kind === "cost_exceeded" && !preserveWorktree ? { nonRetryable: true } : {}),
     };
   }
 
@@ -362,7 +388,7 @@ async function executeFixCode(
   }
   const logResult = await runner.run("git", ["-C", worktreePath, "log", `origin/${branch}..HEAD`, "--oneline"], { cwd: worktreePath });
   if (logResult.stdout.trim() === "") {
-    return { kind: "failed", action: "fix_code", message: "recovery fix agent made no commits", costUsd: outcome.costUsd };
+    return { kind: "failed", action: "fix_code", message: "recovery fix agent made no commits", costUsd: outcome.costUsd, nonRetryable: true };
   }
 
   // Push
@@ -418,7 +444,7 @@ async function executeRebase(
   if (rebaseResult.code !== 0) {
     // Abort the failed rebase
     await runner.run("git", ["-C", worktreePath, "rebase", "--abort"], { cwd: worktreePath });
-    return { kind: "failed", action: "rebase", message: `recovery rebase failed: ${rebaseResult.stderr.trim() || `exit ${rebaseResult.code}`}` };
+    return { kind: "failed", action: "rebase", message: `recovery rebase failed: ${rebaseResult.stderr.trim() || `exit ${rebaseResult.code}`}`, nonRetryable: true };
   }
 
   // Force push with lease
@@ -460,8 +486,13 @@ async function executeRestartReview(
 async function executeAbandon(
   deps: RecoveryTurnDeps,
   session: TaskSessionRow,
+  onAbandonStarting?: () => void,
 ): Promise<RecoveryTurnResult> {
   const { runner, source, git, config, log } = deps;
+  // Notify caller before the PR close so it can persist a crash-recovery marker. If the
+  // process dies mid-abandon the marker lets the next recovery turn detect the partial state
+  // (ES-450 Finding 4).
+  onAbandonStarting?.();
   // Close the PR first so a transient close failure leaves the ticket in its current state
   // (In Progress) rather than Todo. Do not pass --delete-branch: if the branch is checked
   // out in a linked worktree that flag causes gh to fail (local branch deletion is blocked),
