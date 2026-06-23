@@ -29,7 +29,7 @@ import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
-import { commitIfChanged } from "./memory-store.js";
+import { commitIfChanged, initialize as initializeMemory } from "./memory-store.js";
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -117,6 +117,27 @@ export class Orchestrator {
       return "lock_rejected";
     }
     try {
+      // Initialize memory store under the run lock so that a concurrent rejected run
+      // cannot race on the shared git index (ES-452 Finding 2). Push the initial commit
+      // so it survives the git reset --hard in fetchDefaultBranch on the next PM-select
+      // phase (ES-452 Finding 1). All steps are best-effort; failures are warned and skipped.
+      try {
+        initializeMemory(this.config.repo.path, this.store, this.config.digest.recentMergedCount);
+        const initCommitted = await commitIfChanged(this.runner, this.config.repo.path).catch(() => false as const);
+        if (initCommitted) {
+          const initPushRes = await this.runner.run(
+            "git",
+            ["push", "origin", `HEAD:${this.config.repo.defaultBranch}`],
+            { cwd: this.config.repo.path },
+          ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+          if (initPushRes.code !== 0) {
+            this.log(`warning: failed to push initial memory commit: ${initPushRes.stderr.trim()}`);
+          }
+        }
+      } catch (err: unknown) {
+        this.log(`warning: failed to initialize memory: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
       const taskCap = this.config.safety.maxTasksPerRun;
       const run = this.store.createRun(taskCap, this.clock());
       this.runId = run.id;
@@ -2006,17 +2027,24 @@ export class Orchestrator {
   /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
   private async commitMemoryBeforeHalt(): Promise<void> {
     try {
-      const committed = await commitIfChanged(this.runner, this.config.repo.path);
+      const repoPath = this.config.repo.path;
+      const defaultBranch = this.config.repo.defaultBranch;
+      // Fetch and rebase onto the latest remote state before committing so the push is
+      // fast-forward even when a PR was merged during this run and the remote branch has
+      // advanced past the local HEAD (ES-452 Finding 5). Best-effort.
+      await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["rebase", `origin/${defaultBranch}`], { cwd: repoPath }).catch(() => {});
+      const committed = await commitIfChanged(this.runner, repoPath);
       if (committed) {
         // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch
         // on the next run's PM-select phase (ES-452 Finding 1). Best-effort: warn on failure.
-        const push = await this.runner.run(
+        const pushRes = await this.runner.run(
           "git",
-          ["push", "origin", `HEAD:${this.config.repo.defaultBranch}`],
-          { cwd: this.config.repo.path },
-        );
-        if (push.code !== 0) {
-          this.log(`warning: failed to push memory commit: ${push.stderr.trim()}`);
+          ["push", "origin", `HEAD:${defaultBranch}`],
+          { cwd: repoPath },
+        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+        if (pushRes.code !== 0) {
+          this.log(`warning: failed to push memory commit: ${pushRes.stderr.trim()}`);
         }
       }
     } catch {
