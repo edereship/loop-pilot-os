@@ -297,6 +297,56 @@ export interface GroomLogRow {
   errorDetail: string | null;
 }
 
+// ---- GROOM Prompt Builder（ES-455: Board Formatter + Prompt Builder） ----
+
+export interface BoardTicket {
+  identifier: string;
+  title: string;
+  priority: number;
+  labels: string[];
+}
+
+export interface InProgressTicket extends BoardTicket {
+  status: "in_progress" | "in_review";
+  prNumber: number | null;
+}
+
+export interface DoneTicket {
+  identifier: string;
+  title: string;
+  mergedAt: string;
+}
+
+export interface BlockedTicket extends BoardTicket {
+  blockedBy: string;
+}
+
+export interface BoardState {
+  eligible: BoardTicket[];
+  inProgress: InProgressTicket[];
+  recentDone: DoneTicket[];
+  blocked: BlockedTicket[];
+}
+
+export interface GroomPromptArgs {
+  specContent: SpecContent | null;
+  goal: string | null;
+  memory: {
+    pmDecisions: string | null;
+    implResults: string | null;
+    productKnowledge: string | null;
+  };
+  board: BoardState;
+  boardBudgetChars: number;
+  /** Max chars for the combined memory block injected into the prompt (memory.inject_budget_chars). */
+  memoryBudgetChars: number;
+  digest: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
+  codebaseSummary: string | null;
+  optInLabel: string;
+  maxMemoryChars: number;
+  knownLabels: string[];
+}
+
 // ---- 実行コマンド抽象（git/gh/claude 共通） ----
 export interface CommandResult { code: number; stdout: string; stderr: string; }
 export interface RunOptions {
