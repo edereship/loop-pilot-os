@@ -20,6 +20,7 @@ import type {
   PlanOutcome,
   PauseMeta,
   PrDiffSummary,
+  CommandRunner,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
@@ -28,6 +29,7 @@ import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
+import { commitIfChanged } from "./memory-store.js";
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -49,6 +51,7 @@ export interface OrchestratorDeps {
   planner: PlanRunner | null;
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   recoveryTurn: RecoveryTurnDeps | null;
+  runner: CommandRunner;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -76,6 +79,7 @@ export class Orchestrator {
   private readonly planner: PlanRunner | null;
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   private readonly recoveryTurn: RecoveryTurnDeps | null;
+  private readonly runner: CommandRunner;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -97,6 +101,7 @@ export class Orchestrator {
     this.planner = deps.planner;
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
     this.recoveryTurn = deps.recoveryTurn;
+    this.runner = deps.runner;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -2000,6 +2005,11 @@ export class Orchestrator {
   private async haltForInterrupt(): Promise<void> {
     const run = this.store.getRun(this.runId);
     if (run.state === "halted") return;
+    try {
+      await commitIfChanged(this.runner, this.config.repo.path);
+    } catch {
+      this.log("warning: failed to commit memory on halt");
+    }
     const detail = "user_interrupt: stop requested; halting at safe point";
     this.store.setRunState(this.runId, "halted", detail);
     // 他の全 stopSession 経路と同様に await（通知を main の store.close() 前に確実に配信し、

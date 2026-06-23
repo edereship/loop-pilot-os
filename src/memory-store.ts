@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import type { MemoryCategory } from "./types.js";
 import type { SqliteStore } from "./store.js";
+import type { CommandRunner } from "./types.js";
 
 export const MEMORY_DIR = "docs/memory";
 
@@ -93,4 +94,25 @@ export function initialize(
       );
     }
   }
+}
+
+export async function commitIfChanged(
+  runner: CommandRunner,
+  repoPath: string,
+): Promise<boolean> {
+  // Stage first so untracked files (from initialize) are included
+  await runner.run("git", ["add", MEMORY_DIR + "/"], { cwd: repoPath });
+  const diff = await runner.run(
+    "git",
+    ["diff", "--cached", "--quiet", "--", MEMORY_DIR + "/"],
+    { cwd: repoPath },
+  );
+  if (diff.code === 0) return false;
+
+  await runner.run(
+    "git",
+    ["commit", "-m", "chore: persist cross-task memory on halt"],
+    { cwd: repoPath },
+  );
+  return true;
 }

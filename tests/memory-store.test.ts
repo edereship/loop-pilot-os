@@ -7,10 +7,12 @@ import {
   writeCategory,
   readAll,
   initialize,
+  commitIfChanged,
   MEMORY_DIR,
   CATEGORY_FILES,
 } from "../src/memory-store.js";
 import { SqliteStore } from "../src/store.js";
+import { FakeCommandRunner } from "./fakes.js";
 
 let tmpRepo: string;
 
@@ -174,5 +176,40 @@ describe("initialize", () => {
     initialize(tmpRepo, store, 10);
 
     expect(readCategory(tmpRepo, "impl_results")).toBe("manual content");
+  });
+});
+
+describe("commitIfChanged", () => {
+  it("commits when staged diff detects changes", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 0 });
+    // git diff --cached --quiet exits 1 when there are staged changes
+    runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    runner.on(["git", "commit", "-m"], { code: 0 });
+
+    const result = await commitIfChanged(runner, "/repo");
+    expect(result).toBe(true);
+
+    const commitCall = runner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeDefined();
+    expect(commitCall!.args).toContain("chore: persist cross-task memory on halt");
+    expect(commitCall!.opts.cwd).toBe("/repo");
+  });
+
+  it("skips commit when no changes", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 0 });
+    // git diff --cached --quiet exits 0 when no staged changes
+    runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+
+    const result = await commitIfChanged(runner, "/repo");
+    expect(result).toBe(false);
+
+    const commitCall = runner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeUndefined();
   });
 });

@@ -77,6 +77,7 @@ interface Harness {
   logs: string[];
   promptArgs: PromptArgs[];
   recoveryRunner: FakeCommandRunner;
+  memoryRunner: FakeCommandRunner;
 }
 
 function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Harness {
@@ -111,6 +112,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   recoveryRunner.on(["git", "push"], { code: 0 });
   recoveryRunner.on(["gh"], { code: 0 });
   const planner = opts?.planner ?? null;
+  const memoryRunner = new FakeCommandRunner();
+  memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   const orch = new Orchestrator({
     config,
     source,
@@ -136,8 +140,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
       config,
       log,
     } : null,
+    runner: memoryRunner,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner };
+  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner };
 }
 
 describe("Orchestrator 正常系 — 1チケット完走（仕様 §5 SELECT→CLAIM→IMPLEMENT→HANDOFF→MONITOR→DONE）", () => {
@@ -619,6 +624,9 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       return `PROMPT for ${args.issue.identifier}`;
     };
     const recovery = new FakeWorkflowRecovery();
+    const inlineMemoryRunner1 = new FakeCommandRunner();
+    inlineMemoryRunner1.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config,
       source,
@@ -636,6 +644,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       planner: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
+      runner: inlineMemoryRunner1,
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -1902,6 +1911,42 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
   });
 });
 
+describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
+  it("commits memory files on halt when changes exist", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Override memory runner to simulate changes (add already stubbed in harness)
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    // Call requestStop before run() so HALT fires at first safe point (loop entry),
+    // no source/agent/git setup needed.
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("skips memory commit on halt when no changes", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Default stub returns code 0 (no changes) — already set in harness
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeUndefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+});
+
 // 二重起動: ロック拒否は戻り値で通知し、main が古い Run の状態から誤った exit code を導かないようにする
 describe("Orchestrator 二重起動 — run lock 拒否（Fix 1）", () => {
   it("別の生存プロセスがロックを保持しているとき run() は 'lock_rejected' を返し、Run 行を作らず通知も送らない", async () => {
@@ -2089,6 +2134,9 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const monitor = new FakeMonitor();
     const notifier = new FakeNotifier();
     const logs: string[] = [];
+    const inlineMemoryRunner2 = new FakeCommandRunner();
+    inlineMemoryRunner2.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config: specConfig,
       source,
@@ -2106,6 +2154,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       planner,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
+      runner: inlineMemoryRunner2,
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -2614,12 +2663,16 @@ describe("Orchestrator.interruptablePause", () => {
         orchRef.requestStop();
       }
     };
+    const inlineMemoryRunner3 = new FakeCommandRunner();
+    inlineMemoryRunner3.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config, source, agent, git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
+      runner: inlineMemoryRunner3,
     });
     orchRef = orch;
 
