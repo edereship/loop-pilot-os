@@ -29,7 +29,7 @@ import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
-import { commitIfChanged, initialize as initializeMemory } from "./memory-store.js";
+import { commitIfChanged, initialize as initializeMemory, MEMORY_DIR } from "./memory-store.js";
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -143,7 +143,10 @@ export class Orchestrator {
             { cwd: repoPath },
           ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
           if (initPushRes.code !== 0) {
-            this.log(`warning: failed to push initial memory commit: ${initPushRes.stderr.trim()}`);
+            // Roll back the local commit so the branch does not stay ahead of origin
+            // (ES-452 Finding 3 — same pattern as commitMemoryBeforeHalt).
+            await this.runner.run("git", ["reset", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+            this.log(`warning: failed to push initial memory commit (rolled back): ${initPushRes.stderr.trim()}`);
           }
         }
       } catch (err: unknown) {
@@ -2055,6 +2058,18 @@ export class Orchestrator {
         this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
         return;
       }
+      // Even when rebase exits 0, the autostash pop may leave conflict markers in the
+      // working tree. Detect unmerged files and skip the commit to avoid staging conflict
+      // markers as memory content (ES-452 Finding 2).
+      const unmergedRes = await this.runner.run(
+        "git", ["ls-files", "--unmerged", "--", MEMORY_DIR + "/"],
+        { cwd: repoPath },
+      ).catch(() => ({ code: 0, stdout: "", stderr: "" }));
+      if (unmergedRes.stdout.trim().length > 0) {
+        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
+        return;
+      }
       const committed = await commitIfChanged(this.runner, repoPath);
       if (committed) {
         // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch
@@ -2065,7 +2080,10 @@ export class Orchestrator {
           { cwd: repoPath },
         ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
         if (pushRes.code !== 0) {
-          this.log(`warning: failed to push memory commit: ${pushRes.stderr.trim()}`);
+          // Roll back the local commit so the branch does not stay ahead of origin;
+          // fetchDefaultBranch's git reset --hard would silently discard it (ES-452 Finding 3).
+          await this.runner.run("git", ["reset", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+          this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
         }
       }
     } catch {

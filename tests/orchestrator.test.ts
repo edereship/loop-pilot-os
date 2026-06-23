@@ -115,6 +115,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   const memoryRunner = new FakeCommandRunner();
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+  memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
   memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   const orch = new Orchestrator({
@@ -1970,6 +1971,50 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
       (c) => c.cmd === "git" && c.args[0] === "rebase" && c.args.includes("--abort"),
     );
     expect(abortCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("skips memory commit when autostash pop leaves conflicts after successful rebase (ES-452 Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase exits 0 (success), but autostash pop left unmerged files
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], {
+      code: 0,
+      stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
+    });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    // Even though diff shows changes, commit must NOT be called
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCall).toBeUndefined();
+    const checkoutCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD"),
+    );
+    expect(checkoutCall).toBeDefined();
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("rolls back unpushed memory commit when push fails on halt (ES-452 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+    h.memoryRunner.on(["git", "push", "origin", "HEAD:main"], { code: 1, stderr: "remote: Permission denied" });
+    h.memoryRunner.on(["git", "reset", "HEAD~1"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const resetCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args.includes("HEAD~1"),
+    );
+    expect(resetCall).toBeDefined();
     expect(h.store.latestRun()!.state).toBe("halted");
   });
 });

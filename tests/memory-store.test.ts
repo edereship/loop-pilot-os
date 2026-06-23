@@ -248,6 +248,7 @@ describe("commitIfChanged", () => {
   it("cleans up untracked memory files when git add fails (ES-452 Finding 1)", async () => {
     const runner = new FakeCommandRunner();
     runner.on(["git", "add", "docs/memory/"], { code: 128, stderr: "fatal: unable to lock index" });
+    runner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
     runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
 
     await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
@@ -257,6 +258,22 @@ describe("commitIfChanged", () => {
     );
     expect(cleanCall).toBeDefined();
     expect(cleanCall!.args).toContain("docs/memory/");
+  });
+
+  it("restores tracked memory files when git add fails (ES-452 Finding 1)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "add", "docs/memory/"], { code: 128, stderr: "fatal: unable to lock index" });
+    runner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+
+    await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
+
+    const checkoutCall = runner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD"),
+    );
+    expect(checkoutCall).toBeDefined();
+    expect(checkoutCall!.args).toContain("--");
+    expect(checkoutCall!.args).toContain("docs/memory/");
   });
 
   it("throws when git commit fails", async () => {
