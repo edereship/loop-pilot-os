@@ -103,7 +103,13 @@ export class GroomLinearClient {
 
   async closeIssue(issueId: string, rationale: string): Promise<void> {
     await this.issueUpdate(issueId, { stateId: this.stateIds.done });
-    await this.postComment(issueId, `🧹 Closed by GROOM\n\n**Reason**: ${rationale}`);
+    try {
+      await this.postComment(issueId, `🧹 Closed by GROOM\n\n**Reason**: ${rationale}`);
+    } catch (err) {
+      throw new Error(
+        `closeIssue ${issueId}: state changed to Done but rationale comment failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   private resolveLabelId(name: string): string {
@@ -130,22 +136,44 @@ export class GroomLinearClient {
   }
 
   async addLabels(issueId: string, names: string[]): Promise<void> {
+    const added: string[] = [];
     for (const name of names) {
-      const labelId = this.resolveLabelId(name);
-      const data = await graphql<{ issueAddLabel: { success: boolean } }>(
-        this.fetchFn, this.apiKey, ISSUE_ADD_LABEL_MUTATION, { id: issueId, labelId },
-      );
-      if (!data.issueAddLabel.success) throw new Error(`issueAddLabel failed for ${issueId} label ${name}`);
+      try {
+        const labelId = this.resolveLabelId(name);
+        const data = await graphql<{ issueAddLabel: { success: boolean } }>(
+          this.fetchFn, this.apiKey, ISSUE_ADD_LABEL_MUTATION, { id: issueId, labelId },
+        );
+        if (!data.issueAddLabel.success) throw new Error(`issueAddLabel failed for ${issueId} label ${name}`);
+        added.push(name);
+      } catch (err) {
+        if (added.length > 0) {
+          throw new Error(
+            `addLabels partially failed for ${issueId} at "${name}" (already added: ${added.join(", ")}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        throw err;
+      }
     }
   }
 
   async removeLabels(issueId: string, names: string[]): Promise<void> {
+    const removed: string[] = [];
     for (const name of names) {
-      const labelId = this.resolveLabelId(name);
-      const data = await graphql<{ issueRemoveLabel: { success: boolean } }>(
-        this.fetchFn, this.apiKey, ISSUE_REMOVE_LABEL_MUTATION, { id: issueId, labelId },
-      );
-      if (!data.issueRemoveLabel.success) throw new Error(`issueRemoveLabel failed for ${issueId} label ${name}`);
+      try {
+        const labelId = this.resolveLabelId(name);
+        const data = await graphql<{ issueRemoveLabel: { success: boolean } }>(
+          this.fetchFn, this.apiKey, ISSUE_REMOVE_LABEL_MUTATION, { id: issueId, labelId },
+        );
+        if (!data.issueRemoveLabel.success) throw new Error(`issueRemoveLabel failed for ${issueId} label ${name}`);
+        removed.push(name);
+      } catch (err) {
+        if (removed.length > 0) {
+          throw new Error(
+            `removeLabels partially failed for ${issueId} at "${name}" (already removed: ${removed.join(", ")}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        throw err;
+      }
     }
   }
 
