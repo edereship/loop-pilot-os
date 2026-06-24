@@ -1813,9 +1813,13 @@ export class Orchestrator {
             mergeFailures = 0;
             // Reload pendingRestartReason so the stale guard fires on the next poll if
             // done-path recovery was applied (ES-450 Finding 1).
+            // Also reload quotaRetryCount: recovery resets quotaRetryAttempts in the DB
+            // but the local counter would otherwise retain its pre-recovery value, causing
+            // the cap to trip on the next codex_usage_limit stop (ES-469 Finding).
             {
               const recoveredForPending = this.store.getSession(session.id);
               pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
+              quotaRetryCount = recoveredForPending.quotaRetryAttempts;
             }
             continue;
           }

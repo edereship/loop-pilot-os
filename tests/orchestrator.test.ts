@@ -1158,6 +1158,72 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     expect(h.git.calls.some((c) => c.method === "postComment")).toBe(false);
   });
 
+  it("no_findings の ci_failed リカバリ後に quotaRetryCount がリロードされ上限超過しない（ES-469 Finding）", async () => {
+    // Scenario: quotaRetryCount reaches 6, then no_findings triggers tryMerge which sees
+    // ci_failed readiness → stopSession(ci_failed) → recovery resets quotaRetryAttempts=0 in DB.
+    // Without the fix, the local quotaRetryCount stays at 6 and the next codex_usage_limit
+    // increments it to 7 (>6), triggering the cap and halting. With the fix, the reload
+    // brings the local count to 0 so the next retry is treated as attempt #1.
+    const planner = new FakePlanRunner();
+    // Outcome 0: PLAN phase (valid brief so IMPLEMENT proceeds)
+    // Outcome 1: RECOVERY phase (for ci_failed from tryMerge inside the no_findings handler)
+    planner.outcomes = [
+      {
+        kind: "completed",
+        text: [
+          "## Goal", "Fix it.", "", "## Change Targets", "- file.ts", "",
+          "## Implementation Steps", "1. Step one", "", "## Acceptance Criteria", "- Tests pass", "",
+          "## Out of Scope", "- Nothing",
+        ].join("\n"),
+      },
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // Make tryMerge see ci_failed so recovery fires and resets quotaRetryAttempts in DB
+    h.monitor.readiness.set(100, { ready: false, reason: "ci_failed" });
+    h.monitor.verdicts = [
+      // Accumulate quotaRetryCount=6 via 6 retries interleaved with not_engaged to clear pending
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // retry 1
+      { kind: "not_engaged" },
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // retry 2
+      { kind: "not_engaged" },
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // retry 3
+      { kind: "not_engaged" },
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // retry 4
+      { kind: "not_engaged" },
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // retry 5
+      { kind: "not_engaged" },
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // retry 6
+      { kind: "not_engaged" },
+      // quotaRetryCount=6 locally and in DB at this point
+      { kind: "stopped", stopReason: "no_findings" },
+      // → review_done path → tryMerge → ci_failed readiness
+      // → stopSession(ci_failed) → recovery succeeds (restart_review)
+      // → DB: quotaRetryAttempts=0, pendingRestartReason="ci_failed"
+      // → tryMerge returns {kind:"continue"}
+      // → review_done reload: pendingRestartReason="ci_failed", quotaRetryCount=0 (with fix)
+      { kind: "done" },
+      // → pendingRestartReason="ci_failed" consumed (grace), no tryMerge called
+      { kind: "stopped", stopReason: "codex_usage_limit" },
+      // → NOT stale (pendingRestartReason cleared above)
+      // → WITH FIX: quotaRetryCount = 0+1 = 1, sleep+post, pendingRestartReason="codex_usage_limit"
+      // → WITHOUT FIX: quotaRetryCount = 6+1 = 7 > 6 → HALT (cap exceeded)
+      { kind: "stopped", stopReason: "codex_usage_limit" },
+      // → STALE (pending="codex_usage_limit"), clear pending, continue
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // Without the fix the session would be stopped with "looppilot_stopped" (quota cap).
+    // With the fix the quota count is reloaded to 0 and the session eventually merges.
+    expect(s.state).toBe("merged");
+  });
+
   it("auto_restart 2 回で成功（上限 3 内）→ merged", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
