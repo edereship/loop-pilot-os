@@ -108,6 +108,17 @@ describe("GroomLinearClient.closeIssue", () => {
     await expect(makeClient(fetchFn).closeIssue("issue-1", "reason")).rejects.toThrow(/issueUpdate failed/i);
     expect(calls).toHaveLength(1);
   });
+
+  it("includes state-changed context when comment fails after successful transition (ES-461)", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueUpdate: { success: true } } } },
+      { body: { data: { commentCreate: { success: false } } } },
+    ]);
+    await expect(makeClient(fetchFn).closeIssue("issue-1", "reason")).rejects.toThrow(
+      /state changed to Done but rationale comment failed/i,
+    );
+    expect(calls).toHaveLength(2);
+  });
 });
 
 const ISSUE_CREATE_MUTATION_MARKER = "issueCreate";
@@ -166,6 +177,27 @@ describe("GroomLinearClient.addLabels", () => {
     const { fetchFn } = makeFetch([]);
     await expect(makeClient(fetchFn).addLabels("issue-1", ["nonexistent"])).rejects.toThrow(/nonexistent/i);
   });
+
+  it("includes already-added labels in error on partial failure (ES-460)", async () => {
+    const labels = new Map([["bug", "label-bug"], ["urgent", "label-urgent"], ["wont-fix", "label-wontfix"]]);
+    const { fetchFn } = makeFetch([
+      { body: { data: { issueAddLabel: { success: true } } } },
+      { ok: false, status: 500, body: {} },
+    ]);
+    await expect(makeClient(fetchFn, labels).addLabels("issue-1", ["bug", "urgent", "wont-fix"])).rejects.toThrow(
+      /partially failed.*already added: bug/i,
+    );
+  });
+
+  it("re-throws original error without partial context when first label fails", async () => {
+    const labels = new Map([["bug", "label-bug"]]);
+    const { fetchFn } = makeFetch([
+      { ok: false, status: 500, body: {} },
+    ]);
+    const err = await makeClient(fetchFn, labels).addLabels("issue-1", ["bug"]).catch((e: Error) => e);
+    expect(err.message).toMatch(/Linear HTTP 500/i);
+    expect(err.message).not.toMatch(/partially/i);
+  });
 });
 
 describe("GroomLinearClient.removeLabels", () => {
@@ -176,6 +208,17 @@ describe("GroomLinearClient.removeLabels", () => {
     ]);
     await makeClient(fetchFn, labels).removeLabels("issue-1", ["bug"]);
     expect(calls[0].variables).toEqual({ id: "issue-1", labelId: "label-bug" });
+  });
+
+  it("includes already-removed labels in error on partial failure (ES-460)", async () => {
+    const labels = new Map([["bug", "label-bug"], ["urgent", "label-urgent"]]);
+    const { fetchFn } = makeFetch([
+      { body: { data: { issueRemoveLabel: { success: true } } } },
+      { ok: false, status: 500, body: {} },
+    ]);
+    await expect(makeClient(fetchFn, labels).removeLabels("issue-1", ["bug", "urgent"])).rejects.toThrow(
+      /partially failed.*already removed: bug/i,
+    );
   });
 });
 
