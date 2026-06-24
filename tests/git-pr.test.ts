@@ -573,6 +573,58 @@ describe("GitPrManager.discardWorktree", () => {
     });
     expect(runner.calls).toHaveLength(2);
   });
+
+  // ES-463: git branch -D 失敗時は warning ログ、throw しない
+  it("logs warning when git branch -D fails but does not throw", async () => {
+    const logs: string[] = [];
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "worktree", "remove"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "branch", "-D"], {
+      code: 1,
+      stdout: "",
+      stderr: "error: branch 'looppilot/ty-123-x' not found.",
+    });
+
+    const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
+    await mgr.discardWorktree("looppilot/ty-123-x", "/wt/ty-123-x");
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/git branch -D failed/);
+    expect(logs[0]).toContain("looppilot/ty-123-x");
+  });
+
+  // ES-463: git worktree remove 失敗時もログし、branch -D は試行する
+  it("logs warning when git worktree remove fails and still attempts branch -D", async () => {
+    const logs: string[] = [];
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "worktree", "remove"], {
+      code: 128,
+      stdout: "",
+      stderr: "fatal: '/wt/ty-123-x' is not a valid directory",
+    });
+    runner.on(["git", "-C", "/repo", "branch", "-D"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
+    await mgr.discardWorktree("looppilot/ty-123-x", "/wt/ty-123-x");
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/git worktree remove failed/);
+    expect(runner.calls).toHaveLength(2);
+  });
+
+  // ES-463: log なしでも安全に動作する（既存コードの後方互換）
+  it("does not throw when log is not provided and a step fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "worktree", "remove"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "branch", "-D"], {
+      code: 1,
+      stdout: "",
+      stderr: "error: branch not found",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.discardWorktree("looppilot/ty-123-x", "/wt/ty-123-x")).resolves.toBeUndefined();
+  });
 });
 
 describe("GitPrManager.postComment", () => {

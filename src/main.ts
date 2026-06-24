@@ -182,6 +182,7 @@ async function runLoop(configPath: string): Promise<number> {
       worktreeRoot: config.repo.worktreeRoot,
       prBodyTemplate: config.handoff.prBodyTemplate,
       gateLabel: config.looppilot.gateLabel,
+      log: logLine,
     });
     const monitor = new GhLoopPilotMonitor(runner, {
       remote: config.repo.remote,
