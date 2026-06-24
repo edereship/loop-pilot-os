@@ -569,6 +569,7 @@ export class SqliteStore {
       .prepare(
         `SELECT * FROM task_session
          WHERE state = 'merged' AND done_transition_pending = 1
+           AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
          ORDER BY id ASC`,
       )
       .all() as RawSessionRow[];
