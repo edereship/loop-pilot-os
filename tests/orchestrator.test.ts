@@ -1032,6 +1032,8 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     // quota_waiting 通知は初回のみ（1回）
     const quotaWaiting = h.notifier.events.filter((e) => e.kind === "quota_waiting");
     expect(quotaWaiting).toHaveLength(1);
+    // quotaRetryAttempts は 6（最後に成功した post 時点の値。7回目は post 前に停止）
+    expect(s.quotaRetryAttempts).toBe(6);
   });
 
   it("stale quota poll は 1 時間 sleep と postComment を再実行しない（ES-410）", async () => {
@@ -1090,6 +1092,8 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     // postComment は2回（各サイクル1回ずつ）
     const postComments = h.git.calls.filter((c) => c.method === "postComment");
     expect(postComments).toHaveLength(2);
+    // in_progress 復帰でリセットされた後、新エピソードの 1 回分のみ永続化
+    expect(s.quotaRetryAttempts).toBe(1);
   });
 
   it("quota リトライと autoRestartCount は独立（quota リトライが autoRestartCount に影響しない）", async () => {
@@ -1113,6 +1117,8 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
     expect(s.state).toBe("merged");
     // autoRestartAttempts は 2（quota リトライは含まない）
     expect(s.autoRestartAttempts).toBe(2);
+    // quotaRetryAttempts は 1（quota リトライ分のみ）
+    expect(s.quotaRetryAttempts).toBe(1);
   });
 
   it("quota sleep 中に requestStop() → sleep を中断して HALT（セッションは in_review のまま）", async () => {

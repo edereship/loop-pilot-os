@@ -1081,6 +1081,7 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
       prNumber: 100,
       monitorStartedAt: originalStart,
       autoRestartAttempts: 2,
+      quotaRetryAttempts: 3,
       pendingRestartReason: "workflow_crashed",
       workflowFixAttempts: 1,
       workflowHandledErrorCount: 1,
@@ -1109,6 +1110,7 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     expect(s.stopDetail).toBeNull();
     expect(s.endedAt).not.toBeNull(); // re-set by done()
     expect(s.autoRestartAttempts).toBe(0);
+    expect(s.quotaRetryAttempts).toBe(0);
     expect(s.pendingRestartReason).toBeNull();
     // Workflow recovery counters are preserved across recovery (Finding 2)
     expect(s.workflowFixAttempts).toBe(1);
@@ -1186,6 +1188,7 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
       prNumber: 100,
       monitorStartedAt: "2026-06-04T00:10:00.000Z",
       autoRestartAttempts: 1,
+      quotaRetryAttempts: 2,
       workflowFixAttempts: 2,
       workflowHandledErrorCount: 3,
     });
@@ -1206,6 +1209,7 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     expect(s.failureReason).toBeNull();
     expect(s.stopDetail).toBeNull();
     expect(s.autoRestartAttempts).toBe(0);
+    expect(s.quotaRetryAttempts).toBe(0);
     expect(s.pendingRestartReason).toBeNull();
     // Workflow recovery counters are preserved across recovery (Finding 2)
     expect(s.workflowFixAttempts).toBe(2);

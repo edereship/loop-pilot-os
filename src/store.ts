@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS task_session (
   workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
   workflow_handled_error_count INTEGER NOT NULL DEFAULT 0,
   auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
+  quota_retry_attempts INTEGER NOT NULL DEFAULT 0,
   pending_restart_reason TEXT,
   recovery_attempted INTEGER NOT NULL DEFAULT 0,
   recovery_action TEXT,
@@ -129,6 +130,7 @@ interface RawSessionRow {
   workflow_fix_attempts: number;
   workflow_handled_error_count: number;
   auto_restart_attempts: number;
+  quota_retry_attempts: number;
   pending_restart_reason: string | null;
   recovery_attempted: number;
   recovery_action: string | null;
@@ -157,6 +159,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     workflowFixAttempts: r.workflow_fix_attempts,
     workflowHandledErrorCount: r.workflow_handled_error_count,
     autoRestartAttempts: r.auto_restart_attempts,
+    quotaRetryAttempts: r.quota_retry_attempts,
     pendingRestartReason: r.pending_restart_reason,
     recoveryAttempted: r.recovery_attempted,
     recoveryAction: r.recovery_action,
@@ -222,6 +225,7 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   workflowFixAttempts: "workflow_fix_attempts",
   workflowHandledErrorCount: "workflow_handled_error_count",
   autoRestartAttempts: "auto_restart_attempts",
+  quotaRetryAttempts: "quota_retry_attempts",
   pendingRestartReason: "pending_restart_reason",
   recoveryAttempted: "recovery_attempted",
   recoveryAction: "recovery_action",
@@ -271,6 +275,11 @@ export class SqliteStore {
     if (!columns.has("workflow_handled_error_count")) {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN workflow_handled_error_count INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!columns.has("quota_retry_attempts")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0`,
       );
     }
     if (!columns.has("auto_restart_attempts")) {
@@ -484,6 +493,7 @@ export class SqliteStore {
         | "workflowFixAttempts"
         | "workflowHandledErrorCount"
         | "autoRestartAttempts"
+        | "quotaRetryAttempts"
         | "pendingRestartReason"
         | "recoveryAttempted"
         | "recoveryAction"

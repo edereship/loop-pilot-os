@@ -641,6 +641,7 @@ export class Orchestrator {
       stopDetail: null,
       endedAt: null,
       autoRestartAttempts: 0,
+      quotaRetryAttempts: 0,
       pendingRestartReason: null,
       monitorStartedAt: this.clock(),
     });
@@ -1637,7 +1638,7 @@ export class Orchestrator {
     // state from autoRestartAttempts > 0 — that was too broad (blocked even different-reason
     // stops on recovery) and was set before posting (so a pre-post crash left a false block).
     let pendingRestartReason: string | undefined = session.pendingRestartReason ?? undefined;
-    let quotaRetryCount = 0;
+    let quotaRetryCount = session.quotaRetryAttempts;
     let quotaResumedNotified = false;
     let firstPoll = true;
     while (true) {
@@ -1756,6 +1757,7 @@ export class Orchestrator {
             const recoveredForPending = this.store.getSession(session.id);
             pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
             autoRestartCount = recoveredForPending.autoRestartAttempts;
+            quotaRetryCount = recoveredForPending.quotaRetryAttempts;
           }
           continue;
         }
@@ -1858,6 +1860,7 @@ export class Orchestrator {
                 const recoveredState = this.store.getSession(session.id);
                 pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
                 autoRestartCount = recoveredState.autoRestartAttempts;
+                quotaRetryCount = recoveredState.quotaRetryAttempts;
               }
               continue;
             }
@@ -1931,6 +1934,7 @@ export class Orchestrator {
                 const quotaRecoveredState = this.store.getSession(session.id);
                 pendingRestartReason = quotaRecoveredState.pendingRestartReason ?? undefined;
                 autoRestartCount = quotaRecoveredState.autoRestartAttempts;
+                quotaRetryCount = quotaRecoveredState.quotaRetryAttempts;
               }
               continue;
             }
@@ -1985,6 +1989,7 @@ export class Orchestrator {
             // restart is in flight and applies the stale guard above.
             pendingRestartReason = verdict.stopReason ?? undefined;
             this.store.updateSession(session.id, {
+              quotaRetryAttempts: quotaRetryCount,
               pendingRestartReason: verdict.stopReason,
             });
             continue;
@@ -2011,6 +2016,7 @@ export class Orchestrator {
             const recoveredState = this.store.getSession(session.id);
             pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
             autoRestartCount = recoveredState.autoRestartAttempts;
+            quotaRetryCount = recoveredState.quotaRetryAttempts;
             continue;
           }
         }
@@ -2053,6 +2059,7 @@ export class Orchestrator {
             // cap applies per outage episode; after a confirmed recovery the next
             // exhaustion begins at count=1 again (ES-410 Finding 4).
             quotaRetryCount = 0;
+            this.store.updateSession(session.id, { quotaRetryAttempts: 0 });
             quotaResumedNotified = true;
           }
           const timeout = this.config.safety.monitorTimeoutMinutes;
@@ -2393,6 +2400,7 @@ export class Orchestrator {
             stopDetail: null,
             endedAt: null,
             autoRestartAttempts: 0,
+            quotaRetryAttempts: 0,
             recoveryAttempted: 1,
           };
           if (recoveryCost > 0) {
