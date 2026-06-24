@@ -194,9 +194,13 @@ describe("GroomLinearClient.addLabels", () => {
     const { fetchFn } = makeFetch([
       { ok: false, status: 500, body: {} },
     ]);
-    const err = await makeClient(fetchFn, labels).addLabels("issue-1", ["bug"]).catch((e: Error) => e);
-    expect(err.message).toMatch(/Linear HTTP 500/i);
-    expect(err.message).not.toMatch(/partially/i);
+    try {
+      await makeClient(fetchFn, labels).addLabels("issue-1", ["bug"]);
+      expect.unreachable("should have thrown");
+    } catch (err) {
+      expect((err as Error).message).toMatch(/Linear HTTP 500/i);
+      expect((err as Error).message).not.toMatch(/partially/i);
+    }
   });
 });
 
