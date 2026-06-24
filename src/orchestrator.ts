@@ -2644,10 +2644,10 @@ export class Orchestrator {
     const nowMs = Date.parse(now);
     const startMs = Date.parse(fresh.monitorStartedAt);
     if (startMs > nowMs) {
-      // monitorStartedAt is in the future (NTP skew or bad persisted timestamp).
-      // Reset to now so the guard window starts from this poll rather than
-      // staying pinned at 0 until wall time catches up.
-      this.store.updateSession(sessionId, { monitorStartedAt: now });
+      // monitorStartedAt is in the future (transient NTP skew or bad persisted timestamp).
+      // Return 0 without overwriting the stored start: persisting the stale wall-clock
+      // value here would cause the next poll (after NTP corrects the clock) to measure
+      // the skew delta as elapsed monitoring time and fire guards prematurely.
       return 0;
     }
     return (nowMs - startMs) / 60000;
