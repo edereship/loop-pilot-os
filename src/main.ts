@@ -28,6 +28,7 @@ import { CodexPlanner, type CodexRateLimitOpts } from "./codex-planner.js";
 import { generateCodebaseSummary } from "./codebase-summary.js";
 import { GroomBoardFetcher } from "./groom-board-fetcher.js";
 import { GroomLinearClient } from "./groom-linear-client.js";
+import { fetchWithTimeout } from "./fetch-timeout.js";
 
 const EXIT_OK = 0;
 const EXIT_PREFLIGHT = 1;
@@ -90,10 +91,12 @@ async function runLoop(configPath: string): Promise<number> {
   const store = new SqliteStore(config.stateDbPath);
   try {
     const runner = new RealCommandRunner();
+    const timedFetch = fetchWithTimeout(globalThis.fetch as unknown as import("./task-source.js").FetchFn);
     const notifier = new ConsoleSlackNotifier(
       store,
       config.slackWebhookUrl ?? null,
       logLine,
+      timedFetch,
     );
 
     // プリフライト: 違反を全件収集 → 列挙して exit 1（仕様 §8 / カーネル §9）。
@@ -102,7 +105,7 @@ async function runLoop(configPath: string): Promise<number> {
       config,
       runner,
       notifier,
-      fetchFn: globalThis.fetch,
+      fetchFn: timedFetch,
       getuid: process.getuid?.bind(process),
     });
     if (preflightErrors.length > 0) {
@@ -130,7 +133,7 @@ async function runLoop(configPath: string): Promise<number> {
     const linearSetup = await resolveLinearSetup(
       config.linearApiKey,
       setupRequest,
-      globalThis.fetch,
+      timedFetch,
     );
 
     const source = new LinearTaskSource({
@@ -138,7 +141,7 @@ async function runLoop(configPath: string): Promise<number> {
       projectId: linearSetup.projectId,
       stateIds: linearSetup.stateIds,
       optInLabel: config.linear.optInLabel,
-      fetchFn: globalThis.fetch,
+      fetchFn: timedFetch,
     });
     // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 はカスタムモデル/ゲートウェイ向けのエスケープハッチ。
     // *_SUPPORTED_CAPABILITIES env var も同様のオーバーライドとして扱う（loadConfig と一致）。
@@ -214,7 +217,7 @@ async function runLoop(configPath: string): Promise<number> {
       projectId: linearSetup.projectId,
       stateIds: linearSetup.stateIds,
       optInLabel: config.linear.optInLabel,
-      fetchFn: globalThis.fetch,
+      fetchFn: timedFetch,
     });
 
     const groomLinearClient = new GroomLinearClient({
@@ -224,7 +227,7 @@ async function runLoop(configPath: string): Promise<number> {
       stateIds: linearSetup.stateIds,
       optInLabelId: linearSetup.optInLabelId,
       labelMap: linearSetup.labelMap,
-      fetchFn: globalThis.fetch,
+      fetchFn: timedFetch,
     });
 
     const orchestrator = new Orchestrator({

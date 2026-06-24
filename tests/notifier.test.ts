@@ -2,13 +2,14 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { SqliteStore } from "../src/store.js";
 import { ConsoleSlackNotifier, formatNotifyEvent } from "../src/notifier.js";
 import { fixedClock, instantSleep } from "./fakes.js";
+import type { FetchFn } from "../src/task-source.js";
 
 // 注入する fetch のフェイク。応答は responses キューから順に取り出す。
 // "throw" を積むとネットワークエラーを模す。
 function makeFetch(responses: Array<{ ok: boolean; status: number } | "throw">) {
-  const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
-  const fn = (async (url: string | URL | Request, init?: RequestInit) => {
-    calls.push({ url: String(url), init });
+  const calls: Array<{ url: string; init: { method: string; headers: Record<string, string>; body: string } }> = [];
+  const fn: FetchFn = async (url, init) => {
+    calls.push({ url, init });
     const next = responses.shift();
     if (next === undefined) {
       throw new Error("fetch called more times than configured");
@@ -16,8 +17,8 @@ function makeFetch(responses: Array<{ ok: boolean; status: number } | "throw">) 
     if (next === "throw") {
       throw new TypeError("network down");
     }
-    return new Response(null, { status: next.status }) as unknown as Response;
-  }) as unknown as typeof fetch;
+    return { ok: next.ok, status: next.status, json: async () => null as unknown };
+  };
   return { fn, calls };
 }
 
