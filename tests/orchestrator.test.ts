@@ -3489,8 +3489,9 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
       kind: "completed",
       text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Reprioritized ES-1"}\n```',
     });
-    // Make ES-1 a known project issue for validation
+    // Make ES-1 a known opted-in project issue for validation
     h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
 
     // SELECT Codex output — need 2 eligible issues so selectWithPm calls planner
     planner.outcomes.push({
@@ -3613,6 +3614,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
       text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":1,"rationale":"urgent"}],"summary":"Bumped ES-1"}\n```',
     });
     h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
 
     planner.outcomes.push({
       kind: "completed",
@@ -3648,6 +3650,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
       text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":1,"rationale":"a"},{"type":"reprioritize","issueId":"ES-2","priority":2,"rationale":"b"}],"summary":"Two changes"}\n```',
     });
     h.groomBoardFetcher.projectIssueIds = new Set(["ES-1", "ES-2"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1", "ES-2"]);
 
     // After first action executes, request stop
     let callCount = 0;
@@ -3829,6 +3832,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
       text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":1,"rationale":"a"},{"type":"reprioritize","issueId":"ES-2","priority":2,"rationale":"b"}],"summary":"Two changes"}\n```',
     });
     h.groomBoardFetcher.projectIssueIds = new Set(["ES-1", "ES-2"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1", "ES-2"]);
 
     // Make first action fail, second succeed
     let callCount = 0;

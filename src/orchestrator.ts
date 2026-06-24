@@ -40,6 +40,7 @@ export interface IGroomBoardFetcher {
   getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
   getProjectIssueIds(): Promise<Set<string>>;
   getDoneIssueIds(): Promise<Set<string>>;
+  getOptInIssueIds(): Promise<Set<string>>;
   /** Clear any per-cycle cache so fresh data is fetched in the next call. */
   refresh(): void;
 }
@@ -936,7 +937,15 @@ export class Orchestrator {
         return { control: "continue", summary: null };
       }
 
-      // 2. Assemble prompt
+      // 2. Fetch default branch so memory/spec/codebase reads see the current state of main
+      // rather than a stale local checkout from a previous merge iteration (ES-457 Finding 3).
+      try {
+        await this.git.fetchDefaultBranch();
+      } catch (err) {
+        this.log(`groom: fetch failed (non-fatal): ${errMsg(err)}`);
+      }
+
+      // 3. Assemble prompt
       const repoPath = this.config.repo.path;
       const groomMem = readMemoryAll(repoPath);
       if (groomMem.readErrors) {
@@ -1055,14 +1064,16 @@ export class Orchestrator {
       // 5. Validate
       let validationCtx: ValidationContext;
       try {
-        const [projectIds, doneIds] = await Promise.all([
+        const [projectIds, doneIds, optInIds] = await Promise.all([
           this.groomDeps.boardFetcher.getProjectIssueIds(),
           this.groomDeps.boardFetcher.getDoneIssueIds(),
+          this.groomDeps.boardFetcher.getOptInIssueIds(),
         ]);
         validationCtx = {
           projectIssueIds: projectIds,
           allIssueIds: projectIds,
           optInLabel: this.config.linear.optInLabel,
+          optInIssueIds: optInIds,
           doneIssueIds: doneIds,
           maxCharsPerFile: this.config.memory.maxCharsPerFile,
         };
@@ -1096,36 +1107,42 @@ export class Orchestrator {
       };
 
       const executionResults: ExecutionResult[] = [];
+
+      // Shared helper: record partial results and halt (used at both pre- and post-action
+      // interrupt checks so neither can be skipped when SIGINT arrives during the last action).
+      const haltGroomWithPartialResults = async (): Promise<{ control: "halt" }> => {
+        const executed = executionResults.filter((r) => r.outcome === "executed").length;
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            summary: groomOutput.summary,
+            actionsRequested: allActions.length,
+            actionsExecuted: executed,
+            actionsRejected: rejectedCount,
+            actionDetails: JSON.stringify(
+              validationResults.map((vr) => {
+                const execResult = executionResults.find((er) => er.action === vr.action);
+                return {
+                  type: vr.action.type,
+                  payload: vr.action,
+                  result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+                  reason: vr.reason ?? execResult?.error,
+                };
+              }),
+            ),
+            outcome: "skipped",
+            errorDetail: "interrupted during execution",
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        await this.haltForInterrupt();
+        return { control: "halt" };
+      };
+
       for (const action of validActions) {
         if (this.interrupted) {
-          // Record partial results and halt
-          const executed = executionResults.filter((r) => r.outcome === "executed").length;
-          try {
-            this.store.updateGroomLog(groomLogRow.id, {
-              endedAt: this.clock(),
-              summary: groomOutput.summary,
-              actionsRequested: allActions.length,
-              actionsExecuted: executed,
-              actionsRejected: rejectedCount,
-              actionDetails: JSON.stringify(
-                validationResults.map((vr) => {
-                  const execResult = executionResults.find((er) => er.action === vr.action);
-                  return {
-                    type: vr.action.type,
-                    payload: vr.action,
-                    result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
-                    reason: vr.reason ?? execResult?.error,
-                  };
-                }),
-              ),
-              outcome: "skipped",
-              errorDetail: "interrupted during execution",
-            });
-          } catch (logErr) {
-            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
-          }
-          await this.haltForInterrupt();
-          return { control: "halt" };
+          return await haltGroomWithPartialResults();
         }
 
         try {
@@ -1138,15 +1155,34 @@ export class Orchestrator {
           this.log(`groom: action exception (type=${action.type}, target=${"issueId" in action ? action.issueId : "n/a"}): ${errMsg(err)}`);
           executionResults.push({ action, outcome: "failed", error: errMsg(err) });
         }
+
+        // Safe-point check after each action so an interrupt arriving during the last
+        // action halts cleanly instead of falling through to SELECT (ES-457 Finding 5).
+        if (this.interrupted) {
+          return await haltGroomWithPartialResults();
+        }
       }
 
-      // If any update_memory actions executed, commit memory changes
+      // If any update_memory actions executed, commit and push memory changes so they
+      // survive the git reset --hard in fetchDefaultBranch during SELECT (ES-457 Finding 2).
       const memoryUpdated = executionResults.some(
         (r) => r.outcome === "executed" && r.action.type === "update_memory",
       );
       if (memoryUpdated) {
         try {
-          await commitIfChanged(this.runner, repoPath);
+          const committed = await commitIfChanged(this.runner, repoPath);
+          if (committed) {
+            const defaultBranch = this.config.repo.defaultBranch;
+            const pushRes = await this.runner.run(
+              "git",
+              ["push", "origin", `HEAD:${defaultBranch}`],
+              { cwd: repoPath },
+            ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+            if (pushRes.code !== 0) {
+              await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+              this.log(`groom: memory push failed (rolled back): ${pushRes.stderr.trim()}`);
+            }
+          }
         } catch (err) {
           this.log(`groom: memory commit failed (non-fatal): ${errMsg(err)}`);
         }
@@ -1184,7 +1220,14 @@ export class Orchestrator {
         `groom: completed (requested=${allActions.length}, executed=${executedCount}, rejected=${rejectedCount}): ${groomOutput.summary}`,
       );
 
-      return { control: "continue", summary: groomOutput.summary };
+      // Only relay the model's raw summary to SELECT if all accepted actions executed.
+      // If any failed or were rejected, the summary may describe effects that never happened;
+      // annotate it so SELECT sees the discrepancy (ES-457 Finding 6).
+      const failedExecutions = validActions.length - executedCount;
+      const summaryForSelect = (rejectedCount === 0 && failedExecutions === 0)
+        ? groomOutput.summary
+        : `${groomOutput.summary} [${executedCount}/${allActions.length} executed]`;
+      return { control: "continue", summary: summaryForSelect };
     } catch (err) {
       this.log(`groom: unexpected error, skipping: ${errMsg(err)}`);
       try {

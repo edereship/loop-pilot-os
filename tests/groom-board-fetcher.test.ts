@@ -24,10 +24,11 @@ function makeNode(id: string, identifier: string, stateId: string, opts: {
 
 describe("GroomBoardFetcher", () => {
   const stateIds = { todo: "s-todo", in_progress: "s-ip", in_review: "s-ir", done: "s-done" };
-  const BASE_OPTS = { apiKey: "key", projectId: "proj", stateIds, fetchFn: makeFetch({}) };
+  const OPT_IN_LABEL = "opt-in";
+  const BASE_OPTS = { apiKey: "key", projectId: "proj", stateIds, optInLabel: OPT_IN_LABEL, fetchFn: makeFetch({}) };
 
   it("getBoardState classifies tickets by state", async () => {
-    const todoNode = makeNode("id-1", "ES-1", stateIds.todo);
+    const todoNode = makeNode("id-1", "ES-1", stateIds.todo, { labels: [OPT_IN_LABEL] });
     const ipNode = makeNode("id-2", "ES-2", stateIds.in_progress);
     const irNode = makeNode("id-3", "ES-3", stateIds.in_review);
     const doneNode = makeNode("id-4", "ES-4", stateIds.done);
@@ -63,6 +64,7 @@ describe("GroomBoardFetcher", () => {
 
   it("getBoardState identifies blocked tickets", async () => {
     const blockedNode = makeNode("id-5", "ES-5", stateIds.todo, {
+      labels: [OPT_IN_LABEL],
       relations: [{ type: "blocks", relatedIssue: { identifier: "ES-5" } }],
     });
     // Ticket ES-5 has a "blocks" relation pointing TO it (from another ticket).
@@ -135,7 +137,7 @@ describe("GroomBoardFetcher", () => {
       };
     };
 
-    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn: countingFetch });
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, optInLabel: OPT_IN_LABEL, fetchFn: countingFetch });
 
     await fetcher.getBoardState(new Map());
     await fetcher.getProjectIssueIds();
@@ -153,7 +155,7 @@ describe("GroomBoardFetcher", () => {
         data: {
           issues: {
             nodes: Array.from({ length: nodeCount }, (_, i) =>
-              makeNode(`id-${i + 1}`, `ES-${i + 1}`, stateIds.todo),
+              makeNode(`id-${i + 1}`, `ES-${i + 1}`, stateIds.todo, { labels: [OPT_IN_LABEL] }),
             ),
             pageInfo: { hasNextPage: false, endCursor: null },
           },
@@ -161,7 +163,7 @@ describe("GroomBoardFetcher", () => {
       }),
     });
 
-    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn: dynamicFetch });
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, optInLabel: OPT_IN_LABEL, fetchFn: dynamicFetch });
 
     const board1 = await fetcher.getBoardState(new Map());
     expect(board1.eligible.length).toBe(2);
@@ -187,7 +189,7 @@ describe("GroomBoardFetcher", () => {
           json: async () => ({
             data: {
               issues: {
-                nodes: [{ id: "id-1", identifier: "ES-1", title: "First", priority: 3, sortOrder: 0, state: { id: stateIds.todo }, labels: { nodes: [] }, relations: { nodes: [] }, completedAt: null }],
+                nodes: [{ id: "id-1", identifier: "ES-1", title: "First", priority: 3, sortOrder: 0, state: { id: stateIds.todo }, labels: { nodes: [{ name: OPT_IN_LABEL }] }, relations: { nodes: [] }, completedAt: null }],
                 pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
               },
             },
@@ -201,7 +203,7 @@ describe("GroomBoardFetcher", () => {
         json: async () => ({
           data: {
             issues: {
-              nodes: [{ id: "id-2", identifier: "ES-2", title: "Second", priority: 2, sortOrder: 0, state: { id: stateIds.todo }, labels: { nodes: [] }, relations: { nodes: [] }, completedAt: null }],
+              nodes: [{ id: "id-2", identifier: "ES-2", title: "Second", priority: 2, sortOrder: 0, state: { id: stateIds.todo }, labels: { nodes: [{ name: OPT_IN_LABEL }] }, relations: { nodes: [] }, completedAt: null }],
               pageInfo: { hasNextPage: false, endCursor: null },
             },
           },
@@ -209,7 +211,7 @@ describe("GroomBoardFetcher", () => {
       };
     };
 
-    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn });
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, optInLabel: OPT_IN_LABEL, fetchFn });
     const board = await fetcher.getBoardState(new Map());
     expect(board.eligible.length).toBe(2);
     expect(board.eligible.map(e => e.identifier).sort()).toEqual(["ES-1", "ES-2"]);
@@ -219,7 +221,7 @@ describe("GroomBoardFetcher", () => {
   it("getBoardState throws on HTTP error", async () => {
     const stateIds = { todo: "s-todo", in_progress: "s-ip", in_review: "s-ir", done: "s-done" };
     const fetchFn: FetchFn = async () => ({ ok: false, status: 503, json: async () => ({}) });
-    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn });
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, optInLabel: OPT_IN_LABEL, fetchFn });
     await expect(fetcher.getBoardState(new Map())).rejects.toThrow("Linear HTTP 503");
   });
 
@@ -229,7 +231,52 @@ describe("GroomBoardFetcher", () => {
       ok: true, status: 200,
       json: async () => ({ errors: [{ message: "Rate limited" }] }),
     });
-    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn });
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, optInLabel: OPT_IN_LABEL, fetchFn });
     await expect(fetcher.getBoardState(new Map())).rejects.toThrow("Rate limited");
+  });
+
+  it("getBoardState filters eligible to only opted-in todo tickets", async () => {
+    const optedIn = makeNode("id-1", "ES-1", stateIds.todo, { labels: [OPT_IN_LABEL] });
+    const notOptedIn = makeNode("id-2", "ES-2", stateIds.todo);
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [optedIn, notOptedIn], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    const board = await fetcher.getBoardState(new Map());
+    expect(board.eligible.map((t) => t.identifier)).toEqual(["ES-1"]);
+    expect(board.blocked).toHaveLength(0);
+  });
+
+  it("getBoardState sorts recentDone by completedAt descending", async () => {
+    const older = { ...makeNode("id-1", "ES-1", stateIds.done), completedAt: "2024-01-01T00:00:00.000Z" };
+    const newer = { ...makeNode("id-2", "ES-2", stateIds.done), completedAt: "2024-06-01T00:00:00.000Z" };
+    const middle = { ...makeNode("id-3", "ES-3", stateIds.done), completedAt: "2024-03-15T00:00:00.000Z" };
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [older, newer, middle], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    const board = await fetcher.getBoardState(new Map());
+    expect(board.recentDone.map((t) => t.identifier)).toEqual(["ES-2", "ES-3", "ES-1"]);
+  });
+
+  it("getOptInIssueIds returns only issues with the opt-in label", async () => {
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [
+          makeNode("id-1", "ES-1", stateIds.todo, { labels: [OPT_IN_LABEL] }),
+          makeNode("id-2", "ES-2", stateIds.todo),
+          makeNode("id-3", "ES-3", stateIds.done, { labels: [OPT_IN_LABEL] }),
+        ], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    const ids = await fetcher.getOptInIssueIds();
+    expect(ids.has("ES-1")).toBe(true);
+    expect(ids.has("ES-2")).toBe(false);
+    expect(ids.has("ES-3")).toBe(true);
   });
 });

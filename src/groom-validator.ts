@@ -4,6 +4,7 @@ export interface ValidationContext {
   projectIssueIds: Set<string>;
   allIssueIds: Set<string>;
   optInLabel: string;
+  optInIssueIds: Set<string>;
   doneIssueIds: Set<string>;
   maxCharsPerFile: number;
 }
@@ -101,6 +102,11 @@ export function validateGroomActions(
       // Rule 1: project scope
       if (!ctx.projectIssueIds.has(issueId)) {
         return { action: a, result: "rejected", reason: `Issue ${issueId} is out of project scope` };
+      }
+
+      // Rule 1b: opt-in label required — GROOM may only act on opted-in issues
+      if (!ctx.optInIssueIds.has(issueId)) {
+        return { action: a, result: "rejected", reason: `Issue ${issueId} does not have the opt-in label` };
       }
 
       // Rule 4: done issue protection (close is exempt)

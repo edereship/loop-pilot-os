@@ -46,14 +46,26 @@ async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<vo
     case "split": {
       const parent = await linearClient.getIssueDetails(action.issueId);
       const childIds: string[] = [];
-      for (const sub of action.subtasks) {
-        const id = await linearClient.createIssue({
-          title: sub.title,
-          description: sub.description,
-          priority: parent.priority,
-          extraLabelIds: parent.labelIds,
-        });
-        childIds.push(id);
+      try {
+        for (const sub of action.subtasks) {
+          const id = await linearClient.createIssue({
+            title: sub.title,
+            description: sub.description,
+            priority: parent.priority,
+            extraLabelIds: parent.labelIds,
+          });
+          childIds.push(id);
+        }
+      } catch (err) {
+        // Record any partially-created children on the parent so a GROOM retry
+        // does not create duplicates while the parent remains open (ES-457 Finding 4).
+        if (childIds.length > 0) {
+          const partialNote = `→ partial split (creation failed after ${childIds.join(", ")}): manual review needed`;
+          await linearClient.updateIssue(action.issueId, {
+            description: parent.description ? `${parent.description}\n\n${partialNote}` : partialNote,
+          }).catch(() => {});
+        }
+        throw err;
       }
       const splitNote = `→ split into ${childIds.join(", ")}`;
       await linearClient.updateIssue(action.issueId, {

@@ -213,6 +213,7 @@ async function runLoop(configPath: string): Promise<number> {
       apiKey: config.linearApiKey,
       projectId: linearSetup.projectId,
       stateIds: linearSetup.stateIds,
+      optInLabel: config.linear.optInLabel,
       fetchFn: globalThis.fetch,
     });
 

@@ -8,6 +8,7 @@ function makeCtx(overrides?: Partial<ValidationContext>): ValidationContext {
     projectIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     allIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5", "OTHER-1"]),
     optInLabel: "looppilot",
+    optInIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     doneIssueIds: new Set(["ES-5"]),
     maxCharsPerFile: 8000,
     ...overrides,
@@ -66,6 +67,34 @@ describe("validateGroomActions", () => {
       );
       expect(results[0].result).toBe("rejected");
       expect(results[0].reason).toContain("exist");
+    });
+  });
+
+  // ---- Rule 1b: opt-in label required ----
+  describe("Rule 1b: opt-in label required for issue-scoped actions", () => {
+    it("rejects action on in-scope issue without opt-in label", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { issueId: "ES-1" })],
+        makeCtx({ optInIssueIds: new Set() }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("opt-in");
+    });
+
+    it("accepts action on in-scope issue with opt-in label", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { issueId: "ES-1" })],
+        makeCtx({ optInIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("create and update_memory skip opt-in check (no issueId)", () => {
+      const results = validateGroomActions(
+        [action("create"), action("update_memory")],
+        makeCtx({ optInIssueIds: new Set() }),
+      );
+      expect(results.every((r) => r.result === "valid")).toBe(true);
     });
   });
 

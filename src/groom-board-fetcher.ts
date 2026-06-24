@@ -44,6 +44,7 @@ export interface GroomBoardFetcherOptions {
   apiKey: string;
   projectId: string;
   stateIds: Record<TicketState, string>;
+  optInLabel: string;
   fetchFn: FetchFn;
 }
 
@@ -51,6 +52,7 @@ export class GroomBoardFetcher {
   private readonly apiKey: string;
   private readonly projectId: string;
   private readonly stateIds: Record<TicketState, string>;
+  private readonly optInLabel: string;
   private readonly fetchFn: FetchFn;
   private cachedNodes: BoardIssueNode[] | null = null;
 
@@ -58,6 +60,7 @@ export class GroomBoardFetcher {
     this.apiKey = opts.apiKey;
     this.projectId = opts.projectId;
     this.stateIds = opts.stateIds;
+    this.optInLabel = opts.optInLabel;
     this.fetchFn = opts.fetchFn;
   }
 
@@ -126,6 +129,8 @@ export class GroomBoardFetcher {
       const stateId = n.state.id;
 
       if (stateId === todo) {
+        // Only opted-in tickets appear on the GROOM board (Finding 1).
+        if (!labels.includes(this.optInLabel)) continue;
         const blockers = blockedByMap.get(n.identifier);
         if (blockers && blockers.length > 0) {
           blocked.push({
@@ -157,6 +162,8 @@ export class GroomBoardFetcher {
       }
     }
 
+    // Sort newest-first so budget trimming (which pops from the end) removes oldest first.
+    recentDone.sort((a, b) => b.mergedAt.localeCompare(a.mergedAt));
     return { eligible, inProgress, recentDone, blocked };
   }
 
@@ -168,5 +175,14 @@ export class GroomBoardFetcher {
   async getDoneIssueIds(): Promise<Set<string>> {
     const nodes = await this.ensureFetched();
     return new Set(nodes.filter((n) => n.state.id === this.stateIds.done).map((n) => n.identifier));
+  }
+
+  async getOptInIssueIds(): Promise<Set<string>> {
+    const nodes = await this.ensureFetched();
+    return new Set(
+      nodes
+        .filter((n) => n.labels.nodes.some((l) => l.name === this.optInLabel))
+        .map((n) => n.identifier),
+    );
   }
 }
