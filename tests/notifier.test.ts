@@ -155,6 +155,40 @@ describe("ConsoleSlackNotifier", () => {
     expect(errorLogs[0]).toContain("network down");
   });
 
+  // ES-472: タイムアウトエラー時に webhook URL がログへ漏洩しない。
+  it("redacts the webhook URL from timeout error messages", async () => {
+    const webhookUrl = "https://hooks.slack.test/services/SECRET/TOKEN/PATH";
+    const timeoutError = new Error(
+      `fetch timed out after 60000ms: ${webhookUrl}`,
+    );
+    const { fn } = makeFetch([]);
+    const throwingFetch: FetchFn = async () => {
+      throw timeoutError;
+    };
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      webhookUrl,
+      log,
+      throwingFetch,
+      instantSleep(),
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await expect(
+      notifier.notify({ kind: "idle", detail: "queue empty" }),
+    ).resolves.toBeUndefined();
+
+    const errorLogs = logs.filter((l) => l.includes("slack delivery error"));
+    expect(errorLogs.length).toBe(3);
+    // URL must not appear in any log line
+    for (const line of errorLogs) {
+      expect(line).not.toContain(webhookUrl);
+      expect(line).not.toContain("SECRET");
+    }
+    // Sanitized placeholder is present
+    expect(errorLogs[0]).toContain("[redacted]");
+  });
+
   // 2回目で成功: それ以降リトライせず delivered_slack=1、attempts=2。
   it("succeeds on the second attempt and stops retrying", async () => {
     const { fn, calls } = makeFetch([
