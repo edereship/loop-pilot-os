@@ -7,7 +7,9 @@ function makeFetch(data: unknown): FetchFn {
 }
 
 function makeNode(id: string, identifier: string, stateId: string, opts: {
-  priority?: number; title?: string; labels?: string[]; relations?: Array<{ type: string; relatedIssue: { identifier: string } }>;
+  priority?: number; title?: string; labels?: string[];
+  relations?: Array<{ type: string; relatedIssue: { identifier: string } }>;
+  inverseRelations?: Array<{ type: string; relatedIssue: { identifier: string } }>;
 } = {}) {
   return {
     id,
@@ -18,6 +20,7 @@ function makeNode(id: string, identifier: string, stateId: string, opts: {
     state: { id: stateId },
     labels: { nodes: (opts.labels ?? []).map((n) => ({ name: n })) },
     relations: { nodes: (opts.relations ?? []).map((r) => ({ type: r.type, relatedIssue: { identifier: r.relatedIssue.identifier } })) },
+    inverseRelations: { nodes: (opts.inverseRelations ?? []).map((r) => ({ type: r.type, relatedIssue: { identifier: r.relatedIssue.identifier } })) },
     completedAt: null,
   };
 }
@@ -84,6 +87,26 @@ describe("GroomBoardFetcher", () => {
     const board = await fetcher.getBoardState(new Map());
     // ES-5 should appear in blocked (it's a todo blocked by ES-6)
     expect(board.blocked.some((b) => b.identifier === "ES-5")).toBe(true);
+  });
+
+  it("getBoardState identifies blocked tickets via inverseRelations when blocker is outside the project", async () => {
+    // EXT-1 is outside this project and never appears in the query results.
+    // Linear exposes the blocking relationship on ES-5 via inverseRelations.
+    const blockedNode = makeNode("id-5", "ES-5", stateIds.todo, {
+      labels: [OPT_IN_LABEL],
+      inverseRelations: [{ type: "blocks", relatedIssue: { identifier: "EXT-1" } }],
+    });
+
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [blockedNode], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+
+    const board = await fetcher.getBoardState(new Map());
+    expect(board.blocked.some((b) => b.identifier === "ES-5")).toBe(true);
+    expect(board.eligible).toHaveLength(0);
   });
 
   it("getProjectIssueIds returns all issue IDs", async () => {

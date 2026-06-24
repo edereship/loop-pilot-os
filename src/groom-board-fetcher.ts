@@ -10,6 +10,7 @@ const BOARD_QUERY = `query BoardState($projectId: ID!, $after: String) {
       state { id }
       labels { nodes { name } }
       relations { nodes { type relatedIssue { identifier } } }
+      inverseRelations { nodes { type relatedIssue { identifier } } }
       completedAt
     }
     pageInfo { hasNextPage endCursor }
@@ -25,6 +26,7 @@ interface BoardIssueNode {
   state: { id: string };
   labels: { nodes: Array<{ name: string }> };
   relations: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
+  inverseRelations?: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
   completedAt: string | null;
 }
 
@@ -129,6 +131,16 @@ export class GroomBoardFetcher {
           existing.push(n.identifier);
           blockedByMap.set(rel.relatedIssue.identifier, existing);
         } else if (rel.type === "blocked_by") {
+          const existing = blockedByMap.get(n.identifier) ?? [];
+          existing.push(rel.relatedIssue.identifier);
+          blockedByMap.set(n.identifier, existing);
+        }
+      }
+      // inverseRelations are relations where this issue is the relatedIssue.  A
+      // `blocks` entry here means another issue (possibly outside this project and
+      // therefore never fetched by the project filter) blocks the current ticket.
+      for (const rel of n.inverseRelations?.nodes ?? []) {
+        if (rel.type === "blocks") {
           const existing = blockedByMap.get(n.identifier) ?? [];
           existing.push(rel.relatedIssue.identifier);
           blockedByMap.set(n.identifier, existing);

@@ -3873,56 +3873,55 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
 
   it("marks update_memory result as failed when git commit fails during GROOM (Finding 2)", async () => {
     // Use a real tmpdir so writeCategory can write the memory file before commitIfChanged is called.
-    const tmpRepos: string[] = [];
-    afterEach(() => {
-      for (const d of tmpRepos.splice(0)) rmSync(d, { recursive: true, force: true });
-    });
     const tmpRepo = mkdtempSync(path.join(tmpdir(), "groom-commit-fail-"));
-    tmpRepos.push(tmpRepo);
-    mkdirSync(path.join(tmpRepo, "docs", "memory"), { recursive: true });
+    try {
+      mkdirSync(path.join(tmpRepo, "docs", "memory"), { recursive: true });
 
-    const planner = new FakePlanRunner();
-    const config = {
-      ...makeConfig({ maxTasksPerRun: 1, groomEnabled: true }),
-      repo: { ...makeConfig().repo, path: tmpRepo },
-    } as Config;
-    const h = makeHarness(config, { planner });
+      const planner = new FakePlanRunner();
+      const config = {
+        ...makeConfig({ maxTasksPerRun: 1, groomEnabled: true }),
+        repo: { ...makeConfig().repo, path: tmpRepo },
+      } as Config;
+      const h = makeHarness(config, { planner });
 
-    // GROOM Codex output: one update_memory action (writeCategory will succeed to the tmpdir)
-    planner.outcomes.push({
-      kind: "completed",
-      text: '```json\n{"actions":[{"type":"update_memory","category":"pm_decisions","content":"Test decision","rationale":"update"}],"summary":"Updated memory"}\n```',
-    });
-    // Make git add fail so commitIfChanged throws; the catch block should mark the action as failed.
-    h.memoryRunner.on(["git", "add", "docs/memory/"], { code: 1, stderr: "fatal: index.lock exists" });
+      // GROOM Codex output: one update_memory action (writeCategory will succeed to the tmpdir)
+      planner.outcomes.push({
+        kind: "completed",
+        text: '```json\n{"actions":[{"type":"update_memory","category":"pm_decisions","content":"Test decision","rationale":"update"}],"summary":"Updated memory"}\n```',
+      });
+      // Make git add fail so commitIfChanged throws; the catch block should mark the action as failed.
+      h.memoryRunner.on(["git", "add", "docs/memory/"], { code: 1, stderr: "fatal: index.lock exists" });
 
-    // SELECT outcome (2 issues needed to trigger the planner)
-    planner.outcomes.push({
-      kind: "completed",
-      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
-    });
-    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
-    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
-    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+      // SELECT outcome (2 issues needed to trigger the planner)
+      planner.outcomes.push({
+        kind: "completed",
+        text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+      });
+      h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+      h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+      h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
 
-    await h.orch.run();
+      await h.orch.run();
 
-    // groom_log must show 0 executed: the update_memory action was retroactively marked failed
-    const groomLog = h.store.getGroomLog(1);
-    expect(groomLog.outcome).toBe("completed");
-    expect(groomLog.actionsRequested).toBe(1);
-    expect(groomLog.actionsExecuted).toBe(0);
+      // groom_log must show 0 executed: the update_memory action was retroactively marked failed
+      const groomLog = h.store.getGroomLog(1);
+      expect(groomLog.outcome).toBe("completed");
+      expect(groomLog.actionsRequested).toBe(1);
+      expect(groomLog.actionsExecuted).toBe(0);
 
-    // actionDetails must record the action as failed with the commit error message
-    const details = JSON.parse(groomLog.actionDetails!) as Array<{ type: string; result: string; reason?: string }>;
-    expect(details[0].result).toBe("failed");
-    expect(details[0].reason).toContain("memory commit failed");
+      // actionDetails must record the action as failed with the commit error message
+      const details = JSON.parse(groomLog.actionDetails!) as Array<{ type: string; result: string; reason?: string }>;
+      expect(details[0].result).toBe("failed");
+      expect(details[0].reason).toContain("memory commit failed");
 
-    // Log must mention the commit failure
-    expect(h.logs.some(l => l.includes("memory commit failed"))).toBe(true);
+      // Log must mention the commit failure
+      expect(h.logs.some(l => l.includes("memory commit failed"))).toBe(true);
 
-    // summaryForSelect should be annotated with the execution shortfall
-    const selectPrompt = planner.calls[1]!.prompt;
-    expect(selectPrompt).toContain("Updated memory [0/1 executed]");
+      // summaryForSelect should be annotated with the execution shortfall
+      const selectPrompt = planner.calls[1]!.prompt;
+      expect(selectPrompt).toContain("Updated memory [0/1 executed]");
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
   });
 });
