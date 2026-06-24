@@ -379,6 +379,66 @@ describe("resolveLinearSetup", () => {
     ).rejects.toThrow(/NOPE/);
   });
 
+  it("throws when team label pagination exceeds MAX_PAGES", async () => {
+    const setupData = {
+      data: {
+        viewer: { id: "user-1", name: "Bot" },
+        teams: { nodes: [{
+          id: "team-uuid-1", key: "TY",
+          states: { nodes: [
+            { id: "state-todo", name: "Todo" },
+            { id: "state-wip", name: "In Progress" },
+            { id: "state-review", name: "In Review" },
+            { id: "state-done", name: "Done" },
+          ] },
+          labels: { nodes: [{ id: "l-1", name: "ai-ok" }], pageInfo: { hasNextPage: true, endCursor: "c1" } },
+          projects: { nodes: [{ id: "project-uuid-1", name: "LoopPilot OS" }] },
+        }] },
+        issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+      },
+    };
+    const infiniteLabelPage = {
+      body: { data: { team: { labels: { nodes: [{ id: "l-x", name: "x" }], pageInfo: { hasNextPage: true, endCursor: "stuck" } } } } },
+    };
+    const { fetchFn } = makeFetch([
+      { body: setupData },
+      ...Array(51).fill(infiniteLabelPage),
+    ]);
+    await expect(
+      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok" }, fetchFn),
+    ).rejects.toThrow(/exceeded 50 pages.*possible infinite pagination/);
+  });
+
+  it("throws when workspace label pagination exceeds MAX_PAGES", async () => {
+    const setupData = {
+      data: {
+        viewer: { id: "user-1", name: "Bot" },
+        teams: { nodes: [{
+          id: "team-uuid-1", key: "TY",
+          states: { nodes: [
+            { id: "state-todo", name: "Todo" },
+            { id: "state-wip", name: "In Progress" },
+            { id: "state-review", name: "In Review" },
+            { id: "state-done", name: "Done" },
+          ] },
+          labels: { nodes: [{ id: "l-1", name: "ai-ok" }], pageInfo: { hasNextPage: false, endCursor: null } },
+          projects: { nodes: [{ id: "project-uuid-1", name: "LoopPilot OS" }] },
+        }] },
+        issueLabels: { nodes: [], pageInfo: { hasNextPage: true, endCursor: "c1" } },
+      },
+    };
+    const infiniteLabelPage = {
+      body: { data: { issueLabels: { nodes: [{ id: "l-x", name: "x" }], pageInfo: { hasNextPage: true, endCursor: "stuck" } } } },
+    };
+    const { fetchFn } = makeFetch([
+      { body: setupData },
+      ...Array(51).fill(infiniteLabelPage),
+    ]);
+    await expect(
+      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok" }, fetchFn),
+    ).rejects.toThrow(/exceeded 50 pages.*possible infinite pagination/);
+  });
+
   // GraphQL errors は throw。
   it("throws when the setup query returns GraphQL errors", async () => {
     const { fetchFn } = makeFetch([
@@ -485,6 +545,23 @@ describe("LinearTaskSource.getAllEligible", () => {
       "i-urgent", "i-high", "i-medium", "i-low", "i-none",
     ]);
     expect(result).toHaveLength(0);
+  });
+
+  it("throws when pagination exceeds MAX_PAGES (infinite pagination guard)", async () => {
+    const infinitePage = {
+      body: {
+        data: {
+          issues: {
+            nodes: [{ id: "i-1", identifier: "TY-1", title: "t", description: "", priority: 3, sortOrder: 1, url: "u" }],
+            pageInfo: { hasNextPage: true, endCursor: "cursor-stuck" },
+          },
+        },
+      },
+    };
+    const { fetchFn } = makeFetch(Array(51).fill(infinitePage));
+    await expect(makeSource(fetchFn).getAllEligible([])).rejects.toThrow(
+      /exceeded 50 pages.*possible infinite pagination/,
+    );
   });
 
   // getAllEligible は getNextEligible と同じクエリ引数（projectId/todoStateId/label）を使う。

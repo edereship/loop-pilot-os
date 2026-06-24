@@ -182,10 +182,15 @@ export class LinearTaskSource implements TaskSource {
   }
 
   private async queryAllByState(stateId: string): Promise<IssueNode[]> {
+    const MAX_PAGES = 50;
     const all: IssueNode[] = [];
     let after: string | null = null;
     let hasNext = true;
+    let page = 0;
     while (hasNext) {
+      if (++page > MAX_PAGES) {
+        throw new Error(`queryAllByState exceeded ${MAX_PAGES} pages (${all.length} issues fetched); possible infinite pagination`);
+      }
       const data: IssuesPaginatedData = await graphql<IssuesPaginatedData>(
         this.fetchFn,
         this.apiKey,
@@ -285,9 +290,14 @@ async function fetchAllTeamLabels(
   teamId: string,
   initial: LabelPage,
 ): Promise<LabelNode[]> {
+  const MAX_PAGES = 50;
   const all = [...initial.nodes];
   let { hasNextPage, endCursor } = initial.pageInfo;
+  let page = 0;
   while (hasNextPage) {
+    if (++page > MAX_PAGES) {
+      throw new Error(`fetchAllTeamLabels exceeded ${MAX_PAGES} pages (${all.length} labels fetched); possible infinite pagination`);
+    }
     const data = await graphql<{ team: { labels: LabelPage } }>(
       fetchFn, apiKey, TEAM_LABELS_QUERY, { teamId, after: endCursor },
     );
@@ -302,9 +312,14 @@ async function fetchAllWorkspaceLabels(
   apiKey: string,
   initial: LabelPage,
 ): Promise<LabelNode[]> {
+  const MAX_PAGES = 50;
   const all = [...initial.nodes];
   let { hasNextPage, endCursor } = initial.pageInfo;
+  let page = 0;
   while (hasNextPage) {
+    if (++page > MAX_PAGES) {
+      throw new Error(`fetchAllWorkspaceLabels exceeded ${MAX_PAGES} pages (${all.length} labels fetched); possible infinite pagination`);
+    }
     const data = await graphql<{ issueLabels: LabelPage }>(
       fetchFn, apiKey, WORKSPACE_LABELS_QUERY, { after: endCursor },
     );
