@@ -1337,6 +1337,58 @@ describe("Orchestrator 失敗系 — not_engaged ガード / monitor_timeout（�
     // クロック後退でも正常にマージ完了（タイムアウトガードが誤発動しない）
     expect(s.state).toBe("merged");
   });
+
+  it("clock backward (NTP skew): in_progress verdict + monitorStartedAt in future → elapsed clamped to 0, timeout guard not triggered", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, monitorTimeoutMinutes: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // First poll: in_progress — this drives elapsedMinutesSinceMonitorStart through the
+    // in_progress branch.  With monitorStartedAt in the far future the raw elapsed is a
+    // large negative number; the Math.max(0, …) clamp must prevent the 1-minute timeout
+    // guard from misfiring.  Subsequent polls complete normally.
+    h.monitor.verdicts = [{ kind: "in_progress" }, { kind: "done" }, { kind: "merged" }];
+
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    h.monitor.poll = async (pr: number) => {
+      const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+      h.store.updateSession(s.id, { monitorStartedAt: "2099-01-01T00:00:00.000Z" });
+      return origPoll(pr);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // elapsed clamped to 0 ≤ 1 min → guard does NOT fire → session merges normally
+    expect(s.state).toBe("merged");
+    expect(s.failureReason).toBeNull();
+  });
+
+  it("clock backward (NTP skew): not_engaged verdict + monitorStartedAt in future → elapsed clamped to 0, not-engaged guard not triggered", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, notEngagedGuardMinutes: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    // First poll: not_engaged — this drives elapsedMinutesSinceMonitorStart through the
+    // not_engaged branch.  With monitorStartedAt in the far future the raw elapsed is a
+    // large negative number; the Math.max(0, …) clamp must prevent the 1-minute guard
+    // (notEngagedGuardMinutes) from misfiring.  Subsequent polls complete normally.
+    h.monitor.verdicts = [{ kind: "not_engaged" }, { kind: "done" }, { kind: "merged" }];
+
+    const origPoll = h.monitor.poll.bind(h.monitor);
+    h.monitor.poll = async (pr: number) => {
+      const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+      h.store.updateSession(s.id, { monitorStartedAt: "2099-01-01T00:00:00.000Z" });
+      return origPoll(pr);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // elapsed clamped to 0 ≤ 1 min → guard does NOT fire → session merges normally
+    expect(s.state).toBe("merged");
+    expect(s.failureReason).toBeNull();
+  });
 });
 
 describe("Orchestrator 失敗系 — poll throw バックオフ（仕様 §5.5 / カーネル §7.6）", () => {
