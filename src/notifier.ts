@@ -106,8 +106,8 @@ export class ConsoleSlackNotifier implements Notifier {
           return;
         }
         // 非2xx は失敗扱い。次の試行へ（最終試行なら諦める）。
-      } catch {
-        // network エラーも失敗扱い。次の試行へ。
+      } catch (err) {
+        this.log(`slack delivery error (attempt ${attempt}/${SLACK_MAX_ATTEMPTS}): ${err instanceof Error ? err.message : String(err)}`);
       }
       if (attempt < SLACK_MAX_ATTEMPTS) {
         await this.sleep(SLACK_BACKOFF_BASE_MS * 2 ** (attempt - 1));

@@ -2638,8 +2638,8 @@ export class Orchestrator {
           this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
         }
       }
-    } catch {
-      this.log("warning: failed to commit memory on halt");
+    } catch (err) {
+      this.log(`warning: failed to commit memory on halt: ${errMsg(err)}`);
     }
   }
 

@@ -148,6 +148,11 @@ describe("ConsoleSlackNotifier", () => {
 
     expect(calls.length).toBe(3);
     expect(store.undeliveredIntents().length).toBe(1);
+    // ES-471: error messages are now logged for each failed attempt
+    const errorLogs = logs.filter((l) => l.includes("slack delivery error"));
+    expect(errorLogs.length).toBe(3);
+    expect(errorLogs[0]).toContain("attempt 1/3");
+    expect(errorLogs[0]).toContain("network down");
   });
 
   // 2回目で成功: それ以降リトライせず delivered_slack=1、attempts=2。
