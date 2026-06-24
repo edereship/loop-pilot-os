@@ -119,8 +119,15 @@ describe("ConsoleSlackNotifier", () => {
     expect(sleeps).toEqual([1000, 2000]);
 
     // console は必達
-    expect(logs.length).toBe(1);
-    expect(logs[0]).toContain("3/3");
+    const consoleLogs = logs.filter((l) => !l.startsWith("slack delivery error"));
+    expect(consoleLogs.length).toBe(1);
+    expect(consoleLogs[0]).toContain("3/3");
+
+    // ES-472: 非2xx の試行ごとにエラーログが出る
+    const errorLogs = logs.filter((l) => l.includes("slack delivery error"));
+    expect(errorLogs.length).toBe(3);
+    expect(errorLogs[0]).toContain("attempt 1/3");
+    expect(errorLogs[0]).toContain("HTTP 500");
 
     // Slack 未達: undelivered に1件残り attempts=3
     const undelivered = store.undeliveredIntents();
@@ -148,6 +155,45 @@ describe("ConsoleSlackNotifier", () => {
 
     expect(calls.length).toBe(3);
     expect(store.undeliveredIntents().length).toBe(1);
+    // ES-471: error messages are now logged for each failed attempt
+    const errorLogs = logs.filter((l) => l.includes("slack delivery error"));
+    expect(errorLogs.length).toBe(3);
+    expect(errorLogs[0]).toContain("attempt 1/3");
+    expect(errorLogs[0]).toContain("network down");
+  });
+
+  // ES-472: タイムアウトエラー時に webhook URL がログへ漏洩しない。
+  it("redacts the webhook URL from timeout error messages", async () => {
+    const webhookUrl = "https://hooks.slack.test/services/SECRET/TOKEN/PATH";
+    const timeoutError = new Error(
+      `fetch timed out after 60000ms: ${webhookUrl}`,
+    );
+    const { fn } = makeFetch([]);
+    const throwingFetch: FetchFn = async () => {
+      throw timeoutError;
+    };
+    const notifier = new ConsoleSlackNotifier(
+      store,
+      webhookUrl,
+      log,
+      throwingFetch,
+      instantSleep(),
+      fixedClock("2026-06-05T00:00:00.000Z"),
+    );
+
+    await expect(
+      notifier.notify({ kind: "idle", detail: "queue empty" }),
+    ).resolves.toBeUndefined();
+
+    const errorLogs = logs.filter((l) => l.includes("slack delivery error"));
+    expect(errorLogs.length).toBe(3);
+    // URL must not appear in any log line
+    for (const line of errorLogs) {
+      expect(line).not.toContain(webhookUrl);
+      expect(line).not.toContain("SECRET");
+    }
+    // Sanitized placeholder is present
+    expect(errorLogs[0]).toContain("[redacted]");
   });
 
   // 2回目で成功: それ以降リトライせず delivered_slack=1、attempts=2。
