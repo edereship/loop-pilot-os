@@ -264,6 +264,7 @@ export interface SelectPromptArgs {
     implResults?: string;
   } | null;
   memoryBudgetChars?: number;                     // memory.inject_budget_chars（既定 6000）
+  groomSummary?: string | null;                   // D-28: GROOM summary for context
 }
 
 export interface ParsedSelection {
