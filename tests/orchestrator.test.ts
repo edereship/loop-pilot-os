@@ -132,6 +132,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
   memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+  // GROOM always resets the memory directory before executing actions (ES-457 Finding 1).
+  memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const orch = new Orchestrator({
@@ -3923,5 +3926,40 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     } finally {
       rmSync(tmpRepo, { recursive: true, force: true });
     }
+  });
+
+  it("memory directory is reset even when no update_memory actions are present (ES-457 Finding 1)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM output with no update_memory actions — only a reprioritize
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Reprioritized"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // SELECT outcome
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The git checkout + clean commands must have run even though no update_memory actions exist
+    const checkoutCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD") && c.args.includes("docs/memory/"),
+    );
+    expect(checkoutCall).toBeDefined();
+    const cleanCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd") && c.args.includes("docs/memory/"),
+    );
+    expect(cleanCall).toBeDefined();
   });
 });

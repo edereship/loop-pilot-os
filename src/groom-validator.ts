@@ -90,6 +90,13 @@ export function validateGroomActions(
         if (subtask.title.trim() === "") return { action: a, result: "rejected", reason: "empty subtask title" };
         if (subtask.description.trim() === "") return { action: a, result: "rejected", reason: "empty subtask description" };
       }
+      // Each subtask creates one Linear issue; count against the same budget
+      // as explicit create actions so a split with many subtasks cannot bypass
+      // MAX_CREATES or flood Linear in one loop (ES-457 Finding 2).
+      createCount += a.subtasks.length;
+      if (createCount > MAX_CREATES) {
+        return { action: a, result: "rejected", reason: `Exceeds create action limit (${MAX_CREATES})` };
+      }
     }
 
     // Rule 8: memory content validity

@@ -8,9 +8,9 @@ const BOARD_QUERY = `query BoardState($projectId: ID!, $after: String) {
     nodes {
       id identifier title priority sortOrder
       state { id }
-      labels { nodes { name } }
-      relations { nodes { type relatedIssue { identifier } } }
-      inverseRelations { nodes { type relatedIssue { identifier } } }
+      labels(first: 50) { nodes { name } }
+      relations(first: 50) { nodes { type relatedIssue { identifier } } }
+      inverseRelations(first: 50) { nodes { type relatedIssue { identifier } } }
       completedAt
     }
     pageInfo { hasNextPage endCursor }

@@ -199,6 +199,38 @@ describe("validateGroomActions", () => {
       expect(results[5].result).toBe("rejected");
       expect(results[5].reason).toContain("create");
     });
+
+    it("split with 6 subtasks is rejected because it exceeds MAX_CREATES (ES-457 Finding 2)", () => {
+      const subtasks = Array.from({ length: 6 }, (_, i) => ({ title: `Sub ${i}`, description: `Desc ${i}` }));
+      const results = validateGroomActions(
+        [action("split", { subtasks })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("create");
+    });
+
+    it("split with 3 subtasks is accepted when no prior creates have run", () => {
+      const subtasks = Array.from({ length: 3 }, (_, i) => ({ title: `Sub ${i}`, description: `Desc ${i}` }));
+      const results = validateGroomActions(
+        [action("split", { subtasks })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("split subtasks count against the shared create budget with explicit creates", () => {
+      // 3 creates (slots 1-3), then a split with 3 subtasks (slots 4-6) → over limit at slot 6
+      const subtasks = Array.from({ length: 3 }, (_, i) => ({ title: `Sub ${i}`, description: `Desc ${i}` }));
+      const actions = [
+        ...Array.from({ length: 3 }, () => action("create")),
+        action("split", { subtasks }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results.slice(0, 3).every((r) => r.result === "valid")).toBe(true);
+      expect(results[3].result).toBe("rejected");
+      expect(results[3].reason).toContain("create");
+    });
   });
 
   // ---- Rule 6: total action limit ----

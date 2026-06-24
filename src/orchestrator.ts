@@ -1104,13 +1104,11 @@ export class Orchestrator {
         .map((r) => r.action);
       const rejectedCount = validationResults.filter((r) => r.result === "rejected").length;
 
-      // Reset the memory directory to HEAD before executing validated writes so that any
-      // files the Codex process may have written directly to docs/memory/ are discarded;
-      // only content produced by executed update_memory actions will be committed.
-      if (validActions.some((a) => a.type === "update_memory")) {
-        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-      }
+      // Reset the memory directory to HEAD unconditionally so any files the Codex
+      // process may have written directly to docs/memory/ are discarded regardless
+      // of whether valid update_memory actions are present (ES-457 Finding 1).
+      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
 
       // 6. Execute one action at a time with SIGINT check per action (D-14)
       const executorCtx: ExecutorContext = {
