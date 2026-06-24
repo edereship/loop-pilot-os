@@ -273,6 +273,21 @@ export class Orchestrator {
       }
     }
 
+    // 5) merged だが Linear 遷移が未完了のセッションをリトライ（ES-462）
+    for (const session of this.store.sessionsWithPendingDoneTransition()) {
+      try {
+        await retry(3, () => this.source.transition(session.linearIssueId, "done"));
+        this.store.updateSession(session.id, { doneTransitionPending: 0 });
+        this.log(
+          `recovered: transitioned ${session.linearIdentifier} to Done (was pending since merge)`,
+        );
+      } catch (err) {
+        this.log(
+          `warning: recovery transition(done) still failing for ${session.linearIdentifier}: ${errMsg(err)} — will retry on next startup`,
+        );
+      }
+    }
+
     return CONTINUE;
   }
 
@@ -2217,12 +2232,18 @@ export class Orchestrator {
 
   // ---- DONE（仕様 §5.6 / §7） ----
   private async done(session: TaskSessionRow, issue: EligibleIssue): Promise<void> {
-    this.store.updateSession(session.id, { state: "merged", endedAt: this.clock() });
+    this.store.updateSession(session.id, {
+      state: "merged",
+      endedAt: this.clock(),
+      doneTransitionPending: 1,
+    });
     try {
       await retry(3, () => this.source.transition(issue.id, "done"));
+      this.store.updateSession(session.id, { doneTransitionPending: 0 });
     } catch (err) {
-      // best-effort：失敗してもコンソール警告のみで Run=running 維持（仕様 §5.6 注記）
-      this.log(`warning: transition(done) failed for ${issue.identifier}: ${errMsg(err)}`);
+      this.log(
+        `warning: transition(done) failed for ${issue.identifier}: ${errMsg(err)} — will retry on next startup`,
+      );
     }
     const mergedCount = this.store.countMerged(this.runId);
     this.log(`merged ${issue.identifier} (merged_count=${mergedCount})`);
