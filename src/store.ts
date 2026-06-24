@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS task_session (
   auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
   pending_restart_reason TEXT,
   recovery_attempted INTEGER NOT NULL DEFAULT 0,
-  recovery_action TEXT
+  recovery_action TEXT,
+  done_transition_pending INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_session_active ON task_session(state)
   WHERE state NOT IN ('merged','stopped');
@@ -131,6 +132,7 @@ interface RawSessionRow {
   pending_restart_reason: string | null;
   recovery_attempted: number;
   recovery_action: string | null;
+  done_transition_pending: number;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -158,6 +160,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     pendingRestartReason: r.pending_restart_reason,
     recoveryAttempted: r.recovery_attempted,
     recoveryAction: r.recovery_action,
+    doneTransitionPending: r.done_transition_pending,
   };
 }
 
@@ -222,6 +225,7 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   pendingRestartReason: "pending_restart_reason",
   recoveryAttempted: "recovery_attempted",
   recoveryAction: "recovery_action",
+  doneTransitionPending: "done_transition_pending",
 };
 
 export class SqliteStore {
@@ -293,6 +297,11 @@ export class SqliteStore {
     if (!columns.has("recovery_action")) {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN recovery_action TEXT`,
+      );
+    }
+    if (!columns.has("done_transition_pending")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN done_transition_pending INTEGER NOT NULL DEFAULT 0`,
       );
     }
 
@@ -472,6 +481,7 @@ export class SqliteStore {
         | "pendingRestartReason"
         | "recoveryAttempted"
         | "recoveryAction"
+        | "doneTransitionPending"
       >
     >,
   ): void {
@@ -548,6 +558,17 @@ export class SqliteStore {
            AND (stop_detail LIKE '%(recovery failed:%' OR stop_detail LIKE 'recovery failed:%'
                 OR stop_detail LIKE 'abandon_in_progress%')
            AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)
+         ORDER BY id ASC`,
+      )
+      .all() as RawSessionRow[];
+    return rows.map(toSessionRow);
+  }
+
+  sessionsWithPendingDoneTransition(): TaskSessionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM task_session
+         WHERE state = 'merged' AND done_transition_pending = 1
          ORDER BY id ASC`,
       )
       .all() as RawSessionRow[];

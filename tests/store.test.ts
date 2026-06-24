@@ -992,3 +992,87 @@ describe("recentSessionSummaries", () => {
     expect(store.recentSessionSummaries(3)).toHaveLength(3);
   });
 });
+
+describe("doneTransitionPending column (ES-462)", () => {
+  it("doneTransitionPending defaults to 0 on createSession", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "test",
+      branch: "b",
+      worktreePath: "/wt/ty-1",
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    expect(session.doneTransitionPending).toBe(0);
+  });
+
+  it("updateSession can set doneTransitionPending to 1 and back to 0", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "test",
+      branch: "b",
+      worktreePath: "/wt/ty-1",
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    store.updateSession(session.id, { doneTransitionPending: 1 });
+    expect(store.getSession(session.id).doneTransitionPending).toBe(1);
+
+    store.updateSession(session.id, { doneTransitionPending: 0 });
+    expect(store.getSession(session.id).doneTransitionPending).toBe(0);
+  });
+
+  it("sessionsWithPendingDoneTransition returns only merged sessions with flag=1", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+
+    // merged + pending=1 → should be returned
+    const s1 = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "A",
+      branch: "b1",
+      worktreePath: "/wt/1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s1.id, { state: "merged", endedAt: "2026-01-01T01:00:00.000Z", doneTransitionPending: 1 });
+
+    // merged + pending=0 → should NOT be returned
+    const s2 = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-2",
+      linearIdentifier: "TY-2",
+      issueTitle: "B",
+      branch: "b2",
+      worktreePath: "/wt/2",
+      now: "2026-01-01T00:00:02.000Z",
+    });
+    store.updateSession(s2.id, { state: "merged", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    // in_review + pending=1 → should NOT be returned (not merged)
+    const s3 = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-3",
+      linearIdentifier: "TY-3",
+      issueTitle: "C",
+      branch: "b3",
+      worktreePath: "/wt/3",
+      now: "2026-01-01T00:00:03.000Z",
+    });
+    store.updateSession(s3.id, { state: "in_review", doneTransitionPending: 1 });
+
+    const pending = store.sessionsWithPendingDoneTransition();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].linearIssueId).toBe("issue-1");
+  });
+});
