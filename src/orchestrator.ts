@@ -2640,9 +2640,17 @@ export class Orchestrator {
   private elapsedMinutesSinceMonitorStart(sessionId: number): number {
     const fresh = this.store.getSession(sessionId);
     if (fresh.monitorStartedAt === null) return 0;
+    const now = this.clock();
+    const nowMs = Date.parse(now);
     const startMs = Date.parse(fresh.monitorStartedAt);
-    const nowMs = Date.parse(this.clock());
-    return Math.max(0, (nowMs - startMs) / 60000);
+    if (startMs > nowMs) {
+      // monitorStartedAt is in the future (NTP skew or bad persisted timestamp).
+      // Reset to now so the guard window starts from this poll rather than
+      // staying pinned at 0 until wall time catches up.
+      this.store.updateSession(sessionId, { monitorStartedAt: now });
+      return 0;
+    }
+    return (nowMs - startMs) / 60000;
   }
 }
 
