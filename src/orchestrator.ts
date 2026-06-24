@@ -346,7 +346,22 @@ export class Orchestrator {
       }
       // done / in_progress / corrupted / not_engaged = open 扱い → 採用して MONITOR 再開
       case "done":
-      case "in_progress":
+      case "in_progress": {
+        // ES-469 Finding 2: a non-stopped verdict confirms the quota episode has recovered.
+        // Reset the durable count and non-done-path pending reason before adopting so
+        // monitorSession does not carry stale quotaRetryAttempts (e.g. 6) into the next
+        // quota episode if its first poll never observes an in_progress verdict.
+        const clearPendingReason = session.pendingRestartReason !== null &&
+            session.pendingRestartReason !== "ci_failed" &&
+            session.pendingRestartReason !== "merge_conflict";
+        if (session.quotaRetryAttempts > 0 || clearPendingReason) {
+          this.store.updateSession(session.id, {
+            quotaRetryAttempts: 0,
+            ...(clearPendingReason ? { pendingRestartReason: null } : {}),
+          });
+        }
+        return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+      }
       case "corrupted":
       case "not_engaged":
         return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);

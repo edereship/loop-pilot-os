@@ -256,6 +256,51 @@ describe("回復 — in_review + PR が open 扱い → 採用して MONITOR 再
     expect(h.store.countTasksStarted(newRun.id)).toBe(1);
   });
 
+  it("in_review + quotaRetryAttempts=6 + pre-poll in_progress → quotaRetryAttempts reset to 0 so next episode starts fresh (ES-469 Finding 2)", async () => {
+    // Scenario: process crashed with quotaRetryAttempts=6 and
+    // pendingRestartReason="codex_usage_limit" in DB (a /restart-review was posted for
+    // quota episode #6). On recovery the pre-poll sees in_progress (quota recovered).
+    // Without the fix, monitorSession seeds quotaRetryCount=6 and pendingRestartReason=
+    // "codex_usage_limit"; the first new stopped(codex_usage_limit) hits the stale
+    // guard (pending matches), clears pending, and the SECOND one increments to 7>6 →
+    // false HALT. With the fix quotaRetryAttempts=0 and pendingRestartReason=null so
+    // the first stopped is a fresh episode (count=1) and the second is the stale grace.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+      quotaRetryAttempts: 6,
+      pendingRestartReason: "codex_usage_limit",
+    });
+    h.monitor.verdicts = [
+      { kind: "in_progress" },                              // recovery pre-poll: quota recovered
+      // monitorSession polls:
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // WITH fix: not stale → count=1, sleep, post
+                                                             // WITHOUT fix: stale → clears pending
+      { kind: "stopped", stopReason: "codex_usage_limit" }, // WITH fix: stale → grace
+                                                             // WITHOUT fix: not stale → count=7 > 6 → HALT
+      { kind: "done" },                                     // WITH fix: tryMerge → merged
+    ];
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    // Without fix: quotaRetryCount=6+1=7>6 → HALT → state="stopped".
+    // With fix: quotaRetryCount=0+1=1 → quota wait → /restart-review → merged.
+    expect(s.state).toBe("merged");
+    expect(s.quotaRetryAttempts).toBe(1);
+    // /restart-review was posted exactly once (the fresh episode at count=1)
+    const postComments = h.git.calls.filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(1);
+  });
+
   it("poll が corrupted（open 扱いで採用）→ 続く poll が即 corrupted を維持 → MONITOR が即 stopped(monitor_never_engaged) で HALT", async () => {
     const config = makeConfig({ maxTasksPerRun: 3, notEngagedGuardMinutes: 999 });
     const h = makeHarness(config);
