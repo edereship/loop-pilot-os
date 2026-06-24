@@ -659,6 +659,7 @@ export class Orchestrator {
 
       // 0.5) GROOM（D-13: failure → skip to SELECT）
       let groomSummary: string | null = null;
+      let groomBlockedIds: Set<string> = new Set();
       {
         const groomResult = await this.groom();
         if (groomResult.control === "halt") return;
@@ -670,6 +671,7 @@ export class Orchestrator {
           return;
         }
         groomSummary = groomResult.summary;
+        groomBlockedIds = groomResult.blockedIds;
       }
 
       // 2) SELECT（仕様 §5.1 + A1 PM 選別ターン）
@@ -688,6 +690,11 @@ export class Orchestrator {
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
+      }
+      // Filter out GROOM-identified blocked issues so dependency-blocked work is not started
+      // (ES-457 Finding 2).
+      if (groomBlockedIds.size > 0) {
+        eligible = eligible.filter((i) => !groomBlockedIds.has(i.identifier));
       }
       if (eligible.length === 0) {
         // IDLE（キュー空 → 通知は初回のみ → 定期再確認）
@@ -904,9 +911,9 @@ export class Orchestrator {
   }
 
   // ---- GROOM（ES-457: Board Grooming Phase） ----
-  private async groom(): Promise<{ control: "continue"; summary: string | null } | { control: "halt" }> {
+  private async groom(): Promise<{ control: "continue"; summary: string | null; blockedIds: Set<string> } | { control: "halt" }> {
     if (!this.config.groom.enabled || this.groomDeps === null || this.planner === null) {
-      return { control: "continue", summary: null };
+      return { control: "continue", summary: null, blockedIds: new Set<string>() };
     }
 
     this.groomLoopIndex++;
@@ -919,7 +926,7 @@ export class Orchestrator {
       });
     } catch (err) {
       this.log(`groom: failed to insert groom_log, skipping: ${errMsg(err)}`);
-      return { control: "continue", summary: null };
+      return { control: "continue", summary: null, blockedIds: new Set<string>() };
     }
 
     try {
@@ -944,8 +951,10 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
-        return { control: "continue", summary: null };
+        return { control: "continue", summary: null, blockedIds: new Set<string>() };
       }
+      // Build blocked identifier set for SELECT-time filtering (ES-457 Finding 2).
+      const blockedIds = new Set<string>(boardState.blocked.map((b) => b.identifier));
 
       // 2. Fetch default branch so memory/spec/codebase reads see the current state of main
       // rather than a stale local checkout from a previous merge iteration (ES-457 Finding 3).
@@ -1030,6 +1039,10 @@ export class Orchestrator {
           // haltForInterrupt() calls commitMemoryBeforeHalt() (Finding 3 + 4).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+          if (startSha) {
+            await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+          }
           await this.haltForInterrupt();
           return { control: "halt" };
         }
@@ -1047,7 +1060,11 @@ export class Orchestrator {
           // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-          return { control: "continue", summary: null };
+          // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+          if (startSha) {
+            await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+          }
+          return { control: "continue", summary: null, blockedIds };
         }
         codexOutput = outcome.text;
       } catch (err) {
@@ -1064,7 +1081,11 @@ export class Orchestrator {
         // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
         await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-        return { control: "continue", summary: null };
+        // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+        }
+        return { control: "continue", summary: null, blockedIds };
       }
 
       // 4. Parse
@@ -1084,7 +1105,11 @@ export class Orchestrator {
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
         await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-        return { control: "continue", summary: null };
+        // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+        }
+        return { control: "continue", summary: null, blockedIds };
       }
 
       const groomOutput = parseResult.value;
@@ -1128,7 +1153,11 @@ export class Orchestrator {
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
         await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-        return { control: "continue", summary: null };
+        // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+        }
+        return { control: "continue", summary: null, blockedIds };
       }
 
       const validationResults = validateGroomActions(allActions, validationCtx);
@@ -1304,7 +1333,7 @@ export class Orchestrator {
       const summaryForSelect = (rejectedCount === 0 && failedExecutions === 0)
         ? groomOutput.summary
         : `${groomOutput.summary} [${executedCount}/${allActions.length} executed]`;
-      return { control: "continue", summary: summaryForSelect };
+      return { control: "continue", summary: summaryForSelect, blockedIds };
     } catch (err) {
       this.log(`groom: unexpected error, skipping: ${errMsg(err)}`);
       try {
@@ -1316,7 +1345,7 @@ export class Orchestrator {
       } catch (logErr) {
         this.log(`groom: failed to update groom_log in error handler: ${errMsg(logErr)}`);
       }
-      return { control: "continue", summary: null };
+      return { control: "continue", summary: null, blockedIds: new Set<string>() };
     }
   }
 

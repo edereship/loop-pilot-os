@@ -4004,4 +4004,98 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     );
     expect(cleanCall).toBeDefined();
   });
+
+  it("codex error cleanup resets to startSha to undo any Codex-created commits (ES-457 Finding 1)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns error (simulating Codex creating a commit and then erroring)
+    planner.outcomes.push({ kind: "error", message: "codex crashed mid-groom" });
+
+    // SELECT outcome (2 issues needed to trigger the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // git reset --hard <startSha> must have been called during the codex-error cleanup
+    const resetCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234",
+    );
+    expect(resetCalls.length).toBeGreaterThan(0);
+    // Session still completed despite GROOM failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("parse failure cleanup resets to startSha to undo any Codex-created commits (ES-457 Finding 1)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM returns unparseable output
+    planner.outcomes.push({ kind: "completed", text: "not valid json at all" });
+
+    // SELECT outcome (2 issues needed to trigger the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // git reset --hard <startSha> must have been called during the parse-failure cleanup
+    const resetCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234",
+    );
+    expect(resetCalls.length).toBeGreaterThan(0);
+    // Session still completed despite GROOM failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("GROOM-blocked issues are excluded from SELECT eligible list (ES-457 Finding 2)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM output: no actions, summary only
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[],"summary":"TY-1 blocked by ES-99, skipping"}\n```',
+    });
+
+    // GROOM board state: TY-1 is blocked, TY-2 is eligible
+    h.groomBoardFetcher.boardState = {
+      eligible: [{ identifier: "TY-2", title: "Title for TY-2", priority: 2, labels: [] }],
+      inProgress: [],
+      recentDone: [],
+      blocked: [{ identifier: "TY-1", title: "Title for TY-1", priority: 2, labels: [], blockedBy: "ES-99" }],
+    };
+
+    // Both issues are in the task source queue
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Only TY-2 should have been claimed; TY-1 must not appear in any session
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.linearIdentifier).toBe("TY-2");
+    // TY-1 must never have been transitioned to in_progress
+    expect(h.source.transitions.some((t) => t.issueId === "issue-A" && t.state === "in_progress")).toBe(false);
+  });
 });
