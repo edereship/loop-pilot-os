@@ -104,6 +104,92 @@ describe("readAll", () => {
       productKnowledge: "knowledge",
     });
   });
+
+  it("returns null for header-only files (ES-454 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.pm_decisions), "# PM Decisions\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.product_knowledge), "# Product Knowledge\n");
+    expect(readAll(tmpRepo)).toEqual({
+      pmDecisions: null,
+      implResults: null,
+      productKnowledge: null,
+    });
+  });
+
+  it("returns heading-only markdown that is not the seeded header (ES-454 Finding 2)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, CATEGORY_FILES.pm_decisions),
+      "# PM Decisions\n\n## Prefer ES-123 next\n",
+    );
+    const result = readAll(tmpRepo);
+    expect(result.pmDecisions).toBe("# PM Decisions\n\n## Prefer ES-123 next\n");
+  });
+
+  it("returns content when file has content beyond the heading (ES-454 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n\n- ES-100: done\n");
+    const result = readAll(tmpRepo);
+    expect(result.implResults).toBe("# Implementation Results\n\n- ES-100: done\n");
+  });
+
+  it("treats CRLF header-only files as empty (ES-454 Finding 2)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.pm_decisions), "# PM Decisions\r\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\r\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.product_knowledge), "# Product Knowledge\r\n");
+    expect(readAll(tmpRepo)).toEqual({
+      pmDecisions: null,
+      implResults: null,
+      productKnowledge: null,
+    });
+  });
+
+  it("treats header without trailing newline as empty (ES-454 Finding 2)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.pm_decisions), "# PM Decisions");
+    const result = readAll(tmpRepo);
+    expect(result.pmDecisions).toBeNull();
+  });
+
+  it("still returns CRLF content when file has real content (ES-454 Finding 2)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.pm_decisions), "# PM Decisions\r\n\r\n- prefer ES-1\r\n");
+    const result = readAll(tmpRepo);
+    expect(result.pmDecisions).toBe("# PM Decisions\r\n\r\n- prefer ES-1\r\n");
+  });
+
+  it("returns partial results when one category file is unreadable (ES-454 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    // pm-decisions.md as a directory → readFileSync throws EISDIR
+    mkdirSync(path.join(dir, CATEGORY_FILES.pm_decisions));
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n\n- ES-1: done\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.product_knowledge), "# Product Knowledge\n\nsome knowledge\n");
+    const result = readAll(tmpRepo);
+    expect(result.pmDecisions).toBeNull();
+    expect(result.implResults).toBe("# Implementation Results\n\n- ES-1: done\n");
+    expect(result.productKnowledge).toBe("# Product Knowledge\n\nsome knowledge\n");
+    expect(result.readErrors).toBeDefined();
+    expect(result.readErrors!.length).toBe(1);
+  });
+
+  it("returns no readErrors field when all categories succeed (ES-454 Finding 3)", () => {
+    const dir = path.join(tmpRepo, MEMORY_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, CATEGORY_FILES.pm_decisions), "# PM Decisions\n\n- d1\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.impl_results), "# Implementation Results\n\n- r1\n");
+    writeFileSync(path.join(dir, CATEGORY_FILES.product_knowledge), "# Product Knowledge\n\n- k1\n");
+    const result = readAll(tmpRepo);
+    expect(result.readErrors).toBeUndefined();
+  });
 });
 
 describe("initialize", () => {

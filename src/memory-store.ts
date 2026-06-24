@@ -39,11 +39,31 @@ export function readAll(repoPath: string): {
   pmDecisions: string | null;
   implResults: string | null;
   productKnowledge: string | null;
+  readErrors?: string[];
 } {
+  const readErrors: string[] = [];
+  const get = (cat: MemoryCategory): string | null => {
+    try {
+      const content = readCategory(repoPath, cat);
+      if (content === null) return null;
+      // Treat only the known seeded header as "empty". Any other content — including
+      // heading-only markdown like "# Decision\n## Prefer X" — is real memory that
+      // GROOM wrote and should be injected into prompts.
+      // Normalize CRLF and missing trailing newline before comparing so files checked
+      // out with core.autocrlf or saved without a final newline still match.
+      const normalized = content.replace(/\r\n?/g, "\n").trimEnd() + "\n";
+      if (normalized === CATEGORY_HEADERS[cat]) return null;
+      return content;
+    } catch (err) {
+      readErrors.push(err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  };
   return {
-    pmDecisions: readCategory(repoPath, "pm_decisions"),
-    implResults: readCategory(repoPath, "impl_results"),
-    productKnowledge: readCategory(repoPath, "product_knowledge"),
+    pmDecisions: get("pm_decisions"),
+    implResults: get("impl_results"),
+    productKnowledge: get("product_knowledge"),
+    ...(readErrors.length > 0 && { readErrors }),
   };
 }
 

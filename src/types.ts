@@ -210,6 +210,11 @@ export interface PromptArgs {
   issue: EligibleIssue;
   digest: Array<Pick<TaskSessionRow, "linearIdentifier" | "issueTitle" | "agentSummary">>;
   planBrief?: PlanBrief | null;                   // PLAN フェーズで生成した実装ブリーフ（任意）
+  memory?: {                                      // B2 横断メモリ（PLAN 注入: impl-results + product-knowledge）
+    implResults?: string;
+    productKnowledge?: string;
+  } | null;
+  memoryBudgetChars?: number;                     // memory.inject_budget_chars（既定 6000）
 }
 // context-bundle.ts は export function buildPrompt(args: PromptArgs): string を公開
 
@@ -254,6 +259,11 @@ export interface SelectPromptArgs {
   lastPrDiff: { identifier: string; summary: PrDiffSummary } | null;
   diffBudgetChars: number;
   codebaseSummary: string | null;
+  memory?: {                                      // B2 横断メモリ（SELECT 注入: pm-decisions + impl-results）
+    pmDecisions?: string;
+    implResults?: string;
+  } | null;
+  memoryBudgetChars?: number;                     // memory.inject_budget_chars（既定 6000）
 }
 
 export interface ParsedSelection {

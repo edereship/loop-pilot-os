@@ -261,4 +261,72 @@ describe("buildSelectPrompt", () => {
     const prompt = buildSelectPrompt(args);
     expect(prompt).not.toContain("Codebase Structure");
   });
+
+  // ---- B2: Memory Injection（ES-454） ----
+
+  it("injects memory section with pm-decisions and impl-results", () => {
+    const args: SelectPromptArgs = {
+      ...baseArgs,
+      memory: {
+        pmDecisions: "chose TY-1 for momentum",
+        implResults: "TY-0 merged successfully",
+      },
+      memoryBudgetChars: 6000,
+    };
+    const prompt = buildSelectPrompt(args);
+    expect(prompt).toContain("# 横断メモリ");
+    expect(prompt).toContain("chose TY-1 for momentum");
+    expect(prompt).toContain("TY-0 merged successfully");
+  });
+
+  it("omits memory section when memory is null", () => {
+    const args: SelectPromptArgs = {
+      ...baseArgs,
+      memory: null,
+      memoryBudgetChars: 6000,
+    };
+    const prompt = buildSelectPrompt(args);
+    expect(prompt).not.toContain("横断メモリ");
+  });
+
+  it("omits memory section when memory is undefined (default)", () => {
+    const prompt = buildSelectPrompt(baseArgs);
+    expect(prompt).not.toContain("横断メモリ");
+  });
+
+  it("truncates memory when content exceeds inject_budget_chars", () => {
+    const longPm = "d".repeat(4000);
+    const longImpl = "r".repeat(4000);
+    const args: SelectPromptArgs = {
+      ...baseArgs,
+      memory: { pmDecisions: longPm, implResults: longImpl },
+      memoryBudgetChars: 6000,
+    };
+    const prompt = buildSelectPrompt(args);
+    // Structural overhead for "PM Decisions" (12) + "Implementation Results" (22):
+    // mainHeader(11) + sep(2) + catHeaders(17+27) + markers(22) = 79
+    // contentBudget = 6000 - 79 = 5921; perCategory = floor(5921/2) = 2960
+    expect(prompt).toContain("d".repeat(2960));
+    expect(prompt).not.toContain("d".repeat(2961));
+    expect(prompt).toContain("[...省略...]");
+  });
+
+  it("places memory after codebase summary and before board state", () => {
+    const args: SelectPromptArgs = {
+      ...baseArgs,
+      codebaseSummary: "src/main.ts (200L)",
+      inProgress: [{ linearIdentifier: "TY-5", issueTitle: "In progress task" }],
+      memory: { pmDecisions: "pm decision data" },
+      memoryBudgetChars: 6000,
+    };
+    const prompt = buildSelectPrompt(args);
+    const idxCodebase = prompt.indexOf("# Codebase Structure");
+    const idxMemory = prompt.indexOf("# 横断メモリ");
+    const idxInProgress = prompt.indexOf("# Currently In Progress");
+    expect(idxCodebase).toBeGreaterThanOrEqual(0);
+    expect(idxMemory).toBeGreaterThanOrEqual(0);
+    expect(idxInProgress).toBeGreaterThanOrEqual(0);
+    expect(idxCodebase).toBeLessThan(idxMemory);
+    expect(idxMemory).toBeLessThan(idxInProgress);
+  });
 });

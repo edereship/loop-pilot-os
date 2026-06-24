@@ -1,4 +1,5 @@
 import type { SelectPromptArgs, ParsedSelection, PrDiffSummary } from "./types.js";
+import { buildMemoryBlock } from "./memory-inject.js";
 
 export function parseSelection(codexOutput: string): ParsedSelection | null {
   const trimmed = codexOutput.trim();
@@ -177,7 +178,7 @@ function truncateDiffPerFile(unifiedDiff: string, budget: number): string {
 }
 
 export function buildSelectPrompt(args: SelectPromptArgs): string {
-  const { goal, specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars, codebaseSummary } = args;
+  const { goal, specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars, codebaseSummary, memory, memoryBudgetChars } = args;
 
   const blocks: string[] = [];
 
@@ -210,6 +211,16 @@ export function buildSelectPrompt(args: SelectPromptArgs): string {
   // Codebase structure
   if (codebaseSummary) {
     blocks.push(["# Codebase Structure", "", codebaseSummary].join("\n"));
+  }
+
+  // Cross-task memory (B2: pm-decisions + impl-results / D-23)
+  if (memory) {
+    const entries = [
+      ...(memory.pmDecisions ? [{ label: "PM Decisions", content: memory.pmDecisions }] : []),
+      ...(memory.implResults ? [{ label: "Implementation Results", content: memory.implResults }] : []),
+    ];
+    const block = buildMemoryBlock(entries, memoryBudgetChars ?? 6000);
+    if (block.length > 0) blocks.push(block);
   }
 
   // Board state: in-progress

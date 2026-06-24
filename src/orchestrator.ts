@@ -29,7 +29,7 @@ import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
-import { commitIfChanged, initialize as initializeMemory, MEMORY_DIR } from "./memory-store.js";
+import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, MEMORY_DIR } from "./memory-store.js";
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -802,7 +802,20 @@ export class Orchestrator {
       }
     }
 
-    const prompt = buildPlanPrompt({ issue, specContent });
+    const planMem = readMemoryAll(worktreePath);
+    if (planMem.readErrors) {
+      this.log(`plan: memory read failed (non-fatal): ${planMem.readErrors.join("; ")}`);
+    }
+
+    const prompt = buildPlanPrompt({
+      issue,
+      specContent,
+      memory: {
+        implResults: planMem.implResults ?? undefined,
+        productKnowledge: planMem.productKnowledge ?? undefined,
+      },
+      memoryBudgetChars: this.config.memory.injectBudgetChars,
+    });
 
     let outcome: PlanOutcome;
     try {
@@ -908,6 +921,11 @@ export class Orchestrator {
       this.log(`select: codebase summary generation failed (non-fatal): ${errMsg(err)}`);
     }
 
+    const selectMem = readMemoryAll(this.config.repo.path);
+    if (selectMem.readErrors) {
+      this.log(`select: memory read failed (non-fatal): ${selectMem.readErrors.join("; ")}`);
+    }
+
     const prompt = buildSelectPrompt({
       goal: this.config.product.goal ?? null,
       specContent,
@@ -917,6 +935,11 @@ export class Orchestrator {
       lastPrDiff,
       diffBudgetChars: this.config.safety.selectDiffBudgetChars,
       codebaseSummary,
+      memory: {
+        pmDecisions: selectMem.pmDecisions ?? undefined,
+        implResults: selectMem.implResults ?? undefined,
+      },
+      memoryBudgetChars: this.config.memory.injectBudgetChars,
     });
 
     let outcome: PlanOutcome;
@@ -996,12 +1019,22 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
       }
     }
+    const mem = readMemoryAll(worktreePath);
+    if (mem.readErrors) {
+      this.log(`implement: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
+    }
+
     const prompt = this.buildPrompt({
       goal: this.config.product.goal ?? null,
       specContent,
       issue,
       digest,
       planBrief,
+      memory: {
+        implResults: mem.implResults ?? undefined,
+        productKnowledge: mem.productKnowledge ?? undefined,
+      },
+      memoryBudgetChars: this.config.memory.injectBudgetChars,
     });
     let outcome: AgentOutcome;
     try {

@@ -1,4 +1,5 @@
 import type { PromptArgs } from "./types.js";
+import { buildMemoryBlock } from "./memory-inject.js";
 
 /**
  * セッションごとに claude へ渡す決定的プロンプトを組み立てる純粋関数。
@@ -6,22 +7,24 @@ import type { PromptArgs } from "./types.js";
  * v2 注入レイアウト（spec_dir 設定時 / scope doc B1）:
  *   ① 要求（requirements.md 全文 — 不変の錨・必須）
  *   ② 要件定義（領域ファイル群 — 該当分。B1-a では全領域注入）
- *   ③ 担当チケット（identifier / title / url / description）
- *   ④ 実装ブリーフ + ガードレール（PLAN フェーズ生成・存在時のみ）
- *   ⑤ 作業規則
- *   ⑥ 直近の変更アウェアネス（digest — 軽い手がかり・任意。空配列で省略）
+ *   ③ 横断メモリ（impl-results + product-knowledge — B2 / D-23）
+ *   ④ 担当チケット（identifier / title / url / description）
+ *   ⑤ 実装ブリーフ + ガードレール（PLAN フェーズ生成・存在時のみ）
+ *   ⑥ 作業規則
+ *   ⑦ 直近の変更アウェアネス（digest — 軽い手がかり・任意。空配列で省略）
  *
  * v1 フォールバック（spec_dir 未設定・goal のみ）:
  *   ① プロダクトのゴール（config.product.goal）
- *   ② 担当チケット
- *   ③ 実装ブリーフ + ガードレール（存在時のみ）
- *   ④ 作業規則
- *   ⑤ digest
+ *   ② 横断メモリ（存在時のみ）
+ *   ③ 担当チケット
+ *   ④ 実装ブリーフ + ガードレール（存在時のみ）
+ *   ⑤ 作業規則
+ *   ⑥ digest
  *
  * 副作用・時刻・乱数を含まないため、同入力 → 同出力。
  */
 export function buildPrompt(args: PromptArgs): string {
-  const { specContent, goal, issue, digest, planBrief } = args;
+  const { specContent, goal, issue, digest, planBrief, memory, memoryBudgetChars } = args;
 
   const description = issue.description.trim().length > 0 ? issue.description : "(説明なし)";
 
@@ -42,7 +45,17 @@ export function buildPrompt(args: PromptArgs): string {
     blocks.push(["# 要件定義", "", ...specSections].join("\n\n"));
   }
 
-  // ---- ③ チケット ----
+  // ---- ③ 横断メモリ（B2: impl-results + product-knowledge / D-23） ----
+  if (memory) {
+    const entries = [
+      ...(memory.implResults ? [{ label: "Implementation Results", content: memory.implResults }] : []),
+      ...(memory.productKnowledge ? [{ label: "Product Knowledge", content: memory.productKnowledge }] : []),
+    ];
+    const block = buildMemoryBlock(entries, memoryBudgetChars ?? 6000);
+    if (block.length > 0) blocks.push(block);
+  }
+
+  // ---- ④ チケット ----
   blocks.push(
     [
       "# 担当チケット",
@@ -57,7 +70,7 @@ export function buildPrompt(args: PromptArgs): string {
     ].join("\n"),
   );
 
-  // ---- ④ 実装ブリーフ + ガードレール（PLAN フェーズ生成・存在時のみ） ----
+  // ---- ⑤ 実装ブリーフ + ガードレール（PLAN フェーズ生成・存在時のみ） ----
   if (planBrief && planBrief.raw.length > 0) {
     blocks.push(
       [
@@ -71,7 +84,7 @@ export function buildPrompt(args: PromptArgs): string {
     );
   }
 
-  // ---- ⑤ 作業規則 ----
+  // ---- ⑥ 作業規則 ----
   blocks.push(
     [
       "# 作業規則",
@@ -86,7 +99,7 @@ export function buildPrompt(args: PromptArgs): string {
     ].join("\n"),
   );
 
-  // ---- ⑥ digest（B1-b: 格下げ・最小化。digest.enabled=false 時は呼び出し側が空配列を渡す） ----
+  // ---- ⑦ digest（B1-b: 格下げ・最小化。digest.enabled=false 時は呼び出し側が空配列を渡す） ----
   if (digest.length > 0) {
     const lines = digest.map((d) => {
       const summary = truncateToOneLine(d.agentSummary ?? "(要約なし)");

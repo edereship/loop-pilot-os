@@ -154,4 +154,34 @@ describe("buildPlanPrompt", () => {
     });
     expect(prompt).toContain("Fix the bug in auth module.");
   });
+
+  it("injects memory block when memory is provided", () => {
+    const prompt = buildPlanPrompt({
+      issue: issue(),
+      specContent: null,
+      memory: {
+        implResults: "- ES-100: Add auth — merged",
+        productKnowledge: "Users prefer dark mode.",
+      },
+    });
+    expect(prompt).toContain("# 横断メモリ");
+    expect(prompt).toContain("Implementation Results");
+    expect(prompt).toContain("ES-100: Add auth");
+    expect(prompt).toContain("Product Knowledge");
+    expect(prompt).toContain("dark mode");
+  });
+
+  it("omits memory block when memory is null", () => {
+    const prompt = buildPlanPrompt({ issue: issue(), specContent: null, memory: null });
+    expect(prompt).not.toContain("横断メモリ");
+  });
+
+  it("omits memory block when memory fields are empty", () => {
+    const prompt = buildPlanPrompt({
+      issue: issue(),
+      specContent: null,
+      memory: { implResults: undefined, productKnowledge: undefined },
+    });
+    expect(prompt).not.toContain("横断メモリ");
+  });
 });
