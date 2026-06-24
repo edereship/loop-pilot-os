@@ -501,6 +501,75 @@ describe("SqliteStore: schema migration (ES-397)", () => {
     }
   });
 
+  it("adds done_transition_pending column to a pre-existing task_session table (ES-462)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "looppilot-migrate-"));
+    const dbPath = path.join(dir, "looppilot-os.db");
+    try {
+      // Legacy schema WITHOUT done_transition_pending column.
+      const legacy = new Database(dbPath);
+      legacy.exec(`
+        CREATE TABLE IF NOT EXISTS run (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          pid INTEGER NOT NULL,
+          started_at TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+          halt_reason TEXT,
+          pause_meta TEXT
+        );
+        CREATE TABLE IF NOT EXISTS task_session (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id INTEGER NOT NULL REFERENCES run(id),
+          linear_issue_id TEXT NOT NULL,
+          linear_identifier TEXT NOT NULL,
+          issue_title TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          worktree_path TEXT,
+          pr_number INTEGER,
+          state TEXT NOT NULL CHECK (state IN
+            ('claimed','implementing','handing_off','in_review','merged','stopped')),
+          cost_usd REAL,
+          failure_reason TEXT,
+          stop_detail TEXT,
+          agent_summary TEXT,
+          plan_brief TEXT,
+          select_rationale TEXT,
+          started_at TEXT NOT NULL,
+          monitor_started_at TEXT,
+          ended_at TEXT,
+          workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
+          workflow_handled_error_count INTEGER NOT NULL DEFAULT 0,
+          auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
+          pending_restart_reason TEXT,
+          recovery_attempted INTEGER NOT NULL DEFAULT 0,
+          recovery_action TEXT
+        );
+      `);
+      legacy.prepare(
+        `INSERT INTO run (pid, started_at, state) VALUES (1, '2026-01-01T00:00:00.000Z', 'running')`,
+      ).run();
+      legacy.prepare(
+        `INSERT INTO task_session
+           (run_id, linear_issue_id, linear_identifier, issue_title, branch, state, started_at)
+         VALUES (1, 'issue-1', 'TY-1', 'test', 'b', 'merged', '2026-01-01T00:00:00.000Z')`,
+      ).run();
+      legacy.close();
+
+      // Open via SqliteStore — triggers migrate(), which adds done_transition_pending.
+      const store = new SqliteStore(dbPath);
+      openStores.push(store);
+
+      // The migrated session should have doneTransitionPending defaulting to 0.
+      const session = store.getSession(1);
+      expect(session.doneTransitionPending).toBe(0);
+
+      // updateSession should work with the new column without throwing.
+      store.updateSession(session.id, { doneTransitionPending: 1 });
+      expect(store.getSession(session.id).doneTransitionPending).toBe(1);
+    } finally {
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("opening a fresh DB twice is idempotent (no duplicate-column error)", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "looppilot-migrate-"));
     const dbPath = path.join(dir, "looppilot-os.db");
