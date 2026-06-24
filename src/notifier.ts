@@ -1,5 +1,6 @@
 import type { SqliteStore } from "./store.js";
 import type { Notifier, NotifyEvent } from "./types.js";
+import type { FetchFn } from "./task-source.js";
 
 /** Slack へ POST する最大試行回数（カーネル §10: リトライ3回）。 */
 const SLACK_MAX_ATTEMPTS = 3;
@@ -41,7 +42,7 @@ export class ConsoleSlackNotifier implements Notifier {
   private readonly store: SqliteStore;
   private readonly webhookUrl: string | null;
   private readonly log: (s: string) => void;
-  private readonly fetchFn: typeof fetch;
+  private readonly fetchFn: FetchFn;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly clock: () => string;
 
@@ -49,7 +50,7 @@ export class ConsoleSlackNotifier implements Notifier {
     store: SqliteStore,
     webhookUrl: string | null,
     log: (s: string) => void,
-    fetchFn: typeof fetch = fetch,
+    fetchFn: FetchFn = globalThis.fetch as unknown as FetchFn,
     sleep: (ms: number) => Promise<void> = (ms) =>
       new Promise((resolve) => setTimeout(resolve, ms)),
     clock: () => string = () => new Date().toISOString(),

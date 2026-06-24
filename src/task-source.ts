@@ -3,7 +3,7 @@ import type { EligibleIssue, TaskSource, TicketState } from "./types.js";
 /** Web 標準 fetch のサブセット。本番は globalThis.fetch、テストはフェイクを注入する。 */
 export type FetchFn = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
 const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
