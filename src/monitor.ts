@@ -191,7 +191,7 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
         "--json",
         "state,mergedAt,mergeable,mergeStateStatus,headRefOid,statusCheckRollup,closed",
       ],
-      { cwd: process.cwd() },
+      { cwd: process.cwd(), timeoutMs: 60_000 },
     );
     // 非0終了は失敗として throw（poll の backoff/5連続停止に委ねる）。
     // stdout に部分 JSON が載っていても「成功」と誤採用しない。
@@ -223,7 +223,7 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
         "--paginate",
         "--slurp",
       ],
-      { cwd: process.cwd() },
+      { cwd: process.cwd(), timeoutMs: 60_000 },
     );
     if (result.code !== 0) {
       throw new Error(

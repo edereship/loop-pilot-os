@@ -46,12 +46,12 @@ describe("GitPrManager.prepareWorktree", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "fetch", "origin", "main"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 120_000 },
     });
     expect(runner.calls[1]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "worktree", "add", "-b", branch, wtPath, "origin/main"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 30_000 },
     });
   });
 
@@ -177,12 +177,12 @@ describe("GitPrManager.hasCommitsWithDiff", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "git",
       args: ["-C", "/wt/x", "rev-list", "--count", "origin/main..HEAD"],
-      opts: { cwd: "/wt/x" },
+      opts: { cwd: "/wt/x", timeoutMs: 30_000 },
     });
     expect(runner.calls[1]).toEqual({
       cmd: "git",
       args: ["-C", "/wt/x", "diff", "--quiet", "origin/main..HEAD"],
-      opts: { cwd: "/wt/x" },
+      opts: { cwd: "/wt/x", timeoutMs: 30_000 },
     });
   });
 
@@ -237,7 +237,7 @@ describe("GitPrManager.hasUncommittedChanges", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "git",
       args: ["-C", "/wt/x", "status", "--porcelain"],
-      opts: { cwd: "/wt/x" },
+      opts: { cwd: "/wt/x", timeoutMs: 30_000 },
     });
   });
 
@@ -293,7 +293,7 @@ describe("GitPrManager.findOpenPrForBranch", () => {
         "--json",
         "number",
       ],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 60_000 },
     });
   });
 
@@ -345,7 +345,7 @@ describe("GitPrManager.pushAndOpenPr", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "git",
       args: ["-C", "/wt/x", "push", "-u", "origin", branch],
-      opts: { cwd: "/wt/x" },
+      opts: { cwd: "/wt/x", timeoutMs: 120_000 },
     });
 
     // gh pr create の argv。--body は template 置換済み完成本文を直渡し
@@ -368,7 +368,7 @@ describe("GitPrManager.pushAndOpenPr", () => {
         "--body",
         expectedBody,
       ],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 60_000 },
     });
   });
 
@@ -441,7 +441,7 @@ describe("GitPrManager.addLabel", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "gh",
       args: ["pr", "edit", "57", "-R", "owner/name", "--add-label", "loop-pilot"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 60_000 },
     });
   });
 
@@ -466,7 +466,7 @@ describe("GitPrManager.mergePr", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "gh",
       args: ["pr", "merge", "57", "-R", "owner/name", "--squash", "--match-head-commit", "deadbeef"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 60_000 },
     });
   });
 
@@ -564,12 +564,12 @@ describe("GitPrManager.discardWorktree", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "worktree", "remove", "--force", "/wt/ty-123-x"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 30_000 },
     });
     expect(runner.calls[1]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "branch", "-D", "looppilot/ty-123-x"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 30_000 },
     });
     expect(runner.calls).toHaveLength(2);
   });
@@ -591,7 +591,7 @@ describe("GitPrManager.postComment", () => {
         "-f",
         "body=/restart-review",
       ],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 60_000 },
     });
   });
 
@@ -617,12 +617,12 @@ describe("GitPrManager.fetchDefaultBranch", () => {
     expect(runner.calls[0]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "fetch", "origin", "main"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 120_000 },
     });
     expect(runner.calls[1]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "reset", "--hard", "origin/main"],
-      opts: { cwd: "/repo" },
+      opts: { cwd: "/repo", timeoutMs: 30_000 },
     });
   });
 
@@ -686,5 +686,42 @@ describe("GitPrManager.getPrDiffSummary (maxDiffChars)", () => {
     const mgr = new GitPrManager(runner, OPTS);
     const result = await mgr.getPrDiffSummary(7, 10000);
     expect(result.diff).toBe(smallDiff);
+  });
+});
+
+describe("GitPrManager — runner.run に timeoutMs が設定される (ES-465)", () => {
+  it("prepareWorktree の全 runner.run 呼び出しに timeoutMs が設定される", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.prepareWorktree(issue());
+    for (const call of runner.calls) {
+      expect(call.opts.timeoutMs, `${call.cmd} ${call.args.join(" ")}`).toBeTypeOf("number");
+      expect(call.opts.timeoutMs).toBeGreaterThan(0);
+    }
+  });
+
+  it("pushAndOpenPr の全 runner.run 呼び出しに timeoutMs が設定される", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt/test", "push"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["gh", "pr", "create"], { code: 0, stdout: "https://github.com/owner/name/pull/42\n", stderr: "" });
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.pushAndOpenPr("looppilot/ty-123-test", "/wt/test", issue());
+    for (const call of runner.calls) {
+      expect(call.opts.timeoutMs, `${call.cmd} ${call.args.join(" ")}`).toBeTypeOf("number");
+      expect(call.opts.timeoutMs).toBeGreaterThan(0);
+    }
+  });
+
+  it("mergePr の runner.run 呼び出しに timeoutMs が設定される", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "merge"], { code: 0, stdout: "", stderr: "" });
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.mergePr(10, "abc123");
+    for (const call of runner.calls) {
+      expect(call.opts.timeoutMs, `${call.cmd} ${call.args.join(" ")}`).toBeTypeOf("number");
+      expect(call.opts.timeoutMs).toBeGreaterThan(0);
+    }
   });
 });

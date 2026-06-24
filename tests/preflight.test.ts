@@ -2533,3 +2533,16 @@ describe("normalizeRemote", () => {
     expect(normalizeRemote("ssh://git@github.com:443/owner/name.git")).toBe("owner/name");
   });
 });
+
+describe("runPreflight — runner.run に timeoutMs が設定される (ES-465)", () => {
+  it("全 runner.run 呼び出しに timeoutMs が設定される", async () => {
+    const runner = passingRunner();
+    const config = makeConfig();
+    await runPreflight({ runner, config, fetchFn: passingFetch(), notifier: passingNotifier });
+    expect(runner.calls.length).toBeGreaterThan(0);
+    for (const call of runner.calls) {
+      expect(call.opts.timeoutMs, `${call.cmd} ${call.args.join(" ")}`).toBeTypeOf("number");
+      expect(call.opts.timeoutMs).toBeGreaterThan(0);
+    }
+  });
+});
