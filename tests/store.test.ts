@@ -501,6 +501,86 @@ describe("SqliteStore: schema migration (ES-397)", () => {
     }
   });
 
+  it("adds done_transition_pending column to a pre-existing task_session table (ES-462)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "looppilot-migrate-"));
+    const dbPath = path.join(dir, "looppilot-os.db");
+    try {
+      // Legacy schema WITHOUT done_transition_pending column.
+      const legacy = new Database(dbPath);
+      legacy.exec(`
+        CREATE TABLE IF NOT EXISTS run (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          pid INTEGER NOT NULL,
+          started_at TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
+          halt_reason TEXT,
+          pause_meta TEXT
+        );
+        CREATE TABLE IF NOT EXISTS task_session (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id INTEGER NOT NULL REFERENCES run(id),
+          linear_issue_id TEXT NOT NULL,
+          linear_identifier TEXT NOT NULL,
+          issue_title TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          worktree_path TEXT,
+          pr_number INTEGER,
+          state TEXT NOT NULL CHECK (state IN
+            ('claimed','implementing','handing_off','in_review','merged','stopped')),
+          cost_usd REAL,
+          failure_reason TEXT,
+          stop_detail TEXT,
+          agent_summary TEXT,
+          plan_brief TEXT,
+          select_rationale TEXT,
+          started_at TEXT NOT NULL,
+          monitor_started_at TEXT,
+          ended_at TEXT,
+          workflow_fix_attempts INTEGER NOT NULL DEFAULT 0,
+          workflow_handled_error_count INTEGER NOT NULL DEFAULT 0,
+          auto_restart_attempts INTEGER NOT NULL DEFAULT 0,
+          pending_restart_reason TEXT,
+          recovery_attempted INTEGER NOT NULL DEFAULT 0,
+          recovery_action TEXT
+        );
+      `);
+      legacy.prepare(
+        `INSERT INTO run (pid, started_at, state) VALUES (1, '2026-01-01T00:00:00.000Z', 'running')`,
+      ).run();
+      // merged row — should be backfilled to done_transition_pending=1 on migration
+      legacy.prepare(
+        `INSERT INTO task_session
+           (run_id, linear_issue_id, linear_identifier, issue_title, branch, state, started_at)
+         VALUES (1, 'issue-1', 'TY-1', 'test', 'b', 'merged', '2026-01-01T00:00:00.000Z')`,
+      ).run();
+      // stopped row — must NOT be backfilled; transition(done) is never retried for stopped
+      legacy.prepare(
+        `INSERT INTO task_session
+           (run_id, linear_issue_id, linear_identifier, issue_title, branch, state, started_at)
+         VALUES (1, 'issue-2', 'TY-2', 'test2', 'b2', 'stopped', '2026-01-01T00:00:01.000Z')`,
+      ).run();
+      legacy.close();
+
+      // Open via SqliteStore — triggers migrate(), which adds done_transition_pending.
+      const store = new SqliteStore(dbPath);
+      openStores.push(store);
+
+      // Merged rows must be backfilled to 1 so startup recovery retries transition(done).
+      const merged = store.getSession(1);
+      expect(merged.doneTransitionPending).toBe(1);
+
+      // Non-merged rows must stay at 0 — they never need a done transition retry.
+      const stopped = store.getSession(2);
+      expect(stopped.doneTransitionPending).toBe(0);
+
+      // updateSession should work with the new column without throwing.
+      store.updateSession(merged.id, { doneTransitionPending: 0 });
+      expect(store.getSession(merged.id).doneTransitionPending).toBe(0);
+    } finally {
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("opening a fresh DB twice is idempotent (no duplicate-column error)", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "looppilot-migrate-"));
     const dbPath = path.join(dir, "looppilot-os.db");
@@ -990,5 +1070,89 @@ describe("recentSessionSummaries", () => {
       store.updateSession(s.id, { state: "merged", costUsd: i * 0.5, endedAt: clock() });
     }
     expect(store.recentSessionSummaries(3)).toHaveLength(3);
+  });
+});
+
+describe("doneTransitionPending column (ES-462)", () => {
+  it("doneTransitionPending defaults to 0 on createSession", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "test",
+      branch: "b",
+      worktreePath: "/wt/ty-1",
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    expect(session.doneTransitionPending).toBe(0);
+  });
+
+  it("updateSession can set doneTransitionPending to 1 and back to 0", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "test",
+      branch: "b",
+      worktreePath: "/wt/ty-1",
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    store.updateSession(session.id, { doneTransitionPending: 1 });
+    expect(store.getSession(session.id).doneTransitionPending).toBe(1);
+
+    store.updateSession(session.id, { doneTransitionPending: 0 });
+    expect(store.getSession(session.id).doneTransitionPending).toBe(0);
+  });
+
+  it("sessionsWithPendingDoneTransition returns only merged sessions with flag=1", () => {
+    const store = new SqliteStore(":memory:");
+    openStores.push(store);
+    const run = store.createRun(1, "2026-01-01T00:00:00.000Z");
+
+    // merged + pending=1 → should be returned
+    const s1 = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "A",
+      branch: "b1",
+      worktreePath: "/wt/1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s1.id, { state: "merged", endedAt: "2026-01-01T01:00:00.000Z", doneTransitionPending: 1 });
+
+    // merged + pending=0 → should NOT be returned
+    const s2 = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-2",
+      linearIdentifier: "TY-2",
+      issueTitle: "B",
+      branch: "b2",
+      worktreePath: "/wt/2",
+      now: "2026-01-01T00:00:02.000Z",
+    });
+    store.updateSession(s2.id, { state: "merged", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    // in_review + pending=1 → should NOT be returned (not merged)
+    const s3 = store.createSession({
+      runId: run.id,
+      linearIssueId: "issue-3",
+      linearIdentifier: "TY-3",
+      issueTitle: "C",
+      branch: "b3",
+      worktreePath: "/wt/3",
+      now: "2026-01-01T00:00:03.000Z",
+    });
+    store.updateSession(s3.id, { state: "in_review", doneTransitionPending: 1 });
+
+    const pending = store.sessionsWithPendingDoneTransition();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].linearIssueId).toBe("issue-1");
   });
 });

@@ -13,7 +13,7 @@ import {
   instantSleep,
 } from "./fakes.js";
 import type { Config } from "../src/config.js";
-import type { EligibleIssue, PromptArgs, TaskSessionRow } from "../src/types.js";
+import type { EligibleIssue, PromptArgs, TaskSessionRow, TicketState } from "../src/types.js";
 
 // ---- テストヘルパ（Task 12 の makeConfig/issue/makeHarness と同形・独立ファイルのため再定義） ----
 function makeConfig(over: Partial<{
@@ -1601,5 +1601,142 @@ describe("回復 — stopped(looppilot_stopped) + PR ありのセッション回
     const old = h.store.getSession(oldSession.id);
     expect(old.state).toBe("stopped"); // unchanged
     expect(old.runId).toBe(oldRun.id); // not re-parented
+  });
+});
+
+describe("done() transition(done) pending recovery (ES-462)", () => {
+  it("done() sets doneTransitionPending=1 before transition and clears to 0 on success", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    // poll → merged → done() path
+    h.monitor.verdicts = [{ kind: "merged" }];
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.doneTransitionPending).toBe(0);
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+  });
+
+  it("done() leaves doneTransitionPending=1 when transition(done) fails and logs retry message", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(h.store, {
+      state: "in_review",
+      prNumber: 100,
+      monitorStartedAt: "2026-06-04T00:10:00.000Z",
+    });
+    h.monitor.verdicts = [{ kind: "merged" }];
+    // Make transition(done) always fail — failNext only fails once,
+    // but retry(3) calls it 3 times. We need all 3 to fail.
+    // Override transition to throw for "done" state specifically.
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (issueId: string, state: TicketState) => {
+      if (state === "done") throw new Error("Linear API timeout");
+      return origTransition(issueId, state);
+    };
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.doneTransitionPending).toBe(1);
+    expect(h.logs.some((l) => l.includes("will retry on next startup"))).toBe(true);
+  });
+
+  it("recoverPendingSessions retries transition(done) for merged sessions with pending flag", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+
+    // Seed a merged session with doneTransitionPending=1 (simulating previous failed transition)
+    const oldRun = h.store.createRun(3, "2026-06-04T00:00:00.000Z");
+    const s = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Done but stuck",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(s.id, {
+      state: "merged",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      doneTransitionPending: 1,
+    });
+
+    // No eligible issues — just run recovery and idle
+    h.source.queue = [];
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    // transition(done) should have been called
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "done" });
+    // Flag should be cleared
+    const updated = h.store.getSession(s.id);
+    expect(updated.doneTransitionPending).toBe(0);
+    // Log should confirm recovery
+    expect(h.logs.some((l) => l.includes("recovered:") && l.includes("TY-1") && l.includes("Done"))).toBe(true);
+  });
+
+  it("recoverPendingSessions leaves flag=1 and logs warning when retry also fails", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+
+    // Seed a merged session with doneTransitionPending=1
+    const oldRun = h.store.createRun(3, "2026-06-04T00:00:00.000Z");
+    const s = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Done but stuck",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(s.id, {
+      state: "merged",
+      endedAt: "2026-06-04T01:00:00.000Z",
+      doneTransitionPending: 1,
+    });
+
+    // Make transition always fail
+    h.source.transition = async () => {
+      throw new Error("Linear still down");
+    };
+    h.source.queue = [];
+    h.source.getAllEligible = async (_excludeIds: string[]) => {
+      h.orch.requestStop();
+      return [];
+    };
+
+    await h.orch.run();
+
+    // Flag should remain 1
+    const updated = h.store.getSession(s.id);
+    expect(updated.doneTransitionPending).toBe(1);
+    // Warning log present
+    expect(h.logs.some((l) => l.includes("recovery transition(done) still failing") && l.includes("TY-1"))).toBe(true);
   });
 });

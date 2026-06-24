@@ -72,6 +72,7 @@ export interface TaskSessionRow {
   pendingRestartReason: string | null; // stopReason for which the last /restart-review was posted, or null if none pending
   recoveryAttempted: number;    // 0 or 1 — whether Codex recovery was attempted
   recoveryAction: string | null; // action chosen by Codex (fix_code/rebase/restart_review/escalate/abandon)
+  doneTransitionPending: number; // 0 or 1 — whether transition(done) is still pending (ES-462)
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
