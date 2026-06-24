@@ -41,7 +41,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<string[]> {
   const repoPath = config.repo.path;
   const repoSlug = config.repo.remote;
   const branch = config.repo.defaultBranch;
-  const opts = { cwd: repoPath };
+  const opts = { cwd: repoPath, timeoutMs: 30_000 };
 
   // カーネル §9: 全項目を実行して集約。各 check 内で try/catch し、途中 throw しない。
   await checkGitClean(runner, repoPath, branch, opts, errors);          // §9.2
@@ -97,7 +97,7 @@ async function checkRemote(
   errors: string[],
 ): Promise<void> {
   try {
-    const ls = await runner.run("git", ["-C", repoPath, "ls-remote", "origin", "HEAD"], opts);
+    const ls = await runner.run("git", ["-C", repoPath, "ls-remote", "origin", "HEAD"], { ...opts, timeoutMs: 60_000 });
     if (ls.code !== 0) {
       errors.push(`git: remote 'origin' に到達できません（${ls.stderr.trim()}）`);
     }
@@ -989,7 +989,7 @@ async function checkGhAuth(
   errors: string[],
 ): Promise<void> {
   try {
-    const auth = await runner.run("gh", ["auth", "status"], opts);
+    const auth = await runner.run("gh", ["auth", "status"], { ...opts, timeoutMs: 60_000 });
     if (auth.code !== 0) {
       errors.push(`gh: 認証されていません（gh auth login を実行してください: ${auth.stderr.trim()}）`);
     }
@@ -1006,7 +1006,7 @@ async function checkPushPermission(
   errors: string[],
 ): Promise<void> {
   try {
-    const push = await runner.run("gh", ["api", `repos/${repoSlug}`, "--jq", ".permissions.push"], opts);
+    const push = await runner.run("gh", ["api", `repos/${repoSlug}`, "--jq", ".permissions.push"], { ...opts, timeoutMs: 60_000 });
     if (push.code !== 0) {
       errors.push(`gh: リポジトリ ${repoSlug} の権限を取得できません（${push.stderr.trim()}）`);
     } else if (push.stdout.trim() !== "true") {
@@ -1026,7 +1026,7 @@ async function checkBranchProtection(
   errors: string[],
 ): Promise<void> {
   try {
-    const r = await runner.run("gh", ["api", `repos/${repoSlug}/branches/${branch}/protection`], opts);
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/branches/${branch}/protection`], { ...opts, timeoutMs: 60_000 });
     if (isHttp404(r)) return; // 保護なし = OK
     if (isFeatureUnavailable403(r)) return; // Free plan private リポ: 機能未提供 = 保護なし = OK
     if (r.code !== 0) {
@@ -1138,7 +1138,7 @@ async function checkBranchProtection(
     const sigRes = await runner.run(
       "gh",
       ["api", `repos/${repoSlug}/branches/${branch}/protection/required_signatures`],
-      opts,
+      { ...opts, timeoutMs: 60_000 },
     );
     if (!isHttp404(sigRes) && !isFeatureUnavailable403(sigRes) && sigRes.code === 0) {
       let sigData: { enabled?: boolean };
@@ -1167,7 +1167,7 @@ async function resolveAuthenticatedLogin(
   opts: { cwd: string },
 ): Promise<string | null> {
   try {
-    const r = await runner.run("gh", ["api", "user", "--jq", ".login"], opts);
+    const r = await runner.run("gh", ["api", "user", "--jq", ".login"], { ...opts, timeoutMs: 60_000 });
     if (r.code !== 0) return null;
     const login = r.stdout.trim();
     return login.length > 0 ? login : null;
@@ -1183,7 +1183,7 @@ async function resolveAuthenticatedId(
   opts: { cwd: string },
 ): Promise<number | null> {
   try {
-    const r = await runner.run("gh", ["api", "user", "--jq", ".id"], opts);
+    const r = await runner.run("gh", ["api", "user", "--jq", ".id"], { ...opts, timeoutMs: 60_000 });
     if (r.code !== 0) return null;
     const id = parseInt(r.stdout.trim(), 10);
     return isNaN(id) ? null : id;
@@ -1201,7 +1201,7 @@ async function checkRulesets(
   errors: string[],
 ): Promise<void> {
   try {
-    const r = await runner.run("gh", ["api", `repos/${repoSlug}/rules/branches/${branch}`], opts);
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/rules/branches/${branch}`], { ...opts, timeoutMs: 60_000 });
     if (isHttp404(r)) return; // ルールセットなし = OK
     if (isFeatureUnavailable403(r)) return; // Free plan private リポ: 機能未提供 = ルールセットなし = OK
     if (r.code !== 0) {
@@ -1303,7 +1303,7 @@ async function checkRulesetBypassActors(
   opts: { cwd: string },
 ): Promise<boolean> {
   try {
-    const r = await runner.run("gh", ["api", `repos/${repoSlug}/rulesets/${rulesetId}`], opts);
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/rulesets/${rulesetId}`], { ...opts, timeoutMs: 60_000 });
     if (r.code !== 0) return false;
     const ruleset: {
       bypass_actors?: Array<{ actor_id?: number; actor_type?: string; bypass_mode?: string }>;
@@ -1333,7 +1333,7 @@ async function checkGateLabel(
 ): Promise<void> {
   try {
     // gh label list は既定 limit 30 のため使わない。labels API を --paginate で全件取得し大小無視で照合（カーネル §5.3）。
-    const r = await runner.run("gh", ["api", `repos/${repoSlug}/labels`, "--paginate", "--jq", ".[].name"], opts);
+    const r = await runner.run("gh", ["api", `repos/${repoSlug}/labels`, "--paginate", "--jq", ".[].name"], { ...opts, timeoutMs: 60_000 });
     if (r.code !== 0) {
       errors.push(`gh: リポジトリ ${repoSlug} のラベル一覧を取得できません（${r.stderr.trim()}）`);
       return;
@@ -1366,7 +1366,7 @@ async function checkAutoMerge(
     const r = await runner.run(
       "gh",
       ["api", `repos/${repoSlug}/actions/variables/LOOPPILOT_AUTO_MERGE`],
-      opts,
+      { ...opts, timeoutMs: 60_000 },
     );
     if (isHttp404(r)) return; // 未設定 = false = OK
     if (r.code !== 0) {
@@ -1405,7 +1405,7 @@ async function checkStateCommentAuthors(
     const r = await runner.run(
       "gh",
       ["api", `repos/${repoSlug}/actions/variables/LOOPPILOT_STATE_COMMENT_AUTHORS`],
-      opts,
+      { ...opts, timeoutMs: 60_000 },
     );
 
     // R = リポが実際に書き手として使う著者集合（= LoopPilot が信頼コメントの著者に使う集合）

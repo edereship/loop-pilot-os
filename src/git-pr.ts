@@ -50,7 +50,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const fetch = await this.runner.run(
       "git",
       ["-C", repoPath, "fetch", "origin", defaultBranch],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 120_000 },
     );
     if (fetch.code !== 0) {
       throw new Error(
@@ -74,7 +74,7 @@ export class GitPrManager implements GitPrManagerInterface {
           worktreePath,
           `origin/${defaultBranch}`,
         ],
-        { cwd: repoPath },
+        { cwd: repoPath, timeoutMs: 30_000 },
       );
       if (res.code === 0) {
         return { branch, worktreePath };
@@ -97,7 +97,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const count = await this.runner.run(
       "git",
       ["-C", worktreePath, "rev-list", "--count", range],
-      { cwd: worktreePath },
+      { cwd: worktreePath, timeoutMs: 30_000 },
     );
     if (count.code !== 0) {
       throw new Error(
@@ -112,7 +112,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const diff = await this.runner.run(
       "git",
       ["-C", worktreePath, "diff", "--quiet", range],
-      { cwd: worktreePath },
+      { cwd: worktreePath, timeoutMs: 30_000 },
     );
     // diff --quiet: 差分なし → code 0、差分あり → code 1（非0）
     return diff.code !== 0;
@@ -122,7 +122,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const res = await this.runner.run(
       "git",
       ["-C", worktreePath, "status", "--porcelain"],
-      { cwd: worktreePath },
+      { cwd: worktreePath, timeoutMs: 30_000 },
     );
     if (res.code !== 0) {
       throw new Error(
@@ -137,7 +137,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const res = await this.runner.run(
       "gh",
       ["pr", "list", "-R", remote, "--head", branch, "--state", "open", "--json", "number"],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     );
     // 非0終了は throw（他の gh ラッパと一貫）。stdout が空/HTML/部分でも
     // JSON.parse の偶発例外に頼らず明示的に失敗を上げる。
@@ -163,7 +163,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const push = await this.runner.run(
       "git",
       ["-C", worktreePath, "push", "-u", "origin", branch],
-      { cwd: worktreePath },
+      { cwd: worktreePath, timeoutMs: 120_000 },
     );
     if (push.code !== 0) {
       throw new Error(
@@ -189,7 +189,7 @@ export class GitPrManager implements GitPrManagerInterface {
         "--body",
         body,
       ],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     );
 
     if (res.code !== 0) {
@@ -214,7 +214,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const res = await this.runner.run(
       "gh",
       ["pr", "edit", String(prNumber), "-R", remote, "--add-label", label],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     );
     if (res.code !== 0) {
       throw new Error(
@@ -228,7 +228,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const res = await this.runner.run(
       "gh",
       ["pr", "merge", String(prNumber), "-R", remote, "--squash", "--match-head-commit", headSha],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     );
     if (res.code !== 0) {
       throw new Error(
@@ -247,7 +247,7 @@ export class GitPrManager implements GitPrManagerInterface {
         "-f",
         `body=${body}`,
       ],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     );
     if (res.code !== 0) {
       throw new Error(
@@ -261,10 +261,10 @@ export class GitPrManager implements GitPrManagerInterface {
     await this.runner.run(
       "git",
       ["-C", repoPath, "worktree", "remove", "--force", worktreePath],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 30_000 },
     );
     await this.runner.run("git", ["-C", repoPath, "branch", "-D", branch], {
-      cwd: repoPath,
+      cwd: repoPath, timeoutMs: 30_000,
     });
   }
 
@@ -273,7 +273,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const viewRes = await this.runner.run(
       "gh",
       ["pr", "view", String(prNumber), "-R", remote, "--json", "title,body"],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     );
     if (viewRes.code !== 0) {
       throw new Error(
@@ -294,7 +294,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const diffRes = await this.runner.run(
       "gh",
       ["pr", "diff", String(prNumber), "-R", remote],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     );
     if (diffRes.code !== 0) {
       throw new Error(
@@ -315,7 +315,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const fetchRes = await this.runner.run(
       "git",
       ["-C", repoPath, "fetch", "origin", defaultBranch],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 120_000 },
     );
     if (fetchRes.code !== 0) {
       throw new Error(
@@ -325,7 +325,7 @@ export class GitPrManager implements GitPrManagerInterface {
     const resetRes = await this.runner.run(
       "git",
       ["-C", repoPath, "reset", "--hard", `origin/${defaultBranch}`],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 30_000 },
     );
     if (resetRes.code !== 0) {
       throw new Error(

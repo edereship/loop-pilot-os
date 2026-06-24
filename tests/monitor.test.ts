@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { GhLoopPilotMonitor } from "../src/monitor.js";
 import { FakeCommandRunner } from "./fakes.js";
 import type { MonitorVerdict, MergeReadiness } from "../src/types.js";
@@ -961,5 +961,20 @@ describe("GhLoopPilotMonitor — gh 失敗時は throw（オーケストレー�
       ready: true,
       headSha: "deadbeefcafe",
     });
+  });
+});
+
+describe("GhLoopPilotMonitor — runner.run に timeoutMs が設定される (ES-465)", () => {
+  it("poll() の全 runner.run 呼び出しに timeoutMs が設定される", async () => {
+    const { monitor, runner } = makeMonitor({
+      view: prView(),
+      comments: commentsSlurp([[]]),
+    });
+    await monitor.poll(1);
+    expect(runner.calls.length).toBeGreaterThan(0);
+    for (const call of runner.calls) {
+      expect(call.opts.timeoutMs, `${call.cmd} ${call.args.join(" ")}`).toBeTypeOf("number");
+      expect(call.opts.timeoutMs).toBeGreaterThan(0);
+    }
   });
 });
