@@ -2642,7 +2642,7 @@ export class Orchestrator {
     if (fresh.monitorStartedAt === null) return 0;
     const startMs = Date.parse(fresh.monitorStartedAt);
     const nowMs = Date.parse(this.clock());
-    return (nowMs - startMs) / 60000;
+    return Math.max(0, (nowMs - startMs) / 60000);
   }
 }
 
