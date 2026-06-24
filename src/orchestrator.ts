@@ -1196,7 +1196,17 @@ export class Orchestrator {
             }
           }
         } catch (err) {
-          this.log(`groom: memory commit failed (non-fatal): ${errMsg(err)}`);
+          const commitErr = errMsg(err);
+          this.log(`groom: memory commit failed (non-fatal): ${commitErr}`);
+          // The commit (or git add) failed so the memory changes were not persisted.
+          // Mark the corresponding update_memory results as failed so groom_log and
+          // summaryForSelect reflect the actual outcome (Finding 2).
+          for (const r of executionResults) {
+            if (r.outcome === "executed" && r.action.type === "update_memory") {
+              r.outcome = "failed";
+              r.error = `memory commit failed: ${commitErr}`;
+            }
+          }
         }
       }
 

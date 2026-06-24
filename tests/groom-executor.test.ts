@@ -220,6 +220,38 @@ describe("executeGroomActions — split partial failure (Finding 1)", () => {
     expect(removeCall?.args).toEqual(["ES-1", ["looppilot"]]);
   });
 
+  it("surfaces opt-in label removal failure in error when removeLabels fails after partial split", async () => {
+    let createCount = 0;
+    client.createIssue = async (fields) => {
+      client.calls.push({ method: "createIssue", args: [fields] });
+      createCount++;
+      if (createCount === 2) throw new Error("Linear 429 rate limit");
+      return `ES-${100 + createCount}`;
+    };
+    client.removeLabels = async (issueId, names) => {
+      client.calls.push({ method: "removeLabels", args: [issueId, names] });
+      throw new Error("Linear 503 service unavailable");
+    };
+
+    const action: GroomAction = {
+      type: "split", issueId: "ES-1",
+      subtasks: [
+        { title: "Sub A", description: "A desc" },
+        { title: "Sub B", description: "B desc" },
+      ],
+      rationale: "too large",
+    };
+    const results = await executeGroomActions([action], ctx());
+
+    expect(results[0].outcome).toBe("failed");
+    // Error must mention both the original child-creation failure and the label-removal failure
+    expect(results[0].error).toContain("Linear 429 rate limit");
+    expect(results[0].error).toContain("opt-in label removal also failed");
+    expect(results[0].error).toContain("Linear 503 service unavailable");
+    // removeLabels was still called even though it threw
+    expect(client.calls.find((c) => c.method === "removeLabels")).toBeDefined();
+  });
+
   it("does not call removeLabels when no children were created before failure", async () => {
     client.createIssue = async () => {
       client.calls.push({ method: "createIssue", args: [] });

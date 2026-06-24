@@ -67,7 +67,19 @@ async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<vo
           await linearClient.updateIssue(action.issueId, {
             description: parent.description ? `${parent.description}\n\n${partialNote}` : partialNote,
           }).catch(() => {});
-          await linearClient.removeLabels(action.issueId, [ctx.optInLabel]).catch(() => {});
+          // Surface label-removal failure: if removeLabels also fails the parent stays opt-in
+          // and the next GROOM run will re-split it, duplicating the already-created children.
+          // Capture the error and include it in the thrown message so it appears in groom_log.
+          let labelRemoveErr: string | null = null;
+          await linearClient.removeLabels(action.issueId, [ctx.optInLabel]).catch((e: unknown) => {
+            labelRemoveErr = e instanceof Error ? e.message : String(e);
+          });
+          const baseMsg = err instanceof Error ? err.message : String(err);
+          throw new Error(
+            labelRemoveErr != null
+              ? `${baseMsg}; opt-in label removal also failed (parent may be re-split): ${labelRemoveErr}`
+              : baseMsg,
+          );
         }
         throw err;
       }
