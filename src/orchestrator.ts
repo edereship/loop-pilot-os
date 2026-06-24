@@ -2640,8 +2640,16 @@ export class Orchestrator {
   private elapsedMinutesSinceMonitorStart(sessionId: number): number {
     const fresh = this.store.getSession(sessionId);
     if (fresh.monitorStartedAt === null) return 0;
+    const now = this.clock();
+    const nowMs = Date.parse(now);
     const startMs = Date.parse(fresh.monitorStartedAt);
-    const nowMs = Date.parse(this.clock());
+    if (startMs > nowMs) {
+      // monitorStartedAt is in the future (transient NTP skew or bad persisted timestamp).
+      // Return 0 without overwriting the stored start: persisting the stale wall-clock
+      // value here would cause the next poll (after NTP corrects the clock) to measure
+      // the skew delta as elapsed monitoring time and fire guards prematurely.
+      return 0;
+    }
     return (nowMs - startMs) / 60000;
   }
 }
