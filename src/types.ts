@@ -69,6 +69,7 @@ export interface TaskSessionRow {
   workflowFixAttempts: number;       // number of fix-agent runs for this session (budget counter)
   workflowHandledErrorCount: number; // errorCommentCount at the time of the last successful fix (guard counter)
   autoRestartAttempts: number;       // number of /restart-review comments posted (durable cap counter)
+  quotaRetryAttempts: number;        // number of quota-wait retries in the current episode (durable cap counter)
   pendingRestartReason: string | null; // stopReason for which the last /restart-review was posted, or null if none pending
   recoveryAttempted: number;    // 0 or 1 — whether Codex recovery was attempted
   recoveryAction: string | null; // action chosen by Codex (fix_code/rebase/restart_review/escalate/abandon)

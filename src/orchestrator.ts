@@ -346,7 +346,22 @@ export class Orchestrator {
       }
       // done / in_progress / corrupted / not_engaged = open 扱い → 採用して MONITOR 再開
       case "done":
-      case "in_progress":
+      case "in_progress": {
+        // ES-469 Finding 2: a non-stopped verdict confirms the quota episode has recovered.
+        // Reset the durable count and non-done-path pending reason before adopting so
+        // monitorSession does not carry stale quotaRetryAttempts (e.g. 6) into the next
+        // quota episode if its first poll never observes an in_progress verdict.
+        const clearPendingReason = session.pendingRestartReason !== null &&
+            session.pendingRestartReason !== "ci_failed" &&
+            session.pendingRestartReason !== "merge_conflict";
+        if (session.quotaRetryAttempts > 0 || clearPendingReason) {
+          this.store.updateSession(session.id, {
+            quotaRetryAttempts: 0,
+            ...(clearPendingReason ? { pendingRestartReason: null } : {}),
+          });
+        }
+        return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
+      }
       case "corrupted":
       case "not_engaged":
         return await this.adoptAndMonitor(session, prNumber, session.monitorStartedAt);
@@ -641,6 +656,7 @@ export class Orchestrator {
       stopDetail: null,
       endedAt: null,
       autoRestartAttempts: 0,
+      quotaRetryAttempts: 0,
       pendingRestartReason: null,
       monitorStartedAt: this.clock(),
     });
@@ -1637,7 +1653,7 @@ export class Orchestrator {
     // state from autoRestartAttempts > 0 — that was too broad (blocked even different-reason
     // stops on recovery) and was set before posting (so a pre-post crash left a false block).
     let pendingRestartReason: string | undefined = session.pendingRestartReason ?? undefined;
-    let quotaRetryCount = 0;
+    let quotaRetryCount = session.quotaRetryAttempts;
     let quotaResumedNotified = false;
     let firstPoll = true;
     while (true) {
@@ -1756,6 +1772,7 @@ export class Orchestrator {
             const recoveredForPending = this.store.getSession(session.id);
             pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
             autoRestartCount = recoveredForPending.autoRestartAttempts;
+            quotaRetryCount = recoveredForPending.quotaRetryAttempts;
           }
           continue;
         }
@@ -1811,9 +1828,13 @@ export class Orchestrator {
             mergeFailures = 0;
             // Reload pendingRestartReason so the stale guard fires on the next poll if
             // done-path recovery was applied (ES-450 Finding 1).
+            // Also reload quotaRetryCount: recovery resets quotaRetryAttempts in the DB
+            // but the local counter would otherwise retain its pre-recovery value, causing
+            // the cap to trip on the next codex_usage_limit stop (ES-469 Finding).
             {
               const recoveredForPending = this.store.getSession(session.id);
               pendingRestartReason = recoveredForPending.pendingRestartReason ?? undefined;
+              quotaRetryCount = recoveredForPending.quotaRetryAttempts;
             }
             continue;
           }
@@ -1858,6 +1879,7 @@ export class Orchestrator {
                 const recoveredState = this.store.getSession(session.id);
                 pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
                 autoRestartCount = recoveredState.autoRestartAttempts;
+                quotaRetryCount = recoveredState.quotaRetryAttempts;
               }
               continue;
             }
@@ -1931,6 +1953,7 @@ export class Orchestrator {
                 const quotaRecoveredState = this.store.getSession(session.id);
                 pendingRestartReason = quotaRecoveredState.pendingRestartReason ?? undefined;
                 autoRestartCount = quotaRecoveredState.autoRestartAttempts;
+                quotaRetryCount = quotaRecoveredState.quotaRetryAttempts;
               }
               continue;
             }
@@ -1985,6 +2008,7 @@ export class Orchestrator {
             // restart is in flight and applies the stale guard above.
             pendingRestartReason = verdict.stopReason ?? undefined;
             this.store.updateSession(session.id, {
+              quotaRetryAttempts: quotaRetryCount,
               pendingRestartReason: verdict.stopReason,
             });
             continue;
@@ -2011,6 +2035,7 @@ export class Orchestrator {
             const recoveredState = this.store.getSession(session.id);
             pendingRestartReason = recoveredState.pendingRestartReason ?? undefined;
             autoRestartCount = recoveredState.autoRestartAttempts;
+            quotaRetryCount = recoveredState.quotaRetryAttempts;
             continue;
           }
         }
@@ -2053,6 +2078,7 @@ export class Orchestrator {
             // cap applies per outage episode; after a confirmed recovery the next
             // exhaustion begins at count=1 again (ES-410 Finding 4).
             quotaRetryCount = 0;
+            this.store.updateSession(session.id, { quotaRetryAttempts: 0 });
             quotaResumedNotified = true;
           }
           const timeout = this.config.safety.monitorTimeoutMinutes;
@@ -2393,6 +2419,7 @@ export class Orchestrator {
             stopDetail: null,
             endedAt: null,
             autoRestartAttempts: 0,
+            quotaRetryAttempts: 0,
             recoveryAttempted: 1,
           };
           if (recoveryCost > 0) {
