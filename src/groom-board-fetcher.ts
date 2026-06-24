@@ -52,12 +52,25 @@ export class GroomBoardFetcher {
   private readonly projectId: string;
   private readonly stateIds: Record<TicketState, string>;
   private readonly fetchFn: FetchFn;
+  private cachedNodes: BoardIssueNode[] | null = null;
 
   constructor(opts: GroomBoardFetcherOptions) {
     this.apiKey = opts.apiKey;
     this.projectId = opts.projectId;
     this.stateIds = opts.stateIds;
     this.fetchFn = opts.fetchFn;
+  }
+
+  /** Clear the cached nodes so the next call re-fetches from the API. */
+  refresh(): void {
+    this.cachedNodes = null;
+  }
+
+  private async ensureFetched(): Promise<BoardIssueNode[]> {
+    if (this.cachedNodes === null) {
+      this.cachedNodes = await this.fetchAll();
+    }
+    return this.cachedNodes;
   }
 
   private async fetchAll(): Promise<BoardIssueNode[]> {
@@ -82,7 +95,7 @@ export class GroomBoardFetcher {
   }
 
   async getBoardState(activeSessionPrNumbers: Map<string, number | null>): Promise<BoardState> {
-    const nodes = await this.fetchAll();
+    const nodes = await this.ensureFetched();
     const { todo, in_progress, in_review, done } = this.stateIds;
 
     // Build a set of identifiers that are blocked by another issue in this project.
@@ -143,7 +156,7 @@ export class GroomBoardFetcher {
   }
 
   async getProjectIssueIds(): Promise<Set<string>> {
-    const nodes = await this.fetchAll();
+    const nodes = await this.ensureFetched();
     return new Set(nodes.map((n) => n.identifier));
   }
 
@@ -152,7 +165,7 @@ export class GroomBoardFetcher {
   }
 
   async getDoneIssueIds(): Promise<Set<string>> {
-    const nodes = await this.fetchAll();
+    const nodes = await this.ensureFetched();
     return new Set(nodes.filter((n) => n.state.id === this.stateIds.done).map((n) => n.identifier));
   }
 }

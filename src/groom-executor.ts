@@ -1,6 +1,16 @@
 import type { GroomAction } from "./types.js";
-import type { GroomLinearClient } from "./groom-linear-client.js";
 import { writeCategory } from "./memory-store.js";
+
+/** Structural interface for the Linear client used during action execution. */
+export interface IExecutorLinearClient {
+  updatePriority(issueId: string, priority: number): Promise<void>;
+  updateIssue(issueId: string, fields: Record<string, unknown>): Promise<void>;
+  createIssue(fields: Record<string, unknown>): Promise<string>;
+  closeIssue(issueId: string, rationale: string): Promise<void>;
+  addLabels(issueId: string, names: string[]): Promise<void>;
+  removeLabels(issueId: string, names: string[]): Promise<void>;
+  getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }>;
+}
 
 export interface ExecutionResult {
   action: GroomAction;
@@ -9,7 +19,7 @@ export interface ExecutionResult {
 }
 
 export interface ExecutorContext {
-  linearClient: GroomLinearClient;
+  linearClient: IExecutorLinearClient;
   repoPath: string;
   maxCharsPerFile: number;
 }

@@ -382,13 +382,33 @@ export class FakeGroomBoardFetcher {
   projectIssueIds: Set<string> = new Set();
   doneIssueIds: Set<string> = new Set();
   calls: string[] = [];
+  private _failNextMethods = new Map<string, Error>();
+
+  /** Make the next call to `method` throw `error` (or a generic error). */
+  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds", error?: Error): void {
+    this._failNextMethods.set(method, error ?? new Error(`FakeGroomBoardFetcher.${method} forced failure`));
+  }
+
+  private _maybeThrow(method: string): void {
+    const err = this._failNextMethods.get(method);
+    if (err) {
+      this._failNextMethods.delete(method);
+      throw err;
+    }
+  }
+
+  refresh(): void {
+    this.calls.push("refresh");
+  }
 
   async getBoardState(_prMap: Map<string, number | null>): Promise<BoardState> {
     this.calls.push("getBoardState");
+    this._maybeThrow("getBoardState");
     return this.boardState;
   }
   async getProjectIssueIds(): Promise<Set<string>> {
     this.calls.push("getProjectIssueIds");
+    this._maybeThrow("getProjectIssueIds");
     return this.projectIssueIds;
   }
   async getAllIssueIds(): Promise<Set<string>> {
@@ -397,6 +417,7 @@ export class FakeGroomBoardFetcher {
   }
   async getDoneIssueIds(): Promise<Set<string>> {
     this.calls.push("getDoneIssueIds");
+    this._maybeThrow("getDoneIssueIds");
     return this.doneIssueIds;
   }
 }

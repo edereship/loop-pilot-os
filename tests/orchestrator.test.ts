@@ -3720,4 +3720,68 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(groomLog.outcome).toBe("skipped");
     expect(groomLog.errorDetail).toContain("interrupted");
   });
+
+  it("board fetch failure skips GROOM and session still completes", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // Make getBoardState throw
+    h.groomBoardFetcher.failNext("getBoardState", new Error("network timeout"));
+
+    // SELECT succeeds (2 issues needed to trigger planner call)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Session should still complete despite GROOM board fetch failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+
+    // groom_log records a skip with the board fetch error detail
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("skipped");
+    expect(groomLog.errorDetail).toContain("board fetch failed");
+  });
+
+  it("validation context fetch failure skips GROOM execution and session still completes", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM parse succeeds, but getProjectIssueIds throws during validation context fetch
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Reprioritized ES-1"}\n```',
+    });
+    h.groomBoardFetcher.failNext("getProjectIssueIds", new Error("db locked"));
+
+    // SELECT succeeds
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Session should still complete despite GROOM validation context failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+
+    // groom_log records error with validation context fetch error detail
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("validation context fetch failed");
+  });
 });

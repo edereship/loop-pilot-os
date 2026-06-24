@@ -40,6 +40,8 @@ export interface IGroomBoardFetcher {
   getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
   getProjectIssueIds(): Promise<Set<string>>;
   getDoneIssueIds(): Promise<Set<string>>;
+  /** Clear any per-cycle cache so fresh data is fetched in the next call. */
+  refresh(): void;
 }
 
 export interface IGroomLinearClient {
@@ -904,14 +906,21 @@ export class Orchestrator {
     }
 
     this.groomLoopIndex++;
-    const groomLogRow = this.store.insertGroomLog({
-      runId: this.runId,
-      loopIndex: this.groomLoopIndex,
-      startedAt: this.clock(),
-    });
+    let groomLogRow: { id: number };
+    try {
+      groomLogRow = this.store.insertGroomLog({
+        runId: this.runId,
+        loopIndex: this.groomLoopIndex,
+        startedAt: this.clock(),
+      });
+    } catch (err) {
+      this.log(`groom: failed to insert groom_log, skipping: ${errMsg(err)}`);
+      return { control: "continue", summary: null };
+    }
 
     try {
       // 1. Fetch board state
+      this.groomDeps.boardFetcher.refresh();
       const activeSessionPrNumbers = new Map<string, number | null>();
       for (const s of this.store.activeSessions()) {
         activeSessionPrNumbers.set(s.linearIdentifier, s.prNumber);
@@ -1064,7 +1073,7 @@ export class Orchestrator {
 
       // 6. Execute one action at a time with SIGINT check per action (D-14)
       const executorCtx: ExecutorContext = {
-        linearClient: this.groomDeps.linearClient as import("./groom-linear-client.js").GroomLinearClient,
+        linearClient: this.groomDeps.linearClient,
         repoPath,
         maxCharsPerFile: this.config.memory.maxCharsPerFile,
       };
@@ -1096,8 +1105,12 @@ export class Orchestrator {
 
         try {
           const [result] = await executeGroomActions([action], executorCtx);
+          if (result.outcome === "failed") {
+            this.log(`groom: action failed (type=${action.type}, target=${"issueId" in action ? action.issueId : "n/a"}): ${result.error ?? "unknown"}`);
+          }
           executionResults.push(result);
         } catch (err) {
+          this.log(`groom: action exception (type=${action.type}, target=${"issueId" in action ? action.issueId : "n/a"}): ${errMsg(err)}`);
           executionResults.push({ action, outcome: "failed", error: errMsg(err) });
         }
       }
@@ -1145,11 +1158,15 @@ export class Orchestrator {
       return { control: "continue", summary: groomOutput.summary };
     } catch (err) {
       this.log(`groom: unexpected error, skipping: ${errMsg(err)}`);
-      this.store.updateGroomLog(groomLogRow.id, {
-        endedAt: this.clock(),
-        outcome: "error",
-        errorDetail: `unexpected: ${errMsg(err)}`,
-      });
+      try {
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `unexpected: ${errMsg(err)}`,
+        });
+      } catch (logErr) {
+        this.log(`groom: failed to update groom_log in error handler: ${errMsg(logErr)}`);
+      }
       return { control: "continue", summary: null };
     }
   }
