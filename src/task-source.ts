@@ -38,8 +38,18 @@ const COMMENT_CREATE_MUTATION = `mutation CommentCreate($issueId: String!, $body
 // （opt_in_label がワークスペースラベルとして定義されているケースに対応）。
 const SETUP_QUERY = `query Setup {
   viewer { id name }
-  teams { nodes { id key states { nodes { id name } } labels { nodes { id name } } projects { nodes { id name } } } }
-  issueLabels { nodes { id name } }
+  teams { nodes { id key states { nodes { id name } } labels(first: 250) { nodes { id name } pageInfo { hasNextPage endCursor } } projects { nodes { id name } } } }
+  issueLabels(first: 250) { nodes { id name } pageInfo { hasNextPage endCursor } }
+}`;
+
+const TEAM_LABELS_QUERY = `query TeamLabels($teamId: String!, $after: String) {
+  team(id: $teamId) {
+    labels(first: 250, after: $after) { nodes { id name } pageInfo { hasNextPage endCursor } }
+  }
+}`;
+
+const WORKSPACE_LABELS_QUERY = `query WorkspaceLabels($after: String) {
+  issueLabels(first: 250, after: $after) { nodes { id name } pageInfo { hasNextPage endCursor } }
 }`;
 
 interface GraphQLResponse<T> {
@@ -248,6 +258,12 @@ export class LinearTaskSource implements TaskSource {
 
 // ---- プリフライト/main 用のセットアップ解決 ----
 
+interface LabelNode { id: string; name: string; }
+interface LabelPage {
+  nodes: LabelNode[];
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+}
+
 interface SetupData {
   viewer: { id: string; name: string };
   teams: {
@@ -255,12 +271,47 @@ interface SetupData {
       id: string;
       key: string;
       states: { nodes: Array<{ id: string; name: string }> };
-      labels: { nodes: Array<{ id: string; name: string }> };
+      labels: LabelPage;
       projects: { nodes: Array<{ id: string; name: string }> };
     }>;
   };
   // ワークスペース全体のラベル（team スコープに無いラベルの解決に使う）。
-  issueLabels: { nodes: Array<{ id: string; name: string }> };
+  issueLabels: LabelPage;
+}
+
+async function fetchAllTeamLabels(
+  fetchFn: FetchFn,
+  apiKey: string,
+  teamId: string,
+  initial: LabelPage,
+): Promise<LabelNode[]> {
+  const all = [...initial.nodes];
+  let { hasNextPage, endCursor } = initial.pageInfo;
+  while (hasNextPage) {
+    const data = await graphql<{ team: { labels: LabelPage } }>(
+      fetchFn, apiKey, TEAM_LABELS_QUERY, { teamId, after: endCursor },
+    );
+    all.push(...data.team.labels.nodes);
+    ({ hasNextPage, endCursor } = data.team.labels.pageInfo);
+  }
+  return all;
+}
+
+async function fetchAllWorkspaceLabels(
+  fetchFn: FetchFn,
+  apiKey: string,
+  initial: LabelPage,
+): Promise<LabelNode[]> {
+  const all = [...initial.nodes];
+  let { hasNextPage, endCursor } = initial.pageInfo;
+  while (hasNextPage) {
+    const data = await graphql<{ issueLabels: LabelPage }>(
+      fetchFn, apiKey, WORKSPACE_LABELS_QUERY, { after: endCursor },
+    );
+    all.push(...data.issueLabels.nodes);
+    ({ hasNextPage, endCursor } = data.issueLabels.pageInfo);
+  }
+  return all;
 }
 
 export interface LinearSetupRequest {
@@ -324,15 +375,23 @@ export async function resolveLinearSetup(
     }
   }
 
+  // Paginate labels before resolving the opt-in label and building the label map so that
+  // valid labels beyond the first SETUP_QUERY page are not silently omitted (Finding 6).
   // ラベルは team スコープ + ワークスペーススコープの和集合から解決する
   // （カーネル §5.5: `team.labels`+workspace labels）。team ラベルを優先。
+  const [teamLabels, wsLabels] = await Promise.all([
+    fetchAllTeamLabels(fetchFn, apiKey, team.id, team.labels),
+    fetchAllWorkspaceLabels(fetchFn, apiKey, data.issueLabels),
+  ]);
+
   const label =
-    team.labels.nodes.find((l) => l.name === req.optInLabel) ??
-    data.issueLabels.nodes.find((l) => l.name === req.optInLabel);
+    teamLabels.find((l) => l.name === req.optInLabel) ??
+    wsLabels.find((l) => l.name === req.optInLabel);
   if (!label) {
     missing.push(`label "${req.optInLabel}"`);
   }
 
+  // 見つからない要素は名前を列挙して 1 回でまとめて throw（プリフライトの fail-fast 用）。
   if (missing.length > 0) {
     throw new Error(
       `Linear setup resolution failed; not found: ${missing.join(", ")}`,
@@ -341,15 +400,15 @@ export async function resolveLinearSetup(
 
   // Build full label map: team labels (priority) + workspace labels
   const labelMap = new Map<string, string>();
-  for (const l of data.issueLabels.nodes) {
+  for (const l of wsLabels) {
     labelMap.set(l.name, l.id);
   }
-  for (const l of team.labels.nodes) {
+  for (const l of teamLabels) {
     labelMap.set(l.name, l.id); // team labels override workspace on conflict
   }
   const knownLabels = [...new Set([
-    ...team.labels.nodes.map((l) => l.name),
-    ...data.issueLabels.nodes.map((l) => l.name),
+    ...teamLabels.map((l) => l.name),
+    ...wsLabels.map((l) => l.name),
   ])].sort();
 
   return {

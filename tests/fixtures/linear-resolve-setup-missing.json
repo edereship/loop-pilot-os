@@ -11,7 +11,7 @@
             { "id": "state-wip", "name": "In Progress" },
             { "id": "state-review", "name": "In Review" }
           ] },
-          "labels": { "nodes": [] },
+          "labels": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
           "projects": { "nodes": [
             { "id": "project-uuid-2", "name": "Other Project" }
           ] }
@@ -20,6 +20,6 @@
     },
     "issueLabels": { "nodes": [
       { "id": "label-bug", "name": "bug" }
-    ] }
+    ], "pageInfo": { "hasNextPage": false, "endCursor": null } }
   }
 }

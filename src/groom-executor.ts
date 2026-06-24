@@ -84,10 +84,30 @@ async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<vo
         throw err;
       }
       const splitNote = `→ split into ${childIds.join(", ")}`;
-      await linearClient.updateIssue(action.issueId, {
-        description: parent.description ? `${parent.description}\n\n${splitNote}` : splitNote,
-      });
-      await linearClient.closeIssue(action.issueId, action.rationale);
+      try {
+        await linearClient.updateIssue(action.issueId, {
+          description: parent.description ? `${parent.description}\n\n${splitNote}` : splitNote,
+        });
+        await linearClient.closeIssue(action.issueId, action.rationale);
+      } catch (err) {
+        // All children were created but the parent update/close failed: remove the
+        // opt-in label so the next GROOM pass does not re-split the parent and
+        // duplicate the already-created children (Finding 3).
+        const partialNote = `${splitNote} (parent close failed): manual review needed`;
+        await linearClient.updateIssue(action.issueId, {
+          description: parent.description ? `${parent.description}\n\n${partialNote}` : partialNote,
+        }).catch(() => {});
+        let labelRemoveErr: string | null = null;
+        await linearClient.removeLabels(action.issueId, [ctx.optInLabel]).catch((e: unknown) => {
+          labelRemoveErr = e instanceof Error ? e.message : String(e);
+        });
+        const baseMsg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          labelRemoveErr != null
+            ? `${baseMsg}; opt-in label removal also failed (parent may be re-split): ${labelRemoveErr}`
+            : baseMsg,
+        );
+      }
       break;
     }
     case "close":

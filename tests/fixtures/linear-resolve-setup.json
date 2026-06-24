@@ -14,7 +14,7 @@
           ] },
           "labels": { "nodes": [
             { "id": "label-aiok", "name": "ai-ok" }
-          ] },
+          ], "pageInfo": { "hasNextPage": false, "endCursor": null } },
           "projects": { "nodes": [
             { "id": "project-uuid-1", "name": "LoopPilot OS" }
           ] }
@@ -23,7 +23,7 @@
           "id": "team-uuid-2",
           "key": "OTHER",
           "states": { "nodes": [] },
-          "labels": { "nodes": [] },
+          "labels": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
           "projects": { "nodes": [
             { "id": "project-uuid-2", "name": "Other Project" }
           ] }
@@ -32,6 +32,6 @@
     },
     "issueLabels": { "nodes": [
       { "id": "label-bug", "name": "bug" }
-    ] }
+    ], "pageInfo": { "hasNextPage": false, "endCursor": null } }
   }
 }

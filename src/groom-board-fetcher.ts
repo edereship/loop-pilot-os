@@ -48,6 +48,16 @@ export interface GroomBoardFetcherOptions {
   fetchFn: FetchFn;
 }
 
+function boardPriorityRank(priority: number): number {
+  switch (priority) {
+    case 1: return 0; // Urgent
+    case 2: return 1; // High
+    case 3: return 2; // Medium
+    case 4: return 3; // Low
+    default: return 4; // No priority (0)
+  }
+}
+
 export class GroomBoardFetcher {
   private readonly apiKey: string;
   private readonly projectId: string;
@@ -108,6 +118,9 @@ export class GroomBoardFetcher {
 
     // Build a set of identifiers that are blocked by another issue in this project.
     // A "blocks" relation on issue A with relatedIssue B means A blocks B.
+    // A "blocked_by" relation on issue A with relatedIssue B means A is blocked by B
+    // (Finding 1: handle the blocked_by direction so tickets whose blockers are outside
+    // the project are still treated as blocked rather than eligible).
     const blockedByMap = new Map<string, string[]>(); // identifier → [blockerIdentifier, ...]
     for (const n of nodes) {
       for (const rel of n.relations.nodes) {
@@ -115,16 +128,32 @@ export class GroomBoardFetcher {
           const existing = blockedByMap.get(rel.relatedIssue.identifier) ?? [];
           existing.push(n.identifier);
           blockedByMap.set(rel.relatedIssue.identifier, existing);
+        } else if (rel.type === "blocked_by") {
+          const existing = blockedByMap.get(n.identifier) ?? [];
+          existing.push(rel.relatedIssue.identifier);
+          blockedByMap.set(n.identifier, existing);
         }
       }
     }
+
+    // Sort nodes by priority (most urgent first) so that eligible/blocked arrays are in
+    // SELECT-priority order and budget trimming (which pops from the end) removes the
+    // least-urgent tickets first (Finding 2).
+    const sortedNodes = [...nodes].sort((a, b) => {
+      const pr = boardPriorityRank(a.priority) - boardPriorityRank(b.priority);
+      if (pr !== 0) return pr;
+      if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+      if (a.id < b.id) return -1;
+      if (a.id > b.id) return 1;
+      return 0;
+    });
 
     const eligible: BoardTicket[] = [];
     const inProgress: InProgressTicket[] = [];
     const recentDone: DoneTicket[] = [];
     const blocked: BlockedTicket[] = [];
 
-    for (const n of nodes) {
+    for (const n of sortedNodes) {
       const labels = n.labels.nodes.map((l) => l.name);
       const stateId = n.state.id;
 

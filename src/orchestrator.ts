@@ -1063,13 +1063,16 @@ export class Orchestrator {
       const allActions = groomOutput.actions;
 
       // 5. Validate
+      // Refresh the board cache so the validation reads don't use the pre-Codex snapshot
+      // (Finding 4): a ticket may have been completed or lost its opt-in label while GROOM ran.
+      this.groomDeps.boardFetcher.refresh();
       let validationCtx: ValidationContext;
       try {
-        const [projectIds, doneIds, optInIds] = await Promise.all([
-          this.groomDeps.boardFetcher.getProjectIssueIds(),
-          this.groomDeps.boardFetcher.getDoneIssueIds(),
-          this.groomDeps.boardFetcher.getOptInIssueIds(),
-        ]);
+        // Fetch sequentially: the first call re-populates the cache; the subsequent
+        // calls hit the cache and are effectively free.
+        const projectIds = await this.groomDeps.boardFetcher.getProjectIssueIds();
+        const doneIds = await this.groomDeps.boardFetcher.getDoneIssueIds();
+        const optInIds = await this.groomDeps.boardFetcher.getOptInIssueIds();
         validationCtx = {
           projectIssueIds: projectIds,
           allIssueIds: projectIds,
@@ -1208,6 +1211,13 @@ export class Orchestrator {
             }
           }
         }
+      }
+
+      // Safe-point after memory git operations: if SIGINT arrived during the commit/push
+      // the last per-action check has already passed; halt here before launching SELECT
+      // (Finding 5).
+      if (this.interrupted) {
+        return await haltGroomWithPartialResults();
       }
 
       // 7. Record groom_log
