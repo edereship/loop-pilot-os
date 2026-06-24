@@ -643,15 +643,8 @@ export class Orchestrator {
         return;
       }
 
-      // 0.5) GROOM（D-13: failure → skip to SELECT）
-      let groomSummary: string | null = null;
-      {
-        const groomResult = await this.groom();
-        if (groomResult.control === "halt") return;
-        groomSummary = groomResult.summary;
-      }
-
       // 1) タスク上限チェック（仕様 §11 / §5 SELECT 末尾）
+      // Checked before GROOM so a cap-reached run does not mutate the board before halting.
       const started = this.store.countTasksStarted(this.runId);
       if (started >= this.config.safety.maxTasksPerRun) {
         const detail = `task cap reached: ${started}/${this.config.safety.maxTasksPerRun}`;
@@ -660,6 +653,14 @@ export class Orchestrator {
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
+      }
+
+      // 0.5) GROOM（D-13: failure → skip to SELECT）
+      let groomSummary: string | null = null;
+      {
+        const groomResult = await this.groom();
+        if (groomResult.control === "halt") return;
+        groomSummary = groomResult.summary;
       }
 
       // 2) SELECT（仕様 §5.1 + A1 PM 選別ターン）
@@ -1076,6 +1077,7 @@ export class Orchestrator {
           optInIssueIds: optInIds,
           doneIssueIds: doneIds,
           maxCharsPerFile: this.config.memory.maxCharsPerFile,
+          knownLabels: this.groomDeps.knownLabels,
         };
       } catch (err) {
         this.log(`groom: validation context fetch failed, skipping: ${errMsg(err)}`);
@@ -1104,6 +1106,7 @@ export class Orchestrator {
         linearClient: this.groomDeps.linearClient,
         repoPath,
         maxCharsPerFile: this.config.memory.maxCharsPerFile,
+        optInLabel: this.config.linear.optInLabel,
       };
 
       const executionResults: ExecutionResult[] = [];
@@ -1180,7 +1183,16 @@ export class Orchestrator {
             ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
             if (pushRes.code !== 0) {
               await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
-              this.log(`groom: memory push failed (rolled back): ${pushRes.stderr.trim()}`);
+              const pushErr = pushRes.stderr.trim();
+              this.log(`groom: memory push failed (rolled back): ${pushErr}`);
+              // The commit was rolled back, so mark update_memory results as failed so the
+              // groom_log and summaryForSelect reflect the actual outcome.
+              for (const r of executionResults) {
+                if (r.outcome === "executed" && r.action.type === "update_memory") {
+                  r.outcome = "failed";
+                  r.error = `memory push failed; commit rolled back: ${pushErr}`;
+                }
+              }
             }
           }
         } catch (err) {

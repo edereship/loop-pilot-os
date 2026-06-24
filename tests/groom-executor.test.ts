@@ -64,7 +64,7 @@ afterEach(() => {
 
 function ctx(): ExecutorContext {
   // Cast StubLinearClient — it satisfies the duck-typed interface used by the executor.
-  return { linearClient: client as never, repoPath: tmpRepo, maxCharsPerFile: 8000 };
+  return { linearClient: client as never, repoPath: tmpRepo, maxCharsPerFile: 8000, optInLabel: "looppilot" };
 }
 
 describe("executeGroomActions", () => {
@@ -182,6 +182,61 @@ describe("executeGroomActions — split", () => {
     // createIssue should receive extraLabelIds from parent
     const createCall = client.calls.find((c) => c.method === "createIssue");
     expect(createCall?.args[0]).toMatchObject({ extraLabelIds: ["l-parent-1"] });
+  });
+});
+
+describe("executeGroomActions — split partial failure (Finding 1)", () => {
+  it("removes opt-in label from parent when at least one child was created before failure", async () => {
+    let createCount = 0;
+    client.createIssue = async (fields) => {
+      client.calls.push({ method: "createIssue", args: [fields] });
+      createCount++;
+      if (createCount === 2) throw new Error("Linear 429 rate limit");
+      return `ES-${100 + createCount}`;
+    };
+
+    const action: GroomAction = {
+      type: "split", issueId: "ES-1",
+      subtasks: [
+        { title: "Sub A", description: "A desc" },
+        { title: "Sub B", description: "B desc" },
+      ],
+      rationale: "too large",
+    };
+    const results = await executeGroomActions([action], ctx());
+
+    // Action should be recorded as failed (the partial create threw)
+    expect(results[0].outcome).toBe("failed");
+
+    // The partial note should have been written to the parent description
+    const updateCall = client.calls.find((c) => c.method === "updateIssue");
+    expect(updateCall).toBeDefined();
+    expect((updateCall?.args[1] as { description: string }).description).toContain("partial split");
+    expect((updateCall?.args[1] as { description: string }).description).toContain("ES-101");
+
+    // The opt-in label should have been removed so GROOM won't retry this parent
+    const removeCall = client.calls.find((c) => c.method === "removeLabels");
+    expect(removeCall).toBeDefined();
+    expect(removeCall?.args).toEqual(["ES-1", ["looppilot"]]);
+  });
+
+  it("does not call removeLabels when no children were created before failure", async () => {
+    client.createIssue = async () => {
+      client.calls.push({ method: "createIssue", args: [] });
+      throw new Error("Linear 500");
+    };
+
+    const action: GroomAction = {
+      type: "split", issueId: "ES-1",
+      subtasks: [{ title: "Sub A", description: "A" }],
+      rationale: "split",
+    };
+    const results = await executeGroomActions([action], ctx());
+    expect(results[0].outcome).toBe("failed");
+
+    // No child was created so no partial-split recovery should run
+    expect(client.calls.find((c) => c.method === "removeLabels")).toBeUndefined();
+    expect(client.calls.find((c) => c.method === "updateIssue")).toBeUndefined();
   });
 });
 

@@ -11,6 +11,7 @@ function makeCtx(overrides?: Partial<ValidationContext>): ValidationContext {
     optInIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     doneIssueIds: new Set(["ES-5"]),
     maxCharsPerFile: 8000,
+    knownLabels: ["bug", "urgent", "looppilot"],
     ...overrides,
   };
 }
@@ -109,9 +110,9 @@ describe("validateGroomActions", () => {
       expect(results[0].reason).toContain("opt-in");
     });
 
-    it("accepts label action that removes a different label", () => {
+    it("accepts label action that removes a different (known) label", () => {
       const results = validateGroomActions(
-        [action("label", { issueId: "ES-1", remove: ["stale"], add: [] })],
+        [action("label", { issueId: "ES-1", remove: ["urgent"], add: [] })],
         makeCtx(),
       );
       expect(results[0].result).toBe("valid");
@@ -364,6 +365,107 @@ describe("validateGroomActions", () => {
       );
       expect(results[0].result).toBe("rejected");
       expect(results[0].reason).toContain("empty");
+    });
+  });
+
+  // ---- Rule 9: unknown label names (Finding 3) ----
+  describe("Rule 9: unknown label names", () => {
+    it("rejects label action with unknown add label", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug", "typo"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("typo");
+    });
+
+    it("rejects label action with unknown remove label", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", remove: ["nonexistent"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("nonexistent");
+    });
+
+    it("accepts label action with all known add labels", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("accepts label action when add and remove are all known", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug"], remove: ["urgent"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("rejects label action when add has one unknown among known labels", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug", "unknown-label"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("unknown-label");
+    });
+  });
+
+  // ---- Finding 4: virtual close/split tracking ----
+  describe("Finding 4: revalidate issue state between actions", () => {
+    it("rejects reprioritize on issue already closed by earlier action in same batch", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-1" }),
+        action("reprioritize", { issueId: "ES-1" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("rejected");
+      expect(results[1].reason).toContain("Done");
+    });
+
+    it("rejects update on issue split by earlier action in same batch", () => {
+      const actions: GroomAction[] = [
+        action("split", { issueId: "ES-1" }),
+        action("update", { issueId: "ES-1", title: "New title" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("rejected");
+      expect(results[1].reason).toContain("Done");
+    });
+
+    it("allows close on issue that was already closed (close is exempt from done protection)", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-1" }),
+        action("close", { issueId: "ES-1" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("valid");
+    });
+
+    it("rejects label action on issue closed by earlier action in same batch", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-2" }),
+        action("label", { issueId: "ES-2", add: ["bug"] }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("rejected");
+    });
+
+    it("does not affect actions on different issues", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-1" }),
+        action("reprioritize", { issueId: "ES-2" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("valid");
     });
   });
 

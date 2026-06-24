@@ -22,6 +22,7 @@ export interface ExecutorContext {
   linearClient: IExecutorLinearClient;
   repoPath: string;
   maxCharsPerFile: number;
+  optInLabel: string;
 }
 
 async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<void> {
@@ -57,13 +58,16 @@ async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<vo
           childIds.push(id);
         }
       } catch (err) {
-        // Record any partially-created children on the parent so a GROOM retry
-        // does not create duplicates while the parent remains open (ES-457 Finding 4).
+        // At least one child was created before the failure: record the partial split on
+        // the parent description and remove the opt-in label so the parent no longer appears
+        // on the GROOM board (descriptions aren't in the board context, but label changes are),
+        // preventing duplicate subtask creation on the next GROOM run (Finding 1).
         if (childIds.length > 0) {
           const partialNote = `→ partial split (creation failed after ${childIds.join(", ")}): manual review needed`;
           await linearClient.updateIssue(action.issueId, {
             description: parent.description ? `${parent.description}\n\n${partialNote}` : partialNote,
           }).catch(() => {});
+          await linearClient.removeLabels(action.issueId, [ctx.optInLabel]).catch(() => {});
         }
         throw err;
       }
