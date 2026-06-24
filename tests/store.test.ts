@@ -547,10 +547,17 @@ describe("SqliteStore: schema migration (ES-397)", () => {
       legacy.prepare(
         `INSERT INTO run (pid, started_at, state) VALUES (1, '2026-01-01T00:00:00.000Z', 'running')`,
       ).run();
+      // merged row — should be backfilled to done_transition_pending=1 on migration
       legacy.prepare(
         `INSERT INTO task_session
            (run_id, linear_issue_id, linear_identifier, issue_title, branch, state, started_at)
          VALUES (1, 'issue-1', 'TY-1', 'test', 'b', 'merged', '2026-01-01T00:00:00.000Z')`,
+      ).run();
+      // stopped row — must NOT be backfilled; transition(done) is never retried for stopped
+      legacy.prepare(
+        `INSERT INTO task_session
+           (run_id, linear_issue_id, linear_identifier, issue_title, branch, state, started_at)
+         VALUES (1, 'issue-2', 'TY-2', 'test2', 'b2', 'stopped', '2026-01-01T00:00:01.000Z')`,
       ).run();
       legacy.close();
 
@@ -558,13 +565,17 @@ describe("SqliteStore: schema migration (ES-397)", () => {
       const store = new SqliteStore(dbPath);
       openStores.push(store);
 
-      // The migrated session should have doneTransitionPending defaulting to 0.
-      const session = store.getSession(1);
-      expect(session.doneTransitionPending).toBe(0);
+      // Merged rows must be backfilled to 1 so startup recovery retries transition(done).
+      const merged = store.getSession(1);
+      expect(merged.doneTransitionPending).toBe(1);
+
+      // Non-merged rows must stay at 0 — they never need a done transition retry.
+      const stopped = store.getSession(2);
+      expect(stopped.doneTransitionPending).toBe(0);
 
       // updateSession should work with the new column without throwing.
-      store.updateSession(session.id, { doneTransitionPending: 1 });
-      expect(store.getSession(session.id).doneTransitionPending).toBe(1);
+      store.updateSession(merged.id, { doneTransitionPending: 0 });
+      expect(store.getSession(merged.id).doneTransitionPending).toBe(0);
     } finally {
       if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
     }

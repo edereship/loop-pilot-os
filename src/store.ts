@@ -303,6 +303,12 @@ export class SqliteStore {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN done_transition_pending INTEGER NOT NULL DEFAULT 0`,
       );
+      // Backfill all pre-ES-462 merged rows so the startup recovery loop will
+      // retry transition(done) for any that failed before the flag existed.
+      // Calling transition(done) on an already-done ticket is idempotent in Linear.
+      this.db.exec(
+        `UPDATE task_session SET done_transition_pending = 1 WHERE state = 'merged'`,
+      );
     }
 
     const runColumns = new Set(
