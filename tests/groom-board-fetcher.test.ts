@@ -9,7 +9,7 @@ function makeFetch(data: unknown): FetchFn {
 function makeNode(id: string, identifier: string, stateId: string, opts: {
   priority?: number; title?: string; labels?: string[];
   relations?: Array<{ type: string; relatedIssue: { identifier: string } }>;
-  inverseRelations?: Array<{ type: string; relatedIssue: { identifier: string } }>;
+  inverseRelations?: Array<{ type: string; issue: { identifier: string } }>;
 } = {}) {
   return {
     id,
@@ -20,7 +20,7 @@ function makeNode(id: string, identifier: string, stateId: string, opts: {
     state: { id: stateId },
     labels: { nodes: (opts.labels ?? []).map((n) => ({ name: n })) },
     relations: { nodes: (opts.relations ?? []).map((r) => ({ type: r.type, relatedIssue: { identifier: r.relatedIssue.identifier } })) },
-    inverseRelations: { nodes: (opts.inverseRelations ?? []).map((r) => ({ type: r.type, relatedIssue: { identifier: r.relatedIssue.identifier } })) },
+    inverseRelations: { nodes: (opts.inverseRelations ?? []).map((r) => ({ type: r.type, issue: { identifier: r.issue.identifier } })) },
     completedAt: null,
   };
 }
@@ -94,7 +94,7 @@ describe("GroomBoardFetcher", () => {
     // Linear exposes the blocking relationship on ES-5 via inverseRelations.
     const blockedNode = makeNode("id-5", "ES-5", stateIds.todo, {
       labels: [OPT_IN_LABEL],
-      inverseRelations: [{ type: "blocks", relatedIssue: { identifier: "EXT-1" } }],
+      inverseRelations: [{ type: "blocks", issue: { identifier: "EXT-1" } }],
     });
 
     const fetcher = new GroomBoardFetcher({

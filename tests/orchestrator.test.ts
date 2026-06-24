@@ -135,6 +135,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   // GROOM always resets the memory directory before executing actions (ES-457 Finding 1).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+  // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
+  memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const orch = new Orchestrator({
@@ -3760,6 +3763,41 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(groomLog.errorDetail).toContain("interrupted");
   });
 
+  it("SIGINT during GROOM Codex reported as error (not interrupted) still halts before SELECT", async () => {
+    // Finding 2: CodexPlanner can surface a killed child as kind:"error" rather than
+    // kind:"interrupted". Verify that the interrupted flag check after groom() returns
+    // prevents the loop from continuing into SELECT.
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    let callCount = 0;
+    const origRun = planner.run.bind(planner);
+    planner.run = async (ctx) => {
+      callCount++;
+      if (callCount === 1) {
+        // Simulate: SIGINT caused Codex to exit with non-zero code, but
+        // CodexPlanner reports it as 'error' rather than 'interrupted'.
+        h.orch.requestStop();
+        return { kind: "error", message: "Codex exited with code 130" };
+      }
+      return origRun(ctx);
+    };
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    // Loop must halt, not proceed to SELECT (no sessions created).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    expect(h.store.sessionsForRun(run.id)).toHaveLength(0);
+    // GROOM log records the error (not interrupted, since that's what CodexPlanner reported)
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+  });
+
   it("board fetch failure skips GROOM and session still completes", async () => {
     const planner = new FakePlanRunner();
     const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
@@ -3952,13 +3990,14 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
 
     await h.orch.run();
 
-    // The git checkout + clean commands must have run even though no update_memory actions exist
+    // The full-checkout reset commands must have run even though no update_memory actions exist.
+    // Finding 3: reset uses "." (full tree), not "docs/memory/" (memory-only).
     const checkoutCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD") && c.args.includes("docs/memory/"),
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD") && c.args.includes("."),
     );
     expect(checkoutCall).toBeDefined();
     const cleanCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd") && c.args.includes("docs/memory/"),
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd") && !c.args.includes("docs/memory/"),
     );
     expect(cleanCall).toBeDefined();
   });

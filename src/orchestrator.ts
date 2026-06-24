@@ -660,6 +660,13 @@ export class Orchestrator {
       {
         const groomResult = await this.groom();
         if (groomResult.control === "halt") return;
+        // SIGINT can cause the Codex child to exit non-zero; CodexPlanner surfaces that
+        // as kind:"error" rather than kind:"interrupted", so groom() returns "continue".
+        // Check the flag here so a stop requested during GROOM always halts before SELECT.
+        if (this.interrupted) {
+          await this.haltForInterrupt();
+          return;
+        }
         groomSummary = groomResult.summary;
       }
 
@@ -1011,6 +1018,10 @@ export class Orchestrator {
           } catch (logErr) {
             this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
           }
+          // Reset the full checkout so any files Codex wrote are discarded before
+          // haltForInterrupt() calls commitMemoryBeforeHalt() (Finding 3 + 4).
+          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
           await this.haltForInterrupt();
           return { control: "halt" };
         }
@@ -1025,6 +1036,9 @@ export class Orchestrator {
           } catch (logErr) {
             this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
           }
+          // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
+          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
           return { control: "continue", summary: null };
         }
         codexOutput = outcome.text;
@@ -1039,6 +1053,9 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
+        // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
         return { control: "continue", summary: null };
       }
 
@@ -1056,6 +1073,9 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
+        // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
         return { control: "continue", summary: null };
       }
 
@@ -1095,6 +1115,9 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
+        // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
         return { control: "continue", summary: null };
       }
 
@@ -1104,11 +1127,12 @@ export class Orchestrator {
         .map((r) => r.action);
       const rejectedCount = validationResults.filter((r) => r.result === "rejected").length;
 
-      // Reset the memory directory to HEAD unconditionally so any files the Codex
-      // process may have written directly to docs/memory/ are discarded regardless
-      // of whether valid update_memory actions are present (ES-457 Finding 1).
-      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      // Reset the full checkout so any files the Codex process may have written are
+      // discarded before validated update_memory actions write fresh content.
+      // Using the full tree (not just docs/memory/) prevents tracked or untracked
+      // files outside memory from persisting into the next SELECT preflight (Finding 3).
+      await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
 
       // 6. Execute one action at a time with SIGINT check per action (D-14)
       const executorCtx: ExecutorContext = {

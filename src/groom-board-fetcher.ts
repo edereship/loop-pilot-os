@@ -8,9 +8,9 @@ const BOARD_QUERY = `query BoardState($projectId: ID!, $after: String) {
     nodes {
       id identifier title priority sortOrder
       state { id }
-      labels(first: 50) { nodes { name } }
-      relations(first: 50) { nodes { type relatedIssue { identifier } } }
-      inverseRelations(first: 50) { nodes { type relatedIssue { identifier } } }
+      labels(first: 250) { nodes { name } }
+      relations(first: 250) { nodes { type relatedIssue { identifier } } }
+      inverseRelations(first: 250) { nodes { type issue { identifier } } }
       completedAt
     }
     pageInfo { hasNextPage endCursor }
@@ -26,7 +26,7 @@ interface BoardIssueNode {
   state: { id: string };
   labels: { nodes: Array<{ name: string }> };
   relations: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
-  inverseRelations?: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
+  inverseRelations?: { nodes: Array<{ type: string; issue: { identifier: string } }> };
   completedAt: string | null;
 }
 
@@ -142,7 +142,9 @@ export class GroomBoardFetcher {
       for (const rel of n.inverseRelations?.nodes ?? []) {
         if (rel.type === "blocks") {
           const existing = blockedByMap.get(n.identifier) ?? [];
-          existing.push(rel.relatedIssue.identifier);
+          // For inverseRelations, `issue` is the blocking issue (not `relatedIssue`,
+          // which is the current/blocked issue).
+          existing.push(rel.issue.identifier);
           blockedByMap.set(n.identifier, existing);
         }
       }
