@@ -6,6 +6,8 @@ export interface ValidationContext {
   optInLabel: string;
   optInIssueIds: Set<string>;
   doneIssueIds: Set<string>;
+  /** Identifiers currently in in_progress or in_review state (ES-457 Finding 2). */
+  activeIssueIds: Set<string>;
   maxCharsPerFile: number;
   knownLabels: string[];
 }
@@ -133,6 +135,13 @@ export function validateGroomActions(
       // list makes subsequent mutating actions on the same issue ineligible (Finding 4).
       if ((ctx.doneIssueIds.has(issueId) || virtuallyClosedIds.has(issueId)) && a.type !== "close") {
         return { action: a, result: "rejected", reason: `Issue ${issueId} is Done; only close is allowed` };
+      }
+
+      // Rule 4b: active issue protection — reject destructive actions on in-progress or
+      // in-review tickets to prevent Linear state mutation while an implementation
+      // session is still running (ES-457 Finding 2).
+      if ((a.type === "close" || a.type === "split") && ctx.activeIssueIds.has(issueId)) {
+        return { action: a, result: "rejected", reason: `Issue ${issueId} is actively in progress; close and split are not allowed` };
       }
 
       // Rule 3: opt-in label removal

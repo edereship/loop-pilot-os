@@ -138,6 +138,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
   memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
+  // GROOM startSha recording and HEAD reset before memory commit (ES-457 Finding 1).
+  memoryRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
+  memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const orch = new Orchestrator({

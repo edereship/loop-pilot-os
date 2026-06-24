@@ -302,4 +302,49 @@ describe("GroomBoardFetcher", () => {
     expect(ids.has("ES-2")).toBe(false);
     expect(ids.has("ES-3")).toBe(true);
   });
+
+  it("getActiveIssueIds returns in_progress and in_review issues (ES-457 Finding 2)", async () => {
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [
+          makeNode("id-1", "ES-1", stateIds.todo),
+          makeNode("id-2", "ES-2", stateIds.in_progress),
+          makeNode("id-3", "ES-3", stateIds.in_review),
+          makeNode("id-4", "ES-4", stateIds.done),
+        ], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    const ids = await fetcher.getActiveIssueIds();
+    expect(ids.has("ES-1")).toBe(false);
+    expect(ids.has("ES-2")).toBe(true);
+    expect(ids.has("ES-3")).toBe(true);
+    expect(ids.has("ES-4")).toBe(false);
+  });
+
+  it("getBoardState deduplicates blockers when both sides of a blocks relation are in the project (ES-457 Finding 3)", async () => {
+    // ES-6 has a "blocks" relation pointing to ES-5 (forward direction).
+    // ES-5 has an inverseRelation where ES-6 "blocks" it (reverse direction).
+    // Without de-duplication, ES-6 would appear twice in ES-5's blockedBy list.
+    const blockerNode = makeNode("id-6", "ES-6", stateIds.in_progress, {
+      relations: [{ type: "blocks", relatedIssue: { identifier: "ES-5" } }],
+    });
+    const blockedNode = makeNode("id-5", "ES-5", stateIds.todo, {
+      labels: [OPT_IN_LABEL],
+      inverseRelations: [{ type: "blocks", issue: { identifier: "ES-6" } }],
+    });
+
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [blockerNode, blockedNode], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+
+    const board = await fetcher.getBoardState(new Map());
+    const blocked = board.blocked.find((b) => b.identifier === "ES-5");
+    expect(blocked).toBeDefined();
+    // ES-6 must appear exactly once in the blockedBy string
+    expect(blocked!.blockedBy).toBe("ES-6");
+  });
 });

@@ -10,6 +10,7 @@ function makeCtx(overrides?: Partial<ValidationContext>): ValidationContext {
     optInLabel: "looppilot",
     optInIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     doneIssueIds: new Set(["ES-5"]),
+    activeIssueIds: new Set(),
     maxCharsPerFile: 8000,
     knownLabels: ["bug", "urgent", "looppilot"],
     ...overrides,
@@ -498,6 +499,43 @@ describe("validateGroomActions", () => {
       const results = validateGroomActions(actions, makeCtx());
       expect(results[0].result).toBe("valid");
       expect(results[1].result).toBe("valid");
+    });
+  });
+
+  // ---- Rule 4b: active issue protection (ES-457 Finding 2) ----
+  describe("Rule 4b: active issue protection", () => {
+    it("rejects close on an in-progress issue", () => {
+      const results = validateGroomActions(
+        [action("close", { issueId: "ES-1" })],
+        makeCtx({ activeIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("actively in progress");
+    });
+
+    it("rejects split on an in-progress issue", () => {
+      const results = validateGroomActions(
+        [action("split", { issueId: "ES-1" })],
+        makeCtx({ activeIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("actively in progress");
+    });
+
+    it("allows reprioritize and update on an in-progress issue (non-destructive)", () => {
+      const ctx = makeCtx({ activeIssueIds: new Set(["ES-1"]) });
+      const reprio = validateGroomActions([action("reprioritize", { issueId: "ES-1" })], ctx);
+      expect(reprio[0].result).toBe("valid");
+      const upd = validateGroomActions([action("update", { issueId: "ES-1", title: "New title" })], ctx);
+      expect(upd[0].result).toBe("valid");
+    });
+
+    it("allows close on a non-active issue even when other issues are active", () => {
+      const results = validateGroomActions(
+        [action("close", { issueId: "ES-1" })],
+        makeCtx({ activeIssueIds: new Set(["ES-2"]) }),
+      );
+      expect(results[0].result).toBe("valid");
     });
   });
 

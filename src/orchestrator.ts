@@ -41,6 +41,8 @@ export interface IGroomBoardFetcher {
   getProjectIssueIds(): Promise<Set<string>>;
   getDoneIssueIds(): Promise<Set<string>>;
   getOptInIssueIds(): Promise<Set<string>>;
+  /** Returns identifiers of issues currently in in_progress or in_review state. */
+  getActiveIssueIds(): Promise<Set<string>>;
   /** Clear any per-cycle cache so fresh data is fetched in the next call. */
   refresh(): void;
 }
@@ -1000,6 +1002,12 @@ export class Orchestrator {
         knownLabels: this.groomDeps.knownLabels,
       });
 
+      // Record the starting SHA before Codex runs so any commits Codex creates can be
+      // undone before the memory commit is pushed (ES-457 Finding 1).
+      const startSha = await this.runner.run("git", ["rev-parse", "HEAD"], { cwd: repoPath })
+        .then((r) => (r.code === 0 ? r.stdout.trim() : null))
+        .catch(() => null);
+
       // 3. Run Codex
       let codexOutput: string;
       try {
@@ -1093,12 +1101,14 @@ export class Orchestrator {
         const projectIds = await this.groomDeps.boardFetcher.getProjectIssueIds();
         const doneIds = await this.groomDeps.boardFetcher.getDoneIssueIds();
         const optInIds = await this.groomDeps.boardFetcher.getOptInIssueIds();
+        const activeIds = await this.groomDeps.boardFetcher.getActiveIssueIds();
         validationCtx = {
           projectIssueIds: projectIds,
           allIssueIds: projectIds,
           optInLabel: this.config.linear.optInLabel,
           optInIssueIds: optInIds,
           doneIssueIds: doneIds,
+          activeIssueIds: activeIds,
           maxCharsPerFile: this.config.memory.maxCharsPerFile,
           knownLabels: this.groomDeps.knownLabels,
         };
@@ -1133,6 +1143,11 @@ export class Orchestrator {
       // files outside memory from persisting into the next SELECT preflight (Finding 3).
       await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
       await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+      // If Codex created commits and advanced HEAD, reset back to the recorded starting
+      // SHA so only the memory commit is pushed (ES-457 Finding 1).
+      if (startSha) {
+        await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+      }
 
       // 6. Execute one action at a time with SIGINT check per action (D-14)
       const executorCtx: ExecutorContext = {

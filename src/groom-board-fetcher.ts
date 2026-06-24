@@ -144,8 +144,14 @@ export class GroomBoardFetcher {
           const existing = blockedByMap.get(n.identifier) ?? [];
           // For inverseRelations, `issue` is the blocking issue (not `relatedIssue`,
           // which is the current/blocked issue).
-          existing.push(rel.issue.identifier);
-          blockedByMap.set(n.identifier, existing);
+          // Guard against duplicates: when both sides of the blocking relation are in
+          // the fetched project, the blocker's `relations` entry already added this
+          // identifier above; adding it again produces "blocked by ES-6, ES-6"
+          // (ES-457 Finding 3).
+          if (!existing.includes(rel.issue.identifier)) {
+            existing.push(rel.issue.identifier);
+            blockedByMap.set(n.identifier, existing);
+          }
         }
       }
     }
@@ -225,6 +231,16 @@ export class GroomBoardFetcher {
     return new Set(
       nodes
         .filter((n) => n.labels.nodes.some((l) => l.name === this.optInLabel))
+        .map((n) => n.identifier),
+    );
+  }
+
+  async getActiveIssueIds(): Promise<Set<string>> {
+    const nodes = await this.ensureFetched();
+    const { in_progress, in_review } = this.stateIds;
+    return new Set(
+      nodes
+        .filter((n) => n.state.id === in_progress || n.state.id === in_review)
         .map((n) => n.identifier),
     );
   }
