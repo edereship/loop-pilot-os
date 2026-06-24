@@ -12,7 +12,7 @@
             { "id": "state-review", "name": "In Review" },
             { "id": "state-done", "name": "Done" }
           ] },
-          "labels": { "nodes": [] },
+          "labels": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
           "projects": { "nodes": [
             { "id": "project-uuid-1", "name": "LoopPilot OS" }
           ] }
@@ -21,6 +21,6 @@
     },
     "issueLabels": { "nodes": [
       { "id": "label-aiok-ws", "name": "ai-ok" }
-    ] }
+    ], "pageInfo": { "hasNextPage": false, "endCursor": null } }
   }
 }

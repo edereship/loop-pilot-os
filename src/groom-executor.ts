@@ -1,6 +1,16 @@
 import type { GroomAction } from "./types.js";
-import type { GroomLinearClient } from "./groom-linear-client.js";
 import { writeCategory } from "./memory-store.js";
+
+/** Structural interface for the Linear client used during action execution. */
+export interface IExecutorLinearClient {
+  updatePriority(issueId: string, priority: number): Promise<void>;
+  updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void>;
+  createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string>;
+  closeIssue(issueId: string, rationale: string): Promise<void>;
+  addLabels(issueId: string, names: string[]): Promise<void>;
+  removeLabels(issueId: string, names: string[]): Promise<void>;
+  getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }>;
+}
 
 export interface ExecutionResult {
   action: GroomAction;
@@ -9,9 +19,10 @@ export interface ExecutionResult {
 }
 
 export interface ExecutorContext {
-  linearClient: GroomLinearClient;
+  linearClient: IExecutorLinearClient;
   repoPath: string;
   maxCharsPerFile: number;
+  optInLabel: string;
 }
 
 async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<void> {
@@ -36,20 +47,67 @@ async function executeOne(action: GroomAction, ctx: ExecutorContext): Promise<vo
     case "split": {
       const parent = await linearClient.getIssueDetails(action.issueId);
       const childIds: string[] = [];
-      for (const sub of action.subtasks) {
-        const id = await linearClient.createIssue({
-          title: sub.title,
-          description: sub.description,
-          priority: parent.priority,
-          extraLabelIds: parent.labelIds,
-        });
-        childIds.push(id);
+      try {
+        for (const sub of action.subtasks) {
+          const id = await linearClient.createIssue({
+            title: sub.title,
+            description: sub.description,
+            priority: parent.priority,
+            extraLabelIds: parent.labelIds,
+          });
+          childIds.push(id);
+        }
+      } catch (err) {
+        // At least one child was created before the failure: record the partial split on
+        // the parent description and remove the opt-in label so the parent no longer appears
+        // on the GROOM board (descriptions aren't in the board context, but label changes are),
+        // preventing duplicate subtask creation on the next GROOM run (Finding 1).
+        if (childIds.length > 0) {
+          const partialNote = `→ partial split (creation failed after ${childIds.join(", ")}): manual review needed`;
+          await linearClient.updateIssue(action.issueId, {
+            description: parent.description ? `${parent.description}\n\n${partialNote}` : partialNote,
+          }).catch(() => {});
+          // Surface label-removal failure: if removeLabels also fails the parent stays opt-in
+          // and the next GROOM run will re-split it, duplicating the already-created children.
+          // Capture the error and include it in the thrown message so it appears in groom_log.
+          let labelRemoveErr: string | null = null;
+          await linearClient.removeLabels(action.issueId, [ctx.optInLabel]).catch((e: unknown) => {
+            labelRemoveErr = e instanceof Error ? e.message : String(e);
+          });
+          const baseMsg = err instanceof Error ? err.message : String(err);
+          throw new Error(
+            labelRemoveErr != null
+              ? `${baseMsg}; opt-in label removal also failed (parent may be re-split): ${labelRemoveErr}`
+              : baseMsg,
+          );
+        }
+        throw err;
       }
       const splitNote = `→ split into ${childIds.join(", ")}`;
-      await linearClient.updateIssue(action.issueId, {
-        description: parent.description ? `${parent.description}\n\n${splitNote}` : splitNote,
-      });
-      await linearClient.closeIssue(action.issueId, action.rationale);
+      try {
+        await linearClient.updateIssue(action.issueId, {
+          description: parent.description ? `${parent.description}\n\n${splitNote}` : splitNote,
+        });
+        await linearClient.closeIssue(action.issueId, action.rationale);
+      } catch (err) {
+        // All children were created but the parent update/close failed: remove the
+        // opt-in label so the next GROOM pass does not re-split the parent and
+        // duplicate the already-created children (Finding 3).
+        const partialNote = `${splitNote} (parent close failed): manual review needed`;
+        await linearClient.updateIssue(action.issueId, {
+          description: parent.description ? `${parent.description}\n\n${partialNote}` : partialNote,
+        }).catch(() => {});
+        let labelRemoveErr: string | null = null;
+        await linearClient.removeLabels(action.issueId, [ctx.optInLabel]).catch((e: unknown) => {
+          labelRemoveErr = e instanceof Error ? e.message : String(e);
+        });
+        const baseMsg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          labelRemoveErr != null
+            ? `${baseMsg}; opt-in label removal also failed (parent may be re-split): ${labelRemoveErr}`
+            : baseMsg,
+        );
+      }
       break;
     }
     case "close":

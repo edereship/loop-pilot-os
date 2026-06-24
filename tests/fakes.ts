@@ -19,6 +19,7 @@ import type {
   PlanRunner,
   PlanOutcome,
 } from "../src/types.js";
+import type { IGroomBoardFetcher, IGroomLinearClient } from "../src/orchestrator.js";
 
 type StubResponder =
   | Partial<CommandResult>
@@ -371,5 +372,93 @@ export class FakePlanRunner implements PlanRunner {
     const out = this.outcomes.shift();
     if (!out) throw new Error("FakePlanRunner: no outcome queued");
     return out;
+  }
+}
+
+// ---- FakeGroomBoardFetcher ----
+import type { BoardState } from "../src/types.js";
+
+export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
+  boardState: BoardState = { eligible: [], inProgress: [], recentDone: [], blocked: [] };
+  projectIssueIds: Set<string> = new Set();
+  doneIssueIds: Set<string> = new Set();
+  optInIssueIds: Set<string> = new Set();
+  activeIssueIds: Set<string> = new Set();
+  calls: string[] = [];
+  private _failNextMethods = new Map<string, Error>();
+
+  /** Make the next call to `method` throw `error` (or a generic error). */
+  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds" | "getOptInIssueIds" | "getActiveIssueIds", error?: Error): void {
+    this._failNextMethods.set(method, error ?? new Error(`FakeGroomBoardFetcher.${method} forced failure`));
+  }
+
+  private _maybeThrow(method: string): void {
+    const err = this._failNextMethods.get(method);
+    if (err) {
+      this._failNextMethods.delete(method);
+      throw err;
+    }
+  }
+
+  refresh(): void {
+    this.calls.push("refresh");
+  }
+
+  async getBoardState(_prMap: Map<string, number | null>): Promise<BoardState> {
+    this.calls.push("getBoardState");
+    this._maybeThrow("getBoardState");
+    return this.boardState;
+  }
+  async getProjectIssueIds(): Promise<Set<string>> {
+    this.calls.push("getProjectIssueIds");
+    this._maybeThrow("getProjectIssueIds");
+    return this.projectIssueIds;
+  }
+  async getDoneIssueIds(): Promise<Set<string>> {
+    this.calls.push("getDoneIssueIds");
+    this._maybeThrow("getDoneIssueIds");
+    return this.doneIssueIds;
+  }
+  async getOptInIssueIds(): Promise<Set<string>> {
+    this.calls.push("getOptInIssueIds");
+    this._maybeThrow("getOptInIssueIds");
+    return this.optInIssueIds;
+  }
+  async getActiveIssueIds(): Promise<Set<string>> {
+    this.calls.push("getActiveIssueIds");
+    this._maybeThrow("getActiveIssueIds");
+    return this.activeIssueIds;
+  }
+}
+
+// ---- FakeGroomLinearClient ----
+export class FakeGroomLinearClient implements IGroomLinearClient {
+  calls: Array<{ method: string; args: unknown[] }> = [];
+
+  async updatePriority(issueId: string, priority: number): Promise<void> {
+    this.calls.push({ method: "updatePriority", args: [issueId, priority] });
+  }
+  async updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void> {
+    this.calls.push({ method: "updateIssue", args: [issueId, fields] });
+  }
+  async createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string> {
+    this.calls.push({ method: "createIssue", args: [fields] });
+    return "FAKE-NEW";
+  }
+  async closeIssue(issueId: string, rationale: string): Promise<void> {
+    this.calls.push({ method: "closeIssue", args: [issueId, rationale] });
+  }
+  async addLabels(issueId: string, names: string[]): Promise<void> {
+    this.calls.push({ method: "addLabels", args: [issueId, names] });
+  }
+  async removeLabels(issueId: string, names: string[]): Promise<void> {
+    this.calls.push({ method: "removeLabels", args: [issueId, names] });
+  }
+  async getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }> {
+    this.calls.push({ method: "getIssueDetails", args: [issueId] });
+    return { priority: 3, labelIds: [], description: "" };
+  }
+  async postComment(issueId: string, body: string): Promise<void> {
+    this.calls.push({ method: "postComment", args: [issueId, body] });
   }
 }

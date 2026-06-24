@@ -4,8 +4,12 @@ export interface ValidationContext {
   projectIssueIds: Set<string>;
   allIssueIds: Set<string>;
   optInLabel: string;
+  optInIssueIds: Set<string>;
   doneIssueIds: Set<string>;
+  /** Identifiers currently in in_progress or in_review state (ES-457 Finding 2). */
+  activeIssueIds: Set<string>;
   maxCharsPerFile: number;
+  knownLabels: string[];
 }
 
 export interface ValidationResult {
@@ -29,6 +33,9 @@ export function validateGroomActions(
 ): ValidationResult[] {
   let createCount = 0;
   let totalAccepted = 0;
+  // Track issues closed or split during this validation pass so subsequent
+  // actions on the same issue are treated as targeting a Done issue (Finding 4).
+  const virtuallyClosedIds = new Set<string>();
 
   return actions.map((a): ValidationResult => {
     // Rule 6: total action limit (checked first so counter stays accurate)
@@ -68,6 +75,14 @@ export function validateGroomActions(
       }
       if (a.add?.some((l) => l.trim() === "")) return { action: a, result: "rejected", reason: "empty label name" };
       if (a.remove?.some((l) => l.trim() === "")) return { action: a, result: "rejected", reason: "empty label name" };
+      // Rule 9: unknown label names — reject before execution so no partial apply occurs.
+      const knownSet = new Set(ctx.knownLabels);
+      const unknownAdd = a.add?.filter((l) => !knownSet.has(l)) ?? [];
+      const unknownRemove = a.remove?.filter((l) => !knownSet.has(l)) ?? [];
+      const allUnknown = [...unknownAdd, ...unknownRemove];
+      if (allUnknown.length > 0) {
+        return { action: a, result: "rejected", reason: `Unknown label name(s): ${allUnknown.join(", ")}` };
+      }
     }
     if (a.type === "split") {
       if (a.subtasks.length === 0) {
@@ -76,6 +91,13 @@ export function validateGroomActions(
       for (const subtask of a.subtasks) {
         if (subtask.title.trim() === "") return { action: a, result: "rejected", reason: "empty subtask title" };
         if (subtask.description.trim() === "") return { action: a, result: "rejected", reason: "empty subtask description" };
+      }
+      // Each subtask creates one Linear issue; count against the same budget
+      // as explicit create actions so a split with many subtasks cannot bypass
+      // MAX_CREATES or flood Linear in one loop (ES-457 Finding 2).
+      createCount += a.subtasks.length;
+      if (createCount > MAX_CREATES) {
+        return { action: a, result: "rejected", reason: `Exceeds create action limit (${MAX_CREATES})` };
       }
     }
 
@@ -103,9 +125,23 @@ export function validateGroomActions(
         return { action: a, result: "rejected", reason: `Issue ${issueId} is out of project scope` };
       }
 
-      // Rule 4: done issue protection (close is exempt)
-      if (ctx.doneIssueIds.has(issueId) && a.type !== "close") {
+      // Rule 1b: opt-in label required — GROOM may only act on opted-in issues
+      if (!ctx.optInIssueIds.has(issueId)) {
+        return { action: a, result: "rejected", reason: `Issue ${issueId} does not have the opt-in label` };
+      }
+
+      // Rule 4: done issue protection (close is exempt).
+      // Also checks virtuallyClosedIds so a close/split earlier in the same action
+      // list makes subsequent mutating actions on the same issue ineligible (Finding 4).
+      if ((ctx.doneIssueIds.has(issueId) || virtuallyClosedIds.has(issueId)) && a.type !== "close") {
         return { action: a, result: "rejected", reason: `Issue ${issueId} is Done; only close is allowed` };
+      }
+
+      // Rule 4b: active issue protection — reject destructive actions on in-progress or
+      // in-review tickets to prevent Linear state mutation while an implementation
+      // session is still running (ES-457 Finding 2).
+      if ((a.type === "close" || a.type === "split") && ctx.activeIssueIds.has(issueId)) {
+        return { action: a, result: "rejected", reason: `Issue ${issueId} is actively in progress; close and split are not allowed` };
       }
 
       // Rule 3: opt-in label removal
@@ -115,6 +151,10 @@ export function validateGroomActions(
     }
 
     totalAccepted++;
+    // Track close/split so subsequent actions on the same issue see it as Done (Finding 4).
+    if (hasIssueId(a) && (a.type === "close" || a.type === "split")) {
+      virtuallyClosedIds.add(a.issueId);
+    }
     return { action: a, result: "valid" };
   });
 }

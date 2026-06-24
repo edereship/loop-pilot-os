@@ -179,6 +179,7 @@ describe("buildSelectPrompt", () => {
     lastPrDiff: null,
     diffBudgetChars: 6000,
     codebaseSummary: null,
+    groomSummary: null,
   };
 
   it("includes system instruction and eligible candidates", () => {
@@ -328,5 +329,40 @@ describe("buildSelectPrompt", () => {
     expect(idxInProgress).toBeGreaterThanOrEqual(0);
     expect(idxCodebase).toBeLessThan(idxMemory);
     expect(idxMemory).toBeLessThan(idxInProgress);
+  });
+
+  // ---- D-28: GROOM Summary Injection ----
+
+  describe("buildSelectPrompt — GROOM summary (D-28)", () => {
+    it("includes groom summary section when provided", () => {
+      const prompt = buildSelectPrompt({
+        goal: "ship",
+        specContent: null,
+        eligible: [{ id: "1", identifier: "TY-1", title: "task", description: "desc", priority: 2, sortOrder: 0, url: "" }],
+        inProgress: [],
+        recentMerged: [],
+        lastPrDiff: null,
+        diffBudgetChars: 6000,
+        codebaseSummary: null,
+        groomSummary: "Reprioritized ES-10 to High; closed ES-5 as duplicate.",
+      });
+      expect(prompt).toContain("# Recent GROOM Results");
+      expect(prompt).toContain("Reprioritized ES-10 to High");
+    });
+
+    it("omits groom summary section when null", () => {
+      const prompt = buildSelectPrompt({
+        goal: "ship",
+        specContent: null,
+        eligible: [{ id: "1", identifier: "TY-1", title: "task", description: "desc", priority: 2, sortOrder: 0, url: "" }],
+        inProgress: [],
+        recentMerged: [],
+        lastPrDiff: null,
+        diffBudgetChars: 6000,
+        codebaseSummary: null,
+        groomSummary: null,
+      });
+      expect(prompt).not.toContain("GROOM");
+    });
   });
 });

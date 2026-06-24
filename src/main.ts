@@ -26,6 +26,8 @@ import { renderStatus } from "./status.js";
 import { AgentWorkflowRecovery } from "./workflow-recovery.js";
 import { CodexPlanner, type CodexRateLimitOpts } from "./codex-planner.js";
 import { generateCodebaseSummary } from "./codebase-summary.js";
+import { GroomBoardFetcher } from "./groom-board-fetcher.js";
+import { GroomLinearClient } from "./groom-linear-client.js";
 
 const EXIT_OK = 0;
 const EXIT_PREFLIGHT = 1;
@@ -207,6 +209,24 @@ async function runLoop(configPath: string): Promise<number> {
     const codebaseSummaryGenerator = (repoPath: string) =>
       generateCodebaseSummary(repoPath, runner, config.safety.selectCodebaseSummaryBudgetChars);
 
+    const groomBoardFetcher = new GroomBoardFetcher({
+      apiKey: config.linearApiKey,
+      projectId: linearSetup.projectId,
+      stateIds: linearSetup.stateIds,
+      optInLabel: config.linear.optInLabel,
+      fetchFn: globalThis.fetch,
+    });
+
+    const groomLinearClient = new GroomLinearClient({
+      apiKey: config.linearApiKey,
+      projectId: linearSetup.projectId,
+      teamId: linearSetup.teamId,
+      stateIds: linearSetup.stateIds,
+      optInLabelId: linearSetup.optInLabelId,
+      labelMap: linearSetup.labelMap,
+      fetchFn: globalThis.fetch,
+    });
+
     const orchestrator = new Orchestrator({
       config,
       source,
@@ -233,6 +253,11 @@ async function runLoop(configPath: string): Promise<number> {
         config,
         log: logLine,
       },
+      groomDeps: config.groom.enabled ? {
+        boardFetcher: groomBoardFetcher,
+        linearClient: groomLinearClient,
+        knownLabels: linearSetup.knownLabels,
+      } : null,
     });
 
     // Wire the orchestrator's interruptablePause into the agent runner so that

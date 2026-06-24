@@ -178,7 +178,7 @@ function truncateDiffPerFile(unifiedDiff: string, budget: number): string {
 }
 
 export function buildSelectPrompt(args: SelectPromptArgs): string {
-  const { goal, specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars, codebaseSummary, memory, memoryBudgetChars } = args;
+  const { goal, specContent, eligible, inProgress, recentMerged, lastPrDiff, diffBudgetChars, codebaseSummary, memory, memoryBudgetChars, groomSummary } = args;
 
   const blocks: string[] = [];
 
@@ -221,6 +221,11 @@ export function buildSelectPrompt(args: SelectPromptArgs): string {
     ];
     const block = buildMemoryBlock(entries, memoryBudgetChars ?? 6000);
     if (block.length > 0) blocks.push(block);
+  }
+
+  // GROOM summary (D-28)
+  if (groomSummary) {
+    blocks.push(["# Recent GROOM Results", "", groomSummary].join("\n"));
   }
 
   // Board state: in-progress

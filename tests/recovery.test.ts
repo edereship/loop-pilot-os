@@ -41,6 +41,9 @@ function makeConfig(over: Partial<{
       maxCostUsdPerFix: 2,
       codexTimeoutMinutes: 30,
       selectDiffBudgetChars: 6000,
+      selectCodebaseSummaryBudgetChars: 5000,
+      groomTimeoutMinutes: 10,
+      groomBoardBudgetChars: 10000,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -48,6 +51,7 @@ function makeConfig(over: Partial<{
     },
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
     notify: { progress: false },
+    groom: { enabled: false },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
   } as unknown as Config;
 }
@@ -122,6 +126,7 @@ function makeHarness(config: Config): Harness {
     codebaseSummaryGenerator: async () => "",
     recoveryTurn: null,
     runner: memoryRunner,
+    groomDeps: null,
   });
   return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }

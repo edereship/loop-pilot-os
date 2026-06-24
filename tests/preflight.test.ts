@@ -107,12 +107,12 @@ function passingFetch(): FetchFn {
                 { id: "st-done", name: "Done" },
               ],
             },
-            labels: { nodes: [{ id: "lb-1", name: "ai-ok" }] },
+            labels: { nodes: [{ id: "lb-1", name: "ai-ok" }], pageInfo: { hasNextPage: false, endCursor: null } },
             projects: { nodes: [{ id: "proj-1", name: "LoopPilot OS" }] },
           },
         ],
       },
-      issueLabels: { nodes: [] },
+      issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
     },
   };
   return async () => ({

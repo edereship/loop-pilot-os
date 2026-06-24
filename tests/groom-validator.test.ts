@@ -8,8 +8,11 @@ function makeCtx(overrides?: Partial<ValidationContext>): ValidationContext {
     projectIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     allIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5", "OTHER-1"]),
     optInLabel: "looppilot",
+    optInIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     doneIssueIds: new Set(["ES-5"]),
+    activeIssueIds: new Set(),
     maxCharsPerFile: 8000,
+    knownLabels: ["bug", "urgent", "looppilot"],
     ...overrides,
   };
 }
@@ -69,6 +72,34 @@ describe("validateGroomActions", () => {
     });
   });
 
+  // ---- Rule 1b: opt-in label required ----
+  describe("Rule 1b: opt-in label required for issue-scoped actions", () => {
+    it("rejects action on in-scope issue without opt-in label", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { issueId: "ES-1" })],
+        makeCtx({ optInIssueIds: new Set() }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("opt-in");
+    });
+
+    it("accepts action on in-scope issue with opt-in label", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { issueId: "ES-1" })],
+        makeCtx({ optInIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("create and update_memory skip opt-in check (no issueId)", () => {
+      const results = validateGroomActions(
+        [action("create"), action("update_memory")],
+        makeCtx({ optInIssueIds: new Set() }),
+      );
+      expect(results.every((r) => r.result === "valid")).toBe(true);
+    });
+  });
+
   // ---- Rule 3: opt-in label removal ----
   describe("Rule 3: opt-in label removal forbidden", () => {
     it("rejects label action that removes the opt-in label", () => {
@@ -80,9 +111,9 @@ describe("validateGroomActions", () => {
       expect(results[0].reason).toContain("opt-in");
     });
 
-    it("accepts label action that removes a different label", () => {
+    it("accepts label action that removes a different (known) label", () => {
       const results = validateGroomActions(
-        [action("label", { issueId: "ES-1", remove: ["stale"], add: [] })],
+        [action("label", { issueId: "ES-1", remove: ["urgent"], add: [] })],
         makeCtx(),
       );
       expect(results[0].result).toBe("valid");
@@ -168,6 +199,38 @@ describe("validateGroomActions", () => {
       expect(results[4].reason).toContain("empty");
       expect(results[5].result).toBe("rejected");
       expect(results[5].reason).toContain("create");
+    });
+
+    it("split with 6 subtasks is rejected because it exceeds MAX_CREATES (ES-457 Finding 2)", () => {
+      const subtasks = Array.from({ length: 6 }, (_, i) => ({ title: `Sub ${i}`, description: `Desc ${i}` }));
+      const results = validateGroomActions(
+        [action("split", { subtasks })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("create");
+    });
+
+    it("split with 3 subtasks is accepted when no prior creates have run", () => {
+      const subtasks = Array.from({ length: 3 }, (_, i) => ({ title: `Sub ${i}`, description: `Desc ${i}` }));
+      const results = validateGroomActions(
+        [action("split", { subtasks })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("split subtasks count against the shared create budget with explicit creates", () => {
+      // 3 creates (slots 1-3), then a split with 3 subtasks (slots 4-6) → over limit at slot 6
+      const subtasks = Array.from({ length: 3 }, (_, i) => ({ title: `Sub ${i}`, description: `Desc ${i}` }));
+      const actions = [
+        ...Array.from({ length: 3 }, () => action("create")),
+        action("split", { subtasks }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results.slice(0, 3).every((r) => r.result === "valid")).toBe(true);
+      expect(results[3].result).toBe("rejected");
+      expect(results[3].reason).toContain("create");
     });
   });
 
@@ -335,6 +398,144 @@ describe("validateGroomActions", () => {
       );
       expect(results[0].result).toBe("rejected");
       expect(results[0].reason).toContain("empty");
+    });
+  });
+
+  // ---- Rule 9: unknown label names (Finding 3) ----
+  describe("Rule 9: unknown label names", () => {
+    it("rejects label action with unknown add label", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug", "typo"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("typo");
+    });
+
+    it("rejects label action with unknown remove label", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", remove: ["nonexistent"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("nonexistent");
+    });
+
+    it("accepts label action with all known add labels", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("accepts label action when add and remove are all known", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug"], remove: ["urgent"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("rejects label action when add has one unknown among known labels", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug", "unknown-label"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("unknown-label");
+    });
+  });
+
+  // ---- Finding 4: virtual close/split tracking ----
+  describe("Finding 4: revalidate issue state between actions", () => {
+    it("rejects reprioritize on issue already closed by earlier action in same batch", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-1" }),
+        action("reprioritize", { issueId: "ES-1" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("rejected");
+      expect(results[1].reason).toContain("Done");
+    });
+
+    it("rejects update on issue split by earlier action in same batch", () => {
+      const actions: GroomAction[] = [
+        action("split", { issueId: "ES-1" }),
+        action("update", { issueId: "ES-1", title: "New title" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("rejected");
+      expect(results[1].reason).toContain("Done");
+    });
+
+    it("allows close on issue that was already closed (close is exempt from done protection)", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-1" }),
+        action("close", { issueId: "ES-1" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("valid");
+    });
+
+    it("rejects label action on issue closed by earlier action in same batch", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-2" }),
+        action("label", { issueId: "ES-2", add: ["bug"] }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("rejected");
+    });
+
+    it("does not affect actions on different issues", () => {
+      const actions: GroomAction[] = [
+        action("close", { issueId: "ES-1" }),
+        action("reprioritize", { issueId: "ES-2" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("valid");
+      expect(results[1].result).toBe("valid");
+    });
+  });
+
+  // ---- Rule 4b: active issue protection (ES-457 Finding 2) ----
+  describe("Rule 4b: active issue protection", () => {
+    it("rejects close on an in-progress issue", () => {
+      const results = validateGroomActions(
+        [action("close", { issueId: "ES-1" })],
+        makeCtx({ activeIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("actively in progress");
+    });
+
+    it("rejects split on an in-progress issue", () => {
+      const results = validateGroomActions(
+        [action("split", { issueId: "ES-1" })],
+        makeCtx({ activeIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("actively in progress");
+    });
+
+    it("allows reprioritize and update on an in-progress issue (non-destructive)", () => {
+      const ctx = makeCtx({ activeIssueIds: new Set(["ES-1"]) });
+      const reprio = validateGroomActions([action("reprioritize", { issueId: "ES-1" })], ctx);
+      expect(reprio[0].result).toBe("valid");
+      const upd = validateGroomActions([action("update", { issueId: "ES-1", title: "New title" })], ctx);
+      expect(upd[0].result).toBe("valid");
+    });
+
+    it("allows close on a non-active issue even when other issues are active", () => {
+      const results = validateGroomActions(
+        [action("close", { issueId: "ES-1" })],
+        makeCtx({ activeIssueIds: new Set(["ES-2"]) }),
+      );
+      expect(results[0].result).toBe("valid");
     });
   });
 

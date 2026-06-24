@@ -13,6 +13,8 @@ import {
   FakeWorkflowRecovery,
   FakePlanRunner,
   FakeCommandRunner,
+  FakeGroomBoardFetcher,
+  FakeGroomLinearClient,
   fixedClock,
   instantSleep,
 } from "./fakes.js";
@@ -31,6 +33,7 @@ function makeConfig(over: Partial<{
   idleRecheckSeconds: number;
   gateLabel: string;
   notifyProgress: boolean;
+  groomEnabled: boolean;
 }> = {}): Config {
   return {
     product: { goal: over.goal ?? "ship the product", specDir: undefined },
@@ -46,6 +49,9 @@ function makeConfig(over: Partial<{
       maxCostUsdPerFix: 2,
       codexTimeoutMinutes: 30,
       selectDiffBudgetChars: 6000,
+      selectCodebaseSummaryBudgetChars: 5000,
+      groomTimeoutMinutes: 10,
+      groomBoardBudgetChars: 10000,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -53,7 +59,9 @@ function makeConfig(over: Partial<{
     },
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
     notify: { progress: over.notifyProgress ?? false },
+    groom: { enabled: over.groomEnabled ?? false },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
+    linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
   } as unknown as Config;
 }
 
@@ -82,6 +90,8 @@ interface Harness {
   promptArgs: PromptArgs[];
   recoveryRunner: FakeCommandRunner;
   memoryRunner: FakeCommandRunner;
+  groomBoardFetcher: FakeGroomBoardFetcher;
+  groomLinearClient: FakeGroomLinearClient;
 }
 
 function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Harness {
@@ -122,6 +132,17 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
   memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+  // GROOM always resets the memory directory before executing actions (ES-457 Finding 1).
+  memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+  // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
+  memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
+  // GROOM startSha recording and HEAD reset before memory commit (ES-457 Finding 1).
+  memoryRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
+  memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
+  const groomBoardFetcher = new FakeGroomBoardFetcher();
+  const groomLinearClient = new FakeGroomLinearClient();
   const orch = new Orchestrator({
     config,
     source,
@@ -148,8 +169,13 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
       log,
     } : null,
     runner: memoryRunner,
+    groomDeps: (config.groom.enabled && planner !== null) ? {
+      boardFetcher: groomBoardFetcher,
+      linearClient: groomLinearClient,
+      knownLabels: ["looppilot-os"],
+    } : null,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner };
+  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
 }
 
 describe("Orchestrator 正常系 — 1チケット完走（仕様 §5 SELECT→CLAIM→IMPLEMENT→HANDOFF→MONITOR→DONE）", () => {
@@ -654,6 +680,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: inlineMemoryRunner1,
+      groomDeps: null,
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -2297,6 +2324,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: inlineMemoryRunner2,
+      groomDeps: null,
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -2817,6 +2845,7 @@ describe("Orchestrator.interruptablePause", () => {
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: inlineMemoryRunner3,
+      groomDeps: null,
     });
     orchRef = orch;
 
@@ -3455,5 +3484,618 @@ describe("Orchestrator memory read non-fatal (ES-454 Finding 4)", () => {
     expect(s).toBeDefined();
     expect(["merged", "stopped"]).toContain(s!.state);
     expect(h.logs.some((l) => l.includes("memory read failed"))).toBe(true);
+  });
+});
+
+describe("GROOM Orchestrator Integration (ES-457)", () => {
+  it("GROOM → SELECT → CLAIM → IMPLEMENT → HANDOFF → MONITOR → DONE flow", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex output: one reprioritize action
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Reprioritized ES-1"}\n```',
+    });
+    // Make ES-1 a known opted-in project issue for validation
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // SELECT Codex output — need 2 eligible issues so selectWithPm calls planner
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"only candidate"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Verify GROOM ran: board was fetched and a groom_log entry exists
+    expect(h.groomBoardFetcher.calls).toContain("getBoardState");
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("completed");
+    expect(groomLog.summary).toBe("Reprioritized ES-1");
+    // Verify the reprioritize action was executed on the linear client
+    expect(h.groomLinearClient.calls.some(c => c.method === "updatePriority")).toBe(true);
+    // Verify session completed
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("groom.enabled=false skips GROOM", async () => {
+    const planner = new FakePlanRunner();
+    const config = { ...makeConfig({ maxTasksPerRun: 1 }), groom: { enabled: false } } as unknown as Config;
+    const h = makeHarness(config, { planner });
+
+    // Need 2 issues to trigger SELECT planner call; queue SELECT + PLAN outcomes
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+    // PLAN outcome (so it doesn't throw/fall back)
+    planner.outcomes.push({ kind: "error", message: "no brief needed" });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Board fetcher was never called (GROOM never ran)
+    expect(h.groomBoardFetcher.calls).toHaveLength(0);
+    // No groom log created (GROOM skipped entirely)
+    expect(() => h.store.getGroomLog(1)).toThrow();
+    // Session still completed
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("Codex failure skips GROOM and proceeds to SELECT", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex fails
+    planner.outcomes.push({ kind: "error", message: "codex crashed" });
+    // SELECT succeeds (2 issues needed to trigger SELECT planner call)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+    // PLAN falls back gracefully (no outcome queued, throws → caught by plan())
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Session still completed despite GROOM failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+    // groom_log records the error
+    expect(h.logs.some((l) => l.includes("groom: codex failed, skipping"))).toBe(true);
+    // groom_log outcome is "error"
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+  });
+
+  it("GROOM summary is included in SELECT context", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM succeeds with summary
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[],"summary":"Board looks good, no changes needed."}\n```',
+    });
+    // SELECT — capture the prompt to verify GROOM summary injection
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    // Need 2 issues so selectWithPm actually calls the planner
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The SELECT prompt (2nd planner call) should contain the GROOM summary
+    const selectPrompt = planner.calls[1]!.prompt;
+    expect(selectPrompt).toContain("Recent GROOM Results");
+    expect(selectPrompt).toContain("Board looks good");
+  });
+
+  it("groom_log is recorded correctly", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":1,"rationale":"urgent"}],"summary":"Bumped ES-1"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Verify groom_log was recorded
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.runId).toBe(h.store.latestRun()!.id);
+    expect(groomLog.loopIndex).toBe(1);
+    expect(groomLog.outcome).toBe("completed");
+    expect(groomLog.summary).toBe("Bumped ES-1");
+    expect(groomLog.actionsRequested).toBe(1);
+    expect(groomLog.actionsExecuted).toBe(1);
+    expect(groomLog.actionsRejected).toBe(0);
+    expect(groomLog.actionDetails).not.toBeNull();
+  });
+
+  it("SIGINT interrupts GROOM during action execution", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM output with 2 actions — we'll interrupt after the first
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":1,"rationale":"a"},{"type":"reprioritize","issueId":"ES-2","priority":2,"rationale":"b"}],"summary":"Two changes"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1", "ES-2"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1", "ES-2"]);
+
+    // After first action executes, request stop
+    let callCount = 0;
+    const originalCalls = h.groomLinearClient.calls;
+    // Override updatePriority to trigger interrupt after 1st call.
+    (h.groomLinearClient as unknown as Record<string, unknown>).updatePriority = async (issueId: string, priority: number) => {
+      originalCalls.push({ method: "updatePriority", args: [issueId, priority] });
+      callCount++;
+      if (callCount >= 1) {
+        h.orch.requestStop();
+      }
+    };
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    // Run should halt (not continue to SELECT)
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+
+    // groom_log records partial execution
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("skipped");
+    expect(groomLog.errorDetail).toContain("interrupted");
+  });
+
+  it("Codex exception (thrown) skips GROOM and proceeds to SELECT", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // Override planner.run to throw on first call (GROOM), succeed on second call (SELECT)
+    let callCount = 0;
+    const origRun = planner.run.bind(planner);
+    planner.run = async (ctx) => {
+      callCount++;
+      if (callCount === 1) throw new Error("codex process crashed");
+      return origRun(ctx);
+    };
+
+    // SELECT outcome
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("codex exception");
+  });
+
+  it("GROOM parse failure records error in groom_log and skips to SELECT", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM returns unparseable output
+    planner.outcomes.push({ kind: "completed", text: "not json at all" });
+    // SELECT succeeds
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("parse failed");
+  });
+
+  it("SIGINT during GROOM Codex run halts cleanly", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({ kind: "interrupted" });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("skipped");
+    expect(groomLog.errorDetail).toContain("interrupted");
+  });
+
+  it("SIGINT during GROOM Codex reported as error (not interrupted) still halts before SELECT", async () => {
+    // Finding 2: CodexPlanner can surface a killed child as kind:"error" rather than
+    // kind:"interrupted". Verify that the interrupted flag check after groom() returns
+    // prevents the loop from continuing into SELECT.
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    let callCount = 0;
+    const origRun = planner.run.bind(planner);
+    planner.run = async (ctx) => {
+      callCount++;
+      if (callCount === 1) {
+        // Simulate: SIGINT caused Codex to exit with non-zero code, but
+        // CodexPlanner reports it as 'error' rather than 'interrupted'.
+        h.orch.requestStop();
+        return { kind: "error", message: "Codex exited with code 130" };
+      }
+      return origRun(ctx);
+    };
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    // Loop must halt, not proceed to SELECT (no sessions created).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    expect(h.store.sessionsForRun(run.id)).toHaveLength(0);
+    // GROOM log records the error (not interrupted, since that's what CodexPlanner reported)
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+  });
+
+  it("board fetch failure skips GROOM and session still completes", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // Make getBoardState throw
+    h.groomBoardFetcher.failNext("getBoardState", new Error("network timeout"));
+
+    // SELECT succeeds (2 issues needed to trigger planner call)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Session should still complete despite GROOM board fetch failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+
+    // groom_log records a skip with the board fetch error detail
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("skipped");
+    expect(groomLog.errorDetail).toContain("board fetch failed");
+  });
+
+  it("validation context fetch failure skips GROOM execution and session still completes", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM parse succeeds, but getProjectIssueIds throws during validation context fetch
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Reprioritized ES-1"}\n```',
+    });
+    h.groomBoardFetcher.failNext("getProjectIssueIds", new Error("db locked"));
+
+    // SELECT succeeds
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Session should still complete despite GROOM validation context failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+
+    // groom_log records error with validation context fetch error detail
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("validation context fetch failed");
+  });
+
+  it("individual action failure continues to next action", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM output with 2 reprioritize actions
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":1,"rationale":"a"},{"type":"reprioritize","issueId":"ES-2","priority":2,"rationale":"b"}],"summary":"Two changes"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1", "ES-2"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1", "ES-2"]);
+
+    // Make first action fail, second succeed
+    let callCount = 0;
+    (h.groomLinearClient as any).updatePriority = async (issueId: string, priority: number) => {
+      h.groomLinearClient.calls.push({ method: "updatePriority", args: [issueId, priority] });
+      callCount++;
+      if (callCount === 1) throw new Error("Linear API timeout");
+    };
+
+    // SELECT outcome
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Session completes despite action failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+
+    // Both actions attempted: first failed, second succeeded
+    expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(2);
+
+    // groom_log records 1 executed (second succeeded), 0 rejected
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("completed");
+    expect(groomLog.actionsRequested).toBe(2);
+    expect(groomLog.actionsExecuted).toBe(1);
+
+    // Log should contain failure message
+    expect(h.logs.some(l => l.includes("action failed") && l.includes("Linear API timeout"))).toBe(true);
+  });
+
+  it("marks update_memory result as failed when git commit fails during GROOM (Finding 2)", async () => {
+    // Use a real tmpdir so writeCategory can write the memory file before commitIfChanged is called.
+    const tmpRepo = mkdtempSync(path.join(tmpdir(), "groom-commit-fail-"));
+    try {
+      mkdirSync(path.join(tmpRepo, "docs", "memory"), { recursive: true });
+
+      const planner = new FakePlanRunner();
+      const config = {
+        ...makeConfig({ maxTasksPerRun: 1, groomEnabled: true }),
+        repo: { ...makeConfig().repo, path: tmpRepo },
+      } as Config;
+      const h = makeHarness(config, { planner });
+
+      // GROOM Codex output: one update_memory action (writeCategory will succeed to the tmpdir)
+      planner.outcomes.push({
+        kind: "completed",
+        text: '```json\n{"actions":[{"type":"update_memory","category":"pm_decisions","content":"Test decision","rationale":"update"}],"summary":"Updated memory"}\n```',
+      });
+      // Make git add fail so commitIfChanged throws; the catch block should mark the action as failed.
+      h.memoryRunner.on(["git", "add", "docs/memory/"], { code: 1, stderr: "fatal: index.lock exists" });
+
+      // SELECT outcome (2 issues needed to trigger the planner)
+      planner.outcomes.push({
+        kind: "completed",
+        text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+      });
+      h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+      h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+      h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+      await h.orch.run();
+
+      // groom_log must show 0 executed: the update_memory action was retroactively marked failed
+      const groomLog = h.store.getGroomLog(1);
+      expect(groomLog.outcome).toBe("completed");
+      expect(groomLog.actionsRequested).toBe(1);
+      expect(groomLog.actionsExecuted).toBe(0);
+
+      // actionDetails must record the action as failed with the commit error message
+      const details = JSON.parse(groomLog.actionDetails!) as Array<{ type: string; result: string; reason?: string }>;
+      expect(details[0].result).toBe("failed");
+      expect(details[0].reason).toContain("memory commit failed");
+
+      // Log must mention the commit failure
+      expect(h.logs.some(l => l.includes("memory commit failed"))).toBe(true);
+
+      // summaryForSelect should be annotated with the execution shortfall
+      const selectPrompt = planner.calls[1]!.prompt;
+      expect(selectPrompt).toContain("Updated memory [0/1 executed]");
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("memory directory is reset even when no update_memory actions are present (ES-457 Finding 1)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM output with no update_memory actions — only a reprioritize
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Reprioritized"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // SELECT outcome
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The full-checkout reset commands must have run even though no update_memory actions exist.
+    // Finding 3: reset uses "." (full tree), not "docs/memory/" (memory-only).
+    const checkoutCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD") && c.args.includes("."),
+    );
+    expect(checkoutCall).toBeDefined();
+    const cleanCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd") && !c.args.includes("docs/memory/"),
+    );
+    expect(cleanCall).toBeDefined();
+  });
+
+  it("codex error cleanup resets to startSha to undo any Codex-created commits (ES-457 Finding 1)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns error (simulating Codex creating a commit and then erroring)
+    planner.outcomes.push({ kind: "error", message: "codex crashed mid-groom" });
+
+    // SELECT outcome (2 issues needed to trigger the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // git reset --hard <startSha> must have been called during the codex-error cleanup
+    const resetCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234",
+    );
+    expect(resetCalls.length).toBeGreaterThan(0);
+    // Session still completed despite GROOM failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("parse failure cleanup resets to startSha to undo any Codex-created commits (ES-457 Finding 1)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM returns unparseable output
+    planner.outcomes.push({ kind: "completed", text: "not valid json at all" });
+
+    // SELECT outcome (2 issues needed to trigger the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // git reset --hard <startSha> must have been called during the parse-failure cleanup
+    const resetCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234",
+    );
+    expect(resetCalls.length).toBeGreaterThan(0);
+    // Session still completed despite GROOM failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("GROOM-blocked issues are excluded from SELECT eligible list (ES-457 Finding 2)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM output: no actions, summary only
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[],"summary":"TY-1 blocked by ES-99, skipping"}\n```',
+    });
+
+    // GROOM board state: TY-1 is blocked, TY-2 is eligible
+    h.groomBoardFetcher.boardState = {
+      eligible: [{ identifier: "TY-2", title: "Title for TY-2", priority: 2, labels: [] }],
+      inProgress: [],
+      recentDone: [],
+      blocked: [{ identifier: "TY-1", title: "Title for TY-1", priority: 2, labels: [], blockedBy: "ES-99" }],
+    };
+
+    // Both issues are in the task source queue
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Only TY-2 should have been claimed; TY-1 must not appear in any session
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.linearIdentifier).toBe("TY-2");
+    // TY-1 must never have been transitioned to in_progress
+    expect(h.source.transitions.some((t) => t.issueId === "issue-A" && t.state === "in_progress")).toBe(false);
   });
 });

@@ -21,6 +21,8 @@ import type {
   PauseMeta,
   PrDiffSummary,
   CommandRunner,
+  GroomAction,
+  BoardState,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
@@ -30,6 +32,30 @@ import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, MEMORY_DIR } from "./memory-store.js";
+import { buildGroomPrompt } from "./groom-prompt.js";
+import { parseGroomOutput } from "./groom-parser.js";
+import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
+import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
+export interface IGroomBoardFetcher {
+  getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
+  getProjectIssueIds(): Promise<Set<string>>;
+  getDoneIssueIds(): Promise<Set<string>>;
+  getOptInIssueIds(): Promise<Set<string>>;
+  /** Returns identifiers of issues currently in in_progress or in_review state. */
+  getActiveIssueIds(): Promise<Set<string>>;
+  /** Clear any per-cycle cache so fresh data is fetched in the next call. */
+  refresh(): void;
+}
+
+export interface IGroomLinearClient extends IExecutorLinearClient {
+  postComment(issueId: string, body: string): Promise<void>;
+}
+
+export interface GroomDeps {
+  boardFetcher: IGroomBoardFetcher;
+  linearClient: IGroomLinearClient;
+  knownLabels: string[];
+}
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -52,6 +78,7 @@ export interface OrchestratorDeps {
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
+  groomDeps: GroomDeps | null;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -80,9 +107,11 @@ export class Orchestrator {
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
+  private readonly groomDeps: GroomDeps | null;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
+  private groomLoopIndex = 0;
 
   constructor(deps: OrchestratorDeps) {
     this.config = deps.config;
@@ -102,6 +131,7 @@ export class Orchestrator {
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
+    this.groomDeps = deps.groomDeps;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -616,6 +646,7 @@ export class Orchestrator {
       }
 
       // 1) タスク上限チェック（仕様 §11 / §5 SELECT 末尾）
+      // Checked before GROOM so a cap-reached run does not mutate the board before halting.
       const started = this.store.countTasksStarted(this.runId);
       if (started >= this.config.safety.maxTasksPerRun) {
         const detail = `task cap reached: ${started}/${this.config.safety.maxTasksPerRun}`;
@@ -624,6 +655,23 @@ export class Orchestrator {
         this.store.setRunState(this.runId, "halted", detail);
         this.log(detail);
         return;
+      }
+
+      // 0.5) GROOM（D-13: failure → skip to SELECT）
+      let groomSummary: string | null = null;
+      let groomBlockedIds: Set<string> = new Set();
+      {
+        const groomResult = await this.groom();
+        if (groomResult.control === "halt") return;
+        // SIGINT can cause the Codex child to exit non-zero; CodexPlanner surfaces that
+        // as kind:"error" rather than kind:"interrupted", so groom() returns "continue".
+        // Check the flag here so a stop requested during GROOM always halts before SELECT.
+        if (this.interrupted) {
+          await this.haltForInterrupt();
+          return;
+        }
+        groomSummary = groomResult.summary;
+        groomBlockedIds = groomResult.blockedIds;
       }
 
       // 2) SELECT（仕様 §5.1 + A1 PM 選別ターン）
@@ -643,6 +691,11 @@ export class Orchestrator {
         this.log(detail);
         return;
       }
+      // Filter out GROOM-identified blocked issues so dependency-blocked work is not started
+      // (ES-457 Finding 2).
+      if (groomBlockedIds.size > 0) {
+        eligible = eligible.filter((i) => !groomBlockedIds.has(i.identifier));
+      }
       if (eligible.length === 0) {
         // IDLE（キュー空 → 通知は初回のみ → 定期再確認）
         if (!idleNotified) {
@@ -660,7 +713,7 @@ export class Orchestrator {
       let issue: EligibleIssue;
       let selectRationale: string | null = null;
       if (this.planner !== null) {
-        const sel = await this.selectWithPm(eligible);
+        const sel = await this.selectWithPm(eligible, groomSummary);
         if (sel.control === "halt") return;
         issue = sel.issue;
         selectRationale = sel.rationale;
@@ -857,9 +910,449 @@ export class Orchestrator {
     return { control: "continue", brief };
   }
 
+  // ---- GROOM（ES-457: Board Grooming Phase） ----
+  private async groom(): Promise<{ control: "continue"; summary: string | null; blockedIds: Set<string> } | { control: "halt" }> {
+    if (!this.config.groom.enabled || this.groomDeps === null || this.planner === null) {
+      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+    }
+
+    this.groomLoopIndex++;
+    let groomLogRow: { id: number };
+    try {
+      groomLogRow = this.store.insertGroomLog({
+        runId: this.runId,
+        loopIndex: this.groomLoopIndex,
+        startedAt: this.clock(),
+      });
+    } catch (err) {
+      this.log(`groom: failed to insert groom_log, skipping: ${errMsg(err)}`);
+      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+    }
+
+    try {
+      // 1. Fetch board state
+      this.groomDeps.boardFetcher.refresh();
+      const activeSessionPrNumbers = new Map<string, number | null>();
+      for (const s of this.store.activeSessions()) {
+        activeSessionPrNumbers.set(s.linearIdentifier, s.prNumber);
+      }
+
+      let boardState: BoardState;
+      try {
+        boardState = await this.groomDeps.boardFetcher.getBoardState(activeSessionPrNumbers);
+      } catch (err) {
+        this.log(`groom: board fetch failed, skipping: ${errMsg(err)}`);
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "skipped",
+            errorDetail: `board fetch failed: ${errMsg(err)}`,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        return { control: "continue", summary: null, blockedIds: new Set<string>() };
+      }
+      // Build blocked identifier set for SELECT-time filtering (ES-457 Finding 2).
+      const blockedIds = new Set<string>(boardState.blocked.map((b) => b.identifier));
+
+      // 2. Fetch default branch so memory/spec/codebase reads see the current state of main
+      // rather than a stale local checkout from a previous merge iteration (ES-457 Finding 3).
+      try {
+        await this.git.fetchDefaultBranch();
+      } catch (err) {
+        this.log(`groom: fetch failed (non-fatal): ${errMsg(err)}`);
+      }
+
+      // 3. Assemble prompt
+      const repoPath = this.config.repo.path;
+      const groomMem = readMemoryAll(repoPath);
+      if (groomMem.readErrors) {
+        this.log(`groom: memory read failed (non-fatal): ${groomMem.readErrors.join("; ")}`);
+      }
+
+      let specContent: SpecContent | null = null;
+      const specDir = this.config.product.specDir;
+      if (specDir !== undefined && this.specLoader !== null) {
+        try {
+          specContent = this.specLoader(repoPath, specDir);
+        } catch (err) {
+          this.log(`groom: spec loading failed (non-fatal): ${errMsg(err)}`);
+        }
+      }
+
+      const digest = this.config.digest.enabled
+        ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
+        : [];
+
+      let codebaseSummary: string | null = null;
+      try {
+        const summary = await this.codebaseSummaryGenerator(repoPath);
+        if (summary.length > 0) codebaseSummary = summary;
+      } catch (err) {
+        this.log(`groom: codebase summary failed (non-fatal): ${errMsg(err)}`);
+      }
+
+      const prompt = buildGroomPrompt({
+        specContent,
+        goal: this.config.product.goal ?? null,
+        memory: {
+          pmDecisions: groomMem.pmDecisions ?? null,
+          implResults: groomMem.implResults ?? null,
+          productKnowledge: groomMem.productKnowledge ?? null,
+        },
+        board: boardState,
+        boardBudgetChars: this.config.safety.groomBoardBudgetChars,
+        memoryBudgetChars: this.config.memory.injectBudgetChars,
+        digest,
+        codebaseSummary,
+        optInLabel: this.config.linear.optInLabel,
+        maxMemoryChars: this.config.memory.maxCharsPerFile,
+        knownLabels: this.groomDeps.knownLabels,
+      });
+
+      // Record the starting SHA before Codex runs so any commits Codex creates can be
+      // undone before the memory commit is pushed (ES-457 Finding 1).
+      const startSha = await this.runner.run("git", ["rev-parse", "HEAD"], { cwd: repoPath })
+        .then((r) => (r.code === 0 ? r.stdout.trim() : null))
+        .catch(() => null);
+
+      // 3. Run Codex
+      let codexOutput: string;
+      try {
+        const outcome = await this.planner.run({
+          worktreePath: repoPath,
+          prompt,
+          timeoutMs: this.config.safety.groomTimeoutMinutes * 60_000,
+        });
+        if (outcome.kind === "interrupted") {
+          try {
+            this.store.updateGroomLog(groomLogRow.id, {
+              endedAt: this.clock(),
+              outcome: "skipped",
+              errorDetail: "interrupted",
+            });
+          } catch (logErr) {
+            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+          }
+          // Reset the full checkout so any files Codex wrote are discarded before
+          // haltForInterrupt() calls commitMemoryBeforeHalt() (Finding 3 + 4).
+          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+          if (startSha) {
+            await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+          }
+          await this.haltForInterrupt();
+          return { control: "halt" };
+        }
+        if (outcome.kind === "error") {
+          this.log(`groom: codex failed, skipping: ${outcome.message}`);
+          try {
+            this.store.updateGroomLog(groomLogRow.id, {
+              endedAt: this.clock(),
+              outcome: "error",
+              errorDetail: `codex error: ${outcome.message}`,
+            });
+          } catch (logErr) {
+            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+          }
+          // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
+          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+          if (startSha) {
+            await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+          }
+          return { control: "continue", summary: null, blockedIds };
+        }
+        codexOutput = outcome.text;
+      } catch (err) {
+        this.log(`groom: codex exception, skipping: ${errMsg(err)}`);
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: `codex exception: ${errMsg(err)}`,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+        }
+        return { control: "continue", summary: null, blockedIds };
+      }
+
+      // 4. Parse
+      const parseResult = parseGroomOutput(codexOutput);
+      if (parseResult.kind === "parse_error") {
+        const preview = parseResult.raw.slice(0, 200);
+        this.log(`groom: parse failed, skipping. Raw: ${preview}`);
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: `parse failed: ${preview}`,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+        }
+        return { control: "continue", summary: null, blockedIds };
+      }
+
+      const groomOutput = parseResult.value;
+      const allActions = groomOutput.actions;
+
+      // 5. Validate
+      // Refresh the board cache so the validation reads don't use the pre-Codex snapshot
+      // (Finding 4): a ticket may have been completed or lost its opt-in label while GROOM ran.
+      this.groomDeps.boardFetcher.refresh();
+      let validationCtx: ValidationContext;
+      try {
+        // Fetch sequentially: the first call re-populates the cache; the subsequent
+        // calls hit the cache and are effectively free.
+        const projectIds = await this.groomDeps.boardFetcher.getProjectIssueIds();
+        const doneIds = await this.groomDeps.boardFetcher.getDoneIssueIds();
+        const optInIds = await this.groomDeps.boardFetcher.getOptInIssueIds();
+        const activeIds = await this.groomDeps.boardFetcher.getActiveIssueIds();
+        validationCtx = {
+          projectIssueIds: projectIds,
+          allIssueIds: projectIds,
+          optInLabel: this.config.linear.optInLabel,
+          optInIssueIds: optInIds,
+          doneIssueIds: doneIds,
+          activeIssueIds: activeIds,
+          maxCharsPerFile: this.config.memory.maxCharsPerFile,
+          knownLabels: this.groomDeps.knownLabels,
+        };
+      } catch (err) {
+        this.log(`groom: validation context fetch failed, skipping: ${errMsg(err)}`);
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: `validation context fetch failed: ${errMsg(err)}`,
+            actionsRequested: allActions.length,
+            summary: groomOutput.summary,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+        }
+        return { control: "continue", summary: null, blockedIds };
+      }
+
+      const validationResults = validateGroomActions(allActions, validationCtx);
+      const validActions = validationResults
+        .filter((r) => r.result === "valid")
+        .map((r) => r.action);
+      const rejectedCount = validationResults.filter((r) => r.result === "rejected").length;
+
+      // Reset the full checkout so any files the Codex process may have written are
+      // discarded before validated update_memory actions write fresh content.
+      // Using the full tree (not just docs/memory/) prevents tracked or untracked
+      // files outside memory from persisting into the next SELECT preflight (Finding 3).
+      await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+      // If Codex created commits and advanced HEAD, reset back to the recorded starting
+      // SHA so only the memory commit is pushed (ES-457 Finding 1).
+      if (startSha) {
+        await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+      }
+
+      // 6. Execute one action at a time with SIGINT check per action (D-14)
+      const executorCtx: ExecutorContext = {
+        linearClient: this.groomDeps.linearClient,
+        repoPath,
+        maxCharsPerFile: this.config.memory.maxCharsPerFile,
+        optInLabel: this.config.linear.optInLabel,
+      };
+
+      const executionResults: ExecutionResult[] = [];
+
+      // Shared helper: record partial results and halt (used at both pre- and post-action
+      // interrupt checks so neither can be skipped when SIGINT arrives during the last action).
+      const haltGroomWithPartialResults = async (): Promise<{ control: "halt" }> => {
+        const executed = executionResults.filter((r) => r.outcome === "executed").length;
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            summary: groomOutput.summary,
+            actionsRequested: allActions.length,
+            actionsExecuted: executed,
+            actionsRejected: rejectedCount,
+            actionDetails: JSON.stringify(
+              validationResults.map((vr) => {
+                const execResult = executionResults.find((er) => er.action === vr.action);
+                return {
+                  type: vr.action.type,
+                  payload: vr.action,
+                  result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+                  reason: vr.reason ?? execResult?.error,
+                };
+              }),
+            ),
+            outcome: "skipped",
+            errorDetail: "interrupted during execution",
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        await this.haltForInterrupt();
+        return { control: "halt" };
+      };
+
+      for (const action of validActions) {
+        if (this.interrupted) {
+          return await haltGroomWithPartialResults();
+        }
+
+        try {
+          const [result] = await executeGroomActions([action], executorCtx);
+          if (result.outcome === "failed") {
+            this.log(`groom: action failed (type=${action.type}, target=${"issueId" in action ? action.issueId : "n/a"}): ${result.error ?? "unknown"}`);
+          }
+          executionResults.push(result);
+        } catch (err) {
+          this.log(`groom: action exception (type=${action.type}, target=${"issueId" in action ? action.issueId : "n/a"}): ${errMsg(err)}`);
+          executionResults.push({ action, outcome: "failed", error: errMsg(err) });
+        }
+
+        // Safe-point check after each action so an interrupt arriving during the last
+        // action halts cleanly instead of falling through to SELECT (ES-457 Finding 5).
+        if (this.interrupted) {
+          return await haltGroomWithPartialResults();
+        }
+      }
+
+      // If any update_memory actions executed, commit and push memory changes so they
+      // survive the git reset --hard in fetchDefaultBranch during SELECT (ES-457 Finding 2).
+      const memoryUpdated = executionResults.some(
+        (r) => r.outcome === "executed" && r.action.type === "update_memory",
+      );
+      if (memoryUpdated) {
+        try {
+          const committed = await commitIfChanged(this.runner, repoPath);
+          if (committed) {
+            const defaultBranch = this.config.repo.defaultBranch;
+            const pushRes = await this.runner.run(
+              "git",
+              ["push", "origin", `HEAD:${defaultBranch}`],
+              { cwd: repoPath },
+            ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+            if (pushRes.code !== 0) {
+              await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+              const pushErr = pushRes.stderr.trim();
+              this.log(`groom: memory push failed (rolled back): ${pushErr}`);
+              // The commit was rolled back, so mark update_memory results as failed so the
+              // groom_log and summaryForSelect reflect the actual outcome.
+              for (const r of executionResults) {
+                if (r.outcome === "executed" && r.action.type === "update_memory") {
+                  r.outcome = "failed";
+                  r.error = `memory push failed; commit rolled back: ${pushErr}`;
+                }
+              }
+            }
+          }
+        } catch (err) {
+          const commitErr = errMsg(err);
+          this.log(`groom: memory commit failed (non-fatal): ${commitErr}`);
+          // The commit (or git add) failed so the memory changes were not persisted.
+          // Mark the corresponding update_memory results as failed so groom_log and
+          // summaryForSelect reflect the actual outcome (Finding 2).
+          for (const r of executionResults) {
+            if (r.outcome === "executed" && r.action.type === "update_memory") {
+              r.outcome = "failed";
+              r.error = `memory commit failed: ${commitErr}`;
+            }
+          }
+        }
+      }
+
+      // Safe-point after memory git operations: if SIGINT arrived during the commit/push
+      // the last per-action check has already passed; halt here before launching SELECT
+      // (Finding 5).
+      if (this.interrupted) {
+        return await haltGroomWithPartialResults();
+      }
+
+      // 7. Record groom_log
+      const executedCount = executionResults.filter((r) => r.outcome === "executed").length;
+      const actionDetailsList = validationResults.map((vr) => {
+        const execResult = executionResults.find(
+          (er) => er.action === vr.action,
+        );
+        return {
+          type: vr.action.type,
+          payload: vr.action,
+          result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+          reason: vr.reason ?? execResult?.error,
+        };
+      });
+
+      try {
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          summary: groomOutput.summary,
+          actionsRequested: allActions.length,
+          actionsExecuted: executedCount,
+          actionsRejected: rejectedCount,
+          actionDetails: JSON.stringify(actionDetailsList),
+          outcome: "completed",
+        });
+      } catch (logErr) {
+        this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+      }
+
+      this.log(
+        `groom: completed (requested=${allActions.length}, executed=${executedCount}, rejected=${rejectedCount}): ${groomOutput.summary}`,
+      );
+
+      // Only relay the model's raw summary to SELECT if all accepted actions executed.
+      // If any failed or were rejected, the summary may describe effects that never happened;
+      // annotate it so SELECT sees the discrepancy (ES-457 Finding 6).
+      const failedExecutions = validActions.length - executedCount;
+      const summaryForSelect = (rejectedCount === 0 && failedExecutions === 0)
+        ? groomOutput.summary
+        : `${groomOutput.summary} [${executedCount}/${allActions.length} executed]`;
+      return { control: "continue", summary: summaryForSelect, blockedIds };
+    } catch (err) {
+      this.log(`groom: unexpected error, skipping: ${errMsg(err)}`);
+      try {
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `unexpected: ${errMsg(err)}`,
+        });
+      } catch (logErr) {
+        this.log(`groom: failed to update groom_log in error handler: ${errMsg(logErr)}`);
+      }
+      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+    }
+  }
+
   // ---- SELECT PM（スコープ doc A1 / §1.4 / §1.5） ----
   private async selectWithPm(
     eligible: EligibleIssue[],
+    groomSummary: string | null = null,
   ): Promise<
     | { control: "continue"; issue: EligibleIssue; rationale: string | null }
     | { control: "halt" }
@@ -940,6 +1433,7 @@ export class Orchestrator {
         implResults: selectMem.implResults ?? undefined,
       },
       memoryBudgetChars: this.config.memory.injectBudgetChars,
+      groomSummary,
     });
 
     let outcome: PlanOutcome;

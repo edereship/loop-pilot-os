@@ -266,6 +266,8 @@ describe("resolveLinearSetup", () => {
         done: "state-done",
       },
       optInLabelId: "label-aiok",
+      labelMap: new Map([["bug", "label-bug"], ["ai-ok", "label-aiok"]]),
+      knownLabels: ["ai-ok", "bug"],
     });
     expect(calls[0].headers.Authorization).toBe("lin_api_test");
   });
