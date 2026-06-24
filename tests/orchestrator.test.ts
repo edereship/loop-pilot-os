@@ -3675,4 +3675,49 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(groomLog.outcome).toBe("skipped");
     expect(groomLog.errorDetail).toContain("interrupted");
   });
+
+  it("GROOM parse failure records error in groom_log and skips to SELECT", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM returns unparseable output
+    planner.outcomes.push({ kind: "completed", text: "not json at all" });
+    // SELECT succeeds
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("parse failed");
+  });
+
+  it("SIGINT during GROOM Codex run halts cleanly", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({ kind: "interrupted" });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("skipped");
+    expect(groomLog.errorDetail).toContain("interrupted");
+  });
 });
