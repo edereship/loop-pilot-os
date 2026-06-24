@@ -4107,6 +4107,17 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
       // Log must mention the commit failure
       expect(h.logs.some(l => l.includes("memory commit failed"))).toBe(true);
 
+      // ES-470: catch block must clean up dirty memory files so they don't leak into SELECT.
+      // commitIfChanged runs internal cleanup (1 pair), then the catch block retries (1 pair).
+      const checkoutMemCalls = h.memoryRunner.calls.filter(
+        c => c.cmd === "git" && c.args[0] === "checkout" && c.args[3] === "docs/memory/",
+      );
+      expect(checkoutMemCalls.length).toBeGreaterThanOrEqual(2);
+      const cleanMemCalls = h.memoryRunner.calls.filter(
+        c => c.cmd === "git" && c.args[0] === "clean" && c.args[2] === "--" && c.args[3] === "docs/memory/",
+      );
+      expect(cleanMemCalls.length).toBeGreaterThanOrEqual(2);
+
       // summaryForSelect should be annotated with the execution shortfall
       const selectPrompt = planner.calls[1]!.prompt;
       expect(selectPrompt).toContain("Updated memory [0/1 executed]");
