@@ -1115,11 +1115,15 @@ export class Orchestrator {
               actionsExecuted: executed,
               actionsRejected: rejectedCount,
               actionDetails: JSON.stringify(
-                validationResults.map((r) => ({
-                  type: r.action.type,
-                  result: r.result,
-                  reason: r.reason,
-                })),
+                validationResults.map((vr) => {
+                  const execResult = executionResults.find((er) => er.action === vr.action);
+                  return {
+                    type: vr.action.type,
+                    payload: vr.action,
+                    result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+                    reason: vr.reason ?? execResult?.error,
+                  };
+                }),
               ),
               outcome: "skipped",
               errorDetail: "interrupted during execution",
