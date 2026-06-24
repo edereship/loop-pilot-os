@@ -1309,6 +1309,9 @@ export class Orchestrator {
           // ES-470: clean up dirty memory files so they don't leak into SELECT.
           // commitIfChanged already attempts internal cleanup, but if that also fails,
           // dirty files would survive until fetchDefaultBranch() destroys them silently.
+          // Unstage first: if git add succeeded before the failure, newly staged files
+          // are not untracked and git clean would skip them without this reset.
+          await this.runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           // The commit (or git add) failed so the memory changes were not persisted.
