@@ -1,8 +1,8 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Orchestrator } from "../src/orchestrator.js";
+import { Orchestrator, isPidAlive } from "../src/orchestrator.js";
 import { SqliteStore } from "../src/store.js";
 import {
   FakeTaskSource,
@@ -4097,5 +4097,28 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(sessions[0]!.linearIdentifier).toBe("TY-2");
     // TY-1 must never have been transitioned to in_progress
     expect(h.source.transitions.some((t) => t.issueId === "issue-A" && t.state === "in_progress")).toBe(false);
+  });
+});
+
+describe("isPidAlive — EPERM handling (ES-464)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns true when process.kill succeeds (process alive, same user)", () => {
+    vi.spyOn(process, "kill").mockReturnValue(true);
+    expect(isPidAlive(1234)).toBe(true);
+  });
+
+  it("returns false when process.kill throws ESRCH (process does not exist)", () => {
+    const err = Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    vi.spyOn(process, "kill").mockImplementation(() => { throw err; });
+    expect(isPidAlive(99999)).toBe(false);
+  });
+
+  it("returns true when process.kill throws EPERM (process exists, no permission)", () => {
+    const err = Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    vi.spyOn(process, "kill").mockImplementation(() => { throw err; });
+    expect(isPidAlive(1)).toBe(true);
   });
 });

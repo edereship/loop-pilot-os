@@ -2647,11 +2647,14 @@ export class Orchestrator {
 }
 
 // ---- module-private helpers ----
-function isPidAlive(pid: number): boolean {
+export function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (err: unknown) {
+    if (err && typeof err === "object" && "code" in err && (err as { code: string }).code === "EPERM") {
+      return true;
+    }
     return false;
   }
 }
