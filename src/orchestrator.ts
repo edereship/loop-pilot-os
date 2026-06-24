@@ -21,6 +21,8 @@ import type {
   PauseMeta,
   PrDiffSummary,
   CommandRunner,
+  GroomAction,
+  BoardState,
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
@@ -30,6 +32,32 @@ import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, MEMORY_DIR } from "./memory-store.js";
+import { buildGroomPrompt } from "./groom-prompt.js";
+import { parseGroomOutput } from "./groom-parser.js";
+import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
+import { executeGroomActions, type ExecutionResult, type ExecutorContext } from "./groom-executor.js";
+export interface IGroomBoardFetcher {
+  getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
+  getProjectIssueIds(): Promise<Set<string>>;
+  getDoneIssueIds(): Promise<Set<string>>;
+}
+
+export interface IGroomLinearClient {
+  updatePriority(issueId: string, priority: number): Promise<void>;
+  updateIssue(issueId: string, fields: Record<string, unknown>): Promise<void>;
+  createIssue(fields: Record<string, unknown>): Promise<string>;
+  closeIssue(issueId: string, rationale: string): Promise<void>;
+  addLabels(issueId: string, names: string[]): Promise<void>;
+  removeLabels(issueId: string, names: string[]): Promise<void>;
+  getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }>;
+  postComment(issueId: string, body: string): Promise<void>;
+}
+
+export interface GroomDeps {
+  boardFetcher: IGroomBoardFetcher;
+  linearClient: IGroomLinearClient;
+  knownLabels: string[];
+}
 
 export type RunOutcome = "finished" | "lock_rejected";
 
@@ -52,6 +80,7 @@ export interface OrchestratorDeps {
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
+  groomDeps: GroomDeps | null;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -80,9 +109,11 @@ export class Orchestrator {
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
+  private readonly groomDeps: GroomDeps | null;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
+  private groomLoopIndex = 0;
 
   constructor(deps: OrchestratorDeps) {
     this.config = deps.config;
@@ -102,6 +133,7 @@ export class Orchestrator {
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
+    this.groomDeps = deps.groomDeps;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -615,6 +647,14 @@ export class Orchestrator {
         return;
       }
 
+      // 0.5) GROOM（D-13: failure → skip to SELECT）
+      let groomSummary: string | null = null;
+      {
+        const groomResult = await this.groom();
+        if (groomResult.control === "halt") return;
+        groomSummary = groomResult.summary;
+      }
+
       // 1) タスク上限チェック（仕様 §11 / §5 SELECT 末尾）
       const started = this.store.countTasksStarted(this.runId);
       if (started >= this.config.safety.maxTasksPerRun) {
@@ -660,7 +700,7 @@ export class Orchestrator {
       let issue: EligibleIssue;
       let selectRationale: string | null = null;
       if (this.planner !== null) {
-        const sel = await this.selectWithPm(eligible);
+        const sel = await this.selectWithPm(eligible, groomSummary);
         if (sel.control === "halt") return;
         issue = sel.issue;
         selectRationale = sel.rationale;
@@ -857,9 +897,267 @@ export class Orchestrator {
     return { control: "continue", brief };
   }
 
+  // ---- GROOM（ES-457: Board Grooming Phase） ----
+  private async groom(): Promise<{ control: "continue"; summary: string | null } | { control: "halt" }> {
+    if (!this.config.groom.enabled || this.groomDeps === null || this.planner === null) {
+      return { control: "continue", summary: null };
+    }
+
+    this.groomLoopIndex++;
+    const groomLogRow = this.store.insertGroomLog({
+      runId: this.runId,
+      loopIndex: this.groomLoopIndex,
+      startedAt: this.clock(),
+    });
+
+    try {
+      // 1. Fetch board state
+      const activeSessionPrNumbers = new Map<string, number | null>();
+      for (const s of this.store.activeSessions()) {
+        activeSessionPrNumbers.set(s.linearIdentifier, s.prNumber);
+      }
+
+      let boardState: BoardState;
+      try {
+        boardState = await this.groomDeps.boardFetcher.getBoardState(activeSessionPrNumbers);
+      } catch (err) {
+        this.log(`groom: board fetch failed, skipping: ${errMsg(err)}`);
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "skipped",
+          errorDetail: `board fetch failed: ${errMsg(err)}`,
+        });
+        return { control: "continue", summary: null };
+      }
+
+      // 2. Assemble prompt
+      const repoPath = this.config.repo.path;
+      const groomMem = readMemoryAll(repoPath);
+      if (groomMem.readErrors) {
+        this.log(`groom: memory read failed (non-fatal): ${groomMem.readErrors.join("; ")}`);
+      }
+
+      let specContent: SpecContent | null = null;
+      const specDir = this.config.product.specDir;
+      if (specDir !== undefined && this.specLoader !== null) {
+        try {
+          specContent = this.specLoader(repoPath, specDir);
+        } catch (err) {
+          this.log(`groom: spec loading failed (non-fatal): ${errMsg(err)}`);
+        }
+      }
+
+      const digest = this.config.digest.enabled
+        ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
+        : [];
+
+      let codebaseSummary: string | null = null;
+      try {
+        const summary = await this.codebaseSummaryGenerator(repoPath);
+        if (summary.length > 0) codebaseSummary = summary;
+      } catch (err) {
+        this.log(`groom: codebase summary failed (non-fatal): ${errMsg(err)}`);
+      }
+
+      const prompt = buildGroomPrompt({
+        specContent,
+        goal: this.config.product.goal ?? null,
+        memory: {
+          pmDecisions: groomMem.pmDecisions ?? null,
+          implResults: groomMem.implResults ?? null,
+          productKnowledge: groomMem.productKnowledge ?? null,
+        },
+        board: boardState,
+        boardBudgetChars: this.config.safety.groomBoardBudgetChars,
+        memoryBudgetChars: this.config.memory.injectBudgetChars,
+        digest,
+        codebaseSummary,
+        optInLabel: this.config.linear.optInLabel,
+        maxMemoryChars: this.config.memory.maxCharsPerFile,
+        knownLabels: this.groomDeps.knownLabels,
+      });
+
+      // 3. Run Codex
+      let codexOutput: string;
+      try {
+        const outcome = await this.planner.run({
+          worktreePath: repoPath,
+          prompt,
+          timeoutMs: this.config.safety.groomTimeoutMinutes * 60_000,
+        });
+        if (outcome.kind === "interrupted") {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "skipped",
+            errorDetail: "interrupted",
+          });
+          await this.haltForInterrupt();
+          return { control: "halt" };
+        }
+        if (outcome.kind === "error") {
+          this.log(`groom: codex failed, skipping: ${outcome.message}`);
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: `codex error: ${outcome.message}`,
+          });
+          return { control: "continue", summary: null };
+        }
+        codexOutput = outcome.text;
+      } catch (err) {
+        this.log(`groom: codex exception, skipping: ${errMsg(err)}`);
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `codex exception: ${errMsg(err)}`,
+        });
+        return { control: "continue", summary: null };
+      }
+
+      // 4. Parse
+      const parseResult = parseGroomOutput(codexOutput);
+      if (parseResult.kind === "parse_error") {
+        const preview = parseResult.raw.slice(0, 200);
+        this.log(`groom: parse failed, skipping. Raw: ${preview}`);
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `parse failed: ${preview}`,
+        });
+        return { control: "continue", summary: null };
+      }
+
+      const groomOutput = parseResult.value;
+      const allActions = groomOutput.actions;
+
+      // 5. Validate
+      let validationCtx: ValidationContext;
+      try {
+        const [projectIds, doneIds] = await Promise.all([
+          this.groomDeps.boardFetcher.getProjectIssueIds(),
+          this.groomDeps.boardFetcher.getDoneIssueIds(),
+        ]);
+        validationCtx = {
+          projectIssueIds: projectIds,
+          allIssueIds: projectIds,
+          optInLabel: this.config.linear.optInLabel,
+          doneIssueIds: doneIds,
+          maxCharsPerFile: this.config.memory.maxCharsPerFile,
+        };
+      } catch (err) {
+        this.log(`groom: validation context fetch failed, skipping: ${errMsg(err)}`);
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `validation context fetch failed: ${errMsg(err)}`,
+          actionsRequested: allActions.length,
+          summary: groomOutput.summary,
+        });
+        return { control: "continue", summary: null };
+      }
+
+      const validationResults = validateGroomActions(allActions, validationCtx);
+      const validActions = validationResults
+        .filter((r) => r.result === "valid")
+        .map((r) => r.action);
+      const rejectedCount = validationResults.filter((r) => r.result === "rejected").length;
+
+      // 6. Execute one action at a time with SIGINT check per action (D-14)
+      const executorCtx: ExecutorContext = {
+        linearClient: this.groomDeps.linearClient as import("./groom-linear-client.js").GroomLinearClient,
+        repoPath,
+        maxCharsPerFile: this.config.memory.maxCharsPerFile,
+      };
+
+      const executionResults: ExecutionResult[] = [];
+      for (const action of validActions) {
+        if (this.interrupted) {
+          // Record partial results and halt
+          const executed = executionResults.filter((r) => r.outcome === "executed").length;
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            summary: groomOutput.summary,
+            actionsRequested: allActions.length,
+            actionsExecuted: executed,
+            actionsRejected: rejectedCount,
+            actionDetails: JSON.stringify(
+              validationResults.map((r) => ({
+                type: r.action.type,
+                result: r.result,
+                reason: r.reason,
+              })),
+            ),
+            outcome: "skipped",
+            errorDetail: "interrupted during execution",
+          });
+          await this.haltForInterrupt();
+          return { control: "halt" };
+        }
+
+        try {
+          const [result] = await executeGroomActions([action], executorCtx);
+          executionResults.push(result);
+        } catch (err) {
+          executionResults.push({ action, outcome: "failed", error: errMsg(err) });
+        }
+      }
+
+      // If any update_memory actions executed, commit memory changes
+      const memoryUpdated = executionResults.some(
+        (r) => r.outcome === "executed" && r.action.type === "update_memory",
+      );
+      if (memoryUpdated) {
+        try {
+          await commitIfChanged(this.runner, repoPath);
+        } catch (err) {
+          this.log(`groom: memory commit failed (non-fatal): ${errMsg(err)}`);
+        }
+      }
+
+      // 7. Record groom_log
+      const executedCount = executionResults.filter((r) => r.outcome === "executed").length;
+      const actionDetailsList = validationResults.map((vr) => {
+        const execResult = executionResults.find(
+          (er) => er.action === vr.action,
+        );
+        return {
+          type: vr.action.type,
+          payload: vr.action,
+          result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+          reason: vr.reason ?? execResult?.error,
+        };
+      });
+
+      this.store.updateGroomLog(groomLogRow.id, {
+        endedAt: this.clock(),
+        summary: groomOutput.summary,
+        actionsRequested: allActions.length,
+        actionsExecuted: executedCount,
+        actionsRejected: rejectedCount,
+        actionDetails: JSON.stringify(actionDetailsList),
+        outcome: "completed",
+      });
+
+      this.log(
+        `groom: completed (requested=${allActions.length}, executed=${executedCount}, rejected=${rejectedCount}): ${groomOutput.summary}`,
+      );
+
+      return { control: "continue", summary: groomOutput.summary };
+    } catch (err) {
+      this.log(`groom: unexpected error, skipping: ${errMsg(err)}`);
+      this.store.updateGroomLog(groomLogRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: `unexpected: ${errMsg(err)}`,
+      });
+      return { control: "continue", summary: null };
+    }
+  }
+
   // ---- SELECT PM（スコープ doc A1 / §1.4 / §1.5） ----
   private async selectWithPm(
     eligible: EligibleIssue[],
+    groomSummary: string | null = null,
   ): Promise<
     | { control: "continue"; issue: EligibleIssue; rationale: string | null }
     | { control: "halt" }
@@ -940,6 +1238,7 @@ export class Orchestrator {
         implResults: selectMem.implResults ?? undefined,
       },
       memoryBudgetChars: this.config.memory.injectBudgetChars,
+      groomSummary,
     });
 
     let outcome: PlanOutcome;

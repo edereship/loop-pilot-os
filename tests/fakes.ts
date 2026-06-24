@@ -373,3 +373,62 @@ export class FakePlanRunner implements PlanRunner {
     return out;
   }
 }
+
+// ---- FakeGroomBoardFetcher ----
+import type { BoardState } from "../src/types.js";
+
+export class FakeGroomBoardFetcher {
+  boardState: BoardState = { eligible: [], inProgress: [], recentDone: [], blocked: [] };
+  projectIssueIds: Set<string> = new Set();
+  doneIssueIds: Set<string> = new Set();
+  calls: string[] = [];
+
+  async getBoardState(_prMap: Map<string, number | null>): Promise<BoardState> {
+    this.calls.push("getBoardState");
+    return this.boardState;
+  }
+  async getProjectIssueIds(): Promise<Set<string>> {
+    this.calls.push("getProjectIssueIds");
+    return this.projectIssueIds;
+  }
+  async getAllIssueIds(): Promise<Set<string>> {
+    this.calls.push("getAllIssueIds");
+    return this.projectIssueIds;
+  }
+  async getDoneIssueIds(): Promise<Set<string>> {
+    this.calls.push("getDoneIssueIds");
+    return this.doneIssueIds;
+  }
+}
+
+// ---- FakeGroomLinearClient ----
+export class FakeGroomLinearClient {
+  calls: Array<{ method: string; args: unknown[] }> = [];
+
+  async updatePriority(issueId: string, priority: number): Promise<void> {
+    this.calls.push({ method: "updatePriority", args: [issueId, priority] });
+  }
+  async updateIssue(issueId: string, fields: Record<string, unknown>): Promise<void> {
+    this.calls.push({ method: "updateIssue", args: [issueId, fields] });
+  }
+  async createIssue(fields: Record<string, unknown>): Promise<string> {
+    this.calls.push({ method: "createIssue", args: [fields] });
+    return "FAKE-NEW";
+  }
+  async closeIssue(issueId: string, rationale: string): Promise<void> {
+    this.calls.push({ method: "closeIssue", args: [issueId, rationale] });
+  }
+  async addLabels(issueId: string, names: string[]): Promise<void> {
+    this.calls.push({ method: "addLabels", args: [issueId, names] });
+  }
+  async removeLabels(issueId: string, names: string[]): Promise<void> {
+    this.calls.push({ method: "removeLabels", args: [issueId, names] });
+  }
+  async getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }> {
+    this.calls.push({ method: "getIssueDetails", args: [issueId] });
+    return { priority: 3, labelIds: [], description: "" };
+  }
+  async postComment(issueId: string, body: string): Promise<void> {
+    this.calls.push({ method: "postComment", args: [issueId, body] });
+  }
+}
