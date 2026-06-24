@@ -74,10 +74,15 @@ export class GroomBoardFetcher {
   }
 
   private async fetchAll(): Promise<BoardIssueNode[]> {
+    const MAX_PAGES = 50;
     const all: BoardIssueNode[] = [];
     let after: string | null = null;
     let hasNext = true;
+    let page = 0;
     while (hasNext) {
+      if (++page > MAX_PAGES) {
+        throw new Error(`fetchAll exceeded ${MAX_PAGES} pages (${all.length} issues fetched); possible infinite pagination`);
+      }
       const res = await this.fetchFn(LINEAR_GRAPHQL_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: this.apiKey },

@@ -4,8 +4,8 @@ import { writeCategory } from "./memory-store.js";
 /** Structural interface for the Linear client used during action execution. */
 export interface IExecutorLinearClient {
   updatePriority(issueId: string, priority: number): Promise<void>;
-  updateIssue(issueId: string, fields: Record<string, unknown>): Promise<void>;
-  createIssue(fields: Record<string, unknown>): Promise<string>;
+  updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void>;
+  createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string>;
   closeIssue(issueId: string, rationale: string): Promise<void>;
   addLabels(issueId: string, names: string[]): Promise<void>;
   removeLabels(issueId: string, names: string[]): Promise<void>;

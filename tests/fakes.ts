@@ -429,10 +429,10 @@ export class FakeGroomLinearClient {
   async updatePriority(issueId: string, priority: number): Promise<void> {
     this.calls.push({ method: "updatePriority", args: [issueId, priority] });
   }
-  async updateIssue(issueId: string, fields: Record<string, unknown>): Promise<void> {
+  async updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void> {
     this.calls.push({ method: "updateIssue", args: [issueId, fields] });
   }
-  async createIssue(fields: Record<string, unknown>): Promise<string> {
+  async createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string> {
     this.calls.push({ method: "createIssue", args: [fields] });
     return "FAKE-NEW";
   }

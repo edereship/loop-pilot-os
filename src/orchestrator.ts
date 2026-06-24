@@ -46,8 +46,8 @@ export interface IGroomBoardFetcher {
 
 export interface IGroomLinearClient {
   updatePriority(issueId: string, priority: number): Promise<void>;
-  updateIssue(issueId: string, fields: Record<string, unknown>): Promise<void>;
-  createIssue(fields: Record<string, unknown>): Promise<string>;
+  updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void>;
+  createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string>;
   closeIssue(issueId: string, rationale: string): Promise<void>;
   addLabels(issueId: string, names: string[]): Promise<void>;
   removeLabels(issueId: string, names: string[]): Promise<void>;
@@ -931,11 +931,15 @@ export class Orchestrator {
         boardState = await this.groomDeps.boardFetcher.getBoardState(activeSessionPrNumbers);
       } catch (err) {
         this.log(`groom: board fetch failed, skipping: ${errMsg(err)}`);
-        this.store.updateGroomLog(groomLogRow.id, {
-          endedAt: this.clock(),
-          outcome: "skipped",
-          errorDetail: `board fetch failed: ${errMsg(err)}`,
-        });
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "skipped",
+            errorDetail: `board fetch failed: ${errMsg(err)}`,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
         return { control: "continue", summary: null };
       }
 
@@ -995,31 +999,43 @@ export class Orchestrator {
           timeoutMs: this.config.safety.groomTimeoutMinutes * 60_000,
         });
         if (outcome.kind === "interrupted") {
-          this.store.updateGroomLog(groomLogRow.id, {
-            endedAt: this.clock(),
-            outcome: "skipped",
-            errorDetail: "interrupted",
-          });
+          try {
+            this.store.updateGroomLog(groomLogRow.id, {
+              endedAt: this.clock(),
+              outcome: "skipped",
+              errorDetail: "interrupted",
+            });
+          } catch (logErr) {
+            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+          }
           await this.haltForInterrupt();
           return { control: "halt" };
         }
         if (outcome.kind === "error") {
           this.log(`groom: codex failed, skipping: ${outcome.message}`);
-          this.store.updateGroomLog(groomLogRow.id, {
-            endedAt: this.clock(),
-            outcome: "error",
-            errorDetail: `codex error: ${outcome.message}`,
-          });
+          try {
+            this.store.updateGroomLog(groomLogRow.id, {
+              endedAt: this.clock(),
+              outcome: "error",
+              errorDetail: `codex error: ${outcome.message}`,
+            });
+          } catch (logErr) {
+            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+          }
           return { control: "continue", summary: null };
         }
         codexOutput = outcome.text;
       } catch (err) {
         this.log(`groom: codex exception, skipping: ${errMsg(err)}`);
-        this.store.updateGroomLog(groomLogRow.id, {
-          endedAt: this.clock(),
-          outcome: "error",
-          errorDetail: `codex exception: ${errMsg(err)}`,
-        });
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: `codex exception: ${errMsg(err)}`,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
         return { control: "continue", summary: null };
       }
 
@@ -1028,11 +1044,15 @@ export class Orchestrator {
       if (parseResult.kind === "parse_error") {
         const preview = parseResult.raw.slice(0, 200);
         this.log(`groom: parse failed, skipping. Raw: ${preview}`);
-        this.store.updateGroomLog(groomLogRow.id, {
-          endedAt: this.clock(),
-          outcome: "error",
-          errorDetail: `parse failed: ${preview}`,
-        });
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: `parse failed: ${preview}`,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
         return { control: "continue", summary: null };
       }
 
@@ -1055,13 +1075,17 @@ export class Orchestrator {
         };
       } catch (err) {
         this.log(`groom: validation context fetch failed, skipping: ${errMsg(err)}`);
-        this.store.updateGroomLog(groomLogRow.id, {
-          endedAt: this.clock(),
-          outcome: "error",
-          errorDetail: `validation context fetch failed: ${errMsg(err)}`,
-          actionsRequested: allActions.length,
-          summary: groomOutput.summary,
-        });
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: `validation context fetch failed: ${errMsg(err)}`,
+            actionsRequested: allActions.length,
+            summary: groomOutput.summary,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
         return { control: "continue", summary: null };
       }
 
@@ -1083,22 +1107,26 @@ export class Orchestrator {
         if (this.interrupted) {
           // Record partial results and halt
           const executed = executionResults.filter((r) => r.outcome === "executed").length;
-          this.store.updateGroomLog(groomLogRow.id, {
-            endedAt: this.clock(),
-            summary: groomOutput.summary,
-            actionsRequested: allActions.length,
-            actionsExecuted: executed,
-            actionsRejected: rejectedCount,
-            actionDetails: JSON.stringify(
-              validationResults.map((r) => ({
-                type: r.action.type,
-                result: r.result,
-                reason: r.reason,
-              })),
-            ),
-            outcome: "skipped",
-            errorDetail: "interrupted during execution",
-          });
+          try {
+            this.store.updateGroomLog(groomLogRow.id, {
+              endedAt: this.clock(),
+              summary: groomOutput.summary,
+              actionsRequested: allActions.length,
+              actionsExecuted: executed,
+              actionsRejected: rejectedCount,
+              actionDetails: JSON.stringify(
+                validationResults.map((r) => ({
+                  type: r.action.type,
+                  result: r.result,
+                  reason: r.reason,
+                })),
+              ),
+              outcome: "skipped",
+              errorDetail: "interrupted during execution",
+            });
+          } catch (logErr) {
+            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+          }
           await this.haltForInterrupt();
           return { control: "halt" };
         }
@@ -1141,15 +1169,19 @@ export class Orchestrator {
         };
       });
 
-      this.store.updateGroomLog(groomLogRow.id, {
-        endedAt: this.clock(),
-        summary: groomOutput.summary,
-        actionsRequested: allActions.length,
-        actionsExecuted: executedCount,
-        actionsRejected: rejectedCount,
-        actionDetails: JSON.stringify(actionDetailsList),
-        outcome: "completed",
-      });
+      try {
+        this.store.updateGroomLog(groomLogRow.id, {
+          endedAt: this.clock(),
+          summary: groomOutput.summary,
+          actionsRequested: allActions.length,
+          actionsExecuted: executedCount,
+          actionsRejected: rejectedCount,
+          actionDetails: JSON.stringify(actionDetailsList),
+          outcome: "completed",
+        });
+      } catch (logErr) {
+        this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+      }
 
       this.log(
         `groom: completed (requested=${allActions.length}, executed=${executedCount}, rejected=${rejectedCount}): ${groomOutput.summary}`,
