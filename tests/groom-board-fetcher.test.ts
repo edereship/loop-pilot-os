@@ -173,4 +173,63 @@ describe("GroomBoardFetcher", () => {
     const board2 = await fetcher.getBoardState(new Map());
     expect(board2.eligible.length).toBe(3);
   });
+
+  it("getBoardState handles multi-page responses", async () => {
+    const stateIds = { todo: "s-todo", in_progress: "s-ip", in_review: "s-ir", done: "s-done" };
+    let callCount = 0;
+    const fetchFn: FetchFn = async (_url, init) => {
+      callCount++;
+      const body = JSON.parse(init!.body as string);
+      if (callCount === 1) {
+        // First page: 1 issue, hasNextPage=true
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            data: {
+              issues: {
+                nodes: [{ id: "id-1", identifier: "ES-1", title: "First", priority: 3, sortOrder: 0, state: { id: stateIds.todo }, labels: { nodes: [] }, relations: { nodes: [] }, completedAt: null }],
+                pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+              },
+            },
+          }),
+        };
+      }
+      // Second page: 1 issue, hasNextPage=false, verify cursor was forwarded
+      expect(body.variables.after).toBe("cursor-1");
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          data: {
+            issues: {
+              nodes: [{ id: "id-2", identifier: "ES-2", title: "Second", priority: 2, sortOrder: 0, state: { id: stateIds.todo }, labels: { nodes: [] }, relations: { nodes: [] }, completedAt: null }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+      };
+    };
+
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn });
+    const board = await fetcher.getBoardState(new Map());
+    expect(board.eligible.length).toBe(2);
+    expect(board.eligible.map(e => e.identifier).sort()).toEqual(["ES-1", "ES-2"]);
+    expect(callCount).toBe(2);
+  });
+
+  it("getBoardState throws on HTTP error", async () => {
+    const stateIds = { todo: "s-todo", in_progress: "s-ip", in_review: "s-ir", done: "s-done" };
+    const fetchFn: FetchFn = async () => ({ ok: false, status: 503, json: async () => ({}) });
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn });
+    await expect(fetcher.getBoardState(new Map())).rejects.toThrow("Linear HTTP 503");
+  });
+
+  it("getBoardState throws on GraphQL error", async () => {
+    const stateIds = { todo: "s-todo", in_progress: "s-ip", in_review: "s-ir", done: "s-done" };
+    const fetchFn: FetchFn = async () => ({
+      ok: true, status: 200,
+      json: async () => ({ errors: [{ message: "Rate limited" }] }),
+    });
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn });
+    await expect(fetcher.getBoardState(new Map())).rejects.toThrow("Rate limited");
+  });
 });

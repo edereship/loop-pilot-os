@@ -3817,4 +3817,53 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(groomLog.outcome).toBe("error");
     expect(groomLog.errorDetail).toContain("validation context fetch failed");
   });
+
+  it("individual action failure continues to next action", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM output with 2 reprioritize actions
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":1,"rationale":"a"},{"type":"reprioritize","issueId":"ES-2","priority":2,"rationale":"b"}],"summary":"Two changes"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1", "ES-2"]);
+
+    // Make first action fail, second succeed
+    let callCount = 0;
+    (h.groomLinearClient as any).updatePriority = async (issueId: string, priority: number) => {
+      h.groomLinearClient.calls.push({ method: "updatePriority", args: [issueId, priority] });
+      callCount++;
+      if (callCount === 1) throw new Error("Linear API timeout");
+    };
+
+    // SELECT outcome
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Session completes despite action failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+
+    // Both actions attempted: first failed, second succeeded
+    expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(2);
+
+    // groom_log records 1 executed (second succeeded), 0 rejected
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("completed");
+    expect(groomLog.actionsRequested).toBe(2);
+    expect(groomLog.actionsExecuted).toBe(1);
+
+    // Log should contain failure message
+    expect(h.logs.some(l => l.includes("action failed") && l.includes("Linear API timeout"))).toBe(true);
+  });
 });
