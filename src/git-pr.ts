@@ -14,6 +14,7 @@ export interface GitPrManagerOptions {
   worktreeRoot: string;
   prBodyTemplate: string;
   gateLabel: string;
+  log?: (line: string) => void;
 }
 
 /** prBodyTemplate の {identifier}/{title}/{issue_url} を置換（全出現を置換） */
@@ -257,15 +258,21 @@ export class GitPrManager implements GitPrManagerInterface {
   }
 
   async discardWorktree(branch: string, worktreePath: string): Promise<void> {
-    const { repoPath } = this.opts;
-    await this.runner.run(
+    const { repoPath, log } = this.opts;
+    const wtRes = await this.runner.run(
       "git",
       ["-C", repoPath, "worktree", "remove", "--force", worktreePath],
       { cwd: repoPath, timeoutMs: 30_000 },
     );
-    await this.runner.run("git", ["-C", repoPath, "branch", "-D", branch], {
+    if (wtRes.code !== 0) {
+      log?.(`warning: git worktree remove failed for ${worktreePath}: ${wtRes.stderr.trim() || `exit ${wtRes.code}`}`);
+    }
+    const brRes = await this.runner.run("git", ["-C", repoPath, "branch", "-D", branch], {
       cwd: repoPath, timeoutMs: 30_000,
     });
+    if (brRes.code !== 0) {
+      log?.(`warning: git branch -D failed for ${branch}: ${brRes.stderr.trim() || `exit ${brRes.code}`}`);
+    }
   }
 
   async getPrDiffSummary(prNumber: number, maxDiffChars?: number): Promise<PrDiffSummary> {
