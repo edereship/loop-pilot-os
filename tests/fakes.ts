@@ -19,6 +19,7 @@ import type {
   PlanRunner,
   PlanOutcome,
 } from "../src/types.js";
+import type { IGroomBoardFetcher, IGroomLinearClient } from "../src/orchestrator.js";
 
 type StubResponder =
   | Partial<CommandResult>
@@ -377,7 +378,7 @@ export class FakePlanRunner implements PlanRunner {
 // ---- FakeGroomBoardFetcher ----
 import type { BoardState } from "../src/types.js";
 
-export class FakeGroomBoardFetcher {
+export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
   boardState: BoardState = { eligible: [], inProgress: [], recentDone: [], blocked: [] };
   projectIssueIds: Set<string> = new Set();
   doneIssueIds: Set<string> = new Set();
@@ -411,10 +412,6 @@ export class FakeGroomBoardFetcher {
     this._maybeThrow("getProjectIssueIds");
     return this.projectIssueIds;
   }
-  async getAllIssueIds(): Promise<Set<string>> {
-    this.calls.push("getAllIssueIds");
-    return this.projectIssueIds;
-  }
   async getDoneIssueIds(): Promise<Set<string>> {
     this.calls.push("getDoneIssueIds");
     this._maybeThrow("getDoneIssueIds");
@@ -423,7 +420,7 @@ export class FakeGroomBoardFetcher {
 }
 
 // ---- FakeGroomLinearClient ----
-export class FakeGroomLinearClient {
+export class FakeGroomLinearClient implements IGroomLinearClient {
   calls: Array<{ method: string; args: unknown[] }> = [];
 
   async updatePriority(issueId: string, priority: number): Promise<void> {

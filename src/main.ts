@@ -255,7 +255,7 @@ async function runLoop(configPath: string): Promise<number> {
       groomDeps: config.groom.enabled ? {
         boardFetcher: groomBoardFetcher,
         linearClient: groomLinearClient,
-        knownLabels: linearSetup.teamLabels,
+        knownLabels: linearSetup.knownLabels,
       } : null,
     });
 

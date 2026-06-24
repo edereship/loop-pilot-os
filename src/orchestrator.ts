@@ -35,7 +35,7 @@ import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryA
 import { buildGroomPrompt } from "./groom-prompt.js";
 import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
-import { executeGroomActions, type ExecutionResult, type ExecutorContext } from "./groom-executor.js";
+import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
 export interface IGroomBoardFetcher {
   getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
   getProjectIssueIds(): Promise<Set<string>>;
@@ -44,14 +44,7 @@ export interface IGroomBoardFetcher {
   refresh(): void;
 }
 
-export interface IGroomLinearClient {
-  updatePriority(issueId: string, priority: number): Promise<void>;
-  updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void>;
-  createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string>;
-  closeIssue(issueId: string, rationale: string): Promise<void>;
-  addLabels(issueId: string, names: string[]): Promise<void>;
-  removeLabels(issueId: string, names: string[]): Promise<void>;
-  getIssueDetails(issueId: string): Promise<{ priority: number; labelIds: string[]; description: string }>;
+export interface IGroomLinearClient extends IExecutorLinearClient {
   postComment(issueId: string, body: string): Promise<void>;
 }
 

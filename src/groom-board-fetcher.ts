@@ -165,10 +165,6 @@ export class GroomBoardFetcher {
     return new Set(nodes.map((n) => n.identifier));
   }
 
-  async getAllIssueIds(): Promise<Set<string>> {
-    return this.getProjectIssueIds();
-  }
-
   async getDoneIssueIds(): Promise<Set<string>> {
     const nodes = await this.ensureFetched();
     return new Set(nodes.filter((n) => n.state.id === this.stateIds.done).map((n) => n.identifier));

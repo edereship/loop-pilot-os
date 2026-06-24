@@ -277,7 +277,7 @@ export interface ResolvedLinearSetup {
   stateIds: Record<TicketState, string>;
   optInLabelId: string;
   labelMap: Map<string, string>;   // label name → id (team + workspace)
-  teamLabels: string[];            // known label names for GROOM prompt
+  knownLabels: string[];           // known label names for GROOM prompt
 }
 
 const TICKET_STATES: TicketState[] = [
@@ -347,7 +347,7 @@ export async function resolveLinearSetup(
   for (const l of team.labels.nodes) {
     labelMap.set(l.name, l.id); // team labels override workspace on conflict
   }
-  const teamLabels = [...new Set([
+  const knownLabels = [...new Set([
     ...team.labels.nodes.map((l) => l.name),
     ...data.issueLabels.nodes.map((l) => l.name),
   ])].sort();
@@ -360,6 +360,6 @@ export async function resolveLinearSetup(
     stateIds,
     optInLabelId: label!.id,
     labelMap,
-    teamLabels,
+    knownLabels,
   };
 }

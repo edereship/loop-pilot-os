@@ -3676,6 +3676,39 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(groomLog.errorDetail).toContain("interrupted");
   });
 
+  it("Codex exception (thrown) skips GROOM and proceeds to SELECT", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // Override planner.run to throw on first call (GROOM), succeed on second call (SELECT)
+    let callCount = 0;
+    const origRun = planner.run.bind(planner);
+    planner.run = async (ctx) => {
+      callCount++;
+      if (callCount === 1) throw new Error("codex process crashed");
+      return origRun(ctx);
+    };
+
+    // SELECT outcome
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("codex exception");
+  });
+
   it("GROOM parse failure records error in groom_log and skips to SELECT", async () => {
     const planner = new FakePlanRunner();
     const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });

@@ -113,4 +113,64 @@ describe("GroomBoardFetcher", () => {
     expect(ids.has("ES-1")).toBe(false);
     expect(ids.has("ES-2")).toBe(true);
   });
+
+  it("caches results so the fetch function is called only once per cycle", async () => {
+    let callCount = 0;
+    const countingFetch: FetchFn = async () => {
+      callCount++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: {
+            issues: {
+              nodes: [
+                makeNode("id-1", "ES-1", stateIds.todo),
+                makeNode("id-2", "ES-2", stateIds.done),
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+      };
+    };
+
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn: countingFetch });
+
+    await fetcher.getBoardState(new Map());
+    await fetcher.getProjectIssueIds();
+    await fetcher.getDoneIssueIds();
+
+    expect(callCount).toBe(1);
+  });
+
+  it("refresh() invalidates the cache so the next call re-fetches", async () => {
+    let nodeCount = 2;
+    const dynamicFetch: FetchFn = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: {
+          issues: {
+            nodes: Array.from({ length: nodeCount }, (_, i) =>
+              makeNode(`id-${i + 1}`, `ES-${i + 1}`, stateIds.todo),
+            ),
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      }),
+    });
+
+    const fetcher = new GroomBoardFetcher({ apiKey: "key", projectId: "proj", stateIds, fetchFn: dynamicFetch });
+
+    const board1 = await fetcher.getBoardState(new Map());
+    expect(board1.eligible.length).toBe(2);
+
+    // Invalidate cache and change the underlying data
+    fetcher.refresh();
+    nodeCount = 3;
+
+    const board2 = await fetcher.getBoardState(new Map());
+    expect(board2.eligible.length).toBe(3);
+  });
 });

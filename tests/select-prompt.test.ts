@@ -179,6 +179,7 @@ describe("buildSelectPrompt", () => {
     lastPrDiff: null,
     diffBudgetChars: 6000,
     codebaseSummary: null,
+    groomSummary: null,
   };
 
   it("includes system instruction and eligible candidates", () => {
