@@ -105,7 +105,8 @@ export class ConsoleSlackNotifier implements Notifier {
           this.store.markDelivered(intentId, "slack");
           return;
         }
-        // 非2xx は失敗扱い。次の試行へ（最終試行なら諦める）。
+        // 非2xx は失敗扱い。ログに記録して次の試行へ（最終試行なら諦める）。
+        this.log(`slack delivery error (attempt ${attempt}/${SLACK_MAX_ATTEMPTS}): HTTP ${res.status}`);
       } catch (err) {
         const raw = err instanceof Error ? err.message : String(err);
         const safe = raw.replaceAll(url, "[redacted]");

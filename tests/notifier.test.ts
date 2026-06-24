@@ -119,8 +119,15 @@ describe("ConsoleSlackNotifier", () => {
     expect(sleeps).toEqual([1000, 2000]);
 
     // console は必達
-    expect(logs.length).toBe(1);
-    expect(logs[0]).toContain("3/3");
+    const consoleLogs = logs.filter((l) => !l.startsWith("slack delivery error"));
+    expect(consoleLogs.length).toBe(1);
+    expect(consoleLogs[0]).toContain("3/3");
+
+    // ES-472: 非2xx の試行ごとにエラーログが出る
+    const errorLogs = logs.filter((l) => l.includes("slack delivery error"));
+    expect(errorLogs.length).toBe(3);
+    expect(errorLogs[0]).toContain("attempt 1/3");
+    expect(errorLogs[0]).toContain("HTTP 500");
 
     // Slack 未達: undelivered に1件残り attempts=3
     const undelivered = store.undeliveredIntents();
