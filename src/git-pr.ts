@@ -134,6 +134,16 @@ export class GitPrManager implements GitPrManagerInterface {
   }
 
   async discardUncommittedChanges(worktreePath: string): Promise<void> {
+    const unstage = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "restore", "--staged", "."],
+      { cwd: worktreePath, timeoutMs: 30_000 },
+    );
+    if (unstage.code !== 0) {
+      throw new Error(
+        `git restore --staged failed in ${worktreePath}: ${unstage.stderr.trim() || `exit ${unstage.code}`}`,
+      );
+    }
     const restore = await this.runner.run(
       "git",
       ["-C", worktreePath, "restore", "."],

@@ -841,10 +841,17 @@ export class Orchestrator {
           // proceeding to IMPLEMENT without an approved design.
           if (designReviewReasons !== undefined && (planBrief === null || planBrief.raw.length === 0)) {
             await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
-            await bestEffort(() => this.source.transition(issue.id, "todo"));
+            let todoRevertErrA: string | null = null;
+            try {
+              await this.source.transition(issue.id, "todo");
+            } catch (err) {
+              todoRevertErrA = errMsg(err);
+              this.log(`designReview: todo revert failed after redesign failure (ticket may be stuck In Progress): ${todoRevertErrA}`);
+            }
+            const baseDetailA = `redesign agent failed to produce a brief after rejection: ${designReviewReasons.join("; ")}`;
             const ctrl = await this.stopSession(
               session, "design_rejected",
-              `redesign agent failed to produce a brief after rejection: ${designReviewReasons.join("; ")}`,
+              todoRevertErrA !== null ? `${baseDetailA}; todo revert failed: ${todoRevertErrA}` : baseDetailA,
             );
             if (ctrl.control === "halt") return;
             designRejected = true;
@@ -866,9 +873,16 @@ export class Orchestrator {
           designAttempt++;
           if (designAttempt > maxRedesigns) {
             await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
-            await bestEffort(() => this.source.transition(issue.id, "todo"));
+            let todoRevertErr: string | null = null;
+            try {
+              await this.source.transition(issue.id, "todo");
+            } catch (err) {
+              todoRevertErr = errMsg(err);
+              this.log(`designReview: todo revert failed after max redesigns exceeded (ticket may be stuck In Progress): ${todoRevertErr}`);
+            }
             const lastReasons = review.reasons.length > 0 ? review.reasons.join("; ") : "(no reasons provided)";
-            const detail = `design review rejected after ${maxRedesigns} redesign attempts: ${lastReasons}`;
+            const baseDetail = `design review rejected after ${maxRedesigns} redesign attempts: ${lastReasons}`;
+            const detail = todoRevertErr !== null ? `${baseDetail}; todo revert failed: ${todoRevertErr}` : baseDetail;
             const ctrl = await this.stopSession(session, "design_rejected", detail);
             if (ctrl.control === "halt") return;
             designRejected = true;
@@ -1090,6 +1104,12 @@ export class Orchestrator {
 
     const prompt = buildDesignReviewPrompt({ issue, brief, specContent, priorRejectReasons });
 
+    // Record the starting SHA so any commits the reviewer creates can be undone before
+    // the IMPLEMENT phase runs (ES-477 Finding 3).
+    const reviewStartSha = await this.runner.run("git", ["rev-parse", "HEAD"], { cwd: worktreePath })
+      .then((r) => (r.code === 0 ? r.stdout.trim() : null))
+      .catch(() => null);
+
     let outcome: PlanOutcome;
     try {
       outcome = await this.designReviewer.run({
@@ -1105,12 +1125,19 @@ export class Orchestrator {
         errorDetail: errMsg(err),
       });
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+      if (reviewStartSha) {
+        await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => {});
+      }
       return { control: "continue", verdict: "approve" };
     }
 
     // Discard any uncommitted changes the reviewer may have left in the worktree
     // before the implementation phase runs.
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+    // Reset to the pre-review SHA to undo any commits the reviewer created.
+    if (reviewStartSha) {
+      await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => {});
+    }
 
     if (outcome.kind === "interrupted") {
       this.store.updateDesignReviewLog(logRow.id, {

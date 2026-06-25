@@ -4967,4 +4967,116 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("merged");
   });
+
+  it("resets worktree to startSha after reviewer runs to undo any reviewer-created commits (ES-477 Finding 3)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // git reset --hard <startSha> must be called on the worktree path (not repoPath)
+    const resetOnWorktree = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(resetOnWorktree.length).toBeGreaterThan(0);
+  });
+
+  it("resets worktree to startSha even when reviewer throws exception (ES-477 Finding 3)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    // No outcomes queued → FakePlanRunner throws
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Exception path must also reset to startSha on the worktree path
+    const resetOnWorktree = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(resetOnWorktree.length).toBeGreaterThan(0);
+  });
+
+  it("captures Linear transition failure in stop detail when max redesigns exceeded (ES-477 Finding 2)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV2\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV3\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 1"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 2"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 3"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Override transition to succeed for "in_progress" (CLAIM) but fail for "todo" (design rejection revert)
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (...args: Parameters<typeof h.source.transition>): Promise<void> => {
+      if (args[1] === "todo") throw new Error("Linear outage");
+      return origTransition(...args);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("design_rejected");
+    // Stop detail must include both the rejection reason and the transition failure
+    expect(s.stopDetail).toContain("Bad 3");
+    expect(s.stopDetail).toContain("todo revert failed");
+    expect(s.stopDetail).toContain("Linear outage");
+    expect(h.logs.some((l) => l.includes("todo revert failed") && l.includes("Linear outage"))).toBe(true);
+  });
+
+  it("captures Linear transition failure in stop detail when redesign agent returns null brief (ES-477 Finding 2)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      // Second design agent errors out, causing brief: null
+      { kind: "error", message: "agent crashed on redesign" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Needs work"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Override transition to succeed for "in_progress" (CLAIM) but fail for "todo" (design rejection revert)
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (...args: Parameters<typeof h.source.transition>): Promise<void> => {
+      if (args[1] === "todo") throw new Error("Linear outage");
+      return origTransition(...args);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("design_rejected");
+    expect(s.stopDetail).toContain("redesign agent failed");
+    expect(s.stopDetail).toContain("todo revert failed");
+    expect(s.stopDetail).toContain("Linear outage");
+  });
 });
