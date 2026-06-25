@@ -69,6 +69,7 @@ const rawSchema = z.object({
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
     idle_recheck_seconds: z.number().int().positive(),
+    idle_timeout_minutes: z.number().int().nonnegative().default(120),
   }).strict(),
   digest: z.object({
     recent_merged_count: z.number().int().positive(),
@@ -149,6 +150,7 @@ export interface Config {
   loop: {
     monitorPollSeconds: number;
     idleRecheckSeconds: number;
+    idleTimeoutMinutes: number;
   };
   digest: {
     recentMergedCount: number;
@@ -659,6 +661,7 @@ export function loadConfig(
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
       idleRecheckSeconds: raw.loop.idle_recheck_seconds,
+      idleTimeoutMinutes: raw.loop.idle_timeout_minutes,
     },
     digest: {
       recentMergedCount: raw.digest.recent_merged_count,

@@ -88,6 +88,7 @@ interface RawRunRow {
   state: string;
   halt_reason: string | null;
   pause_meta: string | null;
+  idle_started_at: string | null;
 }
 function parsePauseMeta(raw: string | null): PauseMeta | null {
   if (raw === null) return null;
@@ -105,6 +106,7 @@ function toRunRow(r: RawRunRow): RunRow {
     state: r.state as RunState,
     haltReason: r.halt_reason,
     pauseMeta: parsePauseMeta(r.pause_meta),
+    idleStartedAt: r.idle_started_at,
   };
 }
 
@@ -357,6 +359,10 @@ export class SqliteStore {
         this.db.pragma(`foreign_keys = ${fkWasOn}`);
       }
     }
+
+    if (!runColumns.has("idle_started_at")) {
+      this.db.exec(`ALTER TABLE run ADD COLUMN idle_started_at TEXT`);
+    }
   }
 
   close(): void {
@@ -416,6 +422,18 @@ export class SqliteStore {
     if (info.changes !== 1) {
       throw new Error(`clearPauseMeta affected ${info.changes} rows for run id=${id}`);
     }
+  }
+
+  setIdleStartedAt(id: number, isoTimestamp: string): void {
+    this.db.prepare(
+      `UPDATE run SET idle_started_at = ? WHERE id = ? AND idle_started_at IS NULL`,
+    ).run(isoTimestamp, id);
+  }
+
+  clearIdleStartedAt(id: number): void {
+    this.db.prepare(
+      `UPDATE run SET idle_started_at = NULL WHERE id = ?`,
+    ).run(id);
   }
 
   countTasksStarted(runId: number): number {

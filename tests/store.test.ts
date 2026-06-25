@@ -1156,3 +1156,44 @@ describe("doneTransitionPending column (ES-462)", () => {
     expect(pending[0].linearIssueId).toBe("issue-1");
   });
 });
+
+describe("SqliteStore: idle timeout", () => {
+  it("createRun initializes idleStartedAt as null", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    expect(run.idleStartedAt).toBeNull();
+  });
+
+  it("setIdleStartedAt persists timestamp and getRun returns it", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-06-06T01:00:00.000Z");
+    const updated = store.getRun(run.id);
+    expect(updated.idleStartedAt).toBe("2026-06-06T01:00:00.000Z");
+  });
+
+  it("setIdleStartedAt is idempotent — does not overwrite existing value", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-06-06T01:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-06-06T02:00:00.000Z");
+    const updated = store.getRun(run.id);
+    expect(updated.idleStartedAt).toBe("2026-06-06T01:00:00.000Z");
+  });
+
+  it("clearIdleStartedAt resets to null", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-06-06T01:00:00.000Z");
+    store.clearIdleStartedAt(run.id);
+    const updated = store.getRun(run.id);
+    expect(updated.idleStartedAt).toBeNull();
+  });
+
+  it("clearIdleStartedAt is safe when already null", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-06T00:00:00.000Z");
+    store.clearIdleStartedAt(run.id);
+    expect(store.getRun(run.id).idleStartedAt).toBeNull();
+  });
+});
