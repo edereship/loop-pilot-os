@@ -688,6 +688,23 @@ export class Orchestrator {
         return;
       }
 
+      // 1.5) アイドルタイムアウトチェック（ES-475）
+      const idleTimeoutMin = this.config.loop.idleTimeoutMinutes;
+      if (idleTimeoutMin > 0) {
+        const run = this.store.getRun(this.runId);
+        if (run.idleStartedAt !== null) {
+          const elapsedMs = Date.parse(this.clock()) - Date.parse(run.idleStartedAt);
+          if (elapsedMs >= idleTimeoutMin * 60_000) {
+            const detail = `idle timeout: no eligible tickets for ${idleTimeoutMin} minutes`;
+            await this.notifier.notify({ kind: "halted", reason: "idle_timeout", detail });
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", detail);
+            this.log(detail);
+            return;
+          }
+        }
+      }
+
       // 0.5) GROOM（D-13: failure → skip to SELECT）
       let groomSummary: string | null = null;
       let groomBlockedIds: Set<string> = new Set();
@@ -733,12 +750,14 @@ export class Orchestrator {
           await this.notifier.notify({ kind: "idle", detail: "no eligible tickets" });
           idleNotified = true;
         }
+        this.store.setIdleStartedAt(this.runId, this.clock());
         this.store.setRunState(this.runId, "idle");
         await this.sleep(this.config.loop.idleRecheckSeconds * 1000);
         continue;
       }
       // 復帰：idle から running へ
       idleNotified = false;
+      this.store.clearIdleStartedAt(this.runId);
       this.store.setRunState(this.runId, "running");
 
       let issue: EligibleIssue;
