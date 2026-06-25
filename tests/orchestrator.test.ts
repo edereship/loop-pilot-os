@@ -5353,4 +5353,65 @@ describe("Self-Review (ES-473)", () => {
     // selfReviewCostUsd stays null
     expect(sessions[0].selfReviewCostUsd).toBeNull();
   });
+
+  it("self-review verdict=fail → session stopped, no PR opened (ES-473 Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.4, summary: '```json\n{"verdict":"fail","issues":["Missing required feature X"],"summary":"Feature X not implemented."}\n```' },
+    ];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must be stopped — not allowed to proceed to HANDOFF
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("self-review verdict=fail");
+    // No PR should have been opened
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+    // Run should be halted
+    expect(run.state).toBe("halted");
+    // The self-review log must still record the verdict
+    const log = h.store.getSelfReviewLogsForSession(sessions[0].id);
+    expect(log[0].verdict).toBe("fail");
+    expect(log[0].outcome).toBe("failed");
+  });
+
+  it("self-review leaves uncommitted changes → session stopped, no PR opened (ES-473 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.4, summary: '```json\n{"verdict":"pass","issues":["Fixed validation"],"summary":"Fixed 1 issue."}\n```' },
+    ];
+    // IMPLEMENT check returns false (clean commit), self-review check returns true (dirty)
+    let uncommittedCallCount = 0;
+    const origHasUncommitted = h.git.hasUncommittedChanges.bind(h.git);
+    h.git.hasUncommittedChanges = async (worktreePath: string): Promise<boolean> => {
+      uncommittedCallCount++;
+      if (uncommittedCallCount <= 1) return false; // post-IMPLEMENT: clean
+      return origHasUncommitted(worktreePath); // post-self-review: delegate to map
+    };
+    h.git.uncommitted.set("/wt/ty-1", true); // reviewer left uncommitted changes
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must be stopped — uncommitted self-review changes must not be silently dropped
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("agent_no_change");
+    expect(sessions[0].stopDetail).toContain("self-review left uncommitted changes");
+    // No PR should have been opened
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+    // Run should be halted
+    expect(run.state).toBe("halted");
+  });
 });

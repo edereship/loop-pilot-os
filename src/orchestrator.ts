@@ -469,24 +469,23 @@ export class Orchestrator {
     }
     // IMPLEMENT interrupted before PR creation (e.g. SIGINT during rate-limit sleep):
     // revert the ticket to Todo and discard the worktree only when no committed work
-    // exists yet. If the agent already committed changes (crash between runSession
-    // completing and handoff() recording "handing_off"), fall through to manual cleanup
-    // to avoid destroying committed implementation work.
-    // Also treat uncommitted file edits as "work" — if SIGINT fires during the
-    // rate-limit sleep after Claude has edited files but before it commits, the
-    // worktree is dirty but hasCommitsWithDiff returns false.  Discarding that
-    // worktree would silently destroy the partial implementation.
+    // exists yet. If the agent already committed changes and the worktree is clean,
+    // resume from SELF-REVIEW → HANDOFF (ES-473: the safe point between IMPLEMENT and
+    // HANDOFF may leave "implementing" with committed work but no PR on a clean interrupt).
+    // Fall through to manual cleanup for dirty worktrees to avoid destroying partial work.
     if (session.state === "implementing") {
-      let hasWork = false;
+      let hasCommits = false;
+      let hasDirtyFiles = false;
+      let checkFailed = false;
       if (session.worktreePath) {
         try {
-          hasWork = await this.git.hasCommitsWithDiff(session.worktreePath) ||
-            await this.git.hasUncommittedChanges(session.worktreePath);
+          hasCommits = await this.git.hasCommitsWithDiff(session.worktreePath);
+          hasDirtyFiles = await this.git.hasUncommittedChanges(session.worktreePath);
         } catch {
-          hasWork = true; // assume work exists if check fails; prefer manual cleanup
+          checkFailed = true; // assume work exists if check fails; prefer manual cleanup
         }
       }
-      if (!hasWork) {
+      if (!hasCommits && !hasDirtyFiles && !checkFailed) {
         if (session.worktreePath) {
           await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
         }
@@ -505,7 +504,32 @@ export class Orchestrator {
           `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
         return await this.stopSession(session, "exception", detail);
       }
-      // Has committed work → fall through to manual cleanup below
+      if (hasCommits && !hasDirtyFiles && !checkFailed) {
+        // Clean committed work, no open PR: resume from SELF-REVIEW → HANDOFF.
+        this.store.updateSession(session.id, { runId: this.runId });
+        const recoveredIssue: EligibleIssue = {
+          id: session.linearIssueId,
+          identifier: session.linearIdentifier,
+          title: session.issueTitle,
+          description: "",
+          priority: 0,
+          sortOrder: 0,
+          url: "",
+        };
+        const recoveredBrief: PlanBrief | null = session.planBrief !== null
+          ? { raw: session.planBrief, sections: null }
+          : null;
+        if (this.config.selfReview.enabled) {
+          const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
+          if (sr.control === "halt") return HALT;
+        }
+        const handoffResult = await this.handoff(session, recoveredIssue);
+        if ("prNumber" in handoffResult) {
+          return CONTINUE;
+        }
+        return handoffResult;
+      }
+      // Has dirty files or check failed → fall through to manual cleanup below
     }
     // オープン PR なし → 手動掃除を促して HALT（タスク内自動再開は v1 スコープ外）。
     this.store.updateSession(session.id, { runId: this.runId });
@@ -2044,6 +2068,35 @@ export class Orchestrator {
     this.log(
       `selfReview: ${verdict} (issues=${issues.length}): ${summary}`,
     );
+
+    // Finding 2: a fail verdict means the reviewer could not resolve spec/requirement
+    // issues — opening a PR for known-incomplete work is incorrect.
+    if (verdict === "fail") {
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review verdict=fail: ${summary}`,
+      );
+    }
+
+    // Finding 3: if the reviewer fixed files but did not commit them, pushAndOpenPr
+    // only pushes HEAD and the PR omits the self-review fixes while the log records
+    // "fixed". Treat uncommitted leftovers the same way IMPLEMENT does.
+    try {
+      if (await this.git.hasUncommittedChanges(worktreePath)) {
+        return await this.stopSession(
+          session,
+          "agent_no_change",
+          "self-review left uncommitted changes",
+        );
+      }
+    } catch (err) {
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: git status check failed: ${errMsg(err)}`,
+      );
+    }
 
     return CONTINUE;
   }

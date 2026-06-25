@@ -44,6 +44,8 @@ function makeConfig(over: Partial<{
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,
       groomBoardBudgetChars: 10000,
+      selfReviewTimeoutMinutes: 15,
+      maxCostUsdPerSelfReview: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -581,7 +583,7 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     expect(h.source.eligibleCalls).toHaveLength(0);
   });
 
-  it("implementing + no PR + has commits → manual cleanup (no discard, no todo revert) + HALT (Finding 3)", async () => {
+  it("implementing + no PR + clean commits → resumes SELF-REVIEW + HANDOFF, enters monitor (ES-473 Finding 1)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
@@ -589,21 +591,31 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
       { state: "implementing" },
       { branch: "looppilot/ty-wk-x", worktreePath: "/wt/ty-wk", linearIssueId: "issue-WK", linearIdentifier: "TY-WK" },
     );
-    // Agent committed work but orchestrator crashed before handoff; default FakeGitPr returns true
+    // Agent committed clean work but orchestrator crashed before handoff (new ES-473 safe point)
     h.git.commitsWithDiff.set("/wt/ty-wk", true);
+    // Self-review outcome + monitor verdicts to complete the session
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // Stop the loop after monitor completes so run() exits cleanly
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
 
     await h.orch.run();
 
     const s = h.store.getSession(crashed.id);
-    expect(s.state).toBe("stopped");
-    expect(s.failureReason).toBe("exception");
-    // Falls through to the existing manual-cleanup path — no discard, no todo transition
-    expect(s.stopDetail).toContain("manual cleanup");
-    expect(s.stopDetail).toContain("looppilot/ty-wk-x");
-    expect(s.stopDetail).toContain("TY-WK");
+    // Recovery resumed handoff and entered monitor → session merged
+    expect(s.state).toBe("merged");
+    expect(s.prNumber).not.toBeNull();
     // Committed work must NOT be destroyed
     expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
     expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
+    // pushAndOpenPr was called to open the PR
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(true);
   });
 
   it("implementing + no PR + no commits + transition(todo) fails → detail says revert FAILED (Finding 2)", async () => {
