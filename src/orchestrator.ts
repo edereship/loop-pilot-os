@@ -1992,6 +1992,7 @@ export class Orchestrator {
       brief: planBrief,
       specContent,
       defaultBranch: this.config.repo.defaultBranch,
+      specDir: this.config.product.specDir,
       memory: {
         implResults: mem.implResults ?? undefined,
         productKnowledge: mem.productKnowledge ?? undefined,
@@ -2038,6 +2039,16 @@ export class Orchestrator {
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       if (preReviewSha !== null) {
         await bestEffort(async () => {
+          const branchRes = await this.runner.run(
+            "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (branchRes.code === 0 && branchRes.stdout.trim() !== session.branch) {
+            await this.runner.run(
+              "git", ["-C", worktreePath, "checkout", session.branch],
+              { cwd: worktreePath, timeoutMs: 30_000 },
+            );
+          }
           await this.runner.run(
             "git", ["-C", worktreePath, "reset", "--hard", preReviewSha!],
             { cwd: worktreePath, timeoutMs: 30_000 },
@@ -2080,6 +2091,16 @@ export class Orchestrator {
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       if (preReviewSha !== null) {
         await bestEffort(async () => {
+          const branchRes = await this.runner.run(
+            "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (branchRes.code === 0 && branchRes.stdout.trim() !== session.branch) {
+            await this.runner.run(
+              "git", ["-C", worktreePath, "checkout", session.branch],
+              { cwd: worktreePath, timeoutMs: 30_000 },
+            );
+          }
           await this.runner.run(
             "git", ["-C", worktreePath, "reset", "--hard", preReviewSha!],
             { cwd: worktreePath, timeoutMs: 30_000 },
@@ -2108,6 +2129,16 @@ export class Orchestrator {
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       if (preReviewSha !== null) {
         await bestEffort(async () => {
+          const branchRes = await this.runner.run(
+            "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (branchRes.code === 0 && branchRes.stdout.trim() !== session.branch) {
+            await this.runner.run(
+              "git", ["-C", worktreePath, "checkout", session.branch],
+              { cwd: worktreePath, timeoutMs: 30_000 },
+            );
+          }
           await this.runner.run(
             "git", ["-C", worktreePath, "reset", "--hard", preReviewSha!],
             { cwd: worktreePath, timeoutMs: 30_000 },
@@ -2191,6 +2222,48 @@ export class Orchestrator {
         session,
         "exception",
         `self-review: branch verification failed: ${errMsg(err)}`,
+      );
+    }
+
+    // Finding 3: if the reviewer reported fixes (issues.length > 0) but made no new commits,
+    // the PR would contain only the original implementation while the log records "fixed".
+    if (issues.length > 0 && preReviewSha !== null) {
+      try {
+        const currentShaRes = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        if (currentShaRes.code === 0 && currentShaRes.stdout.trim() === preReviewSha) {
+          return await this.stopSession(
+            session,
+            "agent_no_change",
+            "self-review reported fixes but made no commits",
+          );
+        }
+      } catch (err) {
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: commit verification failed: ${errMsg(err)}`,
+        );
+      }
+    }
+
+    // Finding 4: the self-review agent may have reset session.branch back to origin/main
+    // while leaving a clean worktree. Re-verify the branch still carries an implementation diff.
+    try {
+      if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
+        return await this.stopSession(
+          session,
+          "agent_no_change",
+          "self-review reset the implementation: no diff remains",
+        );
+      }
+    } catch (err) {
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: diff check failed: ${errMsg(err)}`,
       );
     }
 

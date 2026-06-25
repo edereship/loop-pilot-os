@@ -6,6 +6,7 @@ export interface SelfReviewPromptArgs {
   brief: PlanBrief | null;
   specContent: SpecContent | null;
   defaultBranch: string;
+  specDir?: string;
   memory?: {
     implResults?: string;
     productKnowledge?: string;
@@ -14,7 +15,7 @@ export interface SelfReviewPromptArgs {
 }
 
 export function buildSelfReviewPrompt(args: SelfReviewPromptArgs): string {
-  const { issue, brief, specContent, defaultBranch, memory, memoryBudgetChars } = args;
+  const { issue, brief, specContent, defaultBranch, specDir, memory, memoryBudgetChars } = args;
   const blocks: string[] = [];
 
   blocks.push(
@@ -26,7 +27,7 @@ export function buildSelfReviewPrompt(args: SelfReviewPromptArgs): string {
       "Review the implementation from these four perspectives:",
       "1. **Requirements alignment**: Do the changes satisfy every acceptance criterion in the ticket?",
       "2. **Brief alignment**: Do the changes follow the implementation brief's approach and steps?",
-      "3. **Spec alignment**: Do the changes comply with the product specifications in `docs/specs/`?",
+      `3. **Spec alignment**: Do the changes comply with the product specifications in \`${specDir ?? "docs/specs/"}\`?`,
       "4. **Completeness**: Is anything missing? Are there any gaps in completeness?",
       "",
       "Do NOT review code quality, style, performance, or security — those are handled by the PR reviewer.",
