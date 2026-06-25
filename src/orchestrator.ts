@@ -505,11 +505,20 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", detail);
       }
       if (hasCommits && !hasDirtyFiles && !checkFailed) {
-        // Clean committed work, no open PR: resume from HANDOFF.
-        // Skip self-review: the recovery path has no ticket description or URL,
-        // so the self-review prompt would lack acceptance criteria and could
-        // approve or reject work it cannot meaningfully evaluate.
         this.store.updateSession(session.id, { runId: this.runId });
+        if (this.config.selfReview.enabled) {
+          // Self-review requires ticket description and acceptance criteria to evaluate
+          // committed work. The recovery context has no ticket description, so proceeding
+          // to HANDOFF would bypass the required self-review gate. Halt for human review.
+          const detail =
+            `crash recovery: self-review required but ticket description unavailable; ` +
+            `manual review and handoff needed: ` +
+            `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+          this.log(`recovery: halting — self-review required but ticket context unavailable (${session.linearIdentifier})`);
+          return await this.stopSession(session, "exception", detail);
+        }
+        // Clean committed work, no open PR: resume from HANDOFF.
+        // Self-review is disabled, so proceed directly.
         const recoveredIssue: EligibleIssue = {
           id: session.linearIssueId,
           identifier: session.linearIdentifier,
@@ -519,9 +528,6 @@ export class Orchestrator {
           sortOrder: 0,
           url: "",
         };
-        if (this.config.selfReview.enabled) {
-          this.log("recovery: skipping self-review (ticket description unavailable during crash recovery)");
-        }
         const handoffResult = await this.handoff(session, recoveredIssue);
         if ("prNumber" in handoffResult) {
           return CONTINUE;
@@ -1999,6 +2005,21 @@ export class Orchestrator {
       startedAt: this.clock(),
     });
 
+    // Capture HEAD before the review agent runs so we can reset any commits it
+    // makes on failure paths (cost_exceeded / error / parse_error / exception).
+    let preReviewSha: string | null = null;
+    try {
+      const shaRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      if (shaRes.code === 0 && shaRes.stdout.trim()) {
+        preReviewSha = shaRes.stdout.trim();
+      }
+    } catch {
+      // non-fatal: proceed without reset-on-failure protection
+    }
+
     let outcome: AgentOutcome;
     try {
       outcome = await this.agent.runSession({
@@ -2015,11 +2036,23 @@ export class Orchestrator {
         errorDetail: errMsg(err),
       });
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+      if (preReviewSha !== null) {
+        await bestEffort(async () => {
+          await this.runner.run(
+            "git", ["-C", worktreePath, "reset", "--hard", preReviewSha!],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+        });
+      }
       return CONTINUE;
     }
 
     if (outcome.kind === "interrupted") {
-      this.store.updateSession(session.id, { selfReviewCostUsd: outcome.costUsd });
+      const interruptedSession = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        selfReviewCostUsd: outcome.costUsd,
+        costUsd: (interruptedSession.costUsd ?? 0) + (outcome.costUsd ?? 0),
+      });
       this.store.updateSelfReviewLog(logRow.id, {
         endedAt: this.clock(),
         outcome: "error",
@@ -2033,7 +2066,11 @@ export class Orchestrator {
     if (outcome.kind === "cost_exceeded" || outcome.kind === "error") {
       const errDetail = outcome.kind === "error" ? outcome.message : "cost exceeded";
       this.log(`selfReview: agent ${outcome.kind} (non-fatal): ${errDetail}`);
-      this.store.updateSession(session.id, { selfReviewCostUsd: outcome.costUsd });
+      const failedSession = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        selfReviewCostUsd: outcome.costUsd,
+        costUsd: (failedSession.costUsd ?? 0) + (outcome.costUsd ?? 0),
+      });
       this.store.updateSelfReviewLog(logRow.id, {
         endedAt: this.clock(),
         outcome: "error",
@@ -2041,11 +2078,23 @@ export class Orchestrator {
         errorDetail: errDetail,
       });
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+      if (preReviewSha !== null) {
+        await bestEffort(async () => {
+          await this.runner.run(
+            "git", ["-C", worktreePath, "reset", "--hard", preReviewSha!],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+        });
+      }
       return CONTINUE;
     }
 
     // completed
-    this.store.updateSession(session.id, { selfReviewCostUsd: outcome.costUsd });
+    const completedSession = this.store.getSession(session.id);
+    this.store.updateSession(session.id, {
+      selfReviewCostUsd: outcome.costUsd,
+      costUsd: (completedSession.costUsd ?? 0) + (outcome.costUsd ?? 0),
+    });
 
     const parsed = parseSelfReviewOutput(outcome.fullResult ?? outcome.summary);
     if (parsed.kind === "parse_error") {
@@ -2057,6 +2106,14 @@ export class Orchestrator {
         errorDetail: `parse error: ${parsed.raw.slice(0, 200)}`,
       });
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+      if (preReviewSha !== null) {
+        await bestEffort(async () => {
+          await this.runner.run(
+            "git", ["-C", worktreePath, "reset", "--hard", preReviewSha!],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+        });
+      }
       return CONTINUE;
     }
 
@@ -2109,9 +2166,10 @@ export class Orchestrator {
     }
 
     // Verify the worktree is still on the expected branch. If the self-review
-    // agent checked out a different branch or detached HEAD and committed there,
-    // pushAndOpenPr pushes the named session branch ref, so the PR would omit
-    // the self-review fixes while the log records them as applied.
+    // agent checked out a different branch or detached HEAD, any commits made
+    // there are not on session.branch and would be absent from the PR even
+    // though the review log records them as applied. Stop unconditionally
+    // so human review can recover or cherry-pick the commits.
     try {
       const headRes = await this.runner.run(
         "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
@@ -2120,20 +2178,13 @@ export class Orchestrator {
       const currentBranch = headRes.code === 0 ? headRes.stdout.trim() : null;
       if (currentBranch !== session.branch) {
         this.log(
-          `selfReview: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}"), attempting restore`,
+          `selfReview: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}"); stopping`,
         );
-        const restoreRes = await this.runner.run(
-          "git", ["-C", worktreePath, "checkout", session.branch],
-          { cwd: worktreePath, timeoutMs: 30_000 },
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}"); fixes may be on off-branch commits`,
         );
-        if (restoreRes.code !== 0) {
-          return await this.stopSession(
-            session,
-            "exception",
-            `self-review: branch restore failed (on "${currentBranch ?? "unknown"}", expected "${session.branch}")`,
-          );
-        }
-        this.log(`selfReview: restored branch ${session.branch}`);
       }
     } catch (err) {
       return await this.stopSession(

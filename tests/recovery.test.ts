@@ -583,7 +583,10 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     expect(h.source.eligibleCalls).toHaveLength(0);
   });
 
-  it("implementing + no PR + clean commits → skips self-review (no ticket context), resumes HANDOFF, enters monitor", async () => {
+  it("implementing + no PR + clean commits + selfReview.enabled → halts (ES-473 Finding 1)", async () => {
+    // When selfReview is enabled, recovery cannot run the gate because the ticket
+    // description is unavailable. Proceeding to HANDOFF would bypass the required
+    // self-review. The safe action is to halt for human review.
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
@@ -593,11 +596,38 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     );
     // Agent committed clean work but orchestrator crashed before handoff
     h.git.commitsWithDiff.set("/wt/ty-wk", true);
-    // No agent outcomes needed — self-review is skipped during recovery
-    // because the ticket description is unavailable
-    h.agent.outcomes = [];
+
+    await h.orch.run();
+
+    const newRun = h.store.latestRun()!;
+    const s = h.store.getSession(crashed.id);
+    // Recovery must halt — self-review cannot run without ticket context
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("exception");
+    expect(s.stopDetail).toContain("self-review required");
+    expect(s.stopDetail).toContain("ticket description unavailable");
+    expect(s.stopDetail).toContain("TY-WK");
+    expect(h.logs.some((l) => l.includes("recovery") && l.includes("halting"))).toBe(true);
+    expect(newRun.state).toBe("halted");
+    // Committed work must NOT be destroyed (leave it for human recovery)
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
+    expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
+    // HANDOFF must not be attempted
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("implementing + no PR + clean commits + selfReview.disabled → skips self-review, resumes HANDOFF (ES-473 Finding 1)", async () => {
+    // When selfReview is disabled, recovery can safely proceed to HANDOFF.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    (config as { selfReview: { enabled: boolean } }).selfReview.enabled = false;
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-wk2-x", worktreePath: "/wt/ty-wk2", linearIssueId: "issue-WK2", linearIdentifier: "TY-WK2" },
+    );
+    h.git.commitsWithDiff.set("/wt/ty-wk2", true);
     h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
-    // Stop the loop after monitor completes so run() exits cleanly
     const origGetAllEligible = h.source.getAllEligible.bind(h.source);
     h.source.getAllEligible = async (excludeIds: string[]) => {
       h.orch.requestStop();
@@ -607,16 +637,11 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     await h.orch.run();
 
     const s = h.store.getSession(crashed.id);
-    // Recovery resumed handoff and entered monitor → session merged
     expect(s.state).toBe("merged");
     expect(s.prNumber).not.toBeNull();
-    // Self-review was skipped during recovery
-    expect(h.logs.some((l) => l.includes("recovery") && l.includes("skipping self-review"))).toBe(true);
-    expect(h.agent.contexts).toHaveLength(0);
     // Committed work must NOT be destroyed
     expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
     expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
-    // pushAndOpenPr was called to open the PR
     expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(true);
   });
 

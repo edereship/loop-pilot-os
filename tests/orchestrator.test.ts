@@ -5477,7 +5477,42 @@ describe("Self-Review (ES-473)", () => {
     expect(h.git.calls.some((c) => c.method === "discardUncommittedChanges")).toBe(true);
   });
 
-  it("self-review agent on wrong branch → restores session branch (Codex Finding 4)", async () => {
+  it("self-review cost_exceeded resets any pre-review commits (ES-473 Finding 2)", async () => {
+    // If the self-review agent committed partial fixes and then hit cost_exceeded,
+    // those commits must be reset to preReviewSha so they don't silently end up in the PR.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "cost_exceeded", costUsd: 2.0 },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // Return a real SHA for rev-parse HEAD so the reset target is known
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && !args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "preReviewSha111\n" };
+      }
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "looppilot/ty-1-x\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    // git reset --hard <preReviewSha> must have been issued to undo any commits
+    const resetCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args.includes("reset") && c.args.includes("--hard") && c.args.includes("preReviewSha111"),
+    );
+    expect(resetCall).toBeDefined();
+  });
+
+  it("self-review cost adds to session costUsd total (ES-473 Finding 3)", async () => {
+    // selfReviewCostUsd must be included in the reported session cost, not tracked
+    // only in a separate column that consumers don't read.
     const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
@@ -5486,25 +5521,38 @@ describe("Self-Review (ES-473)", () => {
       { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
     ];
     h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
-    // Override the memoryRunner to report the wrong branch
-    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
-      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
-        return { code: 0, stdout: "some-other-branch\n" };
-      }
-      // checkout (restore) succeeds
-      return { code: 0, stdout: "" };
-    });
 
     await h.orch.run();
 
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
-    // Should have restored the branch and proceeded to HANDOFF
-    expect(sessions[0].state).toBe("merged");
-    expect(h.logs.some((l) => l.includes("selfReview") && l.includes("wrong branch"))).toBe(true);
-    expect(h.logs.some((l) => l.includes("restored branch"))).toBe(true);
+    // Total cost = IMPLEMENT + SELF-REVIEW
+    expect(sessions[0].costUsd).toBeCloseTo(1.8);
+    expect(sessions[0].selfReviewCostUsd).toBe(0.3);
   });
 
-  it("self-review agent on wrong branch + restore fails → session stopped (Codex Finding 4)", async () => {
+  it("self-review error cost adds to session costUsd total (ES-473 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.1, message: "agent crashed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // Non-fatal self-review error: session proceeds to HANDOFF but cost is included
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].costUsd).toBeCloseTo(1.6);
+    expect(sessions[0].selfReviewCostUsd).toBe(0.1);
+  });
+
+  it("self-review agent on wrong branch → session stopped (ES-473 Finding 4)", async () => {
+    // If the agent checked out a different branch and committed there, restoring the
+    // session branch silently drops those commits from the PR. Stop unconditionally
+    // so human review can recover or cherry-pick the off-branch commits.
     const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
@@ -5512,13 +5560,10 @@ describe("Self-Review (ES-473)", () => {
       { kind: "completed", costUsd: 1.5, summary: "implemented" },
       { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
     ];
-    // Override the memoryRunner: wrong branch AND checkout fails
+    // Override the memoryRunner to report the wrong branch
     h.memoryRunner.on(["git", "-C"], (args, _opts) => {
       if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
-        return { code: 0, stdout: "detached-HEAD\n" };
-      }
-      if (args.includes("checkout")) {
-        return { code: 1, stderr: "error: pathspec did not match" };
+        return { code: 0, stdout: "some-other-branch\n" };
       }
       return { code: 0, stdout: "" };
     });
@@ -5527,10 +5572,38 @@ describe("Self-Review (ES-473)", () => {
 
     const run = h.store.latestRun()!;
     const sessions = h.store.sessionsForRun(run.id);
-    // Session must be stopped — cannot push to the right branch
+    // Session must be stopped — off-branch commits would be silently dropped if we restored
     expect(sessions[0].state).toBe("stopped");
     expect(sessions[0].failureReason).toBe("exception");
-    expect(sessions[0].stopDetail).toContain("branch restore failed");
+    expect(sessions[0].stopDetail).toContain("wrong branch");
+    expect(sessions[0].stopDetail).toContain("some-other-branch");
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.logs.some((l) => l.includes("selfReview") && l.includes("wrong branch"))).toBe(true);
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review agent on wrong branch (detached HEAD) → session stopped (ES-473 Finding 4)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    // Override the memoryRunner: detached HEAD
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "HEAD\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("wrong branch");
     expect(sessions[0].prNumber).toBeNull();
     expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
   });
