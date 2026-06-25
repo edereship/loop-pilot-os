@@ -57,6 +57,8 @@ function makeConfig(over: Partial<{
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,
       groomBoardBudgetChars: 10000,
+      selfReviewTimeoutMinutes: 15,
+      maxCostUsdPerSelfReview: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,

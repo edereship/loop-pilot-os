@@ -69,6 +69,8 @@ const rawSchema = z.object({
     select_codebase_summary_budget_chars: z.number().int().positive().default(5000),
     groom_timeout_minutes: z.number().positive().default(10),
     groom_board_budget_chars: z.number().int().positive().default(10000),
+    self_review_timeout_minutes: z.number().positive().default(15),
+    max_cost_usd_per_self_review: z.number().positive().default(2),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -154,6 +156,8 @@ export interface Config {
     selectCodebaseSummaryBudgetChars: number;
     groomTimeoutMinutes: number;
     groomBoardBudgetChars: number;
+    selfReviewTimeoutMinutes: number;
+    maxCostUsdPerSelfReview: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -669,6 +673,8 @@ export function loadConfig(
       selectCodebaseSummaryBudgetChars: raw.safety.select_codebase_summary_budget_chars,
       groomTimeoutMinutes: raw.safety.groom_timeout_minutes,
       groomBoardBudgetChars: raw.safety.groom_board_budget_chars,
+      selfReviewTimeoutMinutes: raw.safety.self_review_timeout_minutes,
+      maxCostUsdPerSelfReview: raw.safety.max_cost_usd_per_self_review,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
