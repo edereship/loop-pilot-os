@@ -583,7 +583,7 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     expect(h.source.eligibleCalls).toHaveLength(0);
   });
 
-  it("implementing + no PR + clean commits → resumes SELF-REVIEW + HANDOFF, enters monitor (ES-473 Finding 1)", async () => {
+  it("implementing + no PR + clean commits → skips self-review (no ticket context), resumes HANDOFF, enters monitor", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
@@ -591,12 +591,11 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
       { state: "implementing" },
       { branch: "looppilot/ty-wk-x", worktreePath: "/wt/ty-wk", linearIssueId: "issue-WK", linearIdentifier: "TY-WK" },
     );
-    // Agent committed clean work but orchestrator crashed before handoff (new ES-473 safe point)
+    // Agent committed clean work but orchestrator crashed before handoff
     h.git.commitsWithDiff.set("/wt/ty-wk", true);
-    // Self-review outcome + monitor verdicts to complete the session
-    h.agent.outcomes = [
-      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
-    ];
+    // No agent outcomes needed — self-review is skipped during recovery
+    // because the ticket description is unavailable
+    h.agent.outcomes = [];
     h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
     // Stop the loop after monitor completes so run() exits cleanly
     const origGetAllEligible = h.source.getAllEligible.bind(h.source);
@@ -611,6 +610,9 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     // Recovery resumed handoff and entered monitor → session merged
     expect(s.state).toBe("merged");
     expect(s.prNumber).not.toBeNull();
+    // Self-review was skipped during recovery
+    expect(h.logs.some((l) => l.includes("recovery") && l.includes("skipping self-review"))).toBe(true);
+    expect(h.agent.contexts).toHaveLength(0);
     // Committed work must NOT be destroyed
     expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
     expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);

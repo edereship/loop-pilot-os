@@ -156,6 +156,16 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
   // ES-470 fallback: unstage staged memory files when commitIfChanged throws.
   memoryRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+  // Self-review branch verification (Finding 4): git -C <worktreePath> rev-parse / checkout
+  memoryRunner.on(["git", "-C"], (args, _opts) => {
+    if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+      const cIdx = args.indexOf("-C");
+      const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+      const slug = wtPath.replace(/^\/wt\//, "");
+      return { code: 0, stdout: `looppilot/${slug}-x\n` };
+    }
+    return { code: 0, stdout: "" };
+  });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const orch = new Orchestrator({
@@ -285,6 +295,7 @@ describe("Orchestrator 正常系 — フェーズ順序（仕様 §5 状態機�
       "prepareWorktree",    // CLAIM
       "hasUncommittedChanges", // IMPLEMENT 後条件（先に残骸チェック）
       "hasCommitsWithDiff",    // IMPLEMENT 後条件（次に実差分チェック）
+      "discardUncommittedChanges", // SELF-REVIEW exception cleanup (no outcome queued → non-fatal)
       "findOpenPrForBranch",   // HANDOFF（既存PR確認）
       "pushAndOpenPr",         // HANDOFF（新規PR）
       "addLabel",              // HANDOFF（ゲートラベル）
@@ -5413,5 +5424,114 @@ describe("Self-Review (ES-473)", () => {
     expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
     // Run should be halted
     expect(run.state).toBe("halted");
+  });
+
+  it("requestStop() during self-review agent → HALT before HANDOFF (Codex Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      // Self-review agent returns a normal result even though requestStop was called
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    // Request stop during the self-review agent run (2nd agent call)
+    const origRunSession = h.agent.runSession.bind(h.agent);
+    let callCount = 0;
+    h.agent.runSession = async (ctx) => {
+      callCount++;
+      if (callCount === 2) {
+        // requestStop() fires while self-review is running
+        h.orch.requestStop();
+      }
+      return origRunSession(ctx);
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    // Must HALT — not proceed to HANDOFF
+    expect(run.state).toBe("halted");
+    // No PR should have been opened
+    const sessions = h.store.sessionsForRun(run.id);
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review cost_exceeded discards uncommitted changes before HANDOFF (Codex Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "cost_exceeded", costUsd: 2.0 },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // Should proceed to HANDOFF (cost_exceeded is non-fatal)
+    expect(sessions[0].state).toBe("merged");
+    // discardUncommittedChanges must have been called to clean up
+    expect(h.git.calls.some((c) => c.method === "discardUncommittedChanges")).toBe(true);
+  });
+
+  it("self-review agent on wrong branch → restores session branch (Codex Finding 4)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // Override the memoryRunner to report the wrong branch
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "some-other-branch\n" };
+      }
+      // checkout (restore) succeeds
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // Should have restored the branch and proceeded to HANDOFF
+    expect(sessions[0].state).toBe("merged");
+    expect(h.logs.some((l) => l.includes("selfReview") && l.includes("wrong branch"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("restored branch"))).toBe(true);
+  });
+
+  it("self-review agent on wrong branch + restore fails → session stopped (Codex Finding 4)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    // Override the memoryRunner: wrong branch AND checkout fails
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "detached-HEAD\n" };
+      }
+      if (args.includes("checkout")) {
+        return { code: 1, stderr: "error: pathspec did not match" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must be stopped — cannot push to the right branch
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("branch restore failed");
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
   });
 });

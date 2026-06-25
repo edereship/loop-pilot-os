@@ -505,7 +505,10 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", detail);
       }
       if (hasCommits && !hasDirtyFiles && !checkFailed) {
-        // Clean committed work, no open PR: resume from SELF-REVIEW → HANDOFF.
+        // Clean committed work, no open PR: resume from HANDOFF.
+        // Skip self-review: the recovery path has no ticket description or URL,
+        // so the self-review prompt would lack acceptance criteria and could
+        // approve or reject work it cannot meaningfully evaluate.
         this.store.updateSession(session.id, { runId: this.runId });
         const recoveredIssue: EligibleIssue = {
           id: session.linearIssueId,
@@ -516,12 +519,8 @@ export class Orchestrator {
           sortOrder: 0,
           url: "",
         };
-        const recoveredBrief: PlanBrief | null = session.planBrief !== null
-          ? { raw: session.planBrief, sections: null }
-          : null;
         if (this.config.selfReview.enabled) {
-          const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
-          if (sr.control === "halt") return HALT;
+          this.log("recovery: skipping self-review (ticket description unavailable during crash recovery)");
         }
         const handoffResult = await this.handoff(session, recoveredIssue);
         if ("prNumber" in handoffResult) {
@@ -957,6 +956,14 @@ export class Orchestrator {
       if (this.config.selfReview.enabled) {
         const sr = await this.selfReview(session, issue, planBrief);
         if (sr.control === "halt") return;
+      }
+
+      // Safe point: honor a stop request that arrived during self-review.
+      // selfReview() may return CONTINUE even if requestStop() was called
+      // while the agent was running (the agent returned a normal outcome).
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return;
       }
 
       // 6) HANDOFF (was 5)
@@ -2007,6 +2014,7 @@ export class Orchestrator {
         outcome: "error",
         errorDetail: errMsg(err),
       });
+      await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       return CONTINUE;
     }
 
@@ -2032,6 +2040,7 @@ export class Orchestrator {
         costUsd: outcome.costUsd,
         errorDetail: errDetail,
       });
+      await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       return CONTINUE;
     }
 
@@ -2047,6 +2056,7 @@ export class Orchestrator {
         costUsd: outcome.costUsd,
         errorDetail: `parse error: ${parsed.raw.slice(0, 200)}`,
       });
+      await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       return CONTINUE;
     }
 
@@ -2095,6 +2105,41 @@ export class Orchestrator {
         session,
         "exception",
         `self-review: git status check failed: ${errMsg(err)}`,
+      );
+    }
+
+    // Verify the worktree is still on the expected branch. If the self-review
+    // agent checked out a different branch or detached HEAD and committed there,
+    // pushAndOpenPr pushes the named session branch ref, so the PR would omit
+    // the self-review fixes while the log records them as applied.
+    try {
+      const headRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      const currentBranch = headRes.code === 0 ? headRes.stdout.trim() : null;
+      if (currentBranch !== session.branch) {
+        this.log(
+          `selfReview: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}"), attempting restore`,
+        );
+        const restoreRes = await this.runner.run(
+          "git", ["-C", worktreePath, "checkout", session.branch],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        if (restoreRes.code !== 0) {
+          return await this.stopSession(
+            session,
+            "exception",
+            `self-review: branch restore failed (on "${currentBranch ?? "unknown"}", expected "${session.branch}")`,
+          );
+        }
+        this.log(`selfReview: restored branch ${session.branch}`);
+      }
+    } catch (err) {
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: branch verification failed: ${errMsg(err)}`,
       );
     }
 
