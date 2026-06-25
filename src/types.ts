@@ -55,6 +55,7 @@ export interface TaskSessionRow {
   linearIssueId: string;
   linearIdentifier: string;
   issueTitle: string;
+  issueUrl: string;
   branch: string;
   worktreePath: string | null;
   prNumber: number | null;

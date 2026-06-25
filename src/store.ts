@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS task_session (
   linear_issue_id TEXT NOT NULL,
   linear_identifier TEXT NOT NULL,
   issue_title TEXT NOT NULL,
+  issue_url TEXT NOT NULL DEFAULT '',
   branch TEXT NOT NULL,
   worktree_path TEXT,
   pr_number INTEGER,
@@ -145,6 +146,7 @@ interface RawSessionRow {
   linear_issue_id: string;
   linear_identifier: string;
   issue_title: string;
+  issue_url: string;
   branch: string;
   worktree_path: string | null;
   pr_number: number | null;
@@ -176,6 +178,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     linearIssueId: r.linear_issue_id,
     linearIdentifier: r.linear_identifier,
     issueTitle: r.issue_title,
+    issueUrl: r.issue_url,
     branch: r.branch,
     worktreePath: r.worktree_path,
     prNumber: r.pr_number,
@@ -302,6 +305,7 @@ const GROOM_LOG_PATCH_COLUMNS: Record<string, string> = {
 };
 const SESSION_PATCH_COLUMNS: Record<string, string> = {
   state: "state",
+  issueUrl: "issue_url",
   worktreePath: "worktree_path",
   prNumber: "pr_number",
   costUsd: "cost_usd",
@@ -436,6 +440,11 @@ export class SqliteStore {
     if (!columns.has("self_review_cost_usd")) {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN self_review_cost_usd REAL`,
+      );
+    }
+    if (!columns.has("issue_url")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN issue_url TEXT NOT NULL DEFAULT ''`,
       );
     }
 
@@ -575,6 +584,7 @@ export class SqliteStore {
     linearIssueId: string;
     linearIdentifier: string;
     issueTitle: string;
+    issueUrl?: string;
     branch: string;
     worktreePath: string;
     now: string;
@@ -582,15 +592,16 @@ export class SqliteStore {
     const info = this.db
       .prepare(
         `INSERT INTO task_session
-           (run_id, linear_issue_id, linear_identifier, issue_title,
+           (run_id, linear_issue_id, linear_identifier, issue_title, issue_url,
             branch, worktree_path, state, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)`,
       )
       .run(
         s.runId,
         s.linearIssueId,
         s.linearIdentifier,
         s.issueTitle,
+        s.issueUrl ?? "",
         s.branch,
         s.worktreePath,
         s.now,
@@ -614,6 +625,7 @@ export class SqliteStore {
       Pick<
         TaskSessionRow,
         | "state"
+        | "issueUrl"
         | "worktreePath"
         | "prNumber"
         | "costUsd"
