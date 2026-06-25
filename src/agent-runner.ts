@@ -611,8 +611,9 @@ export class ClaudeAgentRunner implements AgentRunner {
       return { kind: "error", costUsd, message: withStderr(`claude exited with code ${code}`) };
     }
     if (resultLine.subtype === "success" && resultLine.is_error !== true) {
-      const summary = (resultLine.result ?? "").slice(0, SUMMARY_MAX);
-      return { kind: "completed", costUsd, summary };
+      const full = resultLine.result ?? "";
+      const summary = full.slice(0, SUMMARY_MAX);
+      return { kind: "completed", costUsd, summary, fullResult: full };
     }
     return {
       kind: "error",

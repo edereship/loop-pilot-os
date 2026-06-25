@@ -123,6 +123,7 @@ function makeHarness(config: Config): Harness {
     log,
     recovery,
     planner: null,
+    designer: null,
     codebaseSummaryGenerator: async () => "",
     recoveryTurn: null,
     runner: memoryRunner,

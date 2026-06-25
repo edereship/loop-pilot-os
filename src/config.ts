@@ -61,6 +61,8 @@ const rawSchema = z.object({
     max_workflow_fix_attempts: z.number().int().positive().default(2),
     max_cost_usd_per_fix: z.number().positive().default(2),
     codex_timeout_minutes: z.number().positive().default(30),
+    design_timeout_minutes: z.number().positive().default(15),
+    max_cost_usd_per_design: z.number().positive().default(2),
     select_diff_budget_chars: z.number().int().positive().default(6000),
     select_codebase_summary_budget_chars: z.number().int().positive().default(5000),
     groom_timeout_minutes: z.number().positive().default(10),
@@ -142,6 +144,8 @@ export interface Config {
     maxWorkflowFixAttempts: number;
     maxCostUsdPerFix: number;
     codexTimeoutMinutes: number;
+    designTimeoutMinutes: number;
+    maxCostUsdPerDesign: number;
     selectDiffBudgetChars: number;
     selectCodebaseSummaryBudgetChars: number;
     groomTimeoutMinutes: number;
@@ -653,6 +657,8 @@ export function loadConfig(
       maxWorkflowFixAttempts: raw.safety.max_workflow_fix_attempts,
       maxCostUsdPerFix: raw.safety.max_cost_usd_per_fix,
       codexTimeoutMinutes: raw.safety.codex_timeout_minutes,
+      designTimeoutMinutes: raw.safety.design_timeout_minutes,
+      maxCostUsdPerDesign: raw.safety.max_cost_usd_per_design,
       selectDiffBudgetChars: raw.safety.select_diff_budget_chars,
       selectCodebaseSummaryBudgetChars: raw.safety.select_codebase_summary_budget_chars,
       groomTimeoutMinutes: raw.safety.groom_timeout_minutes,
