@@ -4631,4 +4631,46 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
 
     store.close();
   });
+
+  it("アイドルタイムアウト経過後に eligible チケットあり → blocked ID を取得して blocked チケットをフィルタリングする（ES-475）", async () => {
+    // Regression: when idle has elapsed but SELECT returns tickets, fetchBlockedIds() must
+    // still run so dependency-blocked tickets are not claimed (ES-475 Codex finding).
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, idleTimeoutMinutes: 60, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // Create a previous idle run with idle_started_at 61 minutes before the harness clock
+    // (makeHarness clock is fixed at 2026-06-05T00:00:00.000Z).
+    const prevRun = h.store.createRun(3, "2026-06-04T22:59:00.000Z");
+    h.store.setRunState(prevRun.id, "idle");
+    h.store.setIdleStartedAt(prevRun.id, "2026-06-04T22:59:00.000Z");
+
+    // Board state: TY-1 is blocked, TY-2 is not blocked.
+    h.groomBoardFetcher.boardState = {
+      eligible: [{ identifier: "TY-2", title: "Title for TY-2", priority: 2, labels: [] }],
+      inProgress: [],
+      recentDone: [],
+      blocked: [{ identifier: "TY-1", title: "Title for TY-1", priority: 2, labels: [], blockedBy: "ES-99" }],
+    };
+
+    // SELECT returns both TY-1 (blocked) and TY-2 (not blocked).
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // TY-1 (blocked) must NOT have been claimed; TY-2 must be claimed.
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.linearIdentifier).toBe("TY-2");
+    expect(h.source.transitions.some((t) => t.issueId === "issue-A" && t.state === "in_progress")).toBe(false);
+
+    // fetchBlockedIds must have called getBoardState, but full GROOM must NOT have run.
+    expect(h.groomBoardFetcher.calls).toContain("getBoardState");
+    // No groom_log entry means the full GROOM phase (planner) was never invoked.
+    expect(() => h.store.getGroomLog(1)).toThrow();
+
+    h.store.close();
+  });
 });

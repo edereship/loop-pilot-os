@@ -742,6 +742,11 @@ export class Orchestrator {
         this.log(detail);
         return;
       }
+      // When GROOM was skipped due to idle timeout but SELECT found eligible tickets,
+      // fetch blocked IDs now so dependency-blocked work is not claimed (ES-475).
+      if (idleAlreadyElapsed && eligible.length > 0) {
+        groomBlockedIds = await this.fetchBlockedIds();
+      }
       // Filter out GROOM-identified blocked issues so dependency-blocked work is not started
       // (ES-457 Finding 2).
       if (groomBlockedIds.size > 0) {
@@ -979,6 +984,27 @@ export class Orchestrator {
     }
 
     return { control: "continue", brief };
+  }
+
+  // ---- fetchBlockedIds（lightweight board fetch, no planner） ----
+  // Used when GROOM is skipped (idle timeout elapsed) but SELECT found eligible tickets,
+  // so that dependency-blocked work is still filtered before claiming (ES-475).
+  private async fetchBlockedIds(): Promise<Set<string>> {
+    if (!this.config.groom.enabled || this.groomDeps === null) {
+      return new Set<string>();
+    }
+    try {
+      this.groomDeps.boardFetcher.refresh();
+      const activeSessionPrNumbers = new Map<string, number | null>();
+      for (const s of this.store.activeSessions()) {
+        activeSessionPrNumbers.set(s.linearIdentifier, s.prNumber);
+      }
+      const boardState = await this.groomDeps.boardFetcher.getBoardState(activeSessionPrNumbers);
+      return new Set<string>(boardState.blocked.map((b) => b.identifier));
+    } catch (err) {
+      this.log(`fetchBlockedIds: board fetch failed, skipping: ${errMsg(err)}`);
+      return new Set<string>();
+    }
   }
 
   // ---- GROOM（ES-457: Board Grooming Phase） ----
