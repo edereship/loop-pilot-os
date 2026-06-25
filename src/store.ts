@@ -280,7 +280,7 @@ function toSelfReviewLogRow(r: RawSelfReviewLogRow): SelfReviewLogRow {
     sessionId: r.session_id,
     startedAt: r.started_at,
     endedAt: r.ended_at,
-    verdict: r.verdict,
+    verdict: r.verdict as "pass" | "fail" | null,
     issueCount: r.issue_count,
     summary: r.summary,
     outcome: r.outcome as SelfReviewOutcome | null,

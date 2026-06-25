@@ -930,7 +930,7 @@ export class Orchestrator {
         await this.haltForInterrupt();
         return;
       }
-      {
+      if (this.config.selfReview.enabled) {
         const sr = await this.selfReview(session, issue, planBrief);
         if (sr.control === "halt") return;
       }

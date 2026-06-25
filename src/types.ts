@@ -324,7 +324,7 @@ export interface SelfReviewLogRow {
   sessionId: number;
   startedAt: string;
   endedAt: string | null;
-  verdict: string | null;
+  verdict: "pass" | "fail" | null;
   issueCount: number;
   summary: string | null;
   outcome: SelfReviewOutcome | null;

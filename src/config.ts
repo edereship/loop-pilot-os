@@ -87,6 +87,9 @@ const rawSchema = z.object({
   groom: z.object({
     enabled: z.boolean().default(true),
   }).strict().optional(),
+  self_review: z.object({
+    enabled: z.boolean().default(true),
+  }).strict().optional(),
   memory: z.object({
     max_chars_per_file: z.number().int().positive().default(8000),
     inject_budget_chars: z.number().int().positive().default(6000),
@@ -172,6 +175,9 @@ export interface Config {
     progress: boolean;
   };
   groom: {
+    enabled: boolean;
+  };
+  selfReview: {
     enabled: boolean;
   };
   memory: {
@@ -690,6 +696,9 @@ export function loadConfig(
     },
     groom: {
       enabled: raw.groom?.enabled ?? true,
+    },
+    selfReview: {
+      enabled: raw.self_review?.enabled ?? true,
     },
     memory: {
       maxCharsPerFile: raw.memory?.max_chars_per_file ?? 8000,

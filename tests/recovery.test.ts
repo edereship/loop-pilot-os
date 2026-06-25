@@ -52,6 +52,7 @@ function makeConfig(over: Partial<{
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
     notify: { progress: false },
     groom: { enabled: false },
+    selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
   } as unknown as Config;
 }

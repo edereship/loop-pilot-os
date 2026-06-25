@@ -68,6 +68,7 @@ function makeConfig(over: Partial<{
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
     notify: { progress: over.notifyProgress ?? false },
     groom: { enabled: over.groomEnabled ?? false },
+    selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
     linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
   } as unknown as Config;
