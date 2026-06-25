@@ -186,8 +186,14 @@ export class Orchestrator {
       }
 
       const taskCap = this.config.safety.maxTasksPerRun;
+      // Capture idle_started_at from the previous run before creating the new one so that
+      // a restart while idle does not reset the timer (ES-475 Finding 2).
+      const previousIdleStartedAt = this.store.latestRun()?.idleStartedAt ?? null;
       const run = this.store.createRun(taskCap, this.clock());
       this.runId = run.id;
+      if (previousIdleStartedAt !== null) {
+        this.store.setIdleStartedAt(this.runId, previousIdleStartedAt);
+      }
       await this.notifier.notify({
         kind: "run_started",
         detail: `run ${run.id} started (taskCap=${taskCap})`,
@@ -688,22 +694,7 @@ export class Orchestrator {
         return;
       }
 
-      // 1.5) アイドルタイムアウトチェック（ES-475）
       const idleTimeoutMin = this.config.loop.idleTimeoutMinutes;
-      if (idleTimeoutMin > 0) {
-        const run = this.store.getRun(this.runId);
-        if (run.idleStartedAt !== null) {
-          const elapsedMs = Date.parse(this.clock()) - Date.parse(run.idleStartedAt);
-          if (elapsedMs >= idleTimeoutMin * 60_000) {
-            const detail = `idle timeout: no eligible tickets for ${idleTimeoutMin} minutes`;
-            await this.notifier.notify({ kind: "halted", reason: "idle_timeout", detail });
-            await this.commitMemoryBeforeHalt();
-            this.store.setRunState(this.runId, "halted", detail);
-            this.log(detail);
-            return;
-          }
-        }
-      }
 
       // 0.5) GROOM（D-13: failure → skip to SELECT）
       let groomSummary: string | null = null;
@@ -745,6 +736,24 @@ export class Orchestrator {
         eligible = eligible.filter((i) => !groomBlockedIds.has(i.identifier));
       }
       if (eligible.length === 0) {
+        // 1.5) アイドルタイムアウトチェック（ES-475）
+        // Checked after SELECT so that work that became eligible during the previous
+        // idle sleep is claimed before the timeout fires (ES-475 Finding 1).
+        if (idleTimeoutMin > 0) {
+          const run = this.store.getRun(this.runId);
+          if (run.idleStartedAt !== null) {
+            const elapsedMs = Date.parse(this.clock()) - Date.parse(run.idleStartedAt);
+            if (elapsedMs >= idleTimeoutMin * 60_000) {
+              const detail = `idle timeout: no eligible tickets for ${idleTimeoutMin} minutes`;
+              await this.notifier.notify({ kind: "halted", reason: "idle_timeout", detail });
+              await this.commitMemoryBeforeHalt();
+              this.store.setRunState(this.runId, "halted", detail);
+              this.log(detail);
+              return;
+            }
+          }
+        }
+
         // IDLE（キュー空 → 通知は初回のみ → 定期再確認）
         if (!idleNotified) {
           await this.notifier.notify({ kind: "idle", detail: "no eligible tickets" });
