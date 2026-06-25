@@ -186,9 +186,12 @@ export class Orchestrator {
       }
 
       const taskCap = this.config.safety.maxTasksPerRun;
-      // Capture idle_started_at from the previous run before creating the new one so that
-      // a restart while idle does not reset the timer (ES-475 Finding 2).
-      const previousIdleStartedAt = this.store.latestRun()?.idleStartedAt ?? null;
+      // Carry idle_started_at forward only when the previous run is still idle
+      // (crash/restart while idle). Halted runs retain the column but their timer is stale;
+      // inheriting it would cause the new run to time-out immediately (ES-475).
+      const previousRun = this.store.latestRun();
+      const previousIdleStartedAt =
+        previousRun?.state === "idle" ? (previousRun.idleStartedAt ?? null) : null;
       const run = this.store.createRun(taskCap, this.clock());
       this.runId = run.id;
       if (previousIdleStartedAt !== null) {
@@ -697,9 +700,18 @@ export class Orchestrator {
       const idleTimeoutMin = this.config.loop.idleTimeoutMinutes;
 
       // 0.5) GROOM（D-13: failure → skip to SELECT）
+      // Skip when the idle timeout has already elapsed so we don't pay for a GROOM pass
+      // on a run that is about to halt. SELECT still runs after this so any tickets that
+      // arrived during the idle sleep are claimed rather than dropped (ES-475).
       let groomSummary: string | null = null;
       let groomBlockedIds: Set<string> = new Set();
-      {
+      const idleAlreadyElapsed = (() => {
+        if (idleTimeoutMin <= 0) return false;
+        const snap = this.store.getRun(this.runId);
+        if (snap.idleStartedAt === null) return false;
+        return Date.parse(this.clock()) - Date.parse(snap.idleStartedAt) >= idleTimeoutMin * 60_000;
+      })();
+      if (!idleAlreadyElapsed) {
         const groomResult = await this.groom();
         if (groomResult.control === "halt") return;
         // SIGINT can cause the Codex child to exit non-zero; CodexPlanner surfaces that

@@ -4493,4 +4493,142 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
 
     store.close();
   });
+
+  it("前の run が halted なら idle_started_at を引き継がない（ES-475 Finding 1）", async () => {
+    // Regression: a halted previous run must NOT propagate its stale idle_started_at to the
+    // new run; otherwise the new run would time out immediately instead of starting fresh.
+    const config = makeConfig({ maxTasksPerRun: 1, idleTimeoutMinutes: 60 });
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const notifier = new FakeNotifier();
+    const logs: string[] = [];
+    const memoryRunner = new FakeCommandRunner();
+    memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
+    memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
+    memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+
+    // Previous run was halted while idle — stale idle_started_at is 2 hours in the past.
+    const prevRun = store.createRun(3, "2026-06-05T00:00:00.000Z");
+    store.setIdleStartedAt(prevRun.id, "2026-06-05T00:00:00.000Z");
+    store.setRunState(prevRun.id, "halted", "idle_timeout");
+
+    // Clock starts 2 hours after the stale idle_started_at, so inheriting it would
+    // exceed the 60-minute threshold and cause an immediate halt.
+    const clock = fixedClock("2026-06-05T02:01:00.000Z");
+
+    // First eligible call returns nothing (goes idle); second returns a ticket so the run
+    // exits cleanly via task_cap rather than idle_timeout.
+    let eligibleCall = 0;
+    source.getAllEligible = async () => {
+      eligibleCall++;
+      if (eligibleCall === 1) return [];
+      return [issue("issue-A", "TY-1")];
+    };
+
+    const agent = new FakeAgentRunner();
+    agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    const monitor = new FakeMonitor();
+    monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    const orch = new Orchestrator({
+      config,
+      source,
+      agent,
+      git: new FakeGitPr(),
+      monitor,
+      notifier,
+      store,
+      buildPrompt: (args) => `PROMPT for ${args.issue.identifier}`,
+      specLoader: null,
+      clock,
+      sleep: async () => {},
+      log: (line) => { logs.push(line); },
+      recovery: new FakeWorkflowRecovery(),
+      planner: null,
+      codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
+      runner: memoryRunner,
+      groomDeps: null,
+    });
+
+    await orch.run();
+
+    const newRun = store.latestRun()!;
+    // The run must NOT have halted with idle_timeout — the stale timer was not inherited.
+    expect(newRun.state).toBe("halted");
+    expect(newRun.haltReason).not.toContain("idle timeout");
+    expect(newRun.haltReason).toContain("task cap");
+
+    store.close();
+  });
+
+  it("アイドルタイムアウト経過後は GROOM をスキップして HALT する（ES-475 Finding 2）", async () => {
+    // Regression: when an already-idle run wakes up after the timeout threshold, GROOM must
+    // NOT be invoked before halting. Previously the run paid for a full GROOM pass even
+    // though it was going to halt anyway.
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60, groomEnabled: true });
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const notifier = new FakeNotifier();
+    const logs: string[] = [];
+    const memoryRunner = new FakeCommandRunner();
+    memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
+    memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
+    memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+
+    // Previous run was idle with idle_started_at 61 minutes in the past.
+    const prevRun = store.createRun(3, "2026-06-05T00:00:00.000Z");
+    store.setRunState(prevRun.id, "idle");
+    store.setIdleStartedAt(prevRun.id, "2026-06-05T00:00:00.000Z");
+
+    // Clock starts 61+ minutes after idle_started_at so the threshold is already exceeded.
+    const clock = fixedClock("2026-06-05T01:01:00.000Z");
+
+    source.getAllEligible = async () => [];
+
+    const groomBoardFetcher = new FakeGroomBoardFetcher();
+    const groomLinearClient = new FakeGroomLinearClient();
+
+    const orch = new Orchestrator({
+      config,
+      source,
+      agent: new FakeAgentRunner(),
+      git: new FakeGitPr(),
+      monitor: new FakeMonitor(),
+      notifier,
+      store,
+      buildPrompt: (args) => `PROMPT for ${args.issue.identifier}`,
+      specLoader: null,
+      clock,
+      sleep: async () => {},
+      log: (line) => { logs.push(line); },
+      recovery: new FakeWorkflowRecovery(),
+      planner,
+      codebaseSummaryGenerator: async () => "",
+      recoveryTurn: null,
+      runner: memoryRunner,
+      groomDeps: {
+        boardFetcher: groomBoardFetcher,
+        linearClient: groomLinearClient,
+        knownLabels: ["looppilot-os"],
+      },
+    });
+
+    await orch.run();
+
+    const newRun = store.latestRun()!;
+    expect(newRun.state).toBe("halted");
+    expect(newRun.haltReason).toContain("idle timeout");
+
+    // GROOM must NOT have been invoked — no board fetch, no groom_log entry.
+    expect(groomBoardFetcher.calls).toHaveLength(0);
+    expect(() => store.getGroomLog(1)).toThrow();
+
+    store.close();
+  });
 });
