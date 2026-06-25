@@ -1133,11 +1133,19 @@ export class Orchestrator {
       // Restore the claimed branch in case the reviewer switched branches, then reset.
       const catchCheckoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
       if (catchCheckoutRes.code !== 0) {
-        this.log(`designReview: branch restore failed in error path for ${session.branch} (exit ${catchCheckoutRes.code}); halting to avoid IMPLEMENT on wrong branch`);
+        const haltDetail = `designReview: branch restore failed in error path for ${session.branch} (exit ${catchCheckoutRes.code}); halting to avoid IMPLEMENT on wrong branch`;
+        this.log(haltDetail);
+        await this.stopSession(session, "exception", haltDetail);
         return { control: "halt" };
       }
       if (reviewStartSha) {
-        await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => {});
+        const catchResetRes = await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "reset threw" }));
+        if (catchResetRes.code !== 0) {
+          const haltDetail = `designReview: reviewer reset to ${reviewStartSha} failed in error path; halting to prevent reviewer-authored commits from reaching IMPLEMENT`;
+          this.log(haltDetail);
+          await this.stopSession(session, "exception", haltDetail);
+          return { control: "halt" };
+        }
       }
       return { control: "continue", verdict: "approve" };
     }
@@ -1148,12 +1156,20 @@ export class Orchestrator {
     // Restore the claimed branch in case the reviewer switched branches, then reset.
     const checkoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
     if (checkoutRes.code !== 0) {
-      this.log(`designReview: branch restore failed for ${session.branch} (exit ${checkoutRes.code}); halting to avoid IMPLEMENT on wrong branch`);
+      const haltDetail = `designReview: branch restore failed for ${session.branch} (exit ${checkoutRes.code}); halting to avoid IMPLEMENT on wrong branch`;
+      this.log(haltDetail);
+      await this.stopSession(session, "exception", haltDetail);
       return { control: "halt" };
     }
     // Reset to the pre-review SHA to undo any commits the reviewer created.
     if (reviewStartSha) {
-      await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => {});
+      const resetRes = await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "reset threw" }));
+      if (resetRes.code !== 0) {
+        const haltDetail = `designReview: reviewer reset to ${reviewStartSha} failed; halting to prevent reviewer-authored commits from reaching IMPLEMENT`;
+        this.log(haltDetail);
+        await this.stopSession(session, "exception", haltDetail);
+        return { control: "halt" };
+      }
     }
 
     if (outcome.kind === "interrupted") {
