@@ -1331,4 +1331,20 @@ describe("self_review_log CRUD", () => {
     expect(updated.costUsd).toBe(0.5);
     store.close();
   });
+
+  it("getSelfReviewLogsForSession returns empty array when no logs", () => {
+    const store = new SqliteStore(":memory:");
+    const run = store.createRun(3, "2026-06-25T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "id-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "b",
+      worktreePath: "/w",
+      now: "2026-06-25T00:00:00.000Z",
+    });
+    expect(store.getSelfReviewLogsForSession(session.id)).toEqual([]);
+    store.close();
+  });
 });
