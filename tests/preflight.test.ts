@@ -38,7 +38,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       groomTimeoutMinutes: 10,
       groomBoardBudgetChars: 10000,
     },
-    loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
+    loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300, idleTimeoutMinutes: 120 },
     digest: { recentMergedCount: 5, enabled: true },
     notify: { progress: false },
     groom: { enabled: true },
