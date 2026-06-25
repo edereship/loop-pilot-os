@@ -5145,4 +5145,28 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     );
     expect(checkoutIdx).toBeLessThan(resetIdx);
   });
+
+  it("halts without running IMPLEMENT when branch restore fails after reviewer runs (ES-477 Finding 4)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    // Make the session-branch checkout fail (longest prefix wins over the 2-element default stub).
+    h.memoryRunner.on(["git", "checkout", "looppilot/ty-1-x"], { code: 1, stderr: "error: pathspec 'looppilot/ty-1-x' did not match any file(s) known to git" });
+
+    await h.orch.run();
+
+    // IMPLEMENT must never have run.
+    expect(h.agent.contexts).toHaveLength(0);
+    // A log message explaining the halt must be emitted.
+    expect(h.logs.some((l) => l.includes("branch restore failed"))).toBe(true);
+  });
 });

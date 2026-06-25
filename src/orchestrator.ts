@@ -1131,7 +1131,11 @@ export class Orchestrator {
       });
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       // Restore the claimed branch in case the reviewer switched branches, then reset.
-      await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => {});
+      const catchCheckoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
+      if (catchCheckoutRes.code !== 0) {
+        this.log(`designReview: branch restore failed in error path for ${session.branch} (exit ${catchCheckoutRes.code}); halting to avoid IMPLEMENT on wrong branch`);
+        return { control: "halt" };
+      }
       if (reviewStartSha) {
         await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => {});
       }
@@ -1142,7 +1146,11 @@ export class Orchestrator {
     // before the implementation phase runs.
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
     // Restore the claimed branch in case the reviewer switched branches, then reset.
-    await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => {});
+    const checkoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
+    if (checkoutRes.code !== 0) {
+      this.log(`designReview: branch restore failed for ${session.branch} (exit ${checkoutRes.code}); halting to avoid IMPLEMENT on wrong branch`);
+      return { control: "halt" };
+    }
     // Reset to the pre-review SHA to undo any commits the reviewer created.
     if (reviewStartSha) {
       await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => {});
