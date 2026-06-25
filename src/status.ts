@@ -55,6 +55,9 @@ export function renderStatus(store: SqliteStore): string {
     lines.push(`  next re-probe: ${pm.nextReprobeAt}`);
     lines.push(`  cap deadline: ${pm.capDeadlineAt}`);
   }
+  if (run.state === "idle" && run.idleStartedAt !== null) {
+    lines.push(`  idle since: ${run.idleStartedAt}`);
+  }
 
   lines.push("");
   const active = store.activeSessions();

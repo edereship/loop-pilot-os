@@ -186,8 +186,17 @@ export class Orchestrator {
       }
 
       const taskCap = this.config.safety.maxTasksPerRun;
+      // Carry idle_started_at forward only when the previous run is still idle
+      // (crash/restart while idle). Halted runs retain the column but their timer is stale;
+      // inheriting it would cause the new run to time-out immediately (ES-475).
+      const previousRun = this.store.latestRun();
+      const previousIdleStartedAt =
+        previousRun?.state === "idle" ? (previousRun.idleStartedAt ?? null) : null;
       const run = this.store.createRun(taskCap, this.clock());
       this.runId = run.id;
+      if (previousIdleStartedAt !== null) {
+        this.store.setIdleStartedAt(this.runId, previousIdleStartedAt);
+      }
       await this.notifier.notify({
         kind: "run_started",
         detail: `run ${run.id} started (taskCap=${taskCap})`,
@@ -688,10 +697,21 @@ export class Orchestrator {
         return;
       }
 
+      const idleTimeoutMin = this.config.loop.idleTimeoutMinutes;
+
       // 0.5) GROOM（D-13: failure → skip to SELECT）
+      // Skip when the idle timeout has already elapsed so we don't pay for a GROOM pass
+      // on a run that is about to halt. SELECT still runs after this so any tickets that
+      // arrived during the idle sleep are claimed rather than dropped (ES-475).
       let groomSummary: string | null = null;
       let groomBlockedIds: Set<string> = new Set();
-      {
+      const idleAlreadyElapsed = (() => {
+        if (idleTimeoutMin <= 0) return false;
+        const snap = this.store.getRun(this.runId);
+        if (snap.idleStartedAt === null) return false;
+        return Date.parse(this.clock()) - Date.parse(snap.idleStartedAt) >= idleTimeoutMin * 60_000;
+      })();
+      if (!idleAlreadyElapsed) {
         const groomResult = await this.groom();
         if (groomResult.control === "halt") return;
         // SIGINT can cause the Codex child to exit non-zero; CodexPlanner surfaces that
@@ -722,23 +742,48 @@ export class Orchestrator {
         this.log(detail);
         return;
       }
+      // When GROOM was skipped due to idle timeout but SELECT found eligible tickets,
+      // fetch blocked IDs now so dependency-blocked work is not claimed (ES-475).
+      if (idleAlreadyElapsed && eligible.length > 0) {
+        groomBlockedIds = await this.fetchBlockedIds();
+      }
       // Filter out GROOM-identified blocked issues so dependency-blocked work is not started
       // (ES-457 Finding 2).
       if (groomBlockedIds.size > 0) {
         eligible = eligible.filter((i) => !groomBlockedIds.has(i.identifier));
       }
       if (eligible.length === 0) {
+        // 1.5) アイドルタイムアウトチェック（ES-475）
+        // Checked after SELECT so that work that became eligible during the previous
+        // idle sleep is claimed before the timeout fires (ES-475 Finding 1).
+        if (idleTimeoutMin > 0) {
+          const run = this.store.getRun(this.runId);
+          if (run.idleStartedAt !== null) {
+            const elapsedMs = Date.parse(this.clock()) - Date.parse(run.idleStartedAt);
+            if (elapsedMs >= idleTimeoutMin * 60_000) {
+              const detail = `idle timeout: no eligible tickets for ${idleTimeoutMin} minutes`;
+              await this.notifier.notify({ kind: "halted", reason: "idle_timeout", detail });
+              await this.commitMemoryBeforeHalt();
+              this.store.setRunState(this.runId, "halted", detail);
+              this.log(detail);
+              return;
+            }
+          }
+        }
+
         // IDLE（キュー空 → 通知は初回のみ → 定期再確認）
         if (!idleNotified) {
           await this.notifier.notify({ kind: "idle", detail: "no eligible tickets" });
           idleNotified = true;
         }
+        this.store.setIdleStartedAt(this.runId, this.clock());
         this.store.setRunState(this.runId, "idle");
         await this.sleep(this.config.loop.idleRecheckSeconds * 1000);
         continue;
       }
       // 復帰：idle から running へ
       idleNotified = false;
+      this.store.clearIdleStartedAt(this.runId);
       this.store.setRunState(this.runId, "running");
 
       let issue: EligibleIssue;
@@ -939,6 +984,27 @@ export class Orchestrator {
     }
 
     return { control: "continue", brief };
+  }
+
+  // ---- fetchBlockedIds（lightweight board fetch, no planner） ----
+  // Used when GROOM is skipped (idle timeout elapsed) but SELECT found eligible tickets,
+  // so that dependency-blocked work is still filtered before claiming (ES-475).
+  private async fetchBlockedIds(): Promise<Set<string>> {
+    if (!this.config.groom.enabled || this.groomDeps === null) {
+      return new Set<string>();
+    }
+    try {
+      this.groomDeps.boardFetcher.refresh();
+      const activeSessionPrNumbers = new Map<string, number | null>();
+      for (const s of this.store.activeSessions()) {
+        activeSessionPrNumbers.set(s.linearIdentifier, s.prNumber);
+      }
+      const boardState = await this.groomDeps.boardFetcher.getBoardState(activeSessionPrNumbers);
+      return new Set<string>(boardState.blocked.map((b) => b.identifier));
+    } catch (err) {
+      this.log(`fetchBlockedIds: board fetch failed, skipping: ${errMsg(err)}`);
+      return new Set<string>();
+    }
   }
 
   // ---- GROOM（ES-457: Board Grooming Phase） ----

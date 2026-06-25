@@ -45,6 +45,7 @@ export interface RunRow {
   state: RunState;
   haltReason: string | null;
   pauseMeta: PauseMeta | null;
+  idleStartedAt: string | null;
 }
 
 export interface TaskSessionRow {

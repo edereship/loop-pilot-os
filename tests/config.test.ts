@@ -65,6 +65,7 @@ describe("loadConfig", () => {
 
     expect(config.loop.monitorPollSeconds).toBe(60);
     expect(config.loop.idleRecheckSeconds).toBe(300);
+    expect(config.loop.idleTimeoutMinutes).toBe(120); // default (not in config-valid.toml)
 
     expect(config.digest.recentMergedCount).toBe(5);
     expect(config.digest.enabled).toBe(true);
