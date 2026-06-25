@@ -45,6 +45,24 @@ describe("parseDesignReviewOutput", () => {
     expect(result.kind).toBe("parse_error");
   });
 
+  it("returns parse_error for reject verdict with empty reasons array", () => {
+    const input = `{"verdict":"reject","reasons":[]}`;
+    const result = parseDesignReviewOutput(input);
+    expect(result.kind).toBe("parse_error");
+  });
+
+  it("returns parse_error for reject verdict with all-empty reason strings", () => {
+    const input = `{"verdict":"reject","reasons":[""]}`;
+    const result = parseDesignReviewOutput(input);
+    expect(result.kind).toBe("parse_error");
+  });
+
+  it("still accepts approve verdict with empty reasons array", () => {
+    const input = `{"verdict":"approve","reasons":[]}`;
+    const result = parseDesignReviewOutput(input);
+    expect(result).toEqual({ kind: "ok", value: { verdict: "approve", reasons: [] } });
+  });
+
   it("prefers last fenced block when multiple exist", () => {
     const input = [
       "```json",

@@ -4,7 +4,9 @@ import type { DesignReviewVerdict } from "./types.js";
 const designReviewVerdictSchema = z.object({
   verdict: z.enum(["approve", "reject"]),
   reasons: z.array(z.string()),
-});
+}).refine(
+  (v) => v.verdict !== "reject" || (v.reasons.length > 0 && v.reasons.every((r) => r.length > 0)),
+);
 
 export type DesignReviewParseResult =
   | { kind: "ok"; value: DesignReviewVerdict }

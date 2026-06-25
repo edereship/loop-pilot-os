@@ -156,7 +156,7 @@ export class GitPrManager implements GitPrManagerInterface {
     }
     const clean = await this.runner.run(
       "git",
-      ["-C", worktreePath, "clean", "-fd"],
+      ["-C", worktreePath, "clean", "-fdx"],
       { cwd: worktreePath, timeoutMs: 30_000 },
     );
     if (clean.code !== 0) {

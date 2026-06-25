@@ -146,6 +146,8 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
   memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
+  // Design reviewer branch restore — git checkout <session.branch> (ES-477 Finding 4).
+  memoryRunner.on(["git", "checkout"], { code: 0 });
   // GROOM startSha recording and HEAD reset before memory commit (ES-457 Finding 1).
   memoryRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
@@ -5078,5 +5080,69 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(s.stopDetail).toContain("redesign agent failed");
     expect(s.stopDetail).toContain("todo revert failed");
     expect(s.stopDetail).toContain("Linear outage");
+  });
+
+  it("requestStop() during reviewer run → HALT without redesign when reviewer rejects (ES-477 Finding 1)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad design"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    // Trigger interrupt during the reviewer run so it fires after reviewer returns reject
+    const origRun = reviewer.run.bind(reviewer);
+    reviewer.run = async (ctx: { worktreePath: string; prompt: string; timeoutMs?: number }) => {
+      h.orch.requestStop();
+      return origRun(ctx);
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    // IMPLEMENT never ran (no redesign attempted after interrupt)
+    expect(h.agent.contexts).toHaveLength(0);
+    // Designer was called exactly once (no redesign)
+    expect(designer.calls).toHaveLength(1);
+  });
+
+  it("checkouts the claimed branch before resetting to startSha after reviewer runs (ES-477 Finding 4)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // git checkout <session.branch> must be called on the worktree path before the reset
+    const checkoutOnWorktree = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args[1] === "looppilot/ty-1-x" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(checkoutOnWorktree.length).toBeGreaterThan(0);
+
+    // The checkout must precede the reset --hard in the call sequence
+    const checkoutIdx = h.memoryRunner.calls.findIndex(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args[1] === "looppilot/ty-1-x" && c.opts.cwd === "/wt/ty-1",
+    );
+    const resetIdx = h.memoryRunner.calls.findIndex(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(checkoutIdx).toBeLessThan(resetIdx);
   });
 });
