@@ -28,6 +28,8 @@ import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import { parseDesignReviewOutput } from "./design-review-parser.js";
 import { buildDesignReviewPrompt } from "./design-review-prompt.js";
+import { buildSelfReviewPrompt } from "./self-review-prompt.js";
+import { parseSelfReviewOutput } from "./self-review-parser.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
 import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
@@ -922,6 +924,16 @@ export class Orchestrator {
       // 5) IMPLEMENT (was 4)
       const impl = await this.implement(session, issue, planBrief);
       if (impl.control === "halt") return;
+
+      // 5.5) SELF-REVIEW (ES-473)
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return;
+      }
+      {
+        const sr = await this.selfReview(session, issue, planBrief);
+        if (sr.control === "halt") return;
+      }
 
       // 6) HANDOFF (was 5)
       const handoff = await this.handoff(session, issue);
@@ -1912,6 +1924,126 @@ export class Orchestrator {
     } catch (err) {
       return await this.stopSession(session, "exception", errMsg(err), { costUsd: outcome.costUsd });
     }
+    return CONTINUE;
+  }
+
+  // ---- SELF-REVIEW (ES-473) ----
+  private async selfReview(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+    planBrief: PlanBrief | null,
+  ): Promise<RunControl> {
+    const worktreePath = session.worktreePath as string;
+
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(worktreePath, specDir);
+      } catch (err) {
+        this.log(`selfReview: spec loading failed (non-fatal): ${errMsg(err)}`);
+      }
+    }
+
+    const mem = readMemoryAll(worktreePath);
+    if (mem.readErrors) {
+      this.log(`selfReview: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
+    }
+
+    const prompt = buildSelfReviewPrompt({
+      issue,
+      brief: planBrief,
+      specContent,
+      memory: {
+        implResults: mem.implResults ?? undefined,
+        productKnowledge: mem.productKnowledge ?? undefined,
+      },
+      memoryBudgetChars: this.config.memory.injectBudgetChars,
+    });
+
+    const logRow = this.store.insertSelfReviewLog({
+      runId: this.runId,
+      sessionId: session.id,
+      startedAt: this.clock(),
+    });
+
+    let outcome: AgentOutcome;
+    try {
+      outcome = await this.agent.runSession({
+        worktreePath,
+        prompt,
+        maxCostUsd: this.config.safety.maxCostUsdPerSelfReview,
+        hardTimeoutMs: this.config.safety.selfReviewTimeoutMinutes * 60_000,
+      });
+    } catch (err) {
+      this.log(`selfReview: agent exception (non-fatal): ${errMsg(err)}`);
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: errMsg(err),
+      });
+      return CONTINUE;
+    }
+
+    if (outcome.kind === "interrupted") {
+      this.store.updateSession(session.id, { selfReviewCostUsd: outcome.costUsd });
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: "interrupted",
+      });
+      await this.haltForInterrupt();
+      return HALT;
+    }
+
+    if (outcome.kind === "cost_exceeded" || outcome.kind === "error") {
+      const errDetail = outcome.kind === "error" ? outcome.message : "cost exceeded";
+      this.log(`selfReview: agent ${outcome.kind} (non-fatal): ${errDetail}`);
+      this.store.updateSession(session.id, { selfReviewCostUsd: outcome.costUsd });
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: errDetail,
+      });
+      return CONTINUE;
+    }
+
+    // completed
+    this.store.updateSession(session.id, { selfReviewCostUsd: outcome.costUsd });
+
+    const parsed = parseSelfReviewOutput(outcome.fullResult ?? outcome.summary);
+    if (parsed.kind === "parse_error") {
+      this.log("selfReview: parse error (non-fatal), proceeding to HANDOFF");
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: `parse error: ${parsed.raw.slice(0, 200)}`,
+      });
+      return CONTINUE;
+    }
+
+    const { verdict, issues, summary } = parsed.value;
+    const reviewOutcome: "passed" | "fixed" | "failed" =
+      verdict === "pass"
+        ? (issues.length > 0 ? "fixed" : "passed")
+        : "failed";
+
+    this.store.updateSelfReviewLog(logRow.id, {
+      endedAt: this.clock(),
+      verdict,
+      issueCount: issues.length,
+      summary,
+      outcome: reviewOutcome,
+      costUsd: outcome.costUsd,
+    });
+
+    this.log(
+      `selfReview: ${verdict} (issues=${issues.length}): ${summary}`,
+    );
+
     return CONTINUE;
   }
 
