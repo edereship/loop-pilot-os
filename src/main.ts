@@ -25,6 +25,7 @@ import { runPreflight } from "./preflight.js";
 import { renderStatus } from "./status.js";
 import { AgentWorkflowRecovery } from "./workflow-recovery.js";
 import { CodexPlanner, type CodexRateLimitOpts } from "./codex-planner.js";
+import { ClaudePlanRunner } from "./claude-planner.js";
 import { generateCodebaseSummary } from "./codebase-summary.js";
 import { GroomBoardFetcher } from "./groom-board-fetcher.js";
 import { GroomLinearClient } from "./groom-linear-client.js";
@@ -174,6 +175,19 @@ async function runLoop(configPath: string): Promise<number> {
       log: logLine,
       rateLimit: rateLimitOpts,
     });
+    const designAgent = new ClaudeAgentRunner(runner, {
+      model: config.agent.model,
+      effort: effortSupported && effort !== "auto" ? effort : undefined,
+      effortEnvOverride: effortSupported || effort === "auto" ? effort : undefined,
+      permissionMode: "plan",
+      allowedTools: config.agent.allowedTools,
+      extraArgs: config.agent.extraArgs,
+      log: logLine,
+      rateLimit: rateLimitOpts,
+    });
+    const designer = new ClaudePlanRunner(designAgent, {
+      maxCostUsd: config.safety.maxCostUsdPerDesign,
+    });
     const git = new GitPrManager(runner, {
       repoPath: config.repo.path,
       remote: config.repo.remote,
@@ -246,6 +260,7 @@ async function runLoop(configPath: string): Promise<number> {
       log: logLine,
       recovery,
       planner: codexPlanner,
+      designer,
       codebaseSummaryGenerator,
       runner,
       recoveryTurn: {

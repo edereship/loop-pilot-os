@@ -75,6 +75,7 @@ export interface OrchestratorDeps {
   log: (line: string) => void;
   recovery: WorkflowRecovery;
   planner: PlanRunner | null;
+  designer: PlanRunner | null;
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
@@ -104,6 +105,7 @@ export class Orchestrator {
   private readonly log: (line: string) => void;
   private readonly recovery: WorkflowRecovery;
   private readonly planner: PlanRunner | null;
+  private readonly designer: PlanRunner | null;
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
@@ -128,6 +130,7 @@ export class Orchestrator {
     this.log = deps.log;
     this.recovery = deps.recovery;
     this.planner = deps.planner;
+    this.designer = deps.designer;
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
@@ -816,13 +819,13 @@ export class Orchestrator {
         this.store.updateSession(session.id, { selectRationale });
       }
 
-      // 4) PLAN
-      const plan = await this.plan(session, issue);
-      if (plan.control === "halt") return;
-      const planBrief = plan.brief;
+      // 4) DESIGN (was PLAN — ES-476)
+      const design = await this.design(session, issue);
+      if (design.control === "halt") return;
+      const planBrief = design.brief;
 
       // Safe point: honor a stop request before the mutating IMPLEMENT phase.
-      // PLAN is read-only, so stopping here leaves the session in "claimed" —
+      // DESIGN is read-only, so stopping here leaves the session in "claimed" —
       // recoverByOpenPr auto-reverts claimed sessions with no open PR on the
       // next startup rather than halting for manual cleanup.
       if (this.interrupted) {
@@ -909,12 +912,12 @@ export class Orchestrator {
     return { control: "continue", session };
   }
 
-  // ---- PLAN（スコープ doc A2 / §1.1 / §1.5） ----
-  private async plan(
+  // ---- DESIGN（設計 brief 生成: Claude Code, ES-476） ----
+  private async design(
     session: TaskSessionRow,
     issue: EligibleIssue,
   ): Promise<{ control: "continue"; brief: PlanBrief | null } | { control: "halt" }> {
-    if (this.planner === null) {
+    if (this.designer === null) {
       return { control: "continue", brief: null };
     }
 
@@ -926,14 +929,14 @@ export class Orchestrator {
       try {
         specContent = this.specLoader(worktreePath, specDir);
       } catch (err) {
-        this.log(`plan: spec loading failed, falling back to raw ticket: ${errMsg(err)}`);
+        this.log(`design: spec loading failed, falling back to raw ticket: ${errMsg(err)}`);
         return { control: "continue", brief: null };
       }
     }
 
     const planMem = readMemoryAll(worktreePath);
     if (planMem.readErrors) {
-      this.log(`plan: memory read failed (non-fatal): ${planMem.readErrors.join("; ")}`);
+      this.log(`design: memory read failed (non-fatal): ${planMem.readErrors.join("; ")}`);
     }
 
     const prompt = buildPlanPrompt({
@@ -948,13 +951,13 @@ export class Orchestrator {
 
     let outcome: PlanOutcome;
     try {
-      outcome = await this.planner.run({
+      outcome = await this.designer.run({
         worktreePath,
         prompt,
-        timeoutMs: this.config.safety.codexTimeoutMinutes * 60_000,
+        timeoutMs: this.config.safety.designTimeoutMinutes * 60_000,
       });
     } catch (err) {
-      this.log(`plan: codex exception, falling back to raw ticket: ${errMsg(err)}`);
+      this.log(`design: agent exception, falling back to raw ticket: ${errMsg(err)}`);
       return { control: "continue", brief: null };
     }
 
@@ -964,23 +967,23 @@ export class Orchestrator {
     }
 
     if (outcome.kind === "error") {
-      this.log(`plan: codex failed, falling back to raw ticket: ${outcome.message}`);
+      this.log(`design: agent failed, falling back to raw ticket: ${outcome.message}`);
       return { control: "continue", brief: null };
     }
 
     const brief = parseBrief(outcome.text);
     if (brief.raw.length > 0) {
-      this.log(`plan: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
+      this.log(`design: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
       this.store.updateSession(session.id, { planBrief: brief.raw });
       if (!this.interrupted) {
         try {
           await this.source.postComment(issue.id, brief.raw);
         } catch (err) {
-          this.log(`plan: brief writeback failed (non-fatal): ${errMsg(err)}`);
+          this.log(`design: brief writeback failed (non-fatal): ${errMsg(err)}`);
         }
       }
     } else {
-      this.log("plan: codex returned empty output, falling back to raw ticket");
+      this.log("design: agent returned empty output, falling back to raw ticket");
     }
 
     return { control: "continue", brief };

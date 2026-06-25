@@ -49,6 +49,8 @@ function makeConfig(over: Partial<{
       maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2,
       codexTimeoutMinutes: 30,
+      designTimeoutMinutes: 15,
+      maxCostUsdPerDesign: 2,
       selectDiffBudgetChars: 6000,
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,
@@ -96,7 +98,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -128,6 +130,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   recoveryRunner.on(["git", "push"], { code: 0 });
   recoveryRunner.on(["gh"], { code: 0 });
   const planner = opts?.planner ?? null;
+  const designer = opts?.designer ?? null;
   const memoryRunner = new FakeCommandRunner();
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
@@ -162,6 +165,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
     log,
     recovery,
     planner,
+    designer,
     codebaseSummaryGenerator,
     recoveryTurn: planner !== null ? {
       planner,
@@ -681,6 +685,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       log: (line: string) => { logs.push(line); },
       recovery,
       planner: null,
+      designer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: inlineMemoryRunner1,
@@ -1183,7 +1188,7 @@ describe("Orchestrator MONITOR — stopReason 自動対処（ES-409）", () => {
       { kind: "completed", text: '{"action":"restart_review"}' },
     ];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
     // Make tryMerge see ci_failed so recovery fires and resets quotaRetryAttempts in DB
@@ -2362,14 +2367,14 @@ describe("Orchestrator 進捗通知 — notify.progress opt-in（ES-378）", () 
   });
 });
 
-describe("Orchestrator PLAN phase (ES-381)", () => {
+describe("Orchestrator DESIGN phase (ES-476)", () => {
   it("generates brief via planner, persists to DB, and proceeds to IMPLEMENT", async () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [
       { kind: "completed", text: "## Goal\nDo the thing.\n\n## Change Targets\n- file.ts\n\n## Implementation Steps\n1. Step one\n\n## Acceptance Criteria\n- Tests pass\n\n## Out of Scope\n- Nothing" },
     ];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2392,7 +2397,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "error", message: "codex crashed" }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2403,14 +2408,14 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("merged");
     expect(s.planBrief).toBeNull();
-    expect(h.logs.some((l) => l.includes("codex failed") && l.includes("codex crashed"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("agent failed") && l.includes("codex crashed"))).toBe(true);
   });
 
   it("falls back to null brief when planner throws", async () => {
     const planner = new FakePlanRunner();
     // No outcomes queued → FakePlanRunner throws
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2420,12 +2425,12 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("merged");
     expect(s.planBrief).toBeNull();
-    expect(h.logs.some((l) => l.includes("codex exception"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("agent exception"))).toBe(true);
   });
 
-  it("skips PLAN entirely when planner is null", async () => {
+  it("skips DESIGN entirely when designer is null", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config); // planner defaults to null
+    const h = makeHarness(config); // designer defaults to null
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2435,11 +2440,11 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("merged");
     expect(s.planBrief).toBeNull();
-    // No plan-related log lines
-    expect(h.logs.some((l) => l.includes("plan:"))).toBe(false);
+    // No design-related log lines
+    expect(h.logs.some((l) => l.includes("design:"))).toBe(false);
   });
 
-  it("falls back when spec loading fails during PLAN (IMPLEMENT also stops)", async () => {
+  it("falls back when spec loading fails during DESIGN (IMPLEMENT also stops)", async () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed", text: "## Goal\nShould not reach." }];
     const config = makeConfig({ maxTasksPerRun: 1 });
@@ -2470,7 +2475,8 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
       sleep: instantSleep(),
       log: (line: string) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
-      planner,
+      planner: null,
+      designer: planner,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: inlineMemoryRunner2,
@@ -2483,9 +2489,9 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
 
     await orch.run();
 
-    // PLAN fell back gracefully (did not halt the loop)
+    // DESIGN fell back gracefully (did not halt the loop)
     expect(planner.calls).toHaveLength(0);
-    expect(logs.some((l) => l.includes("plan: spec loading failed"))).toBe(true);
+    expect(logs.some((l) => l.includes("design: spec loading failed"))).toBe(true);
     // IMPLEMENT independently also fails on spec loading → session stopped
     const s = store.sessionsForRun(store.latestRun()!.id)[0];
     expect(s.state).toBe("stopped");
@@ -2498,7 +2504,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed", text: briefText }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2512,9 +2518,9 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     expect(h.promptArgs[0]!.planBrief?.raw).toContain("Do the thing.");
   });
 
-  it("passes null brief to buildPrompt when planner is absent", async () => {
+  it("passes null brief to buildPrompt when designer is absent", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config); // planner defaults to null
+    const h = makeHarness(config); // designer defaults to null
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2529,7 +2535,7 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed" as const, text: "   \n  \n  " }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2539,31 +2545,31 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("merged");
     expect(s.planBrief).toBeNull();
-    expect(h.logs.some((l) => l.includes("codex returned empty output"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("agent returned empty output"))).toBe(true);
   });
 
-  it("passes codexTimeoutMinutes as timeoutMs to the planner", async () => {
+  it("passes designTimeoutMinutes as timeoutMs to the designer", async () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed", text: "## Goal\nDone." }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
 
     await h.orch.run();
 
-    // codexTimeoutMinutes=30 → 30 * 60_000 = 1_800_000 ms
-    expect(planner.calls[0]!.timeoutMs).toBe(30 * 60_000);
+    // designTimeoutMinutes=15 → 15 * 60_000 = 900_000 ms
+    expect(planner.calls[0]!.timeoutMs).toBe(15 * 60_000);
   });
 
-  it("requestStop() during PLAN halts before IMPLEMENT starts — session stays in claimed (Finding 1)", async () => {
-    // PLAN is read-only. If SIGINT arrives during PLAN, the safe point between
-    // PLAN and IMPLEMENT must honor the stop request so IMPLEMENT (the mutating
+  it("requestStop() during DESIGN halts before IMPLEMENT starts — session stays in claimed (Finding 1)", async () => {
+    // DESIGN is read-only. If SIGINT arrives during DESIGN, the safe point between
+    // DESIGN and IMPLEMENT must honor the stop request so IMPLEMENT (the mutating
     // phase) never launches.
     const config = makeConfig({ maxTasksPerRun: 3 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
 
@@ -2597,13 +2603,13 @@ describe("Orchestrator PLAN phase (ES-381)", () => {
   });
 });
 
-describe("Orchestrator PLAN brief writeback (ES-406)", () => {
+describe("Orchestrator DESIGN brief writeback (ES-406)", () => {
   it("writes back the brief as a Linear comment after successful generation", async () => {
     const briefText = "## Goal\nDo the thing.\n\n## Change Targets\n- file.ts\n\n## Implementation Steps\n1. Step one\n\n## Acceptance Criteria\n- Tests pass\n\n## Out of Scope\n- Nothing";
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed", text: briefText }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2623,7 +2629,7 @@ describe("Orchestrator PLAN brief writeback (ES-406)", () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed", text: "## Goal\nDo it." }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2641,7 +2647,7 @@ describe("Orchestrator PLAN brief writeback (ES-406)", () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "completed", text: "   \n  \n  " }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2651,9 +2657,9 @@ describe("Orchestrator PLAN brief writeback (ES-406)", () => {
     expect(h.source.comments).toHaveLength(0);
   });
 
-  it("does not write back when planner is absent", async () => {
+  it("does not write back when designer is absent", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config); // planner defaults to null
+    const h = makeHarness(config); // designer defaults to null
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2667,7 +2673,7 @@ describe("Orchestrator PLAN brief writeback (ES-406)", () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [{ kind: "error", message: "codex crashed" }];
     const config = makeConfig({ maxTasksPerRun: 1 });
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
     h.monitor.verdicts = [{ kind: "merged" }];
@@ -2682,7 +2688,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
   it("planner ありで eligible 複数 → Codex が選んだチケットを CLAIM する", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
 
     // 2 eligible: TY-1 (Urgent), TY-2 (Medium)
     const ty1 = issue("id-1", "TY-1", { priority: 1 });
@@ -2711,7 +2717,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
   it("planner ありで Codex 失敗 → 決定的順序にフォールバック", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
 
     h.source.queue = [issue("id-1", "TY-1", { priority: 1 }), issue("id-2", "TY-2", { priority: 3 })];
 
@@ -2735,7 +2741,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
   it("planner ありで Codex が無効な identifier → 決定的順序にフォールバック", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
 
     // 2 eligible so PM selection is actually invoked (with 1 eligible it is skipped)
     h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
@@ -2760,11 +2766,11 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
   it("planner ありで eligible が 1 件 → PM 選別スキップ、planner を SELECT に消費しない", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
 
     h.source.queue = [issue("id-1", "TY-1")];
 
-    // Only PLAN outcome (no SELECT since only 1 eligible)
+    // Only DESIGN outcome (no SELECT since only 1 eligible)
     planner.outcomes = [
       { kind: "completed", text: "## Goal\nPlan" },
     ];
@@ -2776,7 +2782,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
 
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions[0].linearIdentifier).toBe("TY-1");
-    // planner called only once (PLAN), not twice (SELECT + PLAN)
+    // planner called only once (DESIGN), not twice (SELECT + DESIGN)
     expect(planner.calls).toHaveLength(1);
   });
 
@@ -2798,7 +2804,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
   it("planner.run() が例外を throw → 決定的フォールバック", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
 
     h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
 
@@ -2830,7 +2836,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
   it("Codex が JSON を含まないテキストを返す → パース失敗で決定的フォールバック", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
 
     h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
 
@@ -2856,7 +2862,7 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
   it("Codex interrupted → HALT（安全停止）", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
 
     h.source.queue = [issue("id-1", "TY-1"), issue("id-2", "TY-2")];
 
@@ -2877,8 +2883,9 @@ describe("Orchestrator PM 選別ターン（ES-382 A1）", () => {
     const planner = new FakePlanRunner();
     planner.outcomes = [
       { kind: "completed", text: '{"identifier":"TY-2","rationale":"has summary context"}' },
+      // DESIGN: no outcome queued → falls back to null brief gracefully
     ];
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("a", "TY-1"), issue("b", "TY-2")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
     h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
@@ -2991,7 +2998,7 @@ describe("Orchestrator.interruptablePause", () => {
     const orch = new Orchestrator({
       config, source, agent, git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
-      log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null,
+      log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null, designer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: inlineMemoryRunner3,
@@ -3033,7 +3040,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("ci_failed triggers recovery -> fix_code -> session resumes monitoring and merges", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
@@ -3086,9 +3093,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("cost_exceeded skips recovery entirely", async () => {
     const config = makeConfig({ maxTasksPerRun: 1, maxCostUsdPerSession: 0.5 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
-    // PLAN outcome
+    // DESIGN outcome
     planner.outcomes = [{ kind: "completed", text: "## Goal\nDo it" }];
     h.agent.outcomes = [{ kind: "cost_exceeded", costUsd: 0.6 }];
 
@@ -3110,7 +3117,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("recovery escalation -> no recovery, just halt", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
     // Monitor: human_required stop (not auto_restart category) -> triggers stopSession
@@ -3136,7 +3143,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("second stop after recovery attempted -> no recovery, just halt", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
@@ -3199,7 +3206,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("recovery codex exception -> falls through to normal stop", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
     h.monitor.verdicts = [{ kind: "stopped", stopReason: null }];
@@ -3225,7 +3232,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("recovery interrupted → recoveryAttempted stays 0, session stays in_review, run halted", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
     h.monitor.verdicts = [{ kind: "done" }];
@@ -3257,7 +3264,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("auto-restart limit exceeded + recovery fix_code → pendingRestartReason reloaded, stale guard fires next poll", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
@@ -3301,7 +3308,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("abandon recovery: abandoned ticket excluded from subsequent SELECT", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     // Single issue so selectWithPm is skipped (eligible.length===1), keeping planner outcomes simple
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
@@ -3337,7 +3344,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("pr_closed with planner configured → no recovery, stops with pr_closed", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
     // Monitor: pr_closed immediately (before any recovery attempt)
@@ -3370,7 +3377,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("handoff_failed recovery retries addLabel and transition(in_review) before flipping to in_review", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
     // Force PR creation to #100
@@ -3412,7 +3419,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("failed abandon does not set recoveryAction or recoveryAttempted, allowing retry", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
     h.monitor.verdicts = [{ kind: "done" }];
@@ -3447,7 +3454,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("ci_failed recovery stale guard fires once then merge succeeds on next poll", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
@@ -3491,7 +3498,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("merge_conflict recovery stale guard fires once then merge succeeds", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
     h.monitor.verdicts = [{ kind: "done" }];
@@ -3531,7 +3538,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
   it("failed fix_code recovery includes recovery failure message in stopDetail", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
-    const h = makeHarness(config, { planner });
+    const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
@@ -4340,6 +4347,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       log: (line) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
       planner: null,
+      designer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: memoryRunner,
@@ -4474,6 +4482,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       log: (line) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
       planner: null,
+      designer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: memoryRunner,
@@ -4547,6 +4556,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       log: (line) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
       planner: null,
+      designer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: memoryRunner,
@@ -4609,6 +4619,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       log: (line) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
       planner,
+      designer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: memoryRunner,

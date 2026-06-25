@@ -33,6 +33,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2,
       codexTimeoutMinutes: 30,
+      designTimeoutMinutes: 15,
+      maxCostUsdPerDesign: 2,
       selectDiffBudgetChars: 6000,
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,
