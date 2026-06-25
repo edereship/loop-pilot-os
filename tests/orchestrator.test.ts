@@ -141,6 +141,8 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null }): Ha
   // GROOM startSha recording and HEAD reset before memory commit (ES-457 Finding 1).
   memoryRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
+  // ES-470 fallback: unstage staged memory files when commitIfChanged throws.
+  memoryRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const orch = new Orchestrator({
@@ -4106,6 +4108,24 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
 
       // Log must mention the commit failure
       expect(h.logs.some(l => l.includes("memory commit failed"))).toBe(true);
+
+      // ES-470: catch block must clean up dirty memory files so they don't leak into SELECT.
+      // bootstrap internal: 1 pair, GROOM commitIfChanged internal: 1 pair, catch block: 1 pair → total >= 3.
+      // >= 2 would pass even without the catch block, so the stricter >= 3 is required.
+      const checkoutMemCalls = h.memoryRunner.calls.filter(
+        c => c.cmd === "git" && c.args[0] === "checkout" && c.args[3] === "docs/memory/",
+      );
+      expect(checkoutMemCalls.length).toBeGreaterThanOrEqual(3);
+      const cleanMemCalls = h.memoryRunner.calls.filter(
+        c => c.cmd === "git" && c.args[0] === "clean" && c.args[2] === "--" && c.args[3] === "docs/memory/",
+      );
+      expect(cleanMemCalls.length).toBeGreaterThanOrEqual(3);
+      // git reset HEAD -- docs/memory/ is issued only by the catch-block fallback (the add-failure
+      // internal path skips it); exactly 1 call proves the catch block actually ran its cleanup.
+      const resetMemCalls = h.memoryRunner.calls.filter(
+        c => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "HEAD" && c.args[3] === "docs/memory/",
+      );
+      expect(resetMemCalls.length).toBeGreaterThanOrEqual(1);
 
       // summaryForSelect should be annotated with the execution shortfall
       const selectPrompt = planner.calls[1]!.prompt;
