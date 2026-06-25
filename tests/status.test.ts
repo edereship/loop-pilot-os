@@ -197,4 +197,31 @@ describe("renderStatus", () => {
       store.close();
     }
   });
+
+  it("Run が idle で idle_started_at がセットされていれば idle since を表示する", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(3, "2026-06-05T10:00:00.000Z");
+      store.setRunState(run.id, "idle");
+      store.setIdleStartedAt(run.id, "2026-06-05T11:00:00.000Z");
+      const out = renderStatus(store);
+      expect(out).toContain("state: idle");
+      expect(out).toContain("idle since: 2026-06-05T11:00:00.000Z");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("Run が idle でも idle_started_at が null なら idle since を表示しない", () => {
+    const store = makeStore();
+    try {
+      const run = store.createRun(3, "2026-06-05T10:00:00.000Z");
+      store.setRunState(run.id, "idle");
+      const out = renderStatus(store);
+      expect(out).toContain("state: idle");
+      expect(out).not.toContain("idle since");
+    } finally {
+      store.close();
+    }
+  });
 });
