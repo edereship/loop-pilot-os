@@ -30,7 +30,7 @@ describe("buildSelfReviewPrompt", () => {
   };
 
   it("includes system role, ticket, brief, specs, and output format", () => {
-    const result = buildSelfReviewPrompt({ issue, brief, specContent });
+    const result = buildSelfReviewPrompt({ issue, brief, specContent, defaultBranch: "main" });
     expect(result).toContain("self-review");
     expect(result).toContain("TY-1");
     expect(result).toContain("Add widget");
@@ -42,7 +42,7 @@ describe("buildSelfReviewPrompt", () => {
   });
 
   it("includes all four review perspectives", () => {
-    const result = buildSelfReviewPrompt({ issue, brief, specContent });
+    const result = buildSelfReviewPrompt({ issue, brief, specContent, defaultBranch: "main" });
     expect(result).toContain("requirements");
     expect(result).toContain("brief");
     expect(result).toContain("spec");
@@ -50,15 +50,21 @@ describe("buildSelfReviewPrompt", () => {
   });
 
   it("works without specContent", () => {
-    const result = buildSelfReviewPrompt({ issue, brief, specContent: null });
+    const result = buildSelfReviewPrompt({ issue, brief, specContent: null, defaultBranch: "main" });
     expect(result).toContain("TY-1");
     expect(result).not.toContain("Product Requirements");
   });
 
   it("works without brief", () => {
-    const result = buildSelfReviewPrompt({ issue, brief: null, specContent: null });
+    const result = buildSelfReviewPrompt({ issue, brief: null, specContent: null, defaultBranch: "main" });
     expect(result).toContain("TY-1");
     expect(result).not.toContain("Implementation Brief");
+  });
+
+  it("interpolates defaultBranch into git diff command", () => {
+    const result = buildSelfReviewPrompt({ issue, brief, specContent: null, defaultBranch: "master" });
+    expect(result).toContain("origin/master...HEAD");
+    expect(result).not.toContain("origin/main");
   });
 
   it("includes memory when provided", () => {
@@ -66,6 +72,7 @@ describe("buildSelfReviewPrompt", () => {
       issue,
       brief,
       specContent: null,
+      defaultBranch: "main",
       memory: { implResults: "Previous: fixed auth bug" },
       memoryBudgetChars: 6000,
     });
@@ -73,7 +80,7 @@ describe("buildSelfReviewPrompt", () => {
   });
 
   it("instructs agent to fix issues and commit", () => {
-    const result = buildSelfReviewPrompt({ issue, brief, specContent });
+    const result = buildSelfReviewPrompt({ issue, brief, specContent, defaultBranch: "main" });
     expect(result).toContain("fix");
     expect(result).toContain("commit");
   });

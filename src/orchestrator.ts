@@ -1954,6 +1954,7 @@ export class Orchestrator {
       issue,
       brief: planBrief,
       specContent,
+      defaultBranch: this.config.repo.defaultBranch,
       memory: {
         implResults: mem.implResults ?? undefined,
         productKnowledge: mem.productKnowledge ?? undefined,

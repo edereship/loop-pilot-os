@@ -5329,4 +5329,28 @@ describe("Self-Review (ES-473)", () => {
     expect(log[0].outcome).toBe("passed");
     expect(log[0].costUsd).toBe(0.3);
   });
+
+  it("selfReview.enabled=false skips self-review entirely", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as { selfReview: { enabled: boolean } }).selfReview.enabled = false;
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Only 1 agent outcome needed (IMPLEMENT only, no self-review)
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "did the work" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Only 1 agent session ran (IMPLEMENT, no self-review)
+    expect(h.agent.contexts).toHaveLength(1);
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    // No self-review log created
+    const log = h.store.getSelfReviewLogsForSession(sessions[0].id);
+    expect(log).toHaveLength(0);
+    // selfReviewCostUsd stays null
+    expect(sessions[0].selfReviewCostUsd).toBeNull();
+  });
 });

@@ -5,6 +5,7 @@ export interface SelfReviewPromptArgs {
   issue: EligibleIssue;
   brief: PlanBrief | null;
   specContent: SpecContent | null;
+  defaultBranch: string;
   memory?: {
     implResults?: string;
     productKnowledge?: string;
@@ -13,7 +14,7 @@ export interface SelfReviewPromptArgs {
 }
 
 export function buildSelfReviewPrompt(args: SelfReviewPromptArgs): string {
-  const { issue, brief, specContent, memory, memoryBudgetChars } = args;
+  const { issue, brief, specContent, defaultBranch, memory, memoryBudgetChars } = args;
   const blocks: string[] = [];
 
   blocks.push(
@@ -74,7 +75,7 @@ export function buildSelfReviewPrompt(args: SelfReviewPromptArgs): string {
     [
       "# Instructions",
       "",
-      "1. Read the git diff (`git diff origin/main...HEAD`) to understand what was implemented.",
+      `1. Read the git diff (\`git diff origin/${defaultBranch}...HEAD\`) to understand what was implemented.`,
       "2. Compare the implementation against the ticket, brief, and specs.",
       "3. If you find issues (missing features, incorrect behavior, spec violations),",
       "   fix them directly in the code and commit your changes.",
