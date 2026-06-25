@@ -52,4 +52,11 @@ describe("buildDesignReviewPrompt", () => {
     expect(prompt).toContain('"verdict"');
     expect(prompt).toContain('"reasons"');
   });
+
+  it("example JSON block in output format is valid JSON", () => {
+    const prompt = buildDesignReviewPrompt({ issue: testIssue, brief: testBrief, specContent: null });
+    const match = /```json\n([\s\S]*?)\n```/.exec(prompt);
+    expect(match).not.toBeNull();
+    expect(() => JSON.parse(match![1]!)).not.toThrow();
+  });
 });

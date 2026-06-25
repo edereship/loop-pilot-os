@@ -381,6 +381,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
       mergePr: async (_prNumber: number, _headSha: string): Promise<void> => {},
       postComment: async (_prNumber: number, _body: string): Promise<void> => {},
       discardWorktree: async (_branch: string, _worktreePath: string): Promise<void> => {},
+      discardUncommittedChanges: async (_worktreePath: string): Promise<void> => {},
       getPrDiffSummary: async (_prNumber: number) => ({ title: "", body: "", diff: "" }),
       fetchDefaultBranch: async (): Promise<void> => {},
     };

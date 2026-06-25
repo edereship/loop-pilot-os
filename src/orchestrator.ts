@@ -1104,8 +1104,13 @@ export class Orchestrator {
         outcome: "error",
         errorDetail: errMsg(err),
       });
+      await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       return { control: "continue", verdict: "approve" };
     }
+
+    // Discard any uncommitted changes the reviewer may have left in the worktree
+    // before the implementation phase runs.
+    await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
 
     if (outcome.kind === "interrupted") {
       this.store.updateDesignReviewLog(logRow.id, {

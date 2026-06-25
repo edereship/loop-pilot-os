@@ -133,6 +133,29 @@ export class GitPrManager implements GitPrManagerInterface {
     return res.stdout.trim().length > 0;
   }
 
+  async discardUncommittedChanges(worktreePath: string): Promise<void> {
+    const restore = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "restore", "."],
+      { cwd: worktreePath, timeoutMs: 30_000 },
+    );
+    if (restore.code !== 0) {
+      throw new Error(
+        `git restore failed in ${worktreePath}: ${restore.stderr.trim() || `exit ${restore.code}`}`,
+      );
+    }
+    const clean = await this.runner.run(
+      "git",
+      ["-C", worktreePath, "clean", "-fd"],
+      { cwd: worktreePath, timeoutMs: 30_000 },
+    );
+    if (clean.code !== 0) {
+      throw new Error(
+        `git clean failed in ${worktreePath}: ${clean.stderr.trim() || `exit ${clean.code}`}`,
+      );
+    }
+  }
+
   async findOpenPrForBranch(branch: string): Promise<number | null> {
     const { repoPath, remote } = this.opts;
     const res = await this.runner.run(

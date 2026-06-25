@@ -113,6 +113,7 @@ export interface GitPrManager {
   prepareWorktree(issue: EligibleIssue): Promise<ClaimResult>;   // 失敗は throw
   hasCommitsWithDiff(worktreePath: string): Promise<boolean>;    // origin/<defaultBranch>..HEAD の実差分
   hasUncommittedChanges(worktreePath: string): Promise<boolean>; // git status --porcelain
+  discardUncommittedChanges(worktreePath: string): Promise<void>; // git restore . && git clean -fd
   findOpenPrForBranch(branch: string): Promise<number | null>;
   pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number>;
   addLabel(prNumber: number, label: string): Promise<void>;
