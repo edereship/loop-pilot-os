@@ -253,6 +253,11 @@ export class FakeGitPr implements GitPrManager {
     return this.uncommitted.get(worktreePath) ?? false;
   }
 
+  async discardUncommittedChanges(worktreePath: string): Promise<void> {
+    this.calls.push({ method: "discardUncommittedChanges", args: [worktreePath] });
+    this.takeFailure("discardUncommittedChanges");
+  }
+
   async findOpenPrForBranch(branch: string): Promise<number | null> {
     this.calls.push({ method: "findOpenPrForBranch", args: [branch] });
     this.takeFailure("findOpenPrForBranch");

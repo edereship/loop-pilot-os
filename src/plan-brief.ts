@@ -9,10 +9,11 @@ export interface PlanPromptArgs {
     productKnowledge?: string;
   } | null;
   memoryBudgetChars?: number;
+  designReviewReasons?: string[];
 }
 
 export function buildPlanPrompt(args: PlanPromptArgs): string {
-  const { issue, specContent, memory, memoryBudgetChars } = args;
+  const { issue, specContent, memory, memoryBudgetChars, designReviewReasons } = args;
   const blocks: string[] = [];
 
   blocks.push(
@@ -62,6 +63,19 @@ export function buildPlanPrompt(args: PlanPromptArgs): string {
       description,
     ].join("\n"),
   );
+
+  if (designReviewReasons && designReviewReasons.length > 0) {
+    blocks.push(
+      [
+        "# Design Review Feedback (MUST ADDRESS)",
+        "",
+        "Your previous design was rejected by the independent reviewer.",
+        "You MUST address ALL of the following issues in your revised design:",
+        "",
+        ...designReviewReasons.map((r, i) => `${i + 1}. ${r}`),
+      ].join("\n"),
+    );
+  }
 
   blocks.push(
     [

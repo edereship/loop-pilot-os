@@ -127,6 +127,7 @@ function makeHarness(config: Config): Harness {
     codebaseSummaryGenerator: async () => "",
     recoveryTurn: null,
     runner: memoryRunner,
+    designReviewer: null,
     groomDeps: null,
   });
   return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };

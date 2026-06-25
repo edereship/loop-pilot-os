@@ -51,6 +51,8 @@ function makeConfig(over: Partial<{
       codexTimeoutMinutes: 30,
       designTimeoutMinutes: 15,
       maxCostUsdPerDesign: 2,
+      designReviewTimeoutMinutes: 15,
+      maxDesignReviewAttempts: 2,
       selectDiffBudgetChars: 6000,
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,
@@ -98,7 +100,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -131,6 +133,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   recoveryRunner.on(["gh"], { code: 0 });
   const planner = opts?.planner ?? null;
   const designer = opts?.designer ?? null;
+  const designReviewer = opts?.designReviewer ?? null;
   const memoryRunner = new FakeCommandRunner();
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
@@ -143,6 +146,8 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
   memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
+  // Design reviewer branch restore — git checkout <session.branch> (ES-477 Finding 4).
+  memoryRunner.on(["git", "checkout"], { code: 0 });
   // GROOM startSha recording and HEAD reset before memory commit (ES-457 Finding 1).
   memoryRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
@@ -166,6 +171,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
     recovery,
     planner,
     designer,
+    designReviewer,
     codebaseSummaryGenerator,
     recoveryTurn: planner !== null ? {
       planner,
@@ -689,6 +695,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: inlineMemoryRunner1,
+      designReviewer: null,
       groomDeps: null,
     });
     source.queue = [issue("issue-A", "TY-1")];
@@ -2479,6 +2486,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
       designer: planner,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
+      designReviewer: null,
       runner: inlineMemoryRunner2,
       groomDeps: null,
     });
@@ -3000,6 +3008,7 @@ describe("Orchestrator.interruptablePause", () => {
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null, designer: null,
       codebaseSummaryGenerator: async () => "",
+      designReviewer: null,
       recoveryTurn: null,
       runner: inlineMemoryRunner3,
       groomDeps: null,
@@ -4348,6 +4357,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       recovery: new FakeWorkflowRecovery(),
       planner: null,
       designer: null,
+      designReviewer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
       runner: memoryRunner,
@@ -4482,6 +4492,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       log: (line) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
       planner: null,
+      designReviewer: null,
       designer: null,
       codebaseSummaryGenerator: async () => "",
       recoveryTurn: null,
@@ -4555,6 +4566,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       sleep: async () => {},
       log: (line) => { logs.push(line); },
       recovery: new FakeWorkflowRecovery(),
+      designReviewer: null,
       planner: null,
       designer: null,
       codebaseSummaryGenerator: async () => "",
@@ -4617,6 +4629,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       clock,
       sleep: async () => {},
       log: (line) => { logs.push(line); },
+      designReviewer: null,
       recovery: new FakeWorkflowRecovery(),
       planner,
       designer: null,
@@ -4683,5 +4696,477 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     expect(() => h.store.getGroomLog(1)).toThrow();
 
     h.store.close();
+  });
+});
+
+describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
+  it("approve → proceeds to IMPLEMENT", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.designReviewAttempts).toBe(0);
+    expect(reviewer.calls).toHaveLength(1);
+    // Brief posted to Linear exactly once (after approval, not during review)
+    expect(h.source.comments.filter((c) => c.body.includes("## Goal"))).toHaveLength(1);
+  });
+
+  it("reject → redesign → approve → IMPLEMENT", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X v1\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nDo X v2\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Missing error handling"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.designReviewAttempts).toBe(1);
+    expect(designer.calls).toHaveLength(2);
+    expect(reviewer.calls).toHaveLength(2);
+    // Second design prompt should contain the rejection reason
+    expect(designer.calls[1]!.prompt).toContain("Missing error handling");
+    // Brief posted to Linear only once (final approved brief, not the rejected draft)
+    expect(h.source.comments.filter((c) => c.body.includes("## Goal"))).toHaveLength(1);
+    expect(h.source.comments[0]!.body).toContain("v2");
+  });
+
+  it("reject N times → HALT with design_rejected", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV2\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV3\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 1"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 2"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 3"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("design_rejected");
+    expect(s.stopDetail).toContain("Bad 3");
+    // 1 initial design + 2 redesigns = 3 designer calls; 3 review calls
+    expect(designer.calls).toHaveLength(3);
+    expect(reviewer.calls).toHaveLength(3);
+    // run must be halted (not just the session stopped)
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(s.designReviewAttempts).toBe(3);
+    // No brief posted to Linear (all were rejected)
+    expect(h.source.comments.filter((c) => c.body.includes("## Goal"))).toHaveLength(0);
+  });
+
+  it("skips DESIGN REVIEW when designReviewer is null", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer }); // no designReviewer
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.logs.some((l) => l.includes("designReview:"))).toBe(false);
+  });
+
+  it("review parse error → treat as approve (fallback)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: "I think this looks great, no issues!" },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.logs.some((l) => l.includes("parse error"))).toBe(true);
+  });
+
+  it("logs review verdicts to design_review_log table", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV2\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Fix A"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const session = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    const log1 = h.store.getDesignReviewLog(1);
+    expect(log1.sessionId).toBe(session.id);
+    expect(log1.attempt).toBe(1);
+    expect(log1.verdict).toBe("reject");
+    expect(log1.outcome).toBe("rejected");
+
+    const log2 = h.store.getDesignReviewLog(2);
+    expect(log2.attempt).toBe(2);
+    expect(log2.verdict).toBe("approve");
+    expect(log2.outcome).toBe("approved");
+  });
+
+  it("SIGINT during review halts cleanly without proceeding to IMPLEMENT", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "interrupted" }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // Agent was never called (IMPLEMENT never ran)
+    expect(h.agent.contexts).toHaveLength(0);
+  });
+
+  it("reviewer error → treat as approve (fail-open)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "error", message: "codex crashed" }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(h.logs.some((l) => l.includes("reviewer failed") && l.includes("codex crashed"))).toBe(true);
+  });
+
+  it("designer failure on redesign → HALT with design_rejected", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "error", message: "agent crashed on redesign" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Fix X"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("design_rejected");
+    expect(s.stopDetail).toContain("redesign agent failed");
+    expect(h.store.latestRun()!.state).toBe("halted");
+    // IMPLEMENT never ran
+    expect(h.agent.contexts).toHaveLength(0);
+  });
+
+  it("discards uncommitted reviewer changes after each review turn", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // discardUncommittedChanges must have been called on the reviewer worktree
+    expect(h.git.calls.some((c) => c.method === "discardUncommittedChanges" && c.args[0] === "/wt/ty-1")).toBe(true);
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+  });
+
+  it("discards uncommitted reviewer changes even when reviewer throws exception", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    // No outcomes queued → FakePlanRunner throws
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Exception path must also clean up the worktree
+    expect(h.git.calls.some((c) => c.method === "discardUncommittedChanges" && c.args[0] === "/wt/ty-1")).toBe(true);
+    // Treated as approve → session proceeds
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+  });
+
+  it("resets worktree to startSha after reviewer runs to undo any reviewer-created commits (ES-477 Finding 3)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // git reset --hard <startSha> must be called on the worktree path (not repoPath)
+    const resetOnWorktree = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(resetOnWorktree.length).toBeGreaterThan(0);
+  });
+
+  it("resets worktree to startSha even when reviewer throws exception (ES-477 Finding 3)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    // No outcomes queued → FakePlanRunner throws
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Exception path must also reset to startSha on the worktree path
+    const resetOnWorktree = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.args[2] === "abc1234" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(resetOnWorktree.length).toBeGreaterThan(0);
+  });
+
+  it("captures Linear transition failure in stop detail when max redesigns exceeded (ES-477 Finding 2)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV2\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV3\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 1"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 2"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad 3"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Override transition to succeed for "in_progress" (CLAIM) but fail for "todo" (design rejection revert)
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (...args: Parameters<typeof h.source.transition>): Promise<void> => {
+      if (args[1] === "todo") throw new Error("Linear outage");
+      return origTransition(...args);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("design_rejected");
+    // Stop detail must include both the rejection reason and the transition failure
+    expect(s.stopDetail).toContain("Bad 3");
+    expect(s.stopDetail).toContain("todo revert failed");
+    expect(s.stopDetail).toContain("Linear outage");
+    expect(h.logs.some((l) => l.includes("todo revert failed") && l.includes("Linear outage"))).toBe(true);
+  });
+
+  it("captures Linear transition failure in stop detail when redesign agent returns null brief (ES-477 Finding 2)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      // Second design agent errors out, causing brief: null
+      { kind: "error", message: "agent crashed on redesign" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Needs work"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Override transition to succeed for "in_progress" (CLAIM) but fail for "todo" (design rejection revert)
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (...args: Parameters<typeof h.source.transition>): Promise<void> => {
+      if (args[1] === "todo") throw new Error("Linear outage");
+      return origTransition(...args);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("design_rejected");
+    expect(s.stopDetail).toContain("redesign agent failed");
+    expect(s.stopDetail).toContain("todo revert failed");
+    expect(s.stopDetail).toContain("Linear outage");
+  });
+
+  it("requestStop() during reviewer run → HALT without redesign when reviewer rejects (ES-477 Finding 1)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad design"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    // Trigger interrupt during the reviewer run so it fires after reviewer returns reject
+    const origRun = reviewer.run.bind(reviewer);
+    reviewer.run = async (ctx: { worktreePath: string; prompt: string; timeoutMs?: number }) => {
+      h.orch.requestStop();
+      return origRun(ctx);
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+    // IMPLEMENT never ran (no redesign attempted after interrupt)
+    expect(h.agent.contexts).toHaveLength(0);
+    // Designer was called exactly once (no redesign)
+    expect(designer.calls).toHaveLength(1);
+  });
+
+  it("checkouts the claimed branch before resetting to startSha after reviewer runs (ES-477 Finding 4)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // git checkout <session.branch> must be called on the worktree path before the reset
+    const checkoutOnWorktree = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args[1] === "looppilot/ty-1-x" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(checkoutOnWorktree.length).toBeGreaterThan(0);
+
+    // The checkout must precede the reset --hard in the call sequence
+    const checkoutIdx = h.memoryRunner.calls.findIndex(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args[1] === "looppilot/ty-1-x" && c.opts.cwd === "/wt/ty-1",
+    );
+    const resetIdx = h.memoryRunner.calls.findIndex(
+      (c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(checkoutIdx).toBeLessThan(resetIdx);
+  });
+
+  it("halts without running IMPLEMENT when branch restore fails after reviewer runs (ES-477 Finding 4)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    // Make the session-branch checkout fail (longest prefix wins over the 2-element default stub).
+    h.memoryRunner.on(["git", "checkout", "looppilot/ty-1-x"], { code: 1, stderr: "error: pathspec 'looppilot/ty-1-x' did not match any file(s) known to git" });
+
+    await h.orch.run();
+
+    // IMPLEMENT must never have run.
+    expect(h.agent.contexts).toHaveLength(0);
+    // A log message explaining the halt must be emitted.
+    expect(h.logs.some((l) => l.includes("branch restore failed"))).toBe(true);
   });
 });

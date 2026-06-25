@@ -23,7 +23,8 @@ export type FailureReason =
   | "pr_closed"
   | "claim_failed"
   | "handoff_failed"
-  | "workflow_setup_failed";
+  | "workflow_setup_failed"
+  | "design_rejected";
 
 // ---- ドメイン ----
 export interface EligibleIssue {
@@ -75,6 +76,7 @@ export interface TaskSessionRow {
   recoveryAttempted: number;    // 0 or 1 — whether Codex recovery was attempted
   recoveryAction: string | null; // action chosen by Codex (fix_code/rebase/restart_review/escalate/abandon)
   doneTransitionPending: number; // 0 or 1 — whether transition(done) is still pending (ES-462)
+  designReviewAttempts: number; // number of DESIGN REVIEW turns attempted for this session (ES-477)
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -111,6 +113,7 @@ export interface GitPrManager {
   prepareWorktree(issue: EligibleIssue): Promise<ClaimResult>;   // 失敗は throw
   hasCommitsWithDiff(worktreePath: string): Promise<boolean>;    // origin/<defaultBranch>..HEAD の実差分
   hasUncommittedChanges(worktreePath: string): Promise<boolean>; // git status --porcelain
+  discardUncommittedChanges(worktreePath: string): Promise<void>; // git restore --staged . && git restore . && git clean -ffdx
   findOpenPrForBranch(branch: string): Promise<number | null>;
   pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number>;
   addLabel(prNumber: number, label: string): Promise<void>;
@@ -308,6 +311,27 @@ export interface GroomLogRow {
   actionsRejected: number;
   actionDetails: string | null;
   outcome: GroomOutcome | null;
+  errorDetail: string | null;
+}
+
+// ---- DESIGN REVIEW（ES-477） ----
+export interface DesignReviewVerdict {
+  verdict: "approve" | "reject";
+  reasons: string[];
+}
+
+export type DesignReviewOutcome = "approved" | "rejected" | "error";
+
+export interface DesignReviewLogRow {
+  id: number;
+  runId: number;
+  sessionId: number;
+  attempt: number;
+  startedAt: string;
+  endedAt: string | null;
+  verdict: string | null;
+  reasons: string | null;
+  outcome: DesignReviewOutcome | null;
   errorDetail: string | null;
 }
 

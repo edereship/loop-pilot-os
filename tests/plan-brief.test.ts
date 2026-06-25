@@ -184,4 +184,23 @@ describe("buildPlanPrompt", () => {
     });
     expect(prompt).not.toContain("横断メモリ");
   });
+
+  it("injects design review rejection reasons when provided", () => {
+    const prompt = buildPlanPrompt({
+      issue: issue(),
+      specContent: null,
+      designReviewReasons: ["Missing error handling", "Scope too broad"],
+    });
+    expect(prompt).toContain("Design Review Feedback");
+    expect(prompt).toContain("Missing error handling");
+    expect(prompt).toContain("Scope too broad");
+  });
+
+  it("omits review feedback block when no rejection reasons", () => {
+    const prompt = buildPlanPrompt({
+      issue: issue(),
+      specContent: null,
+    });
+    expect(prompt).not.toContain("Design Review Feedback");
+  });
 });
