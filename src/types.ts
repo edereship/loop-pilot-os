@@ -98,7 +98,7 @@ export interface SessionContext {
   hardTimeoutMs?: number;
 }
 export type AgentOutcome =
-  | { kind: "completed"; costUsd: number; summary: string }
+  | { kind: "completed"; costUsd: number; summary: string; fullResult?: string }
   | { kind: "cost_exceeded"; costUsd: number }
   | { kind: "interrupted"; costUsd: number }
   | { kind: "error"; costUsd: number; message: string };

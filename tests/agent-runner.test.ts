@@ -259,6 +259,7 @@ describe("ClaudeAgentRunner.runSession", () => {
       kind: "completed",
       costUsd: 1.2345,
       summary: "Added function foo and a test.",
+      fullResult: "Added function foo and a test.",
     });
   });
 
@@ -272,6 +273,20 @@ describe("ClaudeAgentRunner.runSession", () => {
     if (outcome.kind === "completed") {
       expect(outcome.summary).toHaveLength(2000);
       expect(outcome.summary).toBe("x".repeat(2000));
+    }
+  });
+
+  it("completed includes fullResult with untruncated text", async () => {
+    const big = "x".repeat(2500);
+    const resultBig = `{"type":"result","subtype":"success","is_error":false,"total_cost_usd":2,"result":"${big}","session_id":"s1"}`;
+    const { runner } = runnerEmitting([INIT_LINE, resultBig]);
+    const logs: string[] = [];
+    const outcome = await makeRunner(runner, logs).runSession(ctx);
+    expect(outcome.kind).toBe("completed");
+    if (outcome.kind === "completed") {
+      expect(outcome.fullResult).toBe(big);
+      expect(outcome.fullResult).toHaveLength(2500);
+      expect(outcome.summary).toHaveLength(2000);
     }
   });
 
@@ -351,6 +366,7 @@ describe("ClaudeAgentRunner.runSession", () => {
       kind: "completed",
       costUsd: 1.2345,
       summary: "Added function foo and a test.",
+      fullResult: "Added function foo and a test.",
     });
   });
 
