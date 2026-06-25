@@ -664,4 +664,11 @@ describe("loadConfig", () => {
     expect(config.memory.maxCharsPerFile).toBe(4000);
     expect(config.memory.injectBudgetChars).toBe(3000);
   });
+
+  // ES-477: design review safety config defaults
+  it("provides defaults for design review safety keys", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.safety.maxDesignReviewAttempts).toBe(2);
+    expect(config.safety.designReviewTimeoutMinutes).toBe(15);
+  });
 });

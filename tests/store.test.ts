@@ -1197,3 +1197,77 @@ describe("SqliteStore: idle timeout", () => {
     expect(store.getRun(run.id).idleStartedAt).toBeNull();
   });
 });
+
+describe("design_review_log CRUD (ES-477)", () => {
+  it("inserts and retrieves a design review log row", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-25T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-25T00:00:00Z",
+    });
+    const log = store.insertDesignReviewLog({
+      runId: run.id,
+      sessionId: session.id,
+      attempt: 1,
+      startedAt: "2026-06-25T00:01:00Z",
+    });
+    expect(log.runId).toBe(run.id);
+    expect(log.sessionId).toBe(session.id);
+    expect(log.attempt).toBe(1);
+    expect(log.verdict).toBeNull();
+    expect(log.outcome).toBeNull();
+  });
+
+  it("updates a design review log row with verdict", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-25T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-25T00:00:00Z",
+    });
+    const log = store.insertDesignReviewLog({
+      runId: run.id,
+      sessionId: session.id,
+      attempt: 1,
+      startedAt: "2026-06-25T00:01:00Z",
+    });
+    store.updateDesignReviewLog(log.id, {
+      endedAt: "2026-06-25T00:02:00Z",
+      verdict: "approve",
+      reasons: JSON.stringify([]),
+      outcome: "approved",
+    });
+    const updated = store.getDesignReviewLog(log.id);
+    expect(updated.verdict).toBe("approve");
+    expect(updated.outcome).toBe("approved");
+    expect(updated.endedAt).toBe("2026-06-25T00:02:00Z");
+  });
+});
+
+describe("task_session.design_review_attempts migration (ES-477)", () => {
+  it("defaults design_review_attempts to 0 for new sessions", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-25T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-25T00:00:00Z",
+    });
+    expect(session.designReviewAttempts).toBe(0);
+  });
+});

@@ -8,6 +8,8 @@ import type {
   PauseMeta,
   GroomLogRow,
   GroomOutcome,
+  DesignReviewLogRow,
+  DesignReviewOutcome,
 } from "./types.js";
 
 // ---- カーネル §4 のスキーマ（一字一句） ----
@@ -71,6 +73,18 @@ CREATE TABLE IF NOT EXISTS groom_log (
   actions_rejected INTEGER NOT NULL DEFAULT 0,
   action_details TEXT,
   outcome TEXT CHECK (outcome IN ('completed','skipped','error')),
+  error_detail TEXT
+);
+CREATE TABLE IF NOT EXISTS design_review_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES run(id),
+  session_id INTEGER NOT NULL REFERENCES task_session(id),
+  attempt INTEGER NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  verdict TEXT CHECK (verdict IN ('approve','reject')),
+  reasons TEXT,
+  outcome TEXT CHECK (outcome IN ('approved','rejected','error')),
   error_detail TEXT
 );
 CREATE TABLE IF NOT EXISTS run_lock (
@@ -137,6 +151,7 @@ interface RawSessionRow {
   recovery_attempted: number;
   recovery_action: string | null;
   done_transition_pending: number;
+  design_review_attempts: number;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -166,6 +181,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     recoveryAttempted: r.recovery_attempted,
     recoveryAction: r.recovery_action,
     doneTransitionPending: r.done_transition_pending,
+    designReviewAttempts: r.design_review_attempts,
   };
 }
 
@@ -196,6 +212,33 @@ function toGroomLogRow(r: RawGroomLogRow): GroomLogRow {
     actionsRejected: r.actions_rejected,
     actionDetails: r.action_details,
     outcome: r.outcome as GroomOutcome | null,
+    errorDetail: r.error_detail,
+  };
+}
+
+interface RawDesignReviewLogRow {
+  id: number;
+  run_id: number;
+  session_id: number;
+  attempt: number;
+  started_at: string;
+  ended_at: string | null;
+  verdict: string | null;
+  reasons: string | null;
+  outcome: string | null;
+  error_detail: string | null;
+}
+function toDesignReviewLogRow(r: RawDesignReviewLogRow): DesignReviewLogRow {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    sessionId: r.session_id,
+    attempt: r.attempt,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    verdict: r.verdict,
+    reasons: r.reasons,
+    outcome: r.outcome as DesignReviewOutcome | null,
     errorDetail: r.error_detail,
   };
 }
@@ -232,6 +275,14 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   recoveryAttempted: "recovery_attempted",
   recoveryAction: "recovery_action",
   doneTransitionPending: "done_transition_pending",
+  designReviewAttempts: "design_review_attempts",
+};
+const DESIGN_REVIEW_LOG_PATCH_COLUMNS: Record<string, string> = {
+  endedAt: "ended_at",
+  verdict: "verdict",
+  reasons: "reasons",
+  outcome: "outcome",
+  errorDetail: "error_detail",
 };
 
 export class SqliteStore {
@@ -319,6 +370,11 @@ export class SqliteStore {
       // Calling transition(done) on an already-done ticket is idempotent in Linear.
       this.db.exec(
         `UPDATE task_session SET done_transition_pending = 1 WHERE state = 'merged'`,
+      );
+    }
+    if (!columns.has("design_review_attempts")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN design_review_attempts INTEGER NOT NULL DEFAULT 0`,
       );
     }
 
@@ -516,6 +572,7 @@ export class SqliteStore {
         | "recoveryAttempted"
         | "recoveryAction"
         | "doneTransitionPending"
+        | "designReviewAttempts"
       >
     >,
   ): void {
@@ -873,6 +930,64 @@ export class SqliteStore {
       .run(...values);
     if (info.changes !== 1) {
       throw new Error(`updateGroomLog affected ${info.changes} rows for id=${id}`);
+    }
+  }
+
+  // ---- design_review_log (ES-477) ----
+  insertDesignReviewLog(s: {
+    runId: number;
+    sessionId: number;
+    attempt: number;
+    startedAt: string;
+  }): DesignReviewLogRow {
+    const info = this.db
+      .prepare(
+        `INSERT INTO design_review_log (run_id, session_id, attempt, started_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(s.runId, s.sessionId, s.attempt, s.startedAt);
+    return this.getDesignReviewLog(Number(info.lastInsertRowid));
+  }
+
+  getDesignReviewLog(id: number): DesignReviewLogRow {
+    const row = this.db
+      .prepare(`SELECT * FROM design_review_log WHERE id = ?`)
+      .get(id) as RawDesignReviewLogRow | undefined;
+    if (row === undefined) {
+      throw new Error(`design_review_log not found: id=${id}`);
+    }
+    return toDesignReviewLogRow(row);
+  }
+
+  updateDesignReviewLog(
+    id: number,
+    patch: Partial<Pick<DesignReviewLogRow,
+      | "endedAt"
+      | "verdict"
+      | "reasons"
+      | "outcome"
+      | "errorDetail"
+    >>,
+  ): void {
+    const setClauses: string[] = [];
+    const values: Array<string | number | null> = [];
+    for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
+      const column = DESIGN_REVIEW_LOG_PATCH_COLUMNS[key as string];
+      if (column === undefined) {
+        throw new Error(`updateDesignReviewLog: unknown patch key "${String(key)}"`);
+      }
+      const raw = patch[key];
+      if (raw === undefined) continue;
+      setClauses.push(`${column} = ?`);
+      values.push(raw as string | number | null);
+    }
+    if (setClauses.length === 0) return;
+    values.push(id);
+    const info = this.db
+      .prepare(`UPDATE design_review_log SET ${setClauses.join(", ")} WHERE id = ?`)
+      .run(...values);
+    if (info.changes !== 1) {
+      throw new Error(`updateDesignReviewLog affected ${info.changes} rows for id=${id}`);
     }
   }
 }

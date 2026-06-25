@@ -35,6 +35,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       codexTimeoutMinutes: 30,
       designTimeoutMinutes: 15,
       maxCostUsdPerDesign: 2,
+      designReviewTimeoutMinutes: 15,
+      maxDesignReviewAttempts: 2,
       selectDiffBudgetChars: 6000,
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,

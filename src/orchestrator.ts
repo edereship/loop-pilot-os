@@ -26,6 +26,8 @@ import type {
 } from "./types.js";
 import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
+import { parseDesignReviewOutput } from "./design-review-parser.js";
+import { buildDesignReviewPrompt } from "./design-review-prompt.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
 import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
@@ -76,6 +78,7 @@ export interface OrchestratorDeps {
   recovery: WorkflowRecovery;
   planner: PlanRunner | null;
   designer: PlanRunner | null;
+  designReviewer: PlanRunner | null;
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
@@ -106,6 +109,7 @@ export class Orchestrator {
   private readonly recovery: WorkflowRecovery;
   private readonly planner: PlanRunner | null;
   private readonly designer: PlanRunner | null;
+  private readonly designReviewer: PlanRunner | null;
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
@@ -131,6 +135,7 @@ export class Orchestrator {
     this.recovery = deps.recovery;
     this.planner = deps.planner;
     this.designer = deps.designer;
+    this.designReviewer = deps.designReviewer;
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
@@ -819,10 +824,72 @@ export class Orchestrator {
         this.store.updateSession(session.id, { selectRationale });
       }
 
-      // 4) DESIGN (was PLAN — ES-476)
-      const design = await this.design(session, issue);
-      if (design.control === "halt") return;
-      const planBrief = design.brief;
+      // 4) DESIGN + DESIGN REVIEW loop (ES-476 + ES-477)
+      let planBrief: PlanBrief | null = null;
+      let designReviewReasons: string[] | undefined;
+      let designRejected = false;
+      {
+        let designAttempt = 0;
+        const maxRedesigns = this.config.safety.maxDesignReviewAttempts;
+        while (true) {
+          const design = await this.design(session, issue, designReviewReasons);
+          if (design.control === "halt") return;
+          planBrief = design.brief;
+
+          // On a redesign iteration, a null/empty brief means the agent could not
+          // address the rejection — halt with design_rejected rather than silently
+          // proceeding to IMPLEMENT without an approved design.
+          if (designReviewReasons !== undefined && (planBrief === null || planBrief.raw.length === 0)) {
+            await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+            await bestEffort(() => this.source.transition(issue.id, "todo"));
+            const ctrl = await this.stopSession(
+              session, "design_rejected",
+              `redesign agent failed to produce a brief after rejection: ${designReviewReasons.join("; ")}`,
+            );
+            if (ctrl.control === "halt") return;
+            designRejected = true;
+            break;
+          }
+
+          if (planBrief === null || planBrief.raw.length === 0 || this.designReviewer === null) break;
+
+          if (this.interrupted) {
+            await this.haltForInterrupt();
+            return;
+          }
+
+          const review = await this.designReview(session, issue, planBrief, designReviewReasons);
+          if (review.control === "halt") return;
+
+          if (review.verdict === "approve") break;
+
+          designAttempt++;
+          if (designAttempt > maxRedesigns) {
+            await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+            await bestEffort(() => this.source.transition(issue.id, "todo"));
+            const lastReasons = review.reasons.length > 0 ? review.reasons.join("; ") : "(no reasons provided)";
+            const detail = `design review rejected after ${maxRedesigns} redesign attempts: ${lastReasons}`;
+            const ctrl = await this.stopSession(session, "design_rejected", detail);
+            if (ctrl.control === "halt") return;
+            designRejected = true;
+            break;
+          }
+
+          designReviewReasons = review.reasons;
+        }
+
+        if (designRejected) continue;
+      }
+
+      // Post the final (approved or unreviewed) brief to Linear — only once,
+      // not on every redesign iteration.
+      if (planBrief !== null && planBrief.raw.length > 0 && !this.interrupted) {
+        try {
+          await this.source.postComment(issue.id, planBrief.raw);
+        } catch (err) {
+          this.log(`design: brief writeback failed (non-fatal): ${errMsg(err)}`);
+        }
+      }
 
       // Safe point: honor a stop request before the mutating IMPLEMENT phase.
       // DESIGN is read-only, so stopping here leaves the session in "claimed" —
@@ -916,6 +983,7 @@ export class Orchestrator {
   private async design(
     session: TaskSessionRow,
     issue: EligibleIssue,
+    designReviewReasons?: string[],
   ): Promise<{ control: "continue"; brief: PlanBrief | null } | { control: "halt" }> {
     if (this.designer === null) {
       return { control: "continue", brief: null };
@@ -947,6 +1015,7 @@ export class Orchestrator {
         productKnowledge: planMem.productKnowledge ?? undefined,
       },
       memoryBudgetChars: this.config.memory.injectBudgetChars,
+      designReviewReasons,
     });
 
     let outcome: PlanOutcome;
@@ -975,18 +1044,117 @@ export class Orchestrator {
     if (brief.raw.length > 0) {
       this.log(`design: brief generated (sections=${brief.sections !== null ? "parsed" : "raw-only"})`);
       this.store.updateSession(session.id, { planBrief: brief.raw });
-      if (!this.interrupted) {
-        try {
-          await this.source.postComment(issue.id, brief.raw);
-        } catch (err) {
-          this.log(`design: brief writeback failed (non-fatal): ${errMsg(err)}`);
-        }
-      }
     } else {
       this.log("design: agent returned empty output, falling back to raw ticket");
     }
 
     return { control: "continue", brief };
+  }
+
+  // ---- DESIGN REVIEW（ES-477: Codex ブロッキングレビュー） ----
+  private async designReview(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+    brief: PlanBrief,
+    priorRejectReasons?: string[],
+  ): Promise<
+    | { control: "continue"; verdict: "approve" }
+    | { control: "continue"; verdict: "reject"; reasons: string[] }
+    | { control: "halt" }
+  > {
+    if (this.designReviewer === null) {
+      return { control: "continue", verdict: "approve" };
+    }
+
+    const worktreePath = session.worktreePath as string;
+
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(worktreePath, specDir);
+      } catch {
+        // spec load failure is non-fatal for review; proceed without spec context
+      }
+    }
+
+    // Read fresh session to get up-to-date designReviewAttempts (may have been updated by a prior rejection).
+    const freshSession = this.store.getSession(session.id);
+    const attempt = freshSession.designReviewAttempts + 1;
+    const logRow = this.store.insertDesignReviewLog({
+      runId: this.runId,
+      sessionId: session.id,
+      attempt,
+      startedAt: this.clock(),
+    });
+
+    const prompt = buildDesignReviewPrompt({ issue, brief, specContent, priorRejectReasons });
+
+    let outcome: PlanOutcome;
+    try {
+      outcome = await this.designReviewer.run({
+        worktreePath,
+        prompt,
+        timeoutMs: this.config.safety.designReviewTimeoutMinutes * 60_000,
+      });
+    } catch (err) {
+      this.log(`designReview: reviewer exception, treating as approve: ${errMsg(err)}`);
+      this.store.updateDesignReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: errMsg(err),
+      });
+      return { control: "continue", verdict: "approve" };
+    }
+
+    if (outcome.kind === "interrupted") {
+      this.store.updateDesignReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: "interrupted",
+      });
+      await this.haltForInterrupt();
+      return { control: "halt" };
+    }
+
+    if (outcome.kind === "error") {
+      this.log(`designReview: reviewer failed, treating as approve: ${outcome.message}`);
+      this.store.updateDesignReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: outcome.message,
+      });
+      return { control: "continue", verdict: "approve" };
+    }
+
+    const parsed = parseDesignReviewOutput(outcome.text);
+
+    if (parsed.kind === "parse_error") {
+      this.log("designReview: parse error, treating as approve");
+      this.store.updateDesignReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: `parse error: ${parsed.raw.slice(0, 200)}`,
+      });
+      return { control: "continue", verdict: "approve" };
+    }
+
+    const { verdict, reasons } = parsed.value;
+    this.store.updateDesignReviewLog(logRow.id, {
+      endedAt: this.clock(),
+      verdict,
+      reasons: JSON.stringify(reasons),
+      outcome: verdict === "approve" ? "approved" : "rejected",
+    });
+
+    this.log(`designReview: attempt ${attempt} → ${verdict}${reasons.length > 0 ? `: ${reasons.join("; ")}` : ""}`);
+
+    if (verdict === "approve") {
+      return { control: "continue", verdict: "approve" };
+    }
+
+    this.store.updateSession(session.id, { designReviewAttempts: attempt });
+    return { control: "continue", verdict: "reject", reasons };
   }
 
   // ---- fetchBlockedIds（lightweight board fetch, no planner） ----
