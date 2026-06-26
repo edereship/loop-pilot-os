@@ -69,6 +69,8 @@ const rawSchema = z.object({
     select_codebase_summary_budget_chars: z.number().int().positive().default(5000),
     groom_timeout_minutes: z.number().positive().default(10),
     groom_board_budget_chars: z.number().int().positive().default(10000),
+    self_review_timeout_minutes: z.number().positive().default(15),
+    max_cost_usd_per_self_review: z.number().positive().default(2),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -83,6 +85,9 @@ const rawSchema = z.object({
     progress: z.boolean().default(false),
   }).strict().optional(),
   groom: z.object({
+    enabled: z.boolean().default(true),
+  }).strict().optional(),
+  self_review: z.object({
     enabled: z.boolean().default(true),
   }).strict().optional(),
   memory: z.object({
@@ -154,6 +159,8 @@ export interface Config {
     selectCodebaseSummaryBudgetChars: number;
     groomTimeoutMinutes: number;
     groomBoardBudgetChars: number;
+    selfReviewTimeoutMinutes: number;
+    maxCostUsdPerSelfReview: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -168,6 +175,9 @@ export interface Config {
     progress: boolean;
   };
   groom: {
+    enabled: boolean;
+  };
+  selfReview: {
     enabled: boolean;
   };
   memory: {
@@ -669,6 +679,8 @@ export function loadConfig(
       selectCodebaseSummaryBudgetChars: raw.safety.select_codebase_summary_budget_chars,
       groomTimeoutMinutes: raw.safety.groom_timeout_minutes,
       groomBoardBudgetChars: raw.safety.groom_board_budget_chars,
+      selfReviewTimeoutMinutes: raw.safety.self_review_timeout_minutes,
+      maxCostUsdPerSelfReview: raw.safety.max_cost_usd_per_self_review,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
@@ -684,6 +696,9 @@ export function loadConfig(
     },
     groom: {
       enabled: raw.groom?.enabled ?? true,
+    },
+    selfReview: {
+      enabled: raw.self_review?.enabled ?? true,
     },
     memory: {
       maxCharsPerFile: raw.memory?.max_chars_per_file ?? 8000,

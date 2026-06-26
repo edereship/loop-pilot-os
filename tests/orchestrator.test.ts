@@ -57,6 +57,8 @@ function makeConfig(over: Partial<{
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,
       groomBoardBudgetChars: 10000,
+      selfReviewTimeoutMinutes: 15,
+      maxCostUsdPerSelfReview: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -66,6 +68,7 @@ function makeConfig(over: Partial<{
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
     notify: { progress: over.notifyProgress ?? false },
     groom: { enabled: over.groomEnabled ?? false },
+    selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
     linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
   } as unknown as Config;
@@ -153,6 +156,16 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
   // ES-470 fallback: unstage staged memory files when commitIfChanged throws.
   memoryRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+  // Self-review branch verification (Finding 4): git -C <worktreePath> rev-parse / checkout
+  memoryRunner.on(["git", "-C"], (args, _opts) => {
+    if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+      const cIdx = args.indexOf("-C");
+      const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+      const slug = wtPath.replace(/^\/wt\//, "");
+      return { code: 0, stdout: `looppilot/${slug}-x\n` };
+    }
+    return { code: 0, stdout: "" };
+  });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const orch = new Orchestrator({
@@ -227,7 +240,11 @@ describe("Orchestrator 正常系 — 2チケット逐次（仕様 §3 逐次・�
     h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1, summary: "A done" },
+      // SELF-REVIEW for A (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
       { kind: "completed", costUsd: 2, summary: "B done" },
+      // SELF-REVIEW for B (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
     ];
     // 各セッション: done → merged
     h.monitor.verdicts = [
@@ -278,6 +295,7 @@ describe("Orchestrator 正常系 — フェーズ順序（仕様 §5 状態機�
       "prepareWorktree",    // CLAIM
       "hasUncommittedChanges", // IMPLEMENT 後条件（先に残骸チェック）
       "hasCommitsWithDiff",    // IMPLEMENT 後条件（次に実差分チェック）
+      "discardUncommittedChanges", // SELF-REVIEW exception cleanup (no outcome queued → non-fatal)
       "findOpenPrForBranch",   // HANDOFF（既存PR確認）
       "pushAndOpenPr",         // HANDOFF（新規PR）
       "addLabel",              // HANDOFF（ゲートラベル）
@@ -293,11 +311,13 @@ describe("Orchestrator 正常系 — フェーズ順序（仕様 §5 状態機�
     expect(h.promptArgs[0].issue.identifier).toBe("TY-1");
     expect(Array.isArray(h.promptArgs[0].digest)).toBe(true);
 
-    // agent に渡された SessionContext
-    expect(h.agent.contexts).toHaveLength(1);
+    // agent に渡された SessionContext（IMPLEMENT + SELF-REVIEW）
+    expect(h.agent.contexts).toHaveLength(2);
     expect(h.agent.contexts[0].prompt).toBe("PROMPT for TY-1");
     expect(h.agent.contexts[0].maxCostUsd).toBe(10);
     expect(h.agent.contexts[0].worktreePath).toBe("/wt/ty-1");
+    // 2nd context is the self-review call (non-fatal exception: no outcome queued)
+    expect(h.agent.contexts[1].prompt).toContain("self-review");
   });
 });
 
@@ -1975,13 +1995,14 @@ describe("Orchestrator 失敗系 — STOPPED 共通処理の不変条件（仕�
 });
 
 describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 / カーネル §7 末尾）", () => {
-  it("requestStop() を実装フェーズで立てると、現フェーズ群完了後の次の安全点で Run=halted(user_interrupt) して停止する", async () => {
+  it("requestStop() を実装フェーズで立てると、SELF-REVIEW 完了後の安全点で Run=halted(user_interrupt) して停止する", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1, summary: "A ok" },
-      { kind: "completed", costUsd: 1, summary: "B ok" },
+      // Self-review runs (safe stop deferred past the review gate, ES-473 Finding 2)
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
     ];
     h.monitor.verdicts = [
       { kind: "done" },
@@ -1990,7 +2011,7 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
       { kind: "merged" },
     ];
 
-    // 1 件目の IMPLEMENT 中に停止要求を立てる（次の安全点まで現フェーズ群は完了させる）
+    // 1 件目の IMPLEMENT 中に停止要求を立てる
     const origRun = h.agent.runSession.bind(h.agent);
     let agentCalls = 0;
     h.agent.runSession = async (ctx) => {
@@ -2003,21 +2024,20 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
 
     const run = h.store.latestRun()!;
     const sessions = h.store.sessionsForRun(run.id);
-    // 1 件目は現フェーズ群を完走して merged になる（安全点までは止めない）
+    // ES-473: SELF-REVIEW 後の安全点で HALT（HANDOFF は実行されない）
     expect(sessions).toHaveLength(1);
     expect(sessions[0].linearIdentifier).toBe("TY-1");
-    expect(sessions[0].state).toBe("merged");
-    // 2 件目は着手しない（次反復先頭の安全点で停止）
-    expect(h.agent.contexts).toHaveLength(1);
+    expect(sessions[0].state).toBe("implementing");
+    // IMPLEMENT + SELF-REVIEW の 2 回実行（安全点は SELF-REVIEW 後）
+    expect(h.agent.contexts).toHaveLength(2);
     // Run=halted、理由は user_interrupt
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("user_interrupt");
-    // 通知列: run_started → halted(user_interrupt)。失敗 stopped ではない（セッションは merged）
     expect(h.notifier.events.map((e) => e.kind)).toEqual(["run_started", "halted"]);
     expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "user_interrupt" });
   });
 
-  it("requestStop() 後でも進行中セッションは stopped にならず merged のまま（クリーン停止）", async () => {
+  it("requestStop() 後でも進行中セッションは implementing のまま（SELF-REVIEW 前の安全点でクリーン停止）", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
@@ -2033,8 +2053,8 @@ describe("Orchestrator 安全弁 — SIGINT/停止要求フラグ（仕様 §11 
     await h.orch.run();
 
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
-    // 現セッションは完走（merged）。stopped にしない。
-    expect(s.state).toBe("merged");
+    // ES-473: IMPLEMENT 後の安全点で HALT。セッションは implementing のまま（次回起動で回復可能）
+    expect(s.state).toBe("implementing");
     expect(s.failureReason).toBeNull();
     expect(h.store.latestRun()!.state).toBe("halted");
     expect(h.store.latestRun()!.haltReason).toContain("user_interrupt");
@@ -2354,7 +2374,11 @@ describe("Orchestrator 進捗通知 — notify.progress opt-in（ES-378）", () 
     h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1, summary: "A" },
+      // SELF-REVIEW for A (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
       { kind: "completed", costUsd: 2, summary: "B" },
+      // SELF-REVIEW for B (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
     ];
     h.monitor.verdicts = [
       { kind: "done" }, { kind: "merged" },
@@ -3053,6 +3077,8 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // SELF-REVIEW outcome (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
       // Recovery fix agent outcome
       { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
     ];
@@ -3277,6 +3303,8 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // SELF-REVIEW outcome (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
       // Recovery fix agent: succeeds
       { kind: "completed", costUsd: 0.5, summary: "fixed" },
     ];
@@ -3467,6 +3495,8 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // SELF-REVIEW outcome (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
       { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
     ];
     // done verdict repeated — FakeMonitor keeps returning the last element
@@ -3551,6 +3581,8 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     h.source.queue = [issue("issue-A", "TY-1")];
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      // SELF-REVIEW outcome (non-fatal error → proceeds to HANDOFF)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
       { kind: "completed", costUsd: 0.4, summary: "fixed" },
     ];
     h.monitor.verdicts = [{ kind: "done" }];
@@ -4528,6 +4560,17 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
     memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+    // Self-review pre/post-review branch verification: rev-parse --abbrev-ref returns the
+    // expected branch for the worktree so the guard passes without stopping the session.
+    memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        const cIdx = args.indexOf("-C");
+        const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+        const slug = wtPath.replace(/^\/wt\//, "");
+        return { code: 0, stdout: `looppilot/${slug}-x\n` };
+      }
+      return { code: 0, stdout: "" };
+    });
 
     // Previous run was halted while idle — stale idle_started_at is 2 hours in the past.
     const prevRun = store.createRun(3, "2026-06-05T00:00:00.000Z");
@@ -5168,5 +5211,489 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(h.agent.contexts).toHaveLength(0);
     // A log message explaining the halt must be emitted.
     expect(h.logs.some((l) => l.includes("branch restore failed"))).toBe(true);
+  });
+});
+
+describe("Self-Review (ES-473)", () => {
+  it("self-review session runs after IMPLEMENT and before HANDOFF", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // IMPLEMENT outcome + SELF-REVIEW outcome
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "did the work" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Two agent sessions were run (IMPLEMENT + SELF-REVIEW)
+    expect(h.agent.contexts).toHaveLength(2);
+    // The second prompt should contain self-review markers
+    expect(h.agent.contexts[1].prompt).toContain("self-review");
+    // Session should have completed
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    // Self-review cost is tracked
+    expect(sessions[0].selfReviewCostUsd).toBe(0.3);
+  });
+
+  it("self-review fixes issues and proceeds to HANDOFF", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.5, summary: '```json\n{"verdict":"pass","issues":["Fixed missing validation"],"summary":"Fixed 1 issue."}\n```' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].selfReviewCostUsd).toBe(0.5);
+  });
+
+  it("self-review agent error -> logs warning, proceeds to HANDOFF", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.1, message: "agent crashed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(h.logs.some((l) => l.includes("selfReview") && l.includes("agent crashed"))).toBe(true);
+  });
+
+  it("self-review agent interrupted -> HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "interrupted", costUsd: 0.1 },
+    ];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+  });
+
+  it("requestStop() before self-review -> deferred to post-review safe point (ES-473 Finding 2)", async () => {
+    // The safe point is deferred until AFTER self-review so the session always
+    // has a self_review_log entry, making it recoverable on the next startup.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      // Self-review runs even when stop was requested before it started
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    // Request stop after IMPLEMENT completes (before self-review)
+    const origRunSession = h.agent.runSession.bind(h.agent);
+    let callCount = 0;
+    h.agent.runSession = async (ctx) => {
+      callCount++;
+      if (callCount === 1) {
+        const result = await origRunSession(ctx);
+        h.orch.requestStop();
+        return result;
+      }
+      return origRunSession(ctx);
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // Self-review MUST have run (safe stop deferred past review gate)
+    expect(callCount).toBe(2);
+    // No PR should have been opened (stop was honored after self-review)
+    const sessions = h.store.sessionsForRun(run.id);
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+    // A self-review log must be present (enables recovery)
+    const srLog = h.store.getSelfReviewLogsForSession(sessions[0].id);
+    expect(srLog).toHaveLength(1);
+    expect(srLog[0].outcome).toBe("passed");
+  });
+
+  it("self-review parse error -> logs warning, proceeds to HANDOFF", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.2, summary: "no json output" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(h.logs.some((l) => l.includes("selfReview") && l.includes("parse"))).toBe(true);
+  });
+
+  it("self-review execution is logged to self_review_log table", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"OK"}\n```' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const log = h.store.getSelfReviewLogsForSession(sessions[0].id);
+    expect(log).toHaveLength(1);
+    expect(log[0].verdict).toBe("pass");
+    expect(log[0].outcome).toBe("passed");
+    expect(log[0].costUsd).toBe(0.3);
+  });
+
+  it("selfReview.enabled=false skips self-review entirely", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as { selfReview: { enabled: boolean } }).selfReview.enabled = false;
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Only 1 agent outcome needed (IMPLEMENT only, no self-review)
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "did the work" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Only 1 agent session ran (IMPLEMENT, no self-review)
+    expect(h.agent.contexts).toHaveLength(1);
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    // No self-review log created
+    const log = h.store.getSelfReviewLogsForSession(sessions[0].id);
+    expect(log).toHaveLength(0);
+    // selfReviewCostUsd stays null
+    expect(sessions[0].selfReviewCostUsd).toBeNull();
+  });
+
+  it("self-review verdict=fail → session stopped, no PR opened (ES-473 Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.4, summary: '```json\n{"verdict":"fail","issues":["Missing required feature X"],"summary":"Feature X not implemented."}\n```' },
+    ];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must be stopped — not allowed to proceed to HANDOFF
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("self-review verdict=fail");
+    // No PR should have been opened
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+    // Run should be halted
+    expect(run.state).toBe("halted");
+    // The self-review log must still record the verdict
+    const log = h.store.getSelfReviewLogsForSession(sessions[0].id);
+    expect(log[0].verdict).toBe("fail");
+    expect(log[0].outcome).toBe("failed");
+  });
+
+  it("self-review leaves uncommitted changes → session stopped, no PR opened (ES-473 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.4, summary: '```json\n{"verdict":"pass","issues":["Fixed validation"],"summary":"Fixed 1 issue."}\n```' },
+    ];
+    // IMPLEMENT check returns false (clean commit), self-review check returns true (dirty)
+    let uncommittedCallCount = 0;
+    const origHasUncommitted = h.git.hasUncommittedChanges.bind(h.git);
+    h.git.hasUncommittedChanges = async (worktreePath: string): Promise<boolean> => {
+      uncommittedCallCount++;
+      if (uncommittedCallCount <= 1) return false; // post-IMPLEMENT: clean
+      return origHasUncommitted(worktreePath); // post-self-review: delegate to map
+    };
+    h.git.uncommitted.set("/wt/ty-1", true); // reviewer left uncommitted changes
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must be stopped — uncommitted self-review changes must not be silently dropped
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("agent_no_change");
+    expect(sessions[0].stopDetail).toContain("self-review left uncommitted changes");
+    // No PR should have been opened
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+    // Run should be halted
+    expect(run.state).toBe("halted");
+  });
+
+  it("requestStop() during self-review agent → HALT before HANDOFF (Codex Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      // Self-review agent returns a normal result even though requestStop was called
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    // Request stop during the self-review agent run (2nd agent call)
+    const origRunSession = h.agent.runSession.bind(h.agent);
+    let callCount = 0;
+    h.agent.runSession = async (ctx) => {
+      callCount++;
+      if (callCount === 2) {
+        // requestStop() fires while self-review is running
+        h.orch.requestStop();
+      }
+      return origRunSession(ctx);
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    // Must HALT — not proceed to HANDOFF
+    expect(run.state).toBe("halted");
+    // No PR should have been opened
+    const sessions = h.store.sessionsForRun(run.id);
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review cost_exceeded discards uncommitted changes before HANDOFF (Codex Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "cost_exceeded", costUsd: 2.0 },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // Should proceed to HANDOFF (cost_exceeded is non-fatal)
+    expect(sessions[0].state).toBe("merged");
+    // discardUncommittedChanges must have been called to clean up
+    expect(h.git.calls.some((c) => c.method === "discardUncommittedChanges")).toBe(true);
+  });
+
+  it("self-review cost_exceeded resets any pre-review commits (ES-473 Finding 2)", async () => {
+    // If the self-review agent committed partial fixes and then hit cost_exceeded,
+    // those commits must be reset to preReviewSha so they don't silently end up in the PR.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "cost_exceeded", costUsd: 2.0 },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // Return a real SHA for rev-parse HEAD so the reset target is known
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && !args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "preReviewSha111\n" };
+      }
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "looppilot/ty-1-x\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    // git reset --hard <preReviewSha> must have been issued to undo any commits
+    const resetCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args.includes("reset") && c.args.includes("--hard") && c.args.includes("preReviewSha111"),
+    );
+    expect(resetCall).toBeDefined();
+  });
+
+  it("self-review cost adds to session costUsd total (ES-473 Finding 3)", async () => {
+    // selfReviewCostUsd must be included in the reported session cost, not tracked
+    // only in a separate column that consumers don't read.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // Total cost = IMPLEMENT + SELF-REVIEW
+    expect(sessions[0].costUsd).toBeCloseTo(1.8);
+    expect(sessions[0].selfReviewCostUsd).toBe(0.3);
+  });
+
+  it("self-review error cost adds to session costUsd total (ES-473 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.1, message: "agent crashed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // Non-fatal self-review error: session proceeds to HANDOFF but cost is included
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].costUsd).toBeCloseTo(1.6);
+    expect(sessions[0].selfReviewCostUsd).toBe(0.1);
+  });
+
+  it("self-review agent on wrong branch → session stopped (ES-473 Finding 4)", async () => {
+    // If the agent checked out a different branch and committed there, restoring the
+    // session branch silently drops those commits from the PR. Stop unconditionally
+    // so human review can recover or cherry-pick the off-branch commits.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    // Override the memoryRunner to report the wrong branch
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "some-other-branch\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // Session must be stopped — off-branch commits would be silently dropped if we restored
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("wrong branch");
+    expect(sessions[0].stopDetail).toContain("some-other-branch");
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.logs.some((l) => l.includes("selfReview") && l.includes("wrong branch"))).toBe(true);
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review agent on wrong branch (detached HEAD) → session stopped (ES-473 Finding 4)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    // Override the memoryRunner: detached HEAD
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "HEAD\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("wrong branch");
+    expect(sessions[0].prNumber).toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review cost_exceeded: cleanup reset failure → session stopped (ES-473 Finding 3)", async () => {
+    // If git reset --hard fails during nonfatal cleanup, we must stop rather than
+    // letting unreviewed partial commits reach HANDOFF.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "cost_exceeded", costUsd: 2.0 },
+    ];
+    // Return a real SHA so preReviewSha is captured, then make reset fail
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "looppilot/ty-1-x\n" };
+      }
+      if (args.includes("rev-parse") && !args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "abc1234\n" };
+      }
+      if (args.includes("reset") && args.includes("--hard")) {
+        return { code: 128, stdout: "", stderr: "fatal: could not reset" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("cleanup reset failed");
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review pass with no issues but HEAD moved → session stopped (ES-473 Finding 4)", async () => {
+    // A reviewer that accidentally commits changes but reports no issues should be
+    // detected: those unreported commits must not silently reach the PR.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 0.3, summary: '```json\n{"verdict":"pass","issues":[],"summary":"All good."}\n```' },
+    ];
+    let headCallIndex = 0;
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "looppilot/ty-1-x\n" };
+      }
+      if (args.includes("rev-parse") && !args.includes("--abbrev-ref")) {
+        headCallIndex++;
+        // First call: capture preReviewSha. Second call: return a different SHA (HEAD moved).
+        return { code: 0, stdout: headCallIndex === 1 ? "sha-before\n" : "sha-after\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].failureReason).toBe("exception");
+    expect(sessions[0].stopDetail).toContain("unreported commits");
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
   });
 });

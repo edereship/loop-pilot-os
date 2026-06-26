@@ -1271,3 +1271,80 @@ describe("task_session.design_review_attempts migration (ES-477)", () => {
     expect(session.designReviewAttempts).toBe(0);
   });
 });
+
+describe("self_review_log CRUD", () => {
+  it("insertSelfReviewLog creates a row and getSelfReviewLog retrieves it", () => {
+    const store = new SqliteStore(":memory:");
+    const run = store.createRun(3, "2026-06-25T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "id-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "looppilot/ty-1",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-25T00:00:00.000Z",
+    });
+    const log = store.insertSelfReviewLog({
+      runId: run.id,
+      sessionId: session.id,
+      startedAt: "2026-06-25T00:01:00.000Z",
+    });
+    expect(log.id).toBeGreaterThan(0);
+    expect(log.runId).toBe(run.id);
+    expect(log.sessionId).toBe(session.id);
+    expect(log.outcome).toBeNull();
+    store.close();
+  });
+
+  it("updateSelfReviewLog updates fields", () => {
+    const store = new SqliteStore(":memory:");
+    const run = store.createRun(3, "2026-06-25T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "id-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "looppilot/ty-1",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-25T00:00:00.000Z",
+    });
+    const log = store.insertSelfReviewLog({
+      runId: run.id,
+      sessionId: session.id,
+      startedAt: "2026-06-25T00:01:00.000Z",
+    });
+    store.updateSelfReviewLog(log.id, {
+      endedAt: "2026-06-25T00:02:00.000Z",
+      verdict: "pass",
+      issueCount: 0,
+      summary: "All good",
+      outcome: "passed",
+      costUsd: 0.5,
+    });
+    const updated = store.getSelfReviewLog(log.id);
+    expect(updated.endedAt).toBe("2026-06-25T00:02:00.000Z");
+    expect(updated.verdict).toBe("pass");
+    expect(updated.issueCount).toBe(0);
+    expect(updated.summary).toBe("All good");
+    expect(updated.outcome).toBe("passed");
+    expect(updated.costUsd).toBe(0.5);
+    store.close();
+  });
+
+  it("getSelfReviewLogsForSession returns empty array when no logs", () => {
+    const store = new SqliteStore(":memory:");
+    const run = store.createRun(3, "2026-06-25T00:00:00.000Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "id-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "b",
+      worktreePath: "/w",
+      now: "2026-06-25T00:00:00.000Z",
+    });
+    expect(store.getSelfReviewLogsForSession(session.id)).toEqual([]);
+    store.close();
+  });
+});

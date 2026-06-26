@@ -55,6 +55,7 @@ export interface TaskSessionRow {
   linearIssueId: string;
   linearIdentifier: string;
   issueTitle: string;
+  issueUrl: string;
   branch: string;
   worktreePath: string | null;
   prNumber: number | null;
@@ -77,6 +78,7 @@ export interface TaskSessionRow {
   recoveryAction: string | null; // action chosen by Codex (fix_code/rebase/restart_review/escalate/abandon)
   doneTransitionPending: number; // 0 or 1 — whether transition(done) is still pending (ES-462)
   designReviewAttempts: number; // number of DESIGN REVIEW turns attempted for this session (ES-477)
+  selfReviewCostUsd: number | null; // cost of the self-review turn (ES-473)
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -311,6 +313,23 @@ export interface GroomLogRow {
   actionsRejected: number;
   actionDetails: string | null;
   outcome: GroomOutcome | null;
+  errorDetail: string | null;
+}
+
+// ---- SELF-REVIEW (ES-473) ----
+export type SelfReviewOutcome = "passed" | "fixed" | "failed" | "error";
+
+export interface SelfReviewLogRow {
+  id: number;
+  runId: number;
+  sessionId: number;
+  startedAt: string;
+  endedAt: string | null;
+  verdict: "pass" | "fail" | null;
+  issueCount: number;
+  summary: string | null;
+  outcome: SelfReviewOutcome | null;
+  costUsd: number | null;
   errorDetail: string | null;
 }
 

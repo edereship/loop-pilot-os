@@ -671,4 +671,10 @@ describe("loadConfig", () => {
     expect(config.safety.maxDesignReviewAttempts).toBe(2);
     expect(config.safety.designReviewTimeoutMinutes).toBe(15);
   });
+
+  it("provides defaults for self-review safety keys (ES-473)", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.safety.selfReviewTimeoutMinutes).toBe(15);
+    expect(config.safety.maxCostUsdPerSelfReview).toBe(2);
+  });
 });

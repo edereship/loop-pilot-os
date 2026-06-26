@@ -28,6 +28,8 @@ import { classifyStopReason } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import { parseDesignReviewOutput } from "./design-review-parser.js";
 import { buildDesignReviewPrompt } from "./design-review-prompt.js";
+import { buildSelfReviewPrompt } from "./self-review-prompt.js";
+import { parseSelfReviewOutput } from "./self-review-parser.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
 import { executeRecoveryTurn } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
@@ -467,24 +469,23 @@ export class Orchestrator {
     }
     // IMPLEMENT interrupted before PR creation (e.g. SIGINT during rate-limit sleep):
     // revert the ticket to Todo and discard the worktree only when no committed work
-    // exists yet. If the agent already committed changes (crash between runSession
-    // completing and handoff() recording "handing_off"), fall through to manual cleanup
-    // to avoid destroying committed implementation work.
-    // Also treat uncommitted file edits as "work" — if SIGINT fires during the
-    // rate-limit sleep after Claude has edited files but before it commits, the
-    // worktree is dirty but hasCommitsWithDiff returns false.  Discarding that
-    // worktree would silently destroy the partial implementation.
+    // exists yet. If the agent already committed changes and the worktree is clean,
+    // resume from SELF-REVIEW → HANDOFF (ES-473: the safe point between IMPLEMENT and
+    // HANDOFF may leave "implementing" with committed work but no PR on a clean interrupt).
+    // Fall through to manual cleanup for dirty worktrees to avoid destroying partial work.
     if (session.state === "implementing") {
-      let hasWork = false;
+      let hasCommits = false;
+      let hasDirtyFiles = false;
+      let checkFailed = false;
       if (session.worktreePath) {
         try {
-          hasWork = await this.git.hasCommitsWithDiff(session.worktreePath) ||
-            await this.git.hasUncommittedChanges(session.worktreePath);
+          hasCommits = await this.git.hasCommitsWithDiff(session.worktreePath);
+          hasDirtyFiles = await this.git.hasUncommittedChanges(session.worktreePath);
         } catch {
-          hasWork = true; // assume work exists if check fails; prefer manual cleanup
+          checkFailed = true; // assume work exists if check fails; prefer manual cleanup
         }
       }
-      if (!hasWork) {
+      if (!hasCommits && !hasDirtyFiles && !checkFailed) {
         if (session.worktreePath) {
           await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
         }
@@ -503,7 +504,68 @@ export class Orchestrator {
           `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
         return await this.stopSession(session, "exception", detail);
       }
-      // Has committed work → fall through to manual cleanup below
+      if (hasCommits && !hasDirtyFiles && !checkFailed) {
+        this.store.updateSession(session.id, { runId: this.runId });
+        if (this.config.selfReview.enabled) {
+          // Check if a successful self-review already completed before the daemon stopped.
+          // If so, the review gate is already satisfied and we can skip to HANDOFF.
+          const srLogs = this.store.getSelfReviewLogsForSession(session.id);
+          const lastSrLog = srLogs.at(-1);
+          if (lastSrLog?.outcome === "passed" || lastSrLog?.outcome === "fixed" ||
+              (lastSrLog?.outcome === "error" &&
+               lastSrLog.errorDetail != null &&
+               lastSrLog.errorDetail !== "interrupted" &&
+               !lastSrLog.errorDetail.startsWith("guard:"))) {
+            // passed/fixed: gate satisfied.
+            // error with non-null, non-"interrupted", non-"guard:" errorDetail: cleanup-complete
+            // nonfatal outcome (cost cap, agent exception, parse error); the main flow returns
+            // CONTINUE and proceeds to HANDOFF, so recovery must do the same.
+            // excluded: interrupted (outcome written before haltForInterrupt(), cleanup may not
+            // have run); null errorDetail (fatal guard path with no detail); "guard:"-prefixed
+            // errorDetail (fatal guard paths that called stopSession() — branch wrong before/after
+            // review, SHA unreadable, uncommitted changes, no diff remaining, etc.).
+            this.log(`recovery: self-review completed (${lastSrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
+            const recoveredIssue: EligibleIssue = {
+              id: session.linearIssueId,
+              identifier: session.linearIdentifier,
+              title: session.issueTitle,
+              description: "",
+              priority: 0,
+              sortOrder: 0,
+              url: session.issueUrl,
+            };
+            const handoffResult = await this.handoff(session, recoveredIssue);
+            if ("prNumber" in handoffResult) return CONTINUE;
+            return handoffResult;
+          }
+          // Self-review has not completed (crash before self-review started).
+          // The recovery context has no ticket description, so we cannot run the gate.
+          // Halt for human review.
+          const detail =
+            `crash recovery: self-review required but ticket description unavailable; ` +
+            `manual review and handoff needed: ` +
+            `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+          this.log(`recovery: halting — self-review required but ticket context unavailable (${session.linearIdentifier})`);
+          return await this.stopSession(session, "exception", detail);
+        }
+        // Clean committed work, no open PR: resume from HANDOFF.
+        // Self-review is disabled, so proceed directly.
+        const recoveredIssue: EligibleIssue = {
+          id: session.linearIssueId,
+          identifier: session.linearIdentifier,
+          title: session.issueTitle,
+          description: "",
+          priority: 0,
+          sortOrder: 0,
+          url: session.issueUrl,
+        };
+        const handoffResult = await this.handoff(session, recoveredIssue);
+        if ("prNumber" in handoffResult) {
+          return CONTINUE;
+        }
+        return handoffResult;
+      }
+      // Has dirty files or check failed → fall through to manual cleanup below
     }
     // オープン PR なし → 手動掃除を促して HALT（タスク内自動再開は v1 スコープ外）。
     this.store.updateSession(session.id, { runId: this.runId });
@@ -923,6 +985,23 @@ export class Orchestrator {
       const impl = await this.implement(session, issue, planBrief);
       if (impl.control === "halt") return;
 
+      // 5.5) SELF-REVIEW (ES-473)
+      if (this.config.selfReview.enabled) {
+        const sr = await this.selfReview(session, issue, planBrief);
+        if (sr.control === "halt") return;
+      }
+
+      // Safe point: honor a stop request that arrived before or during self-review.
+      // selfReview() may return CONTINUE even if requestStop() was called
+      // while the agent was running (the agent returned a normal outcome).
+      // Deferring to this point (rather than checking before self-review) ensures
+      // the session always has a self_review_log entry on graceful stop, making it
+      // recoverable on the next startup (ES-473 Finding 2).
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return;
+      }
+
       // 6) HANDOFF (was 5)
       const handoff = await this.handoff(session, issue);
       if (!("prNumber" in handoff)) {
@@ -975,6 +1054,7 @@ export class Orchestrator {
       linearIssueId: issue.id,
       linearIdentifier: issue.identifier,
       issueTitle: issue.title,
+      issueUrl: issue.url,
       branch: claimResult.branch,
       worktreePath: claimResult.worktreePath,
       now: this.clock(),
@@ -1912,6 +1992,480 @@ export class Orchestrator {
     } catch (err) {
       return await this.stopSession(session, "exception", errMsg(err), { costUsd: outcome.costUsd });
     }
+    return CONTINUE;
+  }
+
+  // ---- SELF-REVIEW (ES-473) ----
+  private async selfReview(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+    planBrief: PlanBrief | null,
+  ): Promise<RunControl> {
+    const worktreePath = session.worktreePath as string;
+
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(worktreePath, specDir);
+      } catch (err) {
+        // specDir is configured, so spec content is required for the review gate.
+        // Without it the reviewer cannot check spec alignment and must not proceed.
+        this.log(`selfReview: spec loading failed: ${errMsg(err)}`);
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: spec loading failed: ${errMsg(err)}`,
+        );
+      }
+    }
+
+    const mem = readMemoryAll(worktreePath);
+    if (mem.readErrors) {
+      this.log(`selfReview: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
+    }
+
+    const prompt = buildSelfReviewPrompt({
+      issue,
+      brief: planBrief,
+      specContent,
+      defaultBranch: this.config.repo.defaultBranch,
+      specDir: this.config.product.specDir,
+      memory: {
+        implResults: mem.implResults ?? undefined,
+        productKnowledge: mem.productKnowledge ?? undefined,
+      },
+      memoryBudgetChars: this.config.memory.injectBudgetChars,
+    });
+
+    const logRow = this.store.insertSelfReviewLog({
+      runId: this.runId,
+      sessionId: session.id,
+      startedAt: this.clock(),
+    });
+
+    // Verify the worktree is on session.branch before capturing the pre-review SHA.
+    // If IMPLEMENT left the worktree on a different branch, the SHA captured below
+    // belongs to that other branch; the nonfatal cleanup path would then reset
+    // session.branch to an off-branch commit (ES-473 Codex Finding 2).
+    try {
+      const preBranchRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      const preBranch = preBranchRes.code === 0 ? preBranchRes.stdout.trim() : null;
+      if (preBranch !== session.branch) {
+        this.log(`selfReview: worktree on wrong branch "${preBranch ?? "unknown"}" before review (expected "${session.branch}"); stopping`);
+        this.store.updateSelfReviewLog(logRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `guard:pre-review branch: on "${preBranch ?? "unknown"}" (expected "${session.branch}")`,
+        });
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: worktree on wrong branch "${preBranch ?? "unknown"}" before review (expected "${session.branch}")`,
+        );
+      }
+    } catch (preBranchErr) {
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: `guard:pre-review branch check failed: ${errMsg(preBranchErr)}`,
+      });
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: branch check failed before review: ${errMsg(preBranchErr)}`,
+      );
+    }
+
+    // Capture HEAD before the review agent runs so we can reset any commits it
+    // makes on failure paths (cost_exceeded / error / parse_error / exception).
+    // A failure to capture this SHA is fatal: without it, commit-consistency and
+    // reset-on-failure guards are both disabled, so partial reviewer commits could
+    // reach HANDOFF undetected (ES-473 Finding 3).
+    let preReviewSha: string | null = null;
+    try {
+      const shaRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      if (shaRes.code !== 0) {
+        this.store.updateSelfReviewLog(logRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `guard:pre-review SHA: git exit ${shaRes.code}`,
+        });
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: could not capture pre-review HEAD SHA (exit ${shaRes.code})`,
+        );
+      }
+      if (shaRes.stdout.trim()) {
+        preReviewSha = shaRes.stdout.trim();
+      }
+    } catch (shaErr) {
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: `guard:pre-review SHA: ${errMsg(shaErr)}`,
+      });
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: could not capture pre-review HEAD SHA: ${errMsg(shaErr)}`,
+      );
+    }
+
+    let outcome: AgentOutcome;
+    try {
+      outcome = await this.agent.runSession({
+        worktreePath,
+        prompt,
+        maxCostUsd: this.config.safety.maxCostUsdPerSelfReview,
+        hardTimeoutMs: this.config.safety.selfReviewTimeoutMinutes * 60_000,
+      });
+    } catch (err) {
+      const agentErrDetail = errMsg(err);
+      this.log(`selfReview: agent exception (non-fatal): ${agentErrDetail}`);
+      await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+      if (preReviewSha !== null) {
+        try {
+          const branchRes = await this.runner.run(
+            "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (branchRes.code === 0 && branchRes.stdout.trim() !== session.branch) {
+            const checkoutRes = await this.runner.run(
+              "git", ["-C", worktreePath, "checkout", session.branch],
+              { cwd: worktreePath, timeoutMs: 30_000 },
+            );
+            if (checkoutRes.code !== 0) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `self-review: cleanup checkout failed (exit ${checkoutRes.code})`,
+              );
+            }
+          }
+          const resetRes = await this.runner.run(
+            "git", ["-C", worktreePath, "reset", "--hard", preReviewSha],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (resetRes.code !== 0) {
+            return await this.stopSession(
+              session,
+              "exception",
+              `self-review: cleanup reset failed (exit ${resetRes.code})`,
+            );
+          }
+        } catch (cleanupErr) {
+          return await this.stopSession(
+            session,
+            "exception",
+            `self-review: cleanup reset failed: ${errMsg(cleanupErr)}`,
+          );
+        }
+      }
+      // Write outcome only after cleanup succeeds so crash-recovery cannot mistake a
+      // mid-cleanup crash for a handoff-eligible completed error (ES-473 Finding 1).
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: agentErrDetail,
+      });
+      return CONTINUE;
+    }
+
+    if (outcome.kind === "interrupted") {
+      const interruptedSession = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        selfReviewCostUsd: outcome.costUsd,
+        costUsd: (interruptedSession.costUsd ?? 0) + (outcome.costUsd ?? 0),
+      });
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: "interrupted",
+      });
+      await this.haltForInterrupt();
+      return HALT;
+    }
+
+    if (outcome.kind === "cost_exceeded" || outcome.kind === "error") {
+      const errDetail = outcome.kind === "error" ? outcome.message : "cost exceeded";
+      this.log(`selfReview: agent ${outcome.kind} (non-fatal): ${errDetail}`);
+      const failedSession = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        selfReviewCostUsd: outcome.costUsd,
+        costUsd: (failedSession.costUsd ?? 0) + (outcome.costUsd ?? 0),
+      });
+      await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+      if (preReviewSha !== null) {
+        try {
+          const branchRes = await this.runner.run(
+            "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (branchRes.code === 0 && branchRes.stdout.trim() !== session.branch) {
+            const checkoutRes = await this.runner.run(
+              "git", ["-C", worktreePath, "checkout", session.branch],
+              { cwd: worktreePath, timeoutMs: 30_000 },
+            );
+            if (checkoutRes.code !== 0) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `self-review: cleanup checkout failed (exit ${checkoutRes.code})`,
+              );
+            }
+          }
+          const resetRes = await this.runner.run(
+            "git", ["-C", worktreePath, "reset", "--hard", preReviewSha],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (resetRes.code !== 0) {
+            return await this.stopSession(
+              session,
+              "exception",
+              `self-review: cleanup reset failed (exit ${resetRes.code})`,
+            );
+          }
+        } catch (cleanupErr) {
+          return await this.stopSession(
+            session,
+            "exception",
+            `self-review: cleanup reset failed: ${errMsg(cleanupErr)}`,
+          );
+        }
+      }
+      // Write outcome only after cleanup succeeds so crash-recovery cannot mistake a
+      // mid-cleanup crash for a handoff-eligible completed error (ES-473 Finding 1).
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: errDetail,
+      });
+      return CONTINUE;
+    }
+
+    // completed
+    const completedSession = this.store.getSession(session.id);
+    this.store.updateSession(session.id, {
+      selfReviewCostUsd: outcome.costUsd,
+      costUsd: (completedSession.costUsd ?? 0) + (outcome.costUsd ?? 0),
+    });
+
+    const parsed = parseSelfReviewOutput(outcome.fullResult ?? outcome.summary);
+    if (parsed.kind === "parse_error") {
+      this.log("selfReview: parse error (non-fatal), proceeding to HANDOFF");
+      const parseErrDetail = `parse error: ${parsed.raw.slice(0, 200)}`;
+      await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+      if (preReviewSha !== null) {
+        try {
+          const branchRes = await this.runner.run(
+            "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (branchRes.code === 0 && branchRes.stdout.trim() !== session.branch) {
+            const checkoutRes = await this.runner.run(
+              "git", ["-C", worktreePath, "checkout", session.branch],
+              { cwd: worktreePath, timeoutMs: 30_000 },
+            );
+            if (checkoutRes.code !== 0) {
+              return await this.stopSession(
+                session,
+                "exception",
+                `self-review: cleanup checkout failed (exit ${checkoutRes.code})`,
+              );
+            }
+          }
+          const resetRes = await this.runner.run(
+            "git", ["-C", worktreePath, "reset", "--hard", preReviewSha],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (resetRes.code !== 0) {
+            return await this.stopSession(
+              session,
+              "exception",
+              `self-review: cleanup reset failed (exit ${resetRes.code})`,
+            );
+          }
+        } catch (cleanupErr) {
+          return await this.stopSession(
+            session,
+            "exception",
+            `self-review: cleanup reset failed: ${errMsg(cleanupErr)}`,
+          );
+        }
+      }
+      // Write outcome only after cleanup succeeds so crash-recovery cannot mistake a
+      // mid-cleanup crash for a handoff-eligible completed error (ES-473 Finding 1).
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: parseErrDetail,
+      });
+      return CONTINUE;
+    }
+
+    const { verdict, issues, summary } = parsed.value;
+    const reviewOutcome: "passed" | "fixed" | "failed" =
+      verdict === "pass"
+        ? (issues.length > 0 ? "fixed" : "passed")
+        : "failed";
+
+    // Record verdict/issues/summary/cost now; defer outcome and endedAt until all
+    // guards pass so a stop on a guard path does not falsely record passed/fixed.
+    this.store.updateSelfReviewLog(logRow.id, {
+      verdict,
+      issueCount: issues.length,
+      summary,
+      costUsd: outcome.costUsd,
+    });
+
+    this.log(
+      `selfReview: ${verdict} (issues=${issues.length}): ${summary}`,
+    );
+
+    // Finding 2: a fail verdict means the reviewer could not resolve spec/requirement
+    // issues — opening a PR for known-incomplete work is incorrect.
+    if (verdict === "fail") {
+      this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "failed" });
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review verdict=fail: ${summary}`,
+      );
+    }
+
+    // Finding 3: if the reviewer fixed files but did not commit them, pushAndOpenPr
+    // only pushes HEAD and the PR omits the self-review fixes while the log records
+    // "fixed". Treat uncommitted leftovers the same way IMPLEMENT does.
+    try {
+      if (await this.git.hasUncommittedChanges(worktreePath)) {
+        this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: "guard:uncommitted changes after review" });
+        return await this.stopSession(
+          session,
+          "agent_no_change",
+          "self-review left uncommitted changes",
+        );
+      }
+    } catch (err) {
+      this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: `guard:git status check failed: ${errMsg(err)}` });
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: git status check failed: ${errMsg(err)}`,
+      );
+    }
+
+    // Verify the worktree is still on the expected branch. If the self-review
+    // agent checked out a different branch or detached HEAD, any commits made
+    // there are not on session.branch and would be absent from the PR even
+    // though the review log records them as applied. Stop unconditionally
+    // so human review can recover or cherry-pick the commits.
+    try {
+      const headRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      const currentBranch = headRes.code === 0 ? headRes.stdout.trim() : null;
+      if (currentBranch !== session.branch) {
+        this.log(
+          `selfReview: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}"); stopping`,
+        );
+        this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: `guard:wrong branch after review: "${currentBranch ?? "unknown"}" (expected "${session.branch}")` });
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}"); fixes may be on off-branch commits`,
+        );
+      }
+    } catch (err) {
+      this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: `guard:branch verification failed: ${errMsg(err)}` });
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: branch verification failed: ${errMsg(err)}`,
+      );
+    }
+
+    // Verify the reviewer's commits are consistent with the reported issues.
+    // - issues > 0 but HEAD unchanged: reviewer claimed fixes but made no commits.
+    // - issues = 0 but HEAD moved: reviewer made unreported commits on a pass verdict
+    //   (ES-473 Finding 4 — hidden commits would slip into the PR with a clean log).
+    if (preReviewSha !== null) {
+      try {
+        const currentShaRes = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        if (currentShaRes.code !== 0) {
+          // A non-zero exit means the post-review HEAD is unreadable. Both consistency
+          // checks depend on this value; skipping them would allow hidden or missing
+          // commits to reach HANDOFF undetected (ES-473 Codex Finding 3).
+          this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: `guard:post-review SHA: git exit ${currentShaRes.code}` });
+          return await this.stopSession(
+            session,
+            "exception",
+            `self-review: post-review HEAD SHA unreadable (git exit ${currentShaRes.code})`,
+          );
+        }
+        const currentSha = currentShaRes.stdout.trim();
+        if (issues.length > 0 && currentSha === preReviewSha) {
+          this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: "guard:fixes claimed but HEAD unchanged" });
+          return await this.stopSession(
+            session,
+            "agent_no_change",
+            "self-review reported fixes but made no commits",
+          );
+        }
+        if (issues.length === 0 && currentSha !== preReviewSha) {
+          this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: "guard:unreported commits on pass verdict" });
+          return await this.stopSession(
+            session,
+            "exception",
+            "self-review made unreported commits on a pass verdict",
+          );
+        }
+      } catch (err) {
+        this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: `guard:post-review SHA check failed: ${errMsg(err)}` });
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: commit verification failed: ${errMsg(err)}`,
+        );
+      }
+    }
+
+    // Finding 4: the self-review agent may have reset session.branch back to origin/main
+    // while leaving a clean worktree. Re-verify the branch still carries an implementation diff.
+    try {
+      if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
+        this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: "guard:no diff remains after review" });
+        return await this.stopSession(
+          session,
+          "agent_no_change",
+          "self-review reset the implementation: no diff remains",
+        );
+      }
+    } catch (err) {
+      this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: "error", errorDetail: `guard:diff check failed: ${errMsg(err)}` });
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: diff check failed: ${errMsg(err)}`,
+      );
+    }
+
+    // All guards passed: finalize the log with the correct outcome.
+    this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: reviewOutcome });
     return CONTINUE;
   }
 

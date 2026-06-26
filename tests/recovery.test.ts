@@ -44,6 +44,8 @@ function makeConfig(over: Partial<{
       selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10,
       groomBoardBudgetChars: 10000,
+      selfReviewTimeoutMinutes: 15,
+      maxCostUsdPerSelfReview: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -52,6 +54,7 @@ function makeConfig(over: Partial<{
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
     notify: { progress: false },
     groom: { enabled: false },
+    selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
   } as unknown as Config;
 }
@@ -108,6 +111,17 @@ function makeHarness(config: Config): Harness {
   const memoryRunner = new FakeCommandRunner();
   memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+  // Self-review pre/post-review branch verification: rev-parse --abbrev-ref returns the
+  // expected branch for the worktree so the guard passes without stopping the session.
+  memoryRunner.on(["git", "-C"], (args, _opts) => {
+    if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+      const cIdx = args.indexOf("-C");
+      const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+      const slug = wtPath.replace(/^\/wt\//, "");
+      return { code: 0, stdout: `looppilot/${slug}-x\n` };
+    }
+    return { code: 0, stdout: "" };
+  });
   const orch = new Orchestrator({
     config,
     source,
@@ -580,7 +594,10 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     expect(h.source.eligibleCalls).toHaveLength(0);
   });
 
-  it("implementing + no PR + has commits → manual cleanup (no discard, no todo revert) + HALT (Finding 3)", async () => {
+  it("implementing + no PR + clean commits + selfReview.enabled → halts (ES-473 Finding 1)", async () => {
+    // When selfReview is enabled, recovery cannot run the gate because the ticket
+    // description is unavailable. Proceeding to HANDOFF would bypass the required
+    // self-review. The safe action is to halt for human review.
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
@@ -588,21 +605,94 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
       { state: "implementing" },
       { branch: "looppilot/ty-wk-x", worktreePath: "/wt/ty-wk", linearIssueId: "issue-WK", linearIdentifier: "TY-WK" },
     );
-    // Agent committed work but orchestrator crashed before handoff; default FakeGitPr returns true
+    // Agent committed clean work but orchestrator crashed before handoff
     h.git.commitsWithDiff.set("/wt/ty-wk", true);
 
     await h.orch.run();
 
+    const newRun = h.store.latestRun()!;
     const s = h.store.getSession(crashed.id);
+    // Recovery must halt — self-review cannot run without ticket context
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("exception");
-    // Falls through to the existing manual-cleanup path — no discard, no todo transition
-    expect(s.stopDetail).toContain("manual cleanup");
-    expect(s.stopDetail).toContain("looppilot/ty-wk-x");
+    expect(s.stopDetail).toContain("self-review required");
+    expect(s.stopDetail).toContain("ticket description unavailable");
     expect(s.stopDetail).toContain("TY-WK");
+    expect(h.logs.some((l) => l.includes("recovery") && l.includes("halting"))).toBe(true);
+    expect(newRun.state).toBe("halted");
+    // Committed work must NOT be destroyed (leave it for human recovery)
+    expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
+    expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
+    // HANDOFF must not be attempted
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("implementing + no PR + clean commits + selfReview error log → resumes HANDOFF (ES-473 Finding 1 fix)", async () => {
+    // When the last self-review log has outcome "error" (nonfatal: cost cap, agent
+    // exception, parse error, or interrupted), recovery must resume HANDOFF — exactly
+    // as the main flow does (it returns CONTINUE for all these cases).
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-wk3-x", worktreePath: "/wt/ty-wk3", linearIssueId: "issue-WK3", linearIdentifier: "TY-WK3" },
+    );
+    h.git.commitsWithDiff.set("/wt/ty-wk3", true);
+    // Insert a self-review log with a nonfatal "error" outcome (e.g. cost exceeded)
+    const srLog = h.store.insertSelfReviewLog({
+      runId: crashed.runId,
+      sessionId: crashed.id,
+      startedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.store.updateSelfReviewLog(srLog.id, {
+      endedAt: "2026-06-04T00:02:00.000Z",
+      outcome: "error",
+      errorDetail: "cost exceeded",
+    });
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.prNumber).not.toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(true);
+    expect(h.logs.some((l) => l.includes("recovery") && l.includes("error"))).toBe(true);
+  });
+
+  it("implementing + no PR + clean commits + selfReview.disabled → skips self-review, resumes HANDOFF (ES-473 Finding 1)", async () => {
+    // When selfReview is disabled, recovery can safely proceed to HANDOFF.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    (config as { selfReview: { enabled: boolean } }).selfReview.enabled = false;
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-wk2-x", worktreePath: "/wt/ty-wk2", linearIssueId: "issue-WK2", linearIdentifier: "TY-WK2" },
+    );
+    h.git.commitsWithDiff.set("/wt/ty-wk2", true);
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.prNumber).not.toBeNull();
     // Committed work must NOT be destroyed
     expect(h.git.calls.some((c) => c.method === "discardWorktree")).toBe(false);
     expect(h.source.transitions.some((t) => t.state === "todo")).toBe(false);
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(true);
   });
 
   it("implementing + no PR + no commits + transition(todo) fails → detail says revert FAILED (Finding 2)", async () => {
