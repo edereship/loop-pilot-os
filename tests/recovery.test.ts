@@ -616,6 +616,45 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
   });
 
+  it("implementing + no PR + clean commits + selfReview error log → resumes HANDOFF (ES-473 Finding 1 fix)", async () => {
+    // When the last self-review log has outcome "error" (nonfatal: cost cap, agent
+    // exception, parse error, or interrupted), recovery must resume HANDOFF — exactly
+    // as the main flow does (it returns CONTINUE for all these cases).
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    const crashed = seedCrashedSession(
+      h.store,
+      { state: "implementing" },
+      { branch: "looppilot/ty-wk3-x", worktreePath: "/wt/ty-wk3", linearIssueId: "issue-WK3", linearIdentifier: "TY-WK3" },
+    );
+    h.git.commitsWithDiff.set("/wt/ty-wk3", true);
+    // Insert a self-review log with a nonfatal "error" outcome (e.g. cost exceeded)
+    const srLog = h.store.insertSelfReviewLog({
+      runId: crashed.runId,
+      sessionId: crashed.id,
+      startedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.store.updateSelfReviewLog(srLog.id, {
+      endedAt: "2026-06-04T00:02:00.000Z",
+      outcome: "error",
+      errorDetail: "cost exceeded",
+    });
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    const origGetAllEligible = h.source.getAllEligible.bind(h.source);
+    h.source.getAllEligible = async (excludeIds: string[]) => {
+      h.orch.requestStop();
+      return origGetAllEligible(excludeIds);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(crashed.id);
+    expect(s.state).toBe("merged");
+    expect(s.prNumber).not.toBeNull();
+    expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(true);
+    expect(h.logs.some((l) => l.includes("recovery") && l.includes("error"))).toBe(true);
+  });
+
   it("implementing + no PR + clean commits + selfReview.disabled → skips self-review, resumes HANDOFF (ES-473 Finding 1)", async () => {
     // When selfReview is disabled, recovery can safely proceed to HANDOFF.
     const config = makeConfig({ maxTasksPerRun: 3 });
