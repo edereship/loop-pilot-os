@@ -732,4 +732,21 @@ describe("loadConfig", () => {
     expect(() => loadConfig(fixture("config-per-phase-bad-model.toml"), fullEnv))
       .toThrow(/agent\.recovery\.effort.*does not support effort/);
   });
+
+  // ES-486 (review fix): per-phase 'sonnet' bare alias + explicit non-auto effort on third-party provider.
+  it("throws when per-phase 'sonnet' alias is paired with explicit non-auto effort on a third-party provider", () => {
+    expect(() =>
+      loadConfig(fixture("config-per-phase-sonnet-alias.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+      }),
+    ).toThrow(/agent\.recovery\.effort/);
+  });
+
+  // ES-486 (review fix): per-phase 'sonnet' alias with non-auto effort is allowed on direct Anthropic API.
+  it("accepts per-phase 'sonnet' alias with non-auto effort when no third-party provider is set", () => {
+    expect(() =>
+      loadConfig(fixture("config-per-phase-sonnet-alias.toml"), fullEnv),
+    ).not.toThrow();
+  });
 });

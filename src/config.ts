@@ -488,11 +488,31 @@ function validatePhaseModelEffort(
     modelHasMaxEffortCapabilityEnvVar(model, env) ||
     modelSupportsEffort(model);
   const aliasPinnedToUnknown = !skipEffortChecks && isAliasPinnedToUnknownModel(model, env);
+  const isThirdParty = isThirdPartyProviderContext(env);
+  const normalizedModel = normalizeModelForCapabilityCheck(model);
 
   if (!skipEffortChecks && effort !== "auto" && (!modelSupportsEffort(model) || aliasPinnedToUnknown)) {
     errors.push(
       `${phasePath}.effort: model "${model}" does not support effort levels; ` +
-        `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
+        `set ${phasePath}.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
+    );
+  }
+
+  // Bedrock/Vertex/Foundry では "sonnet" ベアエイリアスが Sonnet 4.5 に解決される
+  // 可能性があるため、明示的な non-auto effort は拒否する。
+  if (!skipEffortChecks && isThirdParty && normalizedModel === "sonnet" && effort !== "auto") {
+    errors.push(
+      `${phasePath}.effort: model "sonnet" may resolve to Sonnet 4.5 on Bedrock/Vertex/Foundry which does not support effort; ` +
+        `pin to a versioned model (e.g., claude-sonnet-4-6) or set ${phasePath}.effort = "auto"`,
+    );
+  }
+
+  // "opusplan" は実行フェーズで Sonnet を使用するため、Bedrock/Vertex/Foundry では
+  // Sonnet 4.5 に解決される可能性があり "sonnet" と同様に non-auto effort を拒否する。
+  if (!skipEffortChecks && isThirdParty && normalizedModel === "opusplan" && effort !== "auto") {
+    errors.push(
+      `${phasePath}.effort: model "opusplan" execution phase may resolve to Sonnet 4.5 on Bedrock/Vertex/Foundry which does not support effort; ` +
+        `pin to a versioned model or set ${phasePath}.effort = "auto"`,
     );
   }
 
@@ -500,6 +520,15 @@ function validatePhaseModelEffort(
     errors.push(
       `${phasePath}.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
         `model "${model}" supports low/medium/high/max only`,
+    );
+  }
+
+  // Bedrock/Vertex/Foundry では "opus" ベアエイリアスが Opus 4.6 に解決される
+  // 可能性があるため、xhigh は拒否する（Opus 4.6 は xhigh 非対応）。
+  if (!skipXhighCheck && isThirdParty && normalizedModel === "opus" && effort === "xhigh") {
+    errors.push(
+      `${phasePath}.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
+        `model "opus" on Bedrock/Vertex/Foundry resolves to Opus 4.6 which supports low/medium/high/max only`,
     );
   }
 
@@ -691,13 +720,13 @@ export function loadConfig(
     }
 
     // Per-phase agent model/effort validation (ES-486).
-    const phaseEntries: [string, string, { model: string; effort: string } | undefined][] = [
-      ["agent.design", "design", result.data.agent.design],
-      ["agent.implement", "implement", result.data.agent.implement],
-      ["agent.self_review", "self_review", result.data.agent.self_review],
-      ["agent.recovery", "recovery", result.data.agent.recovery],
+    const phaseEntries: [string, { model: string; effort: string } | undefined][] = [
+      ["agent.design", result.data.agent.design],
+      ["agent.implement", result.data.agent.implement],
+      ["agent.self_review", result.data.agent.self_review],
+      ["agent.recovery", result.data.agent.recovery],
     ];
-    for (const [phasePath, , rawPhase] of phaseEntries) {
+    for (const [phasePath, rawPhase] of phaseEntries) {
       if (rawPhase !== undefined) {
         validatePhaseModelEffort(phasePath, rawPhase.model, rawPhase.effort, env, errors);
       }
