@@ -5127,7 +5127,7 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(resetOnWorktree.length).toBeGreaterThan(0);
   });
 
-  it("captures Linear transition failure in stop detail when max redesigns exceeded (ES-477 Finding 2)", async () => {
+  it("captures Linear transition failure in stop detail when max redesigns exceeded and halts run (ES-477 Finding 2, ES-458)", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -5160,9 +5160,15 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(s.stopDetail).toContain("todo revert failed");
     expect(s.stopDetail).toContain("Linear outage");
     expect(h.logs.some((l) => l.includes("todo revert failed") && l.includes("Linear outage"))).toBe(true);
+    // When todo revert fails the ticket is stuck In Progress — the run must halt so
+    // operators can intervene rather than continuing and leaving the ticket orphaned (ES-458).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("design_rejected");
+    expect(run.haltReason).toContain("todo revert failed");
   });
 
-  it("captures Linear transition failure in stop detail when redesign agent returns null brief (ES-477 Finding 2)", async () => {
+  it("captures Linear transition failure in stop detail when redesign agent returns null brief and halts run (ES-477 Finding 2, ES-458)", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -5191,6 +5197,11 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(s.stopDetail).toContain("redesign agent failed");
     expect(s.stopDetail).toContain("todo revert failed");
     expect(s.stopDetail).toContain("Linear outage");
+    // When todo revert fails the ticket is stuck In Progress — the run must halt (ES-458).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("design_rejected");
+    expect(run.haltReason).toContain("todo revert failed");
   });
 
   it("requestStop() during reviewer run → HALT without redesign when reviewer rejects (ES-477 Finding 1)", async () => {
