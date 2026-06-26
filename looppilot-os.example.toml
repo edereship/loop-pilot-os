@@ -36,6 +36,29 @@ allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"   # --allowedTools
                                    #   その他: default / plan / auto / dontAsk
 # extra_args = []               # 任意の追加 claude フラグ（既定なし）
 
+# ---- フェーズ別 agent オーバーライド（ES-486）----
+# 未設定のフェーズは [agent] の model/effort をそのまま使う。
+# [agent.design]
+# model = "claude-opus-4-8[1m]"
+# effort = "max"
+# [agent.implement]
+# model = "claude-opus-4-6[1m]"
+# effort = "high"
+# [agent.self_review]
+# model = "claude-opus-4-8[1m]"
+# effort = "max"
+# [agent.recovery]
+# model = "claude-sonnet-4-6"
+# effort = "high"
+
+# ---- Codex (PM) 設定（ES-486）----
+# [pm]
+# model = "gpt-5.5"           # codex exec -m に渡す（既定: gpt-5.5）
+# [pm.effort]
+# groom = "medium"            # GROOM フェーズの reasoning effort（既定: medium）
+# select = "low"              # SELECT フェーズの reasoning effort（既定: low）
+# design_review = "high"      # DESIGN REVIEW フェーズの reasoning effort（既定: high）
+
 [handoff]
 branch_prefix = "looppilot"
 pr_body_template = """

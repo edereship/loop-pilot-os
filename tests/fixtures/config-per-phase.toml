@@ -1,0 +1,65 @@
+[product]
+goal = "Build widgets"
+
+[repo]
+path = "/abs/path/to/target-repo"
+remote = "owner/name"
+
+[linear]
+team = "TY"
+project = "LoopPilot OS"
+opt_in_label = "ai-ok"
+[linear.states]
+todo = "Todo"
+in_progress = "In Progress"
+in_review = "In Review"
+done = "Done"
+
+[agent]
+model = "claude-opus-4-6[1m]"
+effort = "high"
+allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"
+
+[agent.design]
+model = "claude-opus-4-8[1m]"
+effort = "max"
+
+[agent.implement]
+model = "claude-opus-4-6[1m]"
+effort = "high"
+
+[agent.self_review]
+model = "claude-opus-4-8[1m]"
+effort = "max"
+
+[agent.recovery]
+model = "claude-sonnet-4-6"
+effort = "high"
+
+[pm]
+model = "gpt-5.5"
+[pm.effort]
+groom = "high"
+select = "medium"
+design_review = "high"
+
+[handoff]
+branch_prefix = "looppilot"
+pr_body_template = "Implements {identifier}: {title}\n\n{issue_url}"
+
+[looppilot]
+gate_label = "loop-pilot"
+state_comment_authors = ["github-actions[bot]"]
+
+[safety]
+max_tasks_per_run = 3
+max_cost_usd_per_session = 10.0
+
+[loop]
+monitor_poll_seconds = 60
+idle_recheck_seconds = 300
+
+[digest]
+recent_merged_count = 5
+
+[notify]

@@ -41,7 +41,36 @@ const rawSchema = z.object({
     permission_mode: z.enum([
       "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions",
     ]).default("acceptEdits"),
+    // Per-phase overrides (ES-486). When absent, the parent agent.model/effort is used.
+    design: z.object({
+      model: z.string(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+    }).strict().optional(),
+    implement: z.object({
+      model: z.string(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+    }).strict().optional(),
+    self_review: z.object({
+      model: z.string(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+    }).strict().optional(),
+    recovery: z.object({
+      model: z.string(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+    }).strict().optional(),
   }).strict(),
+  // Codex (PM) per-phase effort (ES-486). Absent → Codex gets no -m/-c flags (backward compat).
+  // effort fields use z.string() so loadConfig can produce error messages that include the
+  // received value (Zod v4 enum errors omit it). Validation of "low"|"medium"|"high" is done
+  // manually in loadConfig after schema parse.
+  pm: z.object({
+    model: z.string().default("gpt-5.5"),
+    effort: z.object({
+      groom: z.string().default("medium"),
+      select: z.string().default("low"),
+      design_review: z.string().default("high"),
+    }).strict().optional(),
+  }).strict().optional(),
   handoff: z.object({
     branch_prefix: z.string(),
     pr_body_template: z.string(),
@@ -133,7 +162,19 @@ export interface Config {
     extraArgs: string[];
     effort: string;
     permissionMode: string;
+    design: { model: string; effort: string } | undefined;
+    implement: { model: string; effort: string } | undefined;
+    selfReview: { model: string; effort: string } | undefined;
+    recovery: { model: string; effort: string } | undefined;
   };
+  pm: {
+    model: string;
+    effort: {
+      groom: string;
+      select: string;
+      designReview: string;
+    };
+  } | undefined;
   handoff: {
     branchPrefix: string;
     prBodyTemplate: string;
@@ -426,6 +467,51 @@ function isAliasPinnedToUnknownModel(model: string, env: NodeJS.ProcessEnv): boo
   return false;
 }
 
+/**
+ * Per-phase model/effort pair validation (ES-486).
+ * Applies the same allowlist and capability checks as the global agent.model/effort validation,
+ * but scoped to a specific per-phase block (e.g. "agent.design", "agent.recovery").
+ * phasePath is used as the error message prefix; ".effort" is appended automatically.
+ */
+function validatePhaseModelEffort(
+  phasePath: string,
+  model: string,
+  effort: string,
+  env: NodeJS.ProcessEnv,
+  errors: string[],
+): void {
+  const effortAlwaysEnabled = env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
+  const hasEffortEnvVar = modelHasEffortCapabilityEnvVar(model, env);
+  const skipEffortChecks = effortAlwaysEnabled || hasEffortEnvVar;
+  const skipXhighCheck = effortAlwaysEnabled || modelHasXhighEffortCapabilityEnvVar(model, env);
+  const skipMaxCheck = effortAlwaysEnabled ||
+    modelHasMaxEffortCapabilityEnvVar(model, env) ||
+    modelSupportsEffort(model);
+  const aliasPinnedToUnknown = !skipEffortChecks && isAliasPinnedToUnknownModel(model, env);
+
+  if (!skipEffortChecks && effort !== "auto" && (!modelSupportsEffort(model) || aliasPinnedToUnknown)) {
+    errors.push(
+      `${phasePath}.effort: model "${model}" does not support effort levels; ` +
+        `set agent.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
+    );
+  }
+
+  if (!skipXhighCheck && effort === "xhigh" && (skipEffortChecks || modelSupportsEffort(model)) && !modelSupportsXhigh(model)) {
+    errors.push(
+      `${phasePath}.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
+        `model "${model}" supports low/medium/high/max only`,
+    );
+  }
+
+  if (!skipMaxCheck && hasEffortEnvVar && effort === "max") {
+    errors.push(
+      `${phasePath}.effort: effort level "max" requires "max_effort" capability; ` +
+        `model "${model}" declares "effort" but not "max_effort" ` +
+        `— add "max_effort" to the supported capabilities or use a lower effort level`,
+    );
+  }
+}
+
 // xhigh をサポートするのは Fable 5 と Opus 4.7+（README §model×effort 対応表）。
 // Opus 4.6 や Sonnet 4.6 は xhigh 非対応（low/medium/high/max のみ）。
 const XHIGH_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8"];
@@ -585,6 +671,38 @@ export function loadConfig(
       );
     }
 
+    // Codex (pm) effort validation (ES-486): only low/medium/high are valid (Codex caps at high).
+    // Produces custom error messages that include the received value so tests can match on it.
+    const VALID_CODEX_EFFORT = ["low", "medium", "high"];
+    if (result.data.pm?.effort) {
+      const pmEffort = result.data.pm.effort;
+      for (const [field, value] of [
+        ["groom", pmEffort.groom],
+        ["select", pmEffort.select],
+        ["design_review", pmEffort.design_review],
+      ] as [string, string][]) {
+        if (!VALID_CODEX_EFFORT.includes(value)) {
+          errors.push(
+            `pm.effort.${field}: "${value}" is not a valid Codex effort level; ` +
+              `expected one of "low", "medium", "high" (Codex reasoning effort caps at "high")`,
+          );
+        }
+      }
+    }
+
+    // Per-phase agent model/effort validation (ES-486).
+    const phaseEntries: [string, string, { model: string; effort: string } | undefined][] = [
+      ["agent.design", "design", result.data.agent.design],
+      ["agent.implement", "implement", result.data.agent.implement],
+      ["agent.self_review", "self_review", result.data.agent.self_review],
+      ["agent.recovery", "recovery", result.data.agent.recovery],
+    ];
+    for (const [phasePath, , rawPhase] of phaseEntries) {
+      if (rawPhase !== undefined) {
+        validatePhaseModelEffort(phasePath, rawPhase.model, rawPhase.effort, env, errors);
+      }
+    }
+
     if (result.data.rate_limit?.claude_patterns) {
       for (const pattern of result.data.rate_limit.claude_patterns) {
         try {
@@ -653,7 +771,30 @@ export function loadConfig(
       extraArgs: raw.agent.extra_args,
       effort: effectiveEffort,
       permissionMode: raw.agent.permission_mode,
+      design: raw.agent.design
+        ? { model: raw.agent.design.model, effort: raw.agent.design.effort }
+        : undefined,
+      implement: raw.agent.implement
+        ? { model: raw.agent.implement.model, effort: raw.agent.implement.effort }
+        : undefined,
+      selfReview: raw.agent.self_review
+        ? { model: raw.agent.self_review.model, effort: raw.agent.self_review.effort }
+        : undefined,
+      recovery: raw.agent.recovery
+        ? { model: raw.agent.recovery.model, effort: raw.agent.recovery.effort }
+        : undefined,
     },
+    pm: raw.pm !== undefined
+      ? {
+          model: raw.pm.model,
+          effort: {
+            // effort sub-section may be absent (bare [pm] with no [pm.effort]); apply defaults.
+            groom: raw.pm.effort?.groom ?? "medium",
+            select: raw.pm.effort?.select ?? "low",
+            designReview: raw.pm.effort?.design_review ?? "high",
+          },
+        }
+      : undefined,
     handoff: {
       branchPrefix: raw.handoff.branch_prefix,
       prBodyTemplate: raw.handoff.pr_body_template,
