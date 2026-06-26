@@ -165,7 +165,8 @@ export type NotifyEvent =
   | { kind: "paused"; target: PauseTarget; detail: string }
   | { kind: "resumed"; target: PauseTarget; detail: string }
   | { kind: "recovery_started"; identifier: string; reason: string }
-  | { kind: "recovery_succeeded"; identifier: string; action: string };
+  | { kind: "recovery_succeeded"; identifier: string; action: string }
+  | { kind: "task_skipped"; identifier: string; reason: string; detail: string };
 export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */

@@ -238,6 +238,7 @@ describe("resolveLinearSetup", () => {
   // viewer 検証 + team/project/4状態/ラベルの ID 解決（カーネル §5.5 プリフライト解決）。
   it("resolves all ids when team/project/states/label exist", async () => {
     const { fetchFn, calls } = makeFetch([
+      { body: fixture("linear-setup-viewer.json") },
       { body: fixture("linear-resolve-setup.json") },
     ]);
     const resolved = await resolveLinearSetup(
@@ -278,6 +279,7 @@ describe("resolveLinearSetup", () => {
   // team.projects が優先されることを固定する。
   it("resolves the project from the requested team when another team has a same-named project", async () => {
     const { fetchFn } = makeFetch([
+      { body: fixture("linear-setup-viewer.json") },
       { body: fixture("linear-resolve-setup-duplicate-project.json") },
     ]);
     const resolved = await resolveLinearSetup(
@@ -302,6 +304,7 @@ describe("resolveLinearSetup", () => {
   // 解決できる（カーネル §5.5: `team.labels`+workspace labels の和集合）。
   it("resolves the opt-in label from workspace-level labels when absent on the team", async () => {
     const { fetchFn } = makeFetch([
+      { body: fixture("linear-setup-viewer.json") },
       { body: fixture("linear-resolve-setup-workspace-label.json") },
     ]);
     const resolved = await resolveLinearSetup(
@@ -325,6 +328,7 @@ describe("resolveLinearSetup", () => {
   // 不在要素は名前を列挙して 1 回でまとめて throw。
   it("throws listing every missing element", async () => {
     const { fetchFn } = makeFetch([
+      { body: fixture("linear-setup-viewer.json") },
       { body: fixture("linear-resolve-setup-missing.json") },
     ]);
     const err = await resolveLinearSetup(
@@ -358,7 +362,7 @@ describe("resolveLinearSetup", () => {
   // team key が無ければ team 名で throw（後続の解決に進まない）。
   it("throws when the team key is not found", async () => {
     const { fetchFn } = makeFetch([
-      { body: fixture("linear-resolve-setup.json") },
+      { body: fixture("linear-setup-viewer.json") },
     ]);
     await expect(
       resolveLinearSetup(
@@ -380,10 +384,15 @@ describe("resolveLinearSetup", () => {
   });
 
   it("throws when team label pagination exceeds MAX_PAGES", async () => {
-    const setupData = {
+    const viewerData = {
       data: {
         viewer: { id: "user-1", name: "Bot" },
-        teams: { nodes: [{
+        teams: { nodes: [{ id: "team-uuid-1", key: "TY" }] },
+      },
+    };
+    const teamData = {
+      data: {
+        team: {
           id: "team-uuid-1", key: "TY",
           states: { nodes: [
             { id: "state-todo", name: "Todo" },
@@ -393,7 +402,7 @@ describe("resolveLinearSetup", () => {
           ] },
           labels: { nodes: [{ id: "l-1", name: "ai-ok" }], pageInfo: { hasNextPage: true, endCursor: "c1" } },
           projects: { nodes: [{ id: "project-uuid-1", name: "LoopPilot OS" }] },
-        }] },
+        },
         issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
       },
     };
@@ -401,7 +410,8 @@ describe("resolveLinearSetup", () => {
       body: { data: { team: { labels: { nodes: [{ id: "l-x", name: "x" }], pageInfo: { hasNextPage: true, endCursor: "stuck" } } } } },
     };
     const { fetchFn } = makeFetch([
-      { body: setupData },
+      { body: viewerData },
+      { body: teamData },
       ...Array(51).fill(infiniteLabelPage),
     ]);
     await expect(
@@ -410,10 +420,15 @@ describe("resolveLinearSetup", () => {
   });
 
   it("throws when workspace label pagination exceeds MAX_PAGES", async () => {
-    const setupData = {
+    const viewerData = {
       data: {
         viewer: { id: "user-1", name: "Bot" },
-        teams: { nodes: [{
+        teams: { nodes: [{ id: "team-uuid-1", key: "TY" }] },
+      },
+    };
+    const teamData = {
+      data: {
+        team: {
           id: "team-uuid-1", key: "TY",
           states: { nodes: [
             { id: "state-todo", name: "Todo" },
@@ -423,7 +438,7 @@ describe("resolveLinearSetup", () => {
           ] },
           labels: { nodes: [{ id: "l-1", name: "ai-ok" }], pageInfo: { hasNextPage: false, endCursor: null } },
           projects: { nodes: [{ id: "project-uuid-1", name: "LoopPilot OS" }] },
-        }] },
+        },
         issueLabels: { nodes: [], pageInfo: { hasNextPage: true, endCursor: "c1" } },
       },
     };
@@ -431,7 +446,8 @@ describe("resolveLinearSetup", () => {
       body: { data: { issueLabels: { nodes: [{ id: "l-x", name: "x" }], pageInfo: { hasNextPage: true, endCursor: "stuck" } } } },
     };
     const { fetchFn } = makeFetch([
-      { body: setupData },
+      { body: viewerData },
+      { body: teamData },
       ...Array(51).fill(infiniteLabelPage),
     ]);
     await expect(

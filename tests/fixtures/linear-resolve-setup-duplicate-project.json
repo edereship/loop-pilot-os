@@ -1,40 +1,20 @@
 {
   "data": {
-    "viewer": { "id": "user-1", "name": "LoopPilot Bot" },
-    "teams": {
-      "nodes": [
-        {
-          "id": "team-uuid-2",
-          "key": "OTHER",
-          "states": { "nodes": [] },
-          "labels": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
-          "projects": { "nodes": [
-            { "id": "project-uuid-other", "name": "LoopPilot OS" }
-          ] }
-        },
-        {
-          "id": "team-uuid-1",
-          "key": "TY",
-          "states": { "nodes": [
-            { "id": "state-todo", "name": "Todo" },
-            { "id": "state-wip", "name": "In Progress" },
-            { "id": "state-review", "name": "In Review" },
-            { "id": "state-done", "name": "Done" }
-          ] },
-          "labels": { "nodes": [
-            { "id": "label-aiok", "name": "ai-ok" }
-          ], "pageInfo": { "hasNextPage": false, "endCursor": null } },
-          "projects": { "nodes": [
-            { "id": "project-uuid-ty", "name": "LoopPilot OS" }
-          ] }
-        }
-      ]
-    },
-    "projects": {
-      "nodes": [
-        { "id": "project-uuid-other", "name": "LoopPilot OS" },
+    "team": {
+      "id": "team-uuid-1",
+      "key": "TY",
+      "states": { "nodes": [
+        { "id": "state-todo", "name": "Todo" },
+        { "id": "state-wip", "name": "In Progress" },
+        { "id": "state-review", "name": "In Review" },
+        { "id": "state-done", "name": "Done" }
+      ] },
+      "labels": { "nodes": [
+        { "id": "label-aiok", "name": "ai-ok" }
+      ], "pageInfo": { "hasNextPage": false, "endCursor": null } },
+      "projects": { "nodes": [
         { "id": "project-uuid-ty", "name": "LoopPilot OS" }
-      ]
+      ] }
     },
     "issueLabels": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } }
   }

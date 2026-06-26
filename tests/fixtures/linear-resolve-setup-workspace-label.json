@@ -1,23 +1,18 @@
 {
   "data": {
-    "viewer": { "id": "user-1", "name": "LoopPilot Bot" },
-    "teams": {
-      "nodes": [
-        {
-          "id": "team-uuid-1",
-          "key": "TY",
-          "states": { "nodes": [
-            { "id": "state-todo", "name": "Todo" },
-            { "id": "state-wip", "name": "In Progress" },
-            { "id": "state-review", "name": "In Review" },
-            { "id": "state-done", "name": "Done" }
-          ] },
-          "labels": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
-          "projects": { "nodes": [
-            { "id": "project-uuid-1", "name": "LoopPilot OS" }
-          ] }
-        }
-      ]
+    "team": {
+      "id": "team-uuid-1",
+      "key": "TY",
+      "states": { "nodes": [
+        { "id": "state-todo", "name": "Todo" },
+        { "id": "state-wip", "name": "In Progress" },
+        { "id": "state-review", "name": "In Review" },
+        { "id": "state-done", "name": "Done" }
+      ] },
+      "labels": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
+      "projects": { "nodes": [
+        { "id": "project-uuid-1", "name": "LoopPilot OS" }
+      ] }
     },
     "issueLabels": { "nodes": [
       { "id": "label-aiok-ws", "name": "ai-ok" }

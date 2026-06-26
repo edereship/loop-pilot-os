@@ -786,6 +786,7 @@ export class Orchestrator {
         eligible = await this.source.getAllEligible([
           ...this.store.activeIssueIds(),
           ...this.store.abandonedIssueIds(this.runId),
+          ...this.store.designRejectedIssueIds(this.runId),
         ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
@@ -3418,6 +3419,15 @@ export class Orchestrator {
       ...patch,
     });
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+
+    // design_rejected is a ticket-level issue — one ticket's design couldn't
+    // satisfy the reviewer after max attempts. Continue to the next task.
+    if (reason === "design_rejected") {
+      await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: haltDetail });
+      this.log(haltDetail);
+      return CONTINUE;
+    }
+
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     await this.commitMemoryBeforeHalt();
     this.store.setRunState(this.runId, "halted", haltDetail);

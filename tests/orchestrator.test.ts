@@ -4862,7 +4862,7 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(h.source.comments[0]!.body).toContain("v2");
   });
 
-  it("reject N times → HALT with design_rejected", async () => {
+  it("reject N times → design_rejected session, run continues to task_cap", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -4888,8 +4888,10 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     // 1 initial design + 2 redesigns = 3 designer calls; 3 review calls
     expect(designer.calls).toHaveLength(3);
     expect(reviewer.calls).toHaveLength(3);
-    // run must be halted (not just the session stopped)
-    expect(h.store.latestRun()!.state).toBe("halted");
+    // design_rejected is ticket-level: run halts via task_cap (not design_rejected)
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("task cap");
     expect(s.designReviewAttempts).toBe(3);
     // No brief posted to Linear (all were rejected)
     expect(h.source.comments.filter((c) => c.body.includes("## Goal"))).toHaveLength(0);
@@ -5006,7 +5008,7 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(h.logs.some((l) => l.includes("reviewer failed") && l.includes("codex crashed"))).toBe(true);
   });
 
-  it("designer failure on redesign → HALT with design_rejected", async () => {
+  it("designer failure on redesign → design_rejected session, run continues to task_cap", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -5026,7 +5028,10 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("design_rejected");
     expect(s.stopDetail).toContain("redesign agent failed");
-    expect(h.store.latestRun()!.state).toBe("halted");
+    // Run halts via task_cap (not design_rejected)
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("task cap");
     // IMPLEMENT never ran
     expect(h.agent.contexts).toHaveLength(0);
   });
