@@ -163,34 +163,17 @@ export class Orchestrator {
       // git reset --hard on the next PM-select phase (ES-452 Finding 2). All steps are
       // best-effort; failures are warned and skipped.
       try {
-        const repoPath = this.config.repo.path;
-        const defaultBranch = this.config.repo.defaultBranch;
-        await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
-        const bootstrapRebaseRes = await this.runner.run(
-          "git",
-          ["rebase", "--autostash", `origin/${defaultBranch}`],
-          { cwd: repoPath },
-        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
-        if (bootstrapRebaseRes.code !== 0) {
-          await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
-        }
-        initializeMemory(repoPath, this.store, this.config.digest.recentMergedCount);
-        const initCommitted = await commitIfChanged(this.runner, repoPath).catch(() => false as const);
-        if (initCommitted) {
-          const initPushRes = await this.runner.run(
-            "git",
-            ["push", "origin", `HEAD:${defaultBranch}`],
-            { cwd: repoPath },
-          ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
-          if (initPushRes.code !== 0) {
-            // Roll back the local commit so the branch does not stay ahead of origin.
-            // Use --hard to also clean the worktree; --mixed (the default) leaves the memory
-            // files modified, causing the next startup's clean-worktree preflight to fail
-            // (ES-452 Finding 1 — same pattern as commitMemoryBeforeHalt).
-            await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
-            this.log(`warning: failed to push initial memory commit (rolled back): ${initPushRes.stderr.trim()}`);
-          }
-        }
+        // Seed/initialize the local memory files for this run inside the rebase guard so
+        // the bootstrap commit follows the same conflict-marker protection as the halt
+        // commit (ES-452 Findings 2/3/4). initializeMemory always runs (even when the
+        // commit is skipped) so the run has memory available regardless.
+        await this.rebaseGuardAndCommitMemory(() =>
+          initializeMemory(
+            this.config.repo.path,
+            this.store,
+            this.config.digest.recentMergedCount,
+          ),
+        );
       } catch (err: unknown) {
         this.log(`warning: failed to initialize memory: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -3483,54 +3466,84 @@ export class Orchestrator {
   /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
   private async commitMemoryBeforeHalt(): Promise<void> {
     try {
-      const repoPath = this.config.repo.path;
-      const defaultBranch = this.config.repo.defaultBranch;
-      await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
-      // Use --autostash so that dirty docs/memory files are stashed before rebasing
-      // (ES-452 Finding 4). If the rebase fails despite that, abort immediately to
-      // prevent staging conflict markers in the memory commit (ES-452 Finding 3).
-      const rebaseRes = await this.runner.run(
-        "git",
-        ["rebase", "--autostash", `origin/${defaultBranch}`],
-        { cwd: repoPath },
-      ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
-      if (rebaseRes.code !== 0) {
-        await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
-        this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
-        return;
-      }
-      // Even when rebase exits 0, the autostash pop may leave conflict markers in the
-      // working tree. Detect unmerged files and skip the commit to avoid staging conflict
-      // markers as memory content (ES-452 Finding 2).
-      const unmergedRes = await this.runner.run(
-        "git", ["ls-files", "--unmerged", "--", MEMORY_DIR + "/"],
-        { cwd: repoPath },
-      ).catch(() => ({ code: 0, stdout: "", stderr: "" }));
-      if (unmergedRes.stdout.trim().length > 0) {
-        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-        this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
-        return;
-      }
-      const committed = await commitIfChanged(this.runner, repoPath);
-      if (committed) {
-        // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch
-        // on the next run's PM-select phase (ES-452 Finding 1). Best-effort: warn on failure.
-        const pushRes = await this.runner.run(
-          "git",
-          ["push", "origin", `HEAD:${defaultBranch}`],
-          { cwd: repoPath },
-        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
-        if (pushRes.code !== 0) {
-          // Roll back the local commit so the branch does not stay ahead of origin;
-          // fetchDefaultBranch's git reset --hard would silently discard it (ES-452 Finding 3).
-          // Use --hard to also clean the worktree; --mixed (the default) would leave the
-          // memory files modified, causing the next startup's clean-worktree preflight to fail.
-          await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
-          this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
-        }
-      }
+      await this.rebaseGuardAndCommitMemory();
     } catch (err) {
       this.log(`warning: failed to commit memory on halt: ${errMsg(err)}`);
+    }
+  }
+
+  /**
+   * Rebase onto origin/<defaultBranch> with --autostash, then commit + push docs/memory/.
+   * Shared by the startup bootstrap path and commitMemoryBeforeHalt so both apply the same
+   * conflict-marker guards (ES-452 Findings 2/3/4): skip the commit when the rebase fails
+   * (aborting it) or when the autostash pop leaves unmerged files. `beforeCommit` runs after
+   * the rebase guard in every branch — including the skip branches — so the bootstrap path
+   * can seed/initialize memory locally for the run even when the commit itself is skipped.
+   * All steps are best-effort.
+   */
+  private async rebaseGuardAndCommitMemory(beforeCommit?: () => void): Promise<void> {
+    const repoPath = this.config.repo.path;
+    const defaultBranch = this.config.repo.defaultBranch;
+    await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
+    // Use --autostash so that dirty docs/memory files are stashed before rebasing
+    // (ES-452 Finding 4). If the rebase fails despite that, abort immediately to
+    // prevent staging conflict markers in the memory commit (ES-452 Finding 3).
+    const rebaseRes = await this.runner.run(
+      "git",
+      ["rebase", "--autostash", `origin/${defaultBranch}`],
+      { cwd: repoPath },
+    ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
+    if (rebaseRes.code !== 0) {
+      await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
+      this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
+      beforeCommit?.();
+      // Halt-path only: restore any dirty docs/memory files so the clean-worktree
+      // preflight on the next startup does not fail (ES-452 Finding 1). The bootstrap
+      // path (beforeCommit defined) intentionally leaves files dirty for the current run.
+      if (beforeCommit === undefined) {
+        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      }
+      return;
+    }
+    // Even when rebase exits 0, the autostash pop may leave conflict markers in the
+    // working tree. Detect unmerged files, restore them to HEAD, and skip the commit to
+    // avoid staging conflict markers as memory content (ES-452 Finding 2).
+    const unmergedRes = await this.runner.run(
+      "git", ["ls-files", "--unmerged", "--", MEMORY_DIR + "/"],
+      { cwd: repoPath },
+    ).catch(() => ({ code: 0, stdout: "", stderr: "" }));
+    if (unmergedRes.stdout.trim().length > 0) {
+      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
+      beforeCommit?.();
+      // Halt-path only: also remove any untracked files created by the bootstrap path's
+      // initializeMemory so the next startup's clean-worktree preflight does not fail.
+      if (beforeCommit === undefined) {
+        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      }
+      return;
+    }
+    beforeCommit?.();
+    // Do not swallow commitIfChanged errors: let them propagate so the outer catch in
+    // commitMemoryBeforeHalt (or the bootstrap try/catch) logs a warning (ES-452 Finding 2).
+    const committed = await commitIfChanged(this.runner, repoPath);
+    if (committed) {
+      // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch
+      // on the next run's PM-select phase (ES-452 Finding 1). Best-effort: warn on failure.
+      const pushRes = await this.runner.run(
+        "git",
+        ["push", "origin", `HEAD:${defaultBranch}`],
+        { cwd: repoPath },
+      ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+      if (pushRes.code !== 0) {
+        // Roll back the local commit so the branch does not stay ahead of origin;
+        // fetchDefaultBranch's git reset --hard would silently discard it (ES-452 Finding 3).
+        // Use --hard to also clean the worktree; --mixed (the default) would leave the
+        // memory files modified, causing the next startup's clean-worktree preflight to fail.
+        await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+        this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
+      }
     }
   }
 
