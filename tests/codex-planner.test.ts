@@ -1452,3 +1452,86 @@ describe("CodexPlanner rate-limit retry loop", () => {
     expect(capturedWaitMs[0]).toBe(15 * 60_000);
   });
 });
+
+describe("CodexPlannerContext model/effort flags", () => {
+  it("passes -m and -c model_reasoning_effort when context specifies model and effort", async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    codexStub(runner, { code: 0, stdout: "groom result" });
+    await makePlanner(runner, logs).run({
+      worktreePath: "/repo",
+      prompt: "groom the board",
+      model: "gpt-5.5",
+      effort: "medium",
+    });
+    const call = runner.calls.find((c) => c.cmd === CODEX_CMD);
+    expect(call).toBeDefined();
+    expect(call!.args).toContain("-m");
+    const mIdx = call!.args.indexOf("-m");
+    expect(call!.args[mIdx + 1]).toBe("gpt-5.5");
+    expect(call!.args).toContain("-c");
+    const cIdx = call!.args.indexOf("-c");
+    expect(call!.args[cIdx + 1]).toBe("model_reasoning_effort=medium");
+  });
+
+  it("omits -m and -c when context does not specify model/effort", async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    codexStub(runner, { code: 0, stdout: "select result" });
+    await makePlanner(runner, logs).run({
+      worktreePath: "/repo",
+      prompt: "select a ticket",
+    });
+    const call = runner.calls.find((c) => c.cmd === CODEX_CMD);
+    expect(call).toBeDefined();
+    expect(call!.args).not.toContain("-m");
+    expect(call!.args).not.toContain("-c");
+  });
+
+  it("passes only -m when model is set but effort is not", async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    codexStub(runner, { code: 0, stdout: "result" });
+    await makePlanner(runner, logs).run({
+      worktreePath: "/repo",
+      prompt: "test",
+      model: "gpt-5.5",
+    });
+    const call = runner.calls.find((c) => c.cmd === CODEX_CMD);
+    expect(call!.args).toContain("-m");
+    expect(call!.args).not.toContain("-c");
+  });
+
+  it("passes only -c when effort is set but model is not", async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    codexStub(runner, { code: 0, stdout: "result" });
+    await makePlanner(runner, logs).run({
+      worktreePath: "/repo",
+      prompt: "test",
+      effort: "high",
+    });
+    const call = runner.calls.find((c) => c.cmd === CODEX_CMD);
+    expect(call!.args).not.toContain("-m");
+    expect(call!.args).toContain("-c");
+  });
+
+  it("does not duplicate -m when extraArgs already contain -m", async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    const planner = new CodexPlanner(runner, {
+      log: (line: string) => logs.push(line),
+      extraArgs: ["-m", "custom-model"],
+    });
+    codexStub(runner, { code: 0, stdout: "result" });
+    await planner.run({
+      worktreePath: "/repo",
+      prompt: "test",
+      model: "gpt-5.5",
+    });
+    const call = runner.calls.find((c) => c.cmd === CODEX_CMD);
+    // extraArgs -m takes precedence; context model is not added
+    const mCount = call!.args.filter((a) => a === "-m").length;
+    expect(mCount).toBe(1);
+  });
+});

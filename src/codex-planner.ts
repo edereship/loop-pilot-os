@@ -216,6 +216,8 @@ export interface CodexPlannerContext {
   worktreePath: string;
   prompt: string;
   timeoutMs?: number;
+  model?: string;
+  effort?: string;
 }
 
 export type CodexOutcome =
@@ -390,6 +392,8 @@ export class CodexPlanner {
     const hasIgnoreRules = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-rules" || a.startsWith("--ignore-rules="),
     );
+    const hasCustomModel = hasFlagOrAlias(this.opts.extraArgs ?? [], "-m", "--model");
+    const hasCustomConfig = hasFlagOrAlias(this.opts.extraArgs ?? [], "-c", "--config");
     const promptArg = "-";
 
     const args: string[] = [
@@ -398,6 +402,8 @@ export class CodexPlanner {
       ...(hasCustomSandbox ? [] : ["--sandbox", "danger-full-access"]),
       ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
       ...(hasIgnoreRules ? [] : ["--ignore-rules"]),
+      ...(!hasCustomModel && ctx.model ? ["-m", ctx.model] : []),
+      ...(!hasCustomConfig && ctx.effort ? ["-c", `model_reasoning_effort=${ctx.effort}`] : []),
       ...(this.opts.extraArgs ?? []),
       "--",
       promptArg,
