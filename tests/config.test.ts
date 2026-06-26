@@ -685,13 +685,14 @@ describe("loadConfig", () => {
     expect(config.pm).toBeUndefined();
   });
 
-  it("pm defaults model to gpt-5.5 when [pm] is present but model is omitted", () => {
+  it("pm defaults model to gpt-5.5 when [pm] is present but model is omitted; effort fields are undefined without [pm.effort]", () => {
     const config = loadConfig(fixture("config-per-phase-pm-minimal.toml"), fullEnv);
     expect(config.pm).toBeDefined();
     expect(config.pm!.model).toBe("gpt-5.5");
-    expect(config.pm!.effort.groom).toBe("medium");
-    expect(config.pm!.effort.select).toBe("low");
-    expect(config.pm!.effort.designReview).toBe("high");
+    expect(config.pm!.effort.groom).toBeUndefined();
+    expect(config.pm!.effort.select).toBeUndefined();
+    expect(config.pm!.effort.designReview).toBeUndefined();
+    expect(config.pm!.effort.recovery).toBeUndefined();
   });
 
   it("reads explicit [pm] section with per-phase effort", () => {
@@ -701,6 +702,7 @@ describe("loadConfig", () => {
     expect(config.pm!.effort.groom).toBe("high");
     expect(config.pm!.effort.select).toBe("medium");
     expect(config.pm!.effort.designReview).toBe("high");
+    expect(config.pm!.effort.recovery).toBe("high");
   });
 
   it("reads per-phase agent overrides", () => {
@@ -721,6 +723,12 @@ describe("loadConfig", () => {
     expect(config.agent.implement).toBeUndefined();
     expect(config.agent.selfReview).toBeUndefined();
     expect(config.agent.recovery).toBeUndefined();
+  });
+
+  it("per-phase agent block with only model inherits global effort", () => {
+    const config = loadConfig(fixture("config-per-phase-model-only.toml"), fullEnv);
+    expect(config.agent.design!.model).toBe("claude-opus-4-8[1m]");
+    expect(config.agent.design!.effort).toBe("high"); // inherited from agent.effort
   });
 
   it("rejects codex effort 'max' (only low/medium/high allowed)", () => {

@@ -373,7 +373,7 @@ export class FakeWorkflowRecovery implements WorkflowRecovery {
 // ---- FakePlanRunner ----
 export class FakePlanRunner implements PlanRunner {
   outcomes: PlanOutcome[] = [];
-  calls: Array<{ worktreePath: string; prompt: string; timeoutMs?: number }> = [];
+  calls: Array<{ worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }> = [];
   contexts: Array<{ worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }> = [];
 
   async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }): Promise<PlanOutcome> {

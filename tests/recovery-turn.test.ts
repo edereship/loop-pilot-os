@@ -732,9 +732,9 @@ describe("executeRecoveryTurn", () => {
     expect(result).toEqual<RecoveryTurnResult>({ kind: "recovered", action: "restart_review", costUsd: 0 });
   });
 
-  it("passes pm.model and pm.effort.designReview to the planner context", async () => {
+  it("passes pm.model and pm.effort.recovery to the planner context", async () => {
     const { deps, planner, agent, runner, git } = makeDeps();
-    (deps.config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high" } };
+    (deps.config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
     planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix it"}' }];
     agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "fixed" }];
     runner.on(["git", "-C"], (args) => {

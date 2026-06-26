@@ -58,6 +58,7 @@ allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"   # --allowedTools
 # groom = "medium"            # GROOM フェーズの reasoning effort（既定: medium）
 # select = "low"              # SELECT フェーズの reasoning effort（既定: low）
 # design_review = "high"      # DESIGN REVIEW フェーズの reasoning effort（既定: high）
+# recovery = "high"            # Codex 回復ターンの reasoning effort（既定: high）
 
 [handoff]
 branch_prefix = "looppilot"

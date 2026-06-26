@@ -5817,7 +5817,7 @@ describe("Self-Review (ES-473)", () => {
 describe("Orchestrator per-phase model/effort config (ES-486 Task 4)", () => {
   it("GROOM passes pm.model and pm.effort.groom to the planner context", async () => {
     const config = makeConfig({ groomEnabled: true });
-    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high" } };
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designer: new FakePlanRunner() });
     h.source.queue = [issue("A", "TY-1")];
@@ -5839,7 +5839,7 @@ describe("Orchestrator per-phase model/effort config (ES-486 Task 4)", () => {
 
   it("SELECT passes pm.model and pm.effort.select to the planner context", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
-    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high" } };
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designer: new FakePlanRunner() });
     h.source.queue = [issue("A", "TY-1"), issue("B", "TY-2")];
@@ -5857,7 +5857,7 @@ describe("Orchestrator per-phase model/effort config (ES-486 Task 4)", () => {
 
   it("DESIGN REVIEW passes pm.model and pm.effort.designReview", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
-    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high" } };
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
     const selectPlanner = new FakePlanRunner();
     const reviewPlanner = new FakePlanRunner();
     const designer = new FakePlanRunner();

@@ -201,7 +201,7 @@ export async function executeRecoveryTurn(
       prompt,
       timeoutMs: config.safety.codexTimeoutMinutes * 60_000,
       model: config.pm?.model,
-      effort: config.pm?.effort.designReview, // no dedicated pm.effort.recovery key; reuses designReview ("high")
+      effort: config.pm?.effort.recovery,
     });
     if (outcome.kind === "error") {
       log(`recovery: codex error: ${outcome.message}`);

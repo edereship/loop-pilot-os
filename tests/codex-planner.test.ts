@@ -1534,4 +1534,43 @@ describe("CodexPlannerContext model/effort flags", () => {
     const mCount = call!.args.filter((a) => a === "-m").length;
     expect(mCount).toBe(1);
   });
+
+  it("does not suppress effort when extraArgs contain unrelated -c key", async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    const planner = new CodexPlanner(runner, {
+      log: (line: string) => logs.push(line),
+      extraArgs: ["-c", "model_provider=openai"],
+    });
+    codexStub(runner, { code: 0, stdout: "result" });
+    await planner.run({
+      worktreePath: "/repo",
+      prompt: "test",
+      effort: "high",
+    });
+    const call = runner.calls.find((c) => c.cmd === CODEX_CMD);
+    expect(call!.args).toContain("-c");
+    const cArgs = call!.args.filter((a) => a === "-c");
+    expect(cArgs.length).toBe(2); // one from extraArgs, one from effort
+    expect(call!.args).toContain("model_reasoning_effort=high");
+    expect(call!.args).toContain("model_provider=openai");
+  });
+
+  it("suppresses effort when extraArgs already set model_reasoning_effort", async () => {
+    const runner = new FakeCommandRunner();
+    const logs: string[] = [];
+    const planner = new CodexPlanner(runner, {
+      log: (line: string) => logs.push(line),
+      extraArgs: ["-c", "model_reasoning_effort=low"],
+    });
+    codexStub(runner, { code: 0, stdout: "result" });
+    await planner.run({
+      worktreePath: "/repo",
+      prompt: "test",
+      effort: "high",
+    });
+    const call = runner.calls.find((c) => c.cmd === CODEX_CMD);
+    const effortArgs = call!.args.filter((a) => typeof a === "string" && a.startsWith("model_reasoning_effort="));
+    expect(effortArgs).toEqual(["model_reasoning_effort=low"]); // extraArgs wins
+  });
 });

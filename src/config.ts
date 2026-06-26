@@ -41,22 +41,24 @@ const rawSchema = z.object({
     permission_mode: z.enum([
       "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions",
     ]).default("acceptEdits"),
-    // Per-phase overrides (ES-486). When absent, the parent agent.model/effort is used.
+    // Per-phase overrides (ES-486). Each field is individually optional; omitted fields
+    // fall back to the parent agent.model/effort. E.g. [agent.design] model = "opus" with
+    // no effort key inherits agent.effort.
     design: z.object({
-      model: z.string(),
-      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     }).strict().optional(),
     implement: z.object({
-      model: z.string(),
-      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     }).strict().optional(),
     self_review: z.object({
-      model: z.string(),
-      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     }).strict().optional(),
     recovery: z.object({
-      model: z.string(),
-      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]),
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     }).strict().optional(),
   }).strict(),
   // Codex (PM) per-phase effort (ES-486). Absent → Codex gets no -m/-c flags (backward compat).
@@ -69,6 +71,7 @@ const rawSchema = z.object({
       groom: z.string().default("medium"),
       select: z.string().default("low"),
       design_review: z.string().default("high"),
+      recovery: z.string().default("high"),
     }).strict().optional(),
   }).strict().optional(),
   handoff: z.object({
@@ -170,9 +173,10 @@ export interface Config {
   pm: {
     model: string;
     effort: {
-      groom: string;
-      select: string;
-      designReview: string;
+      groom: string | undefined;
+      select: string | undefined;
+      designReview: string | undefined;
+      recovery: string | undefined;
     };
   } | undefined;
   handoff: {
@@ -709,6 +713,7 @@ export function loadConfig(
         ["groom", pmEffort.groom],
         ["select", pmEffort.select],
         ["design_review", pmEffort.design_review],
+        ["recovery", pmEffort.recovery],
       ] as [string, string][]) {
         if (!VALID_CODEX_EFFORT.includes(value)) {
           errors.push(
@@ -720,7 +725,8 @@ export function loadConfig(
     }
 
     // Per-phase agent model/effort validation (ES-486).
-    const phaseEntries: [string, { model: string; effort: string } | undefined][] = [
+    // Validate the resolved values (with parent fallback) so partial overrides are also checked.
+    const phaseEntries: [string, { model?: string; effort?: string } | undefined][] = [
       ["agent.design", result.data.agent.design],
       ["agent.implement", result.data.agent.implement],
       ["agent.self_review", result.data.agent.self_review],
@@ -728,7 +734,9 @@ export function loadConfig(
     ];
     for (const [phasePath, rawPhase] of phaseEntries) {
       if (rawPhase !== undefined) {
-        validatePhaseModelEffort(phasePath, rawPhase.model, rawPhase.effort, env, errors);
+        const resolvedModel = rawPhase.model ?? result.data.agent.model;
+        const resolvedEffort = rawPhase.effort ?? effectiveEffort;
+        validatePhaseModelEffort(phasePath, resolvedModel, resolvedEffort, env, errors);
       }
     }
 
@@ -801,26 +809,26 @@ export function loadConfig(
       effort: effectiveEffort,
       permissionMode: raw.agent.permission_mode,
       design: raw.agent.design
-        ? { model: raw.agent.design.model, effort: raw.agent.design.effort }
+        ? { model: raw.agent.design.model ?? raw.agent.model, effort: raw.agent.design.effort ?? effectiveEffort }
         : undefined,
       implement: raw.agent.implement
-        ? { model: raw.agent.implement.model, effort: raw.agent.implement.effort }
+        ? { model: raw.agent.implement.model ?? raw.agent.model, effort: raw.agent.implement.effort ?? effectiveEffort }
         : undefined,
       selfReview: raw.agent.self_review
-        ? { model: raw.agent.self_review.model, effort: raw.agent.self_review.effort }
+        ? { model: raw.agent.self_review.model ?? raw.agent.model, effort: raw.agent.self_review.effort ?? effectiveEffort }
         : undefined,
       recovery: raw.agent.recovery
-        ? { model: raw.agent.recovery.model, effort: raw.agent.recovery.effort }
+        ? { model: raw.agent.recovery.model ?? raw.agent.model, effort: raw.agent.recovery.effort ?? effectiveEffort }
         : undefined,
     },
     pm: raw.pm !== undefined
       ? {
           model: raw.pm.model,
           effort: {
-            // effort sub-section may be absent (bare [pm] with no [pm.effort]); apply defaults.
-            groom: raw.pm.effort?.groom ?? "medium",
-            select: raw.pm.effort?.select ?? "low",
-            designReview: raw.pm.effort?.design_review ?? "high",
+            groom: raw.pm.effort?.groom,
+            select: raw.pm.effort?.select,
+            designReview: raw.pm.effort?.design_review,
+            recovery: raw.pm.effort?.recovery,
           },
         }
       : undefined,
