@@ -111,7 +111,17 @@ function makeHarness(config: Config): Harness {
   const memoryRunner = new FakeCommandRunner();
   memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
-  memoryRunner.on(["git", "-C"], { code: 0, stdout: "" });
+  // Self-review pre/post-review branch verification: rev-parse --abbrev-ref returns the
+  // expected branch for the worktree so the guard passes without stopping the session.
+  memoryRunner.on(["git", "-C"], (args, _opts) => {
+    if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+      const cIdx = args.indexOf("-C");
+      const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+      const slug = wtPath.replace(/^\/wt\//, "");
+      return { code: 0, stdout: `looppilot/${slug}-x\n` };
+    }
+    return { code: 0, stdout: "" };
+  });
   const orch = new Orchestrator({
     config,
     source,
