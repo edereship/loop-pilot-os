@@ -67,6 +67,7 @@ export interface OrchestratorDeps {
   config: Config;
   source: TaskSource;
   agent: AgentRunner;
+  selfReviewAgent: AgentRunner;
   git: GitPrManager;
   monitor: LoopPilotMonitor;
   notifier: Notifier;
@@ -99,6 +100,7 @@ export class Orchestrator {
   private readonly config: Config;
   private readonly source: TaskSource;
   private readonly agent: AgentRunner;
+  private readonly selfReviewAgent: AgentRunner;
   private readonly git: GitPrManager;
   private readonly monitor: LoopPilotMonitor;
   private readonly notifier: Notifier;
@@ -125,6 +127,7 @@ export class Orchestrator {
     this.config = deps.config;
     this.source = deps.source;
     this.agent = deps.agent;
+    this.selfReviewAgent = deps.selfReviewAgent;
     this.git = deps.git;
     this.monitor = deps.monitor;
     this.notifier = deps.notifier;
@@ -2107,7 +2110,7 @@ export class Orchestrator {
 
     let outcome: AgentOutcome;
     try {
-      outcome = await this.agent.runSession({
+      outcome = await this.selfReviewAgent.runSession({
         worktreePath,
         prompt,
         maxCostUsd: this.config.safety.maxCostUsdPerSelfReview,

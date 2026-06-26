@@ -103,7 +103,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -168,10 +168,12 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
+  const selfReviewAgent = opts?.selfReviewAgent ?? agent;
   const orch = new Orchestrator({
     config,
     source,
     agent,
+    selfReviewAgent,
     git,
     monitor,
     notifier,
@@ -5782,5 +5784,31 @@ describe("Self-Review (ES-473)", () => {
     expect(sessions[0].failureReason).toBe("exception");
     expect(sessions[0].stopDetail).toContain("unreported commits");
     expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review uses selfReviewAgent, not the implement agent", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { selfReviewAgent });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // IMPLEMENT outcome on the main agent
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    // SELF-REVIEW outcome on the dedicated selfReviewAgent
+    selfReviewAgent.outcomes.push({
+      kind: "completed", costUsd: 0.5, summary: '```json\n{"verdict":"pass","issues":[],"summary":"LGTM"}\n```',
+    });
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The implement agent should have 1 call (IMPLEMENT), selfReviewAgent should have 1 call (SELF-REVIEW)
+    expect(h.agent.callCount).toBe(1);
+    expect(selfReviewAgent.callCount).toBe(1);
+    // selfReviewAgent received the self-review prompt
+    expect(selfReviewAgent.contexts[0].prompt).toContain("self-review");
+    // Session completed successfully
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].selfReviewCostUsd).toBe(0.5);
   });
 });

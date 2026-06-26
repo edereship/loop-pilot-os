@@ -193,8 +193,11 @@ export class FakeAgentRunner implements AgentRunner {
   outcomes: AgentOutcome[] = [];
   /** 呼び出された SessionContext を記録 */
   contexts: SessionContext[] = [];
+  /** Total number of runSession invocations */
+  callCount = 0;
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
+    this.callCount++;
     this.contexts.push(ctx);
     const out = this.outcomes.shift();
     if (!out) throw new Error("FakeAgentRunner: no outcome queued");
