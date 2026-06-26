@@ -742,7 +742,7 @@ describe("executeRecoveryTurn", () => {
       return { code: 0, stdout: "" };
     });
     runner.on(["git", "push"], { code: 0 });
-    git.prExists = true;
+    git.openPrForBranch.set("looppilot/ty-1-fix", 42);
     const session = fakeSession({ prNumber: 42 });
     await executeRecoveryTurn(deps, session, "ci_failed", "tests failed");
     expect(planner.contexts[0].model).toBe("gpt-5.5");

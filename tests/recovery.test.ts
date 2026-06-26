@@ -126,6 +126,7 @@ function makeHarness(config: Config): Harness {
     config,
     source,
     agent,
+    selfReviewAgent: agent,
     git,
     monitor,
     notifier,
