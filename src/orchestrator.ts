@@ -1190,6 +1190,8 @@ export class Orchestrator {
         worktreePath,
         prompt,
         timeoutMs: this.config.safety.designReviewTimeoutMinutes * 60_000,
+        model: this.config.pm?.model,
+        effort: this.config.pm?.effort.designReview,
       });
     } catch (err) {
       this.log(`designReview: reviewer exception, treating as approve: ${errMsg(err)}`);
@@ -1426,6 +1428,8 @@ export class Orchestrator {
           worktreePath: repoPath,
           prompt,
           timeoutMs: this.config.safety.groomTimeoutMinutes * 60_000,
+          model: this.config.pm?.model,
+          effort: this.config.pm?.effort.groom,
         });
         if (outcome.kind === "interrupted") {
           try {
@@ -1854,6 +1858,8 @@ export class Orchestrator {
         worktreePath: repoPath,
         prompt,
         timeoutMs: this.config.safety.codexTimeoutMinutes * 60_000,
+        model: this.config.pm?.model,
+        effort: this.config.pm?.effort.select,
       });
     } catch (err) {
       this.log(`select: codex exception, deterministic fallback: ${errMsg(err)}`);

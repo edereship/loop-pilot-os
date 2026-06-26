@@ -71,6 +71,7 @@ function makeConfig(over: Partial<{
     selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
     linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
+    pm: undefined,
   } as unknown as Config;
 }
 
@@ -5810,5 +5811,66 @@ describe("Self-Review (ES-473)", () => {
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions[0].state).toBe("merged");
     expect(sessions[0].selfReviewCostUsd).toBe(0.5);
+  });
+});
+
+describe("Orchestrator per-phase model/effort config (ES-486 Task 4)", () => {
+  it("GROOM passes pm.model and pm.effort.groom to the planner context", async () => {
+    const config = makeConfig({ groomEnabled: true });
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high" } };
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: new FakePlanRunner() });
+    h.source.queue = [issue("A", "TY-1")];
+    // GROOM outcome
+    planner.outcomes.push({ kind: "completed", text: '{"actions":[],"summary":"all good","blocked_issues":[]}' });
+    // SELECT outcome
+    planner.outcomes.push({ kind: "completed", text: '{"identifier":"TY-1"}' });
+    // DESIGN outcome
+    (h as any).orch["designer"]?.outcomes.push({ kind: "completed", text: "brief" });
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    h.monitor.verdicts.push({ kind: "merged" });
+    await h.orch.run();
+
+    // Check that the first planner call (GROOM) had model/effort
+    const groomCtx = planner.contexts[0];
+    expect(groomCtx.model).toBe("gpt-5.5");
+    expect(groomCtx.effort).toBe("medium");
+  });
+
+  it("SELECT passes pm.model and pm.effort.select to the planner context", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high" } };
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: new FakePlanRunner() });
+    h.source.queue = [issue("A", "TY-1"), issue("B", "TY-2")];
+    // SELECT outcome
+    planner.outcomes.push({ kind: "completed", text: '{"identifier":"TY-1"}' });
+    (h as any).orch["designer"]?.outcomes.push({ kind: "completed", text: "brief" });
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    h.monitor.verdicts.push({ kind: "merged" });
+    await h.orch.run();
+    // First planner call is SELECT (groom disabled by default)
+    const selectCtx = planner.contexts[0];
+    expect(selectCtx.model).toBe("gpt-5.5");
+    expect(selectCtx.effort).toBe("low");
+  });
+
+  it("DESIGN REVIEW passes pm.model and pm.effort.designReview", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high" } };
+    const selectPlanner = new FakePlanRunner();
+    const reviewPlanner = new FakePlanRunner();
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { planner: selectPlanner, designer, designReviewer: reviewPlanner });
+    h.source.queue = [issue("A", "TY-1")];
+    selectPlanner.outcomes.push({ kind: "completed", text: '{"identifier":"TY-1"}' });
+    designer.outcomes.push({ kind: "completed", text: "## Goal\ngoal\n## Change Targets\ntargets\n## Steps\nsteps\n## Acceptance Criteria\nac\n## Out of Scope\noos" });
+    reviewPlanner.outcomes.push({ kind: "completed", text: '{"verdict":"approve"}' });
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    h.monitor.verdicts.push({ kind: "merged" });
+    await h.orch.run();
+    const reviewCtx = reviewPlanner.contexts[0];
+    expect(reviewCtx.model).toBe("gpt-5.5");
+    expect(reviewCtx.effort).toBe("high");
   });
 });

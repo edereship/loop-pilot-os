@@ -10,7 +10,7 @@ export class ClaudePlanRunner implements PlanRunner {
     private readonly opts: ClaudePlanRunnerOptions,
   ) {}
 
-  async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number }): Promise<PlanOutcome> {
+  async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }): Promise<PlanOutcome> {
     const sessionCtx: SessionContext = {
       worktreePath: ctx.worktreePath,
       prompt: ctx.prompt,

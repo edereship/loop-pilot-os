@@ -374,9 +374,11 @@ export class FakeWorkflowRecovery implements WorkflowRecovery {
 export class FakePlanRunner implements PlanRunner {
   outcomes: PlanOutcome[] = [];
   calls: Array<{ worktreePath: string; prompt: string; timeoutMs?: number }> = [];
+  contexts: Array<{ worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }> = [];
 
-  async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number }): Promise<PlanOutcome> {
+  async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }): Promise<PlanOutcome> {
     this.calls.push(ctx);
+    this.contexts.push(ctx);
     const out = this.outcomes.shift();
     if (!out) throw new Error("FakePlanRunner: no outcome queued");
     return out;
