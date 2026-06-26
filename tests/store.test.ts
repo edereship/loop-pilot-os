@@ -902,7 +902,7 @@ describe("designRejectedIssueIds (ES-458 Finding 2)", () => {
   it("returns empty array when no design-rejected sessions", () => {
     const store = new SqliteStore(":memory:");
     openStores.push(store);
-    expect(store.designRejectedIssueIds()).toEqual([]);
+    expect(store.designRejectedIssueIds(0)).toEqual([]);
   });
 
   it("returns issue IDs for stopped sessions with failure_reason=design_rejected", () => {
@@ -923,12 +923,12 @@ describe("designRejectedIssueIds (ES-458 Finding 2)", () => {
     });
     store.updateSession(s2.id, { state: "stopped", failureReason: "exception", endedAt: "2026-01-01T02:00:00.000Z" });
 
-    const ids = store.designRejectedIssueIds();
+    const ids = store.designRejectedIssueIds(run.id);
     expect(ids).toContain("issue-A");
     expect(ids).not.toContain("issue-B");
   });
 
-  it("includes design-rejected tickets from previous runs (cross-run exclusion prevents repeated rejection)", () => {
+  it("does not exclude design-rejected tickets from previous runs (operator can re-enable by revising the ticket)", () => {
     const store = new SqliteStore(":memory:");
     openStores.push(store);
     const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
@@ -939,9 +939,12 @@ describe("designRejectedIssueIds (ES-458 Finding 2)", () => {
     });
     store.updateSession(s.id, { state: "stopped", failureReason: "design_rejected", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    // Start a new run — the ticket must still be excluded so operators must intervene
-    store.createRun(3, "2026-01-02T00:00:00.000Z");
-    expect(store.designRejectedIssueIds()).toContain("issue-A");
+    // Issue was design-rejected in run1 — still excluded within that run
+    expect(store.designRejectedIssueIds(run1.id)).toContain("issue-A");
+
+    // In a new run the exclusion is lifted so an operator's ticket revision takes effect
+    const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
+    expect(store.designRejectedIssueIds(run2.id)).not.toContain("issue-A");
   });
 });
 
