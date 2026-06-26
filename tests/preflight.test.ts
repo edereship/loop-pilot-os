@@ -94,38 +94,41 @@ function passingRunner(): FakeCommandRunner {
   return r;
 }
 
-// resolveLinearSetup は https://api.linear.app/graphql を `FetchFn` で叩く。
-// 解決に必要な viewer/teams/projects/issueLabels を一括で返す合格応答（Task 7 SETUP_QUERY の shape）。
+// resolveLinearSetup は 2段階で Linear GraphQL を叩く:
+// (1) viewer + team keys (2) 対象 team の詳細 + workspace labels。
 // FetchFn の戻り値は { ok, status, json() }。Web Response ではない。
 function passingFetch(): FetchFn {
-  const body = {
+  const viewerBody = {
     data: {
       viewer: { id: "user-1", name: "Viewer" },
-      teams: {
-        nodes: [
-          {
-            id: "team-1",
-            key: "TY",
-            states: {
-              nodes: [
-                { id: "st-todo", name: "Todo" },
-                { id: "st-prog", name: "In Progress" },
-                { id: "st-rev", name: "In Review" },
-                { id: "st-done", name: "Done" },
-              ],
-            },
-            labels: { nodes: [{ id: "lb-1", name: "ai-ok" }], pageInfo: { hasNextPage: false, endCursor: null } },
-            projects: { nodes: [{ id: "proj-1", name: "LoopPilot OS" }] },
-          },
-        ],
+      teams: { nodes: [{ id: "team-1", key: "TY" }] },
+    },
+  };
+  const teamBody = {
+    data: {
+      team: {
+        id: "team-1",
+        key: "TY",
+        states: {
+          nodes: [
+            { id: "st-todo", name: "Todo" },
+            { id: "st-prog", name: "In Progress" },
+            { id: "st-rev", name: "In Review" },
+            { id: "st-done", name: "Done" },
+          ],
+        },
+        labels: { nodes: [{ id: "lb-1", name: "ai-ok" }], pageInfo: { hasNextPage: false, endCursor: null } },
+        projects: { nodes: [{ id: "proj-1", name: "LoopPilot OS" }] },
       },
       issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
     },
   };
+  const bodies = [viewerBody, teamBody];
+  let i = 0;
   return async () => ({
     ok: true,
     status: 200,
-    json: async () => body,
+    json: async () => bodies[Math.min(i++, bodies.length - 1)],
   });
 }
 

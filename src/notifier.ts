@@ -35,6 +35,8 @@ export function formatNotifyEvent(event: NotifyEvent): string {
       return `🔄 リカバリー開始: ${event.identifier} (${event.reason})`;
     case "recovery_succeeded":
       return `✅ リカバリー成功: ${event.identifier} (${event.action})`;
+    case "task_skipped":
+      return `⏭️ スキップ: ${event.identifier} (${event.reason}) — ${event.detail}`;
   }
 }
 

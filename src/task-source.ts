@@ -32,13 +32,15 @@ const TRANSITION_MUTATION = `mutation IssueUpdate($id: String!, $stateId: String
 const COMMENT_CREATE_MUTATION = `mutation CommentCreate($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }`;
 
 // カーネル §5.5 プリフライト解決: viewer 検証 + team/project/states/labels。
-// project は team.projects から解決する（ワークスペース横断の名前解決は、同名 project が
-// 他チームにある場合に誤った projectId へ解決し得るため。仕様 §5.1「指定Team/PJ」）。
-// ラベルは team.labels + ワークスペース全体の issueLabels の和集合で解決する
-// （opt_in_label がワークスペースラベルとして定義されているケースに対応）。
-const SETUP_QUERY = `query Setup {
+// 2段階に分割: (1) viewer + team keys (2) 対象 team の詳細 + workspace labels。
+// 全チームの nested resources を一括取得すると Linear の query complexity 上限に抵触するため。
+const SETUP_VIEWER_QUERY = `query SetupViewer {
   viewer { id name }
-  teams { nodes { id key states { nodes { id name } } labels(first: 250) { nodes { id name } pageInfo { hasNextPage endCursor } } projects { nodes { id name } } } }
+  teams { nodes { id key } }
+}`;
+
+const SETUP_TEAM_QUERY = `query SetupTeam($teamId: String!) {
+  team(id: $teamId) { id key states { nodes { id name } } labels(first: 250) { nodes { id name } pageInfo { hasNextPage endCursor } } projects { nodes { id name } } }
   issueLabels(first: 250) { nodes { id name } pageInfo { hasNextPage endCursor } }
 }`;
 
@@ -269,18 +271,19 @@ interface LabelPage {
   pageInfo: { hasNextPage: boolean; endCursor: string | null };
 }
 
-interface SetupData {
+interface SetupViewerData {
   viewer: { id: string; name: string };
-  teams: {
-    nodes: Array<{
-      id: string;
-      key: string;
-      states: { nodes: Array<{ id: string; name: string }> };
-      labels: LabelPage;
-      projects: { nodes: Array<{ id: string; name: string }> };
-    }>;
+  teams: { nodes: Array<{ id: string; key: string }> };
+}
+
+interface SetupTeamData {
+  team: {
+    id: string;
+    key: string;
+    states: { nodes: Array<{ id: string; name: string }> };
+    labels: LabelPage;
+    projects: { nodes: Array<{ id: string; name: string }> };
   };
-  // ワークスペース全体のラベル（team スコープに無いラベルの解決に使う）。
   issueLabels: LabelPage;
 }
 
@@ -362,16 +365,20 @@ export async function resolveLinearSetup(
   req: LinearSetupRequest,
   fetchFn: FetchFn,
 ): Promise<ResolvedLinearSetup> {
-  const data = await graphql<SetupData>(fetchFn, apiKey, SETUP_QUERY, {});
+  // Phase 1: viewer + team keys のみ（軽量クエリ）
+  const viewerData = await graphql<SetupViewerData>(fetchFn, apiKey, SETUP_VIEWER_QUERY, {});
 
-  const team = data.teams.nodes.find((t) => t.key === req.teamKey);
-  if (!team) {
+  const teamEntry = viewerData.teams.nodes.find((t) => t.key === req.teamKey);
+  if (!teamEntry) {
     throw new Error(`Linear team not found: key "${req.teamKey}"`);
   }
 
+  // Phase 2: 対象 team の詳細 + workspace labels
+  const data = await graphql<SetupTeamData>(fetchFn, apiKey, SETUP_TEAM_QUERY, { teamId: teamEntry.id });
+  const team = data.team;
+
   const missing: string[] = [];
 
-  // project は指定 team 配下から解決（他チームの同名 project に誤解決しない）。
   const project = team.projects.nodes.find(
     (p) => p.name === req.projectName,
   );
@@ -390,10 +397,7 @@ export async function resolveLinearSetup(
     }
   }
 
-  // Paginate labels before resolving the opt-in label and building the label map so that
-  // valid labels beyond the first SETUP_QUERY page are not silently omitted (Finding 6).
   // ラベルは team スコープ + ワークスペーススコープの和集合から解決する
-  // （カーネル §5.5: `team.labels`+workspace labels）。team ラベルを優先。
   const [teamLabels, wsLabels] = await Promise.all([
     fetchAllTeamLabels(fetchFn, apiKey, team.id, team.labels),
     fetchAllWorkspaceLabels(fetchFn, apiKey, data.issueLabels),
@@ -406,20 +410,18 @@ export async function resolveLinearSetup(
     missing.push(`label "${req.optInLabel}"`);
   }
 
-  // 見つからない要素は名前を列挙して 1 回でまとめて throw（プリフライトの fail-fast 用）。
   if (missing.length > 0) {
     throw new Error(
       `Linear setup resolution failed; not found: ${missing.join(", ")}`,
     );
   }
 
-  // Build full label map: team labels (priority) + workspace labels
   const labelMap = new Map<string, string>();
   for (const l of wsLabels) {
     labelMap.set(l.name, l.id);
   }
   for (const l of teamLabels) {
-    labelMap.set(l.name, l.id); // team labels override workspace on conflict
+    labelMap.set(l.name, l.id);
   }
   const knownLabels = [...new Set([
     ...teamLabels.map((l) => l.name),
@@ -427,7 +429,7 @@ export async function resolveLinearSetup(
   ])].sort();
 
   return {
-    viewerId: data.viewer.id,
+    viewerId: viewerData.viewer.id,
     teamId: team.id,
     // project と label は missing.length===0 の時点で必ず解決済み。
     projectId: project!.id,

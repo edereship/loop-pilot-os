@@ -1,0 +1,11 @@
+{
+  "data": {
+    "viewer": { "id": "user-1", "name": "LoopPilot Bot" },
+    "teams": {
+      "nodes": [
+        { "id": "team-uuid-1", "key": "TY" },
+        { "id": "team-uuid-2", "key": "OTHER" }
+      ]
+    }
+  }
+}

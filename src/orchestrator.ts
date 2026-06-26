@@ -786,6 +786,7 @@ export class Orchestrator {
         eligible = await this.source.getAllEligible([
           ...this.store.activeIssueIds(),
           ...this.store.abandonedIssueIds(this.runId),
+          ...this.store.designRejectedIssueIds(this.runId),
         ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
@@ -897,6 +898,8 @@ export class Orchestrator {
             const ctrl = await this.stopSession(
               session, "design_rejected",
               todoRevertErrA !== null ? `${baseDetailA}; todo revert failed: ${todoRevertErrA}` : baseDetailA,
+              {},
+              { haltIfRevertFailed: todoRevertErrA !== null },
             );
             if (ctrl.control === "halt") return;
             designRejected = true;
@@ -933,7 +936,7 @@ export class Orchestrator {
             const lastReasons = review.reasons.length > 0 ? review.reasons.join("; ") : "(no reasons provided)";
             const baseDetail = `design review rejected after ${maxRedesigns} redesign attempts: ${lastReasons}`;
             const detail = todoRevertErr !== null ? `${baseDetail}; todo revert failed: ${todoRevertErr}` : baseDetail;
-            const ctrl = await this.stopSession(session, "design_rejected", detail);
+            const ctrl = await this.stopSession(session, "design_rejected", detail, {}, { haltIfRevertFailed: todoRevertErr !== null });
             if (ctrl.control === "halt") return;
             designRejected = true;
             break;
@@ -3136,6 +3139,7 @@ export class Orchestrator {
     reason: FailureReason,
     detail: string | null,
     extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber" | "workflowHandledErrorCount">> = {},
+    opts: { haltIfRevertFailed?: boolean } = {},
   ): Promise<RunControl> {
     let patch = extraPatch;
     // Effective stop detail — may be augmented with recovery failure message (Finding 3).
@@ -3418,6 +3422,24 @@ export class Orchestrator {
       ...patch,
     });
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+
+    // design_rejected is a ticket-level issue — one ticket's design couldn't
+    // satisfy the reviewer after max attempts. Continue to the next task.
+    // Exception: if the todo revert failed, the ticket is stuck In Progress and
+    // knownIssueIds() will prevent startup orphan recovery from fixing it — halt
+    // so operators can intervene rather than continuing with a stuck ticket (ES-458).
+    if (reason === "design_rejected") {
+      await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: haltDetail });
+      this.log(haltDetail);
+      if (opts.haltIfRevertFailed) {
+        await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
+        await this.commitMemoryBeforeHalt();
+        this.store.setRunState(this.runId, "halted", haltDetail);
+        return HALT;
+      }
+      return CONTINUE;
+    }
+
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     await this.commitMemoryBeforeHalt();
     this.store.setRunState(this.runId, "halted", haltDetail);

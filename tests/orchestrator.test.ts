@@ -4862,7 +4862,7 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(h.source.comments[0]!.body).toContain("v2");
   });
 
-  it("reject N times → HALT with design_rejected", async () => {
+  it("reject N times → design_rejected session, run continues to task_cap", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -4888,8 +4888,10 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     // 1 initial design + 2 redesigns = 3 designer calls; 3 review calls
     expect(designer.calls).toHaveLength(3);
     expect(reviewer.calls).toHaveLength(3);
-    // run must be halted (not just the session stopped)
-    expect(h.store.latestRun()!.state).toBe("halted");
+    // design_rejected is ticket-level: run halts via task_cap (not design_rejected)
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("task cap");
     expect(s.designReviewAttempts).toBe(3);
     // No brief posted to Linear (all were rejected)
     expect(h.source.comments.filter((c) => c.body.includes("## Goal"))).toHaveLength(0);
@@ -5006,7 +5008,7 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(h.logs.some((l) => l.includes("reviewer failed") && l.includes("codex crashed"))).toBe(true);
   });
 
-  it("designer failure on redesign → HALT with design_rejected", async () => {
+  it("designer failure on redesign → design_rejected session, run continues to task_cap", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -5026,7 +5028,10 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("design_rejected");
     expect(s.stopDetail).toContain("redesign agent failed");
-    expect(h.store.latestRun()!.state).toBe("halted");
+    // Run halts via task_cap (not design_rejected)
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("task cap");
     // IMPLEMENT never ran
     expect(h.agent.contexts).toHaveLength(0);
   });
@@ -5122,7 +5127,7 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(resetOnWorktree.length).toBeGreaterThan(0);
   });
 
-  it("captures Linear transition failure in stop detail when max redesigns exceeded (ES-477 Finding 2)", async () => {
+  it("captures Linear transition failure in stop detail when max redesigns exceeded and halts run (ES-477 Finding 2, ES-458)", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -5155,9 +5160,19 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(s.stopDetail).toContain("todo revert failed");
     expect(s.stopDetail).toContain("Linear outage");
     expect(h.logs.some((l) => l.includes("todo revert failed") && l.includes("Linear outage"))).toBe(true);
+    // When todo revert fails the ticket is stuck In Progress — the run must halt so
+    // operators can intervene rather than continuing and leaving the ticket orphaned (ES-458).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("design_rejected");
+    expect(run.haltReason).toContain("todo revert failed");
+    // A halted notification must be emitted so operators see the halt in Slack/console (ES-458).
+    const haltNotifications = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(haltNotifications.length).toBeGreaterThanOrEqual(1);
+    expect((haltNotifications[0] as { reason: string }).reason).toBe("design_rejected");
   });
 
-  it("captures Linear transition failure in stop detail when redesign agent returns null brief (ES-477 Finding 2)", async () => {
+  it("captures Linear transition failure in stop detail when redesign agent returns null brief and halts run (ES-477 Finding 2, ES-458)", async () => {
     const designer = new FakePlanRunner();
     designer.outcomes = [
       { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
@@ -5186,6 +5201,15 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(s.stopDetail).toContain("redesign agent failed");
     expect(s.stopDetail).toContain("todo revert failed");
     expect(s.stopDetail).toContain("Linear outage");
+    // When todo revert fails the ticket is stuck In Progress — the run must halt (ES-458).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("design_rejected");
+    expect(run.haltReason).toContain("todo revert failed");
+    // A halted notification must be emitted so operators see the halt in Slack/console (ES-458).
+    const haltNotifications = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(haltNotifications.length).toBeGreaterThanOrEqual(1);
+    expect((haltNotifications[0] as { reason: string }).reason).toBe("design_rejected");
   });
 
   it("requestStop() during reviewer run → HALT without redesign when reviewer rejects (ES-477 Finding 1)", async () => {
