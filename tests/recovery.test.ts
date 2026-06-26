@@ -111,6 +111,7 @@ function makeHarness(config: Config): Harness {
   const memoryRunner = new FakeCommandRunner();
   memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "-C"], { code: 0, stdout: "" });
   const orch = new Orchestrator({
     config,
     source,

@@ -511,11 +511,14 @@ export class Orchestrator {
           // If so, the review gate is already satisfied and we can skip to HANDOFF.
           const srLogs = this.store.getSelfReviewLogsForSession(session.id);
           const lastSrLog = srLogs.at(-1);
-          if (lastSrLog?.outcome === "passed" || lastSrLog?.outcome === "fixed" || lastSrLog?.outcome === "error") {
+          if (lastSrLog?.outcome === "passed" || lastSrLog?.outcome === "fixed" ||
+              (lastSrLog?.outcome === "error" && lastSrLog?.errorDetail !== "interrupted")) {
             // passed/fixed: gate satisfied.
-            // error: nonfatal outcome (cost cap, agent exception, parse error, or interrupted);
-            // the main flow returns CONTINUE and proceeds to HANDOFF in all these cases, so
-            // recovery must do the same (ES-473 Finding 1).
+            // error (non-interrupted): cleanup-complete nonfatal outcome (cost cap, agent
+            // exception, parse error); the main flow returns CONTINUE and proceeds to HANDOFF,
+            // so recovery must do the same.
+            // interrupted errors are excluded: the outcome is written before haltForInterrupt()
+            // and the cleanup/reset may not have run, so HANDOFF must not be assumed safe.
             this.log(`recovery: self-review completed (${lastSrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
             const recoveredIssue: EligibleIssue = {
               id: session.linearIssueId,
@@ -2001,7 +2004,14 @@ export class Orchestrator {
       try {
         specContent = this.specLoader(worktreePath, specDir);
       } catch (err) {
-        this.log(`selfReview: spec loading failed (non-fatal): ${errMsg(err)}`);
+        // specDir is configured, so spec content is required for the review gate.
+        // Without it the reviewer cannot check spec alignment and must not proceed.
+        this.log(`selfReview: spec loading failed: ${errMsg(err)}`);
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: spec loading failed: ${errMsg(err)}`,
+        );
       }
     }
 
@@ -2031,17 +2041,41 @@ export class Orchestrator {
 
     // Capture HEAD before the review agent runs so we can reset any commits it
     // makes on failure paths (cost_exceeded / error / parse_error / exception).
+    // A failure to capture this SHA is fatal: without it, commit-consistency and
+    // reset-on-failure guards are both disabled, so partial reviewer commits could
+    // reach HANDOFF undetected (ES-473 Finding 3).
     let preReviewSha: string | null = null;
     try {
       const shaRes = await this.runner.run(
         "git", ["-C", worktreePath, "rev-parse", "HEAD"],
         { cwd: worktreePath, timeoutMs: 30_000 },
       );
-      if (shaRes.code === 0 && shaRes.stdout.trim()) {
+      if (shaRes.code !== 0) {
+        this.store.updateSelfReviewLog(logRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `pre-review SHA: git exit ${shaRes.code}`,
+        });
+        return await this.stopSession(
+          session,
+          "exception",
+          `self-review: could not capture pre-review HEAD SHA (exit ${shaRes.code})`,
+        );
+      }
+      if (shaRes.stdout.trim()) {
         preReviewSha = shaRes.stdout.trim();
       }
-    } catch {
-      // non-fatal: proceed without reset-on-failure protection
+    } catch (shaErr) {
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: `pre-review SHA: ${errMsg(shaErr)}`,
+      });
+      return await this.stopSession(
+        session,
+        "exception",
+        `self-review: could not capture pre-review HEAD SHA: ${errMsg(shaErr)}`,
+      );
     }
 
     let outcome: AgentOutcome;
@@ -2053,12 +2087,8 @@ export class Orchestrator {
         hardTimeoutMs: this.config.safety.selfReviewTimeoutMinutes * 60_000,
       });
     } catch (err) {
-      this.log(`selfReview: agent exception (non-fatal): ${errMsg(err)}`);
-      this.store.updateSelfReviewLog(logRow.id, {
-        endedAt: this.clock(),
-        outcome: "error",
-        errorDetail: errMsg(err),
-      });
+      const agentErrDetail = errMsg(err);
+      this.log(`selfReview: agent exception (non-fatal): ${agentErrDetail}`);
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       if (preReviewSha !== null) {
         try {
@@ -2098,6 +2128,13 @@ export class Orchestrator {
           );
         }
       }
+      // Write outcome only after cleanup succeeds so crash-recovery cannot mistake a
+      // mid-cleanup crash for a handoff-eligible completed error (ES-473 Finding 1).
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: agentErrDetail,
+      });
       return CONTINUE;
     }
 
@@ -2125,12 +2162,6 @@ export class Orchestrator {
         selfReviewCostUsd: outcome.costUsd,
         costUsd: (failedSession.costUsd ?? 0) + (outcome.costUsd ?? 0),
       });
-      this.store.updateSelfReviewLog(logRow.id, {
-        endedAt: this.clock(),
-        outcome: "error",
-        costUsd: outcome.costUsd,
-        errorDetail: errDetail,
-      });
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       if (preReviewSha !== null) {
         try {
@@ -2170,6 +2201,14 @@ export class Orchestrator {
           );
         }
       }
+      // Write outcome only after cleanup succeeds so crash-recovery cannot mistake a
+      // mid-cleanup crash for a handoff-eligible completed error (ES-473 Finding 1).
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: errDetail,
+      });
       return CONTINUE;
     }
 
@@ -2183,12 +2222,7 @@ export class Orchestrator {
     const parsed = parseSelfReviewOutput(outcome.fullResult ?? outcome.summary);
     if (parsed.kind === "parse_error") {
       this.log("selfReview: parse error (non-fatal), proceeding to HANDOFF");
-      this.store.updateSelfReviewLog(logRow.id, {
-        endedAt: this.clock(),
-        outcome: "error",
-        costUsd: outcome.costUsd,
-        errorDetail: `parse error: ${parsed.raw.slice(0, 200)}`,
-      });
+      const parseErrDetail = `parse error: ${parsed.raw.slice(0, 200)}`;
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       if (preReviewSha !== null) {
         try {
@@ -2228,6 +2262,14 @@ export class Orchestrator {
           );
         }
       }
+      // Write outcome only after cleanup succeeds so crash-recovery cannot mistake a
+      // mid-cleanup crash for a handoff-eligible completed error (ES-473 Finding 1).
+      this.store.updateSelfReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        costUsd: outcome.costUsd,
+        errorDetail: parseErrDetail,
+      });
       return CONTINUE;
     }
 

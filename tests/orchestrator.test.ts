@@ -4560,6 +4560,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
     memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "-C"], { code: 0, stdout: "" });
 
     // Previous run was halted while idle — stale idle_started_at is 2 hours in the past.
     const prevRun = store.createRun(3, "2026-06-05T00:00:00.000Z");
