@@ -786,7 +786,7 @@ export class Orchestrator {
         eligible = await this.source.getAllEligible([
           ...this.store.activeIssueIds(),
           ...this.store.abandonedIssueIds(this.runId),
-          ...this.store.designRejectedIssueIds(this.runId),
+          ...this.store.designRejectedIssueIds(),
         ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
@@ -3432,6 +3432,7 @@ export class Orchestrator {
       await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: haltDetail });
       this.log(haltDetail);
       if (opts.haltIfRevertFailed) {
+        await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
         await this.commitMemoryBeforeHalt();
         this.store.setRunState(this.runId, "halted", haltDetail);
         return HALT;

@@ -5166,6 +5166,10 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("design_rejected");
     expect(run.haltReason).toContain("todo revert failed");
+    // A halted notification must be emitted so operators see the halt in Slack/console (ES-458).
+    const haltNotifications = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(haltNotifications.length).toBeGreaterThanOrEqual(1);
+    expect((haltNotifications[0] as { reason: string }).reason).toBe("design_rejected");
   });
 
   it("captures Linear transition failure in stop detail when redesign agent returns null brief and halts run (ES-477 Finding 2, ES-458)", async () => {
@@ -5202,6 +5206,10 @@ describe("Orchestrator DESIGN REVIEW gate (ES-477)", () => {
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("design_rejected");
     expect(run.haltReason).toContain("todo revert failed");
+    // A halted notification must be emitted so operators see the halt in Slack/console (ES-458).
+    const haltNotifications = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(haltNotifications.length).toBeGreaterThanOrEqual(1);
+    expect((haltNotifications[0] as { reason: string }).reason).toBe("design_rejected");
   });
 
   it("requestStop() during reviewer run → HALT without redesign when reviewer rejects (ES-477 Finding 1)", async () => {

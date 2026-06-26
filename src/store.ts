@@ -761,13 +761,13 @@ export class SqliteStore {
     return rows.map((r) => r.id);
   }
 
-  designRejectedIssueIds(runId: number): string[] {
+  designRejectedIssueIds(): string[] {
     const rows = this.db
       .prepare(
         `SELECT DISTINCT linear_issue_id AS id FROM task_session
-         WHERE state = 'stopped' AND failure_reason = 'design_rejected' AND run_id = ?`,
+         WHERE state = 'stopped' AND failure_reason = 'design_rejected'`,
       )
-      .all(runId) as Array<{ id: string }>;
+      .all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }
 
