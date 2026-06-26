@@ -3497,6 +3497,13 @@ export class Orchestrator {
       await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
       this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
       beforeCommit?.();
+      // Halt-path only: restore any dirty docs/memory files so the clean-worktree
+      // preflight on the next startup does not fail (ES-452 Finding 1). The bootstrap
+      // path (beforeCommit defined) intentionally leaves files dirty for the current run.
+      if (beforeCommit === undefined) {
+        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      }
       return;
     }
     // Even when rebase exits 0, the autostash pop may leave conflict markers in the
@@ -3510,10 +3517,17 @@ export class Orchestrator {
       await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
       beforeCommit?.();
+      // Halt-path only: also remove any untracked files created by the bootstrap path's
+      // initializeMemory so the next startup's clean-worktree preflight does not fail.
+      if (beforeCommit === undefined) {
+        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      }
       return;
     }
     beforeCommit?.();
-    const committed = await commitIfChanged(this.runner, repoPath).catch(() => false as const);
+    // Do not swallow commitIfChanged errors: let them propagate so the outer catch in
+    // commitMemoryBeforeHalt (or the bootstrap try/catch) logs a warning (ES-452 Finding 2).
+    const committed = await commitIfChanged(this.runner, repoPath);
     if (committed) {
       // Push the memory commit so it survives the git reset --hard in fetchDefaultBranch
       // on the next run's PM-select phase (ES-452 Finding 1). Best-effort: warn on failure.

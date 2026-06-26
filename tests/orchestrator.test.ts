@@ -2257,6 +2257,69 @@ describe("Orchestrator bootstrap memory commit — ES-452 Finding 1", () => {
   });
 });
 
+describe("Orchestrator HALT memory commit — Codex Findings 1 & 2", () => {
+  it("cleans up dirty memory files when halt-path rebase fails (Codex Finding 1)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Both bootstrap and halt rebase calls fail; the bootstrap initializeMemory
+    // may create dirty docs/memory/ files that the halt path must clean up.
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // The halt path (beforeCommit === undefined) must restore and clean the memory dir
+    // so the next startup's clean-worktree preflight does not fail.
+    const checkoutCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args[3] === "docs/memory/",
+    );
+    expect(checkoutCalls.length).toBeGreaterThan(0);
+    const cleanCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args[2] === "--" && c.args[3] === "docs/memory/",
+    );
+    expect(cleanCalls.length).toBeGreaterThan(0);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("logs commitIfChanged errors instead of silently swallowing them on halt (Codex Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Simulate a commitIfChanged failure (e.g. index lock) in the halt path.
+    h.memoryRunner.on(["git", "add", "docs/memory/"], { code: 1, stderr: "fatal: Unable to create index.lock" });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // Run must still halt despite the failure.
+    expect(h.store.latestRun()!.state).toBe("halted");
+    // The error must be logged as a warning, not silently swallowed.
+    expect(h.logs.some((l) => l.includes("warning") && l.includes("commit memory on halt"))).toBe(true);
+  });
+
+  it("cleans up dirty memory files when halt-path autostash conflict is detected (Codex Finding 1)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase exits 0 but autostash pop left unmerged files; halt path must also
+    // remove untracked files left by the bootstrap initializeMemory.
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], {
+      code: 0,
+      stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
+    });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // git clean -fd -- docs/memory/ must run in the halt path to remove untracked files.
+    const cleanCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args[2] === "--" && c.args[3] === "docs/memory/",
+    );
+    expect(cleanCalls.length).toBeGreaterThan(0);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+});
+
 describe("Orchestrator HALT memory commit — non-interrupt halt paths — ES-452 Finding 2", () => {
   it("commits memory on task_cap halt when changes exist", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
