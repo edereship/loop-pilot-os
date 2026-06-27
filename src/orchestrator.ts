@@ -402,6 +402,29 @@ export class Orchestrator {
     return CONTINUE;
   }
 
+  /** Returns null to proceed to HANDOFF, or a RunControl to halt the session. */
+  private async checkVerifyGateForRecovery(session: TaskSessionRow): Promise<RunControl | null> {
+    if (!this.config.verify.enabled) return null;
+    const vrLogs = this.store.getVerifyLogsForSession(session.id);
+    const lastVrLog = vrLogs.at(-1);
+    if (lastVrLog?.outcome === "passed") {
+      this.log(`recovery: verify completed (${lastVrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
+      return null;
+    }
+    if (lastVrLog?.outcome === "error" &&
+        lastVrLog.errorDetail != null &&
+        lastVrLog.errorDetail !== "interrupted") {
+      this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
+      return null;
+    }
+    const detail =
+      `crash recovery: verify required but not completed; ` +
+      `manual review needed: ` +
+      `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+    this.log(`recovery: halting — verify gate incomplete (${session.linearIdentifier})`);
+    return await this.stopSession(session, "exception", detail);
+  }
+
   /** claimed/implementing/handing_off（および PR 番号欠落 in_review）の回復（カーネル §8）。 */
   private async recoverByOpenPr(session: TaskSessionRow): Promise<RunControl> {
     let prNumber: number | null;
@@ -516,29 +539,8 @@ export class Orchestrator {
             // errorDetail (fatal guard paths that called stopSession() — branch wrong before/after
             // review, SHA unreadable, uncommitted changes, no diff remaining, etc.).
             this.log(`recovery: self-review completed (${lastSrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
-            // ── VERIFY gate check (ES-491) ──
-            if (this.config.verify.enabled) {
-              const vrLogs = this.store.getVerifyLogsForSession(session.id);
-              const lastVrLog = vrLogs.at(-1);
-              if (lastVrLog?.outcome === "passed") {
-                this.log(`recovery: verify completed (${lastVrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
-                // fall through to HANDOFF
-              } else if (
-                lastVrLog?.outcome === "error" &&
-                lastVrLog.errorDetail != null &&
-                lastVrLog.errorDetail !== "interrupted"
-              ) {
-                this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
-                // fall through to HANDOFF
-              } else {
-                const verifyHaltDetail =
-                  `crash recovery: verify required but not completed; ` +
-                  `manual review needed: ` +
-                  `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
-                this.log(`recovery: halting — verify gate incomplete (${session.linearIdentifier})`);
-                return await this.stopSession(session, "exception", verifyHaltDetail);
-              }
-            }
+            const verifyGate = await this.checkVerifyGateForRecovery(session);
+            if (verifyGate !== null) return verifyGate;
             const recoveredIssue: EligibleIssue = {
               id: session.linearIssueId,
               identifier: session.linearIdentifier,
@@ -564,29 +566,8 @@ export class Orchestrator {
         }
         // Clean committed work, no open PR: resume from HANDOFF.
         // Self-review is disabled, so proceed directly.
-        // ── VERIFY gate check (ES-491) ──
-        if (this.config.verify.enabled) {
-          const vrLogs = this.store.getVerifyLogsForSession(session.id);
-          const lastVrLog = vrLogs.at(-1);
-          if (lastVrLog?.outcome === "passed") {
-            this.log(`recovery: verify completed (${lastVrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
-            // fall through to HANDOFF
-          } else if (
-            lastVrLog?.outcome === "error" &&
-            lastVrLog.errorDetail != null &&
-            lastVrLog.errorDetail !== "interrupted"
-          ) {
-            this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
-            // fall through to HANDOFF
-          } else {
-            const verifyHaltDetail =
-              `crash recovery: verify required but not completed; ` +
-              `manual review needed: ` +
-              `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
-            this.log(`recovery: halting — verify gate incomplete (${session.linearIdentifier})`);
-            return await this.stopSession(session, "exception", verifyHaltDetail);
-          }
-        }
+        const verifyGate = await this.checkVerifyGateForRecovery(session);
+        if (verifyGate !== null) return verifyGate;
         const recoveredIssue: EligibleIssue = {
           id: session.linearIssueId,
           identifier: session.linearIdentifier,
@@ -2526,10 +2507,10 @@ export class Orchestrator {
   private async cleanupVerifierWorktree(
     worktreePath: string,
     branch: string,
-    postImplSha: string | null,
+    preVerifySha: string | null,
   ): Promise<void> {
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
-    if (postImplSha === null) return;
+    if (preVerifySha === null) return;
     try {
       const branchRes = await this.runner.run(
         "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
@@ -2546,11 +2527,11 @@ export class Orchestrator {
         }
       }
       const resetRes = await this.runner.run(
-        "git", ["-C", worktreePath, "reset", "--hard", postImplSha],
+        "git", ["-C", worktreePath, "reset", "--hard", preVerifySha],
         { cwd: worktreePath, timeoutMs: 30_000 },
       );
       if (resetRes.code !== 0) {
-        this.log(`verify: cleanup reset to ${postImplSha} failed (exit ${resetRes.code})`);
+        this.log(`verify: cleanup reset to ${preVerifySha} failed (exit ${resetRes.code})`);
       }
     } catch (err) {
       this.log(`verify: cleanup failed: ${errMsg(err)}`);
@@ -2584,17 +2565,17 @@ export class Orchestrator {
       startedAt: this.clock(),
     });
 
-    // Record post-IMPLEMENT SHA for worktree protection.
+    // SHA before verification starts — includes both IMPLEMENT and SELF-REVIEW commits.
     // ⚠️ This is the SHA AFTER implementation — NOT pre-work. We preserve
     // implementation commits and only strip verifier pollution.
-    let postImplSha: string | null = null;
+    let preVerifySha: string | null = null;
     try {
       const shaRes = await this.runner.run(
         "git", ["-C", worktreePath, "rev-parse", "HEAD"],
         { cwd: worktreePath, timeoutMs: 30_000 },
       );
       if (shaRes.code === 0 && shaRes.stdout.trim()) {
-        postImplSha = shaRes.stdout.trim();
+        preVerifySha = shaRes.stdout.trim();
       }
     } catch {
       // non-fatal
@@ -2632,7 +2613,7 @@ export class Orchestrator {
       if (eo.kind === "cost_exceeded" || eo.kind === "error") {
         const errDetail = eo.kind === "error" ? eo.message : "cost exceeded";
         this.log(`verify: evidence agent ${eo.kind} (fail-open): ${errDetail}`);
-        await this.cleanupVerifierWorktree(worktreePath, session.branch, postImplSha);
+        await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
         this.store.updateSession(session.id, { verifyAttempts: attempt });
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "passed",
@@ -2644,7 +2625,7 @@ export class Orchestrator {
       evidenceText = eo.fullResult ?? eo.summary;
     } catch (err) {
       this.log(`verify: evidence agent exception (fail-open): ${errMsg(err)}`);
-      await this.cleanupVerifierWorktree(worktreePath, session.branch, postImplSha);
+      await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
       this.store.updateSession(session.id, { verifyAttempts: attempt });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
@@ -2654,7 +2635,7 @@ export class Orchestrator {
     }
 
     // ── Worktree cleanup ──
-    await this.cleanupVerifierWorktree(worktreePath, session.branch, postImplSha);
+    await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
 
     // ── Judgment (Codex planner) ──
     if (this.planner === null) {
