@@ -131,9 +131,10 @@ cp looppilot-os.example.toml looppilot-os.toml
 | Opus 4.8 / 4.7 | low / medium / high / xhigh / max |
 | **Opus 4.6**（出荷既定 `claude-opus-4-6[1m]`） | low / medium / high / **max**（xhigh 非対応） |
 | Sonnet 4.6 | low / medium / high / max（xhigh 非対応） |
-| Haiku 4.5 / Sonnet 4.5 | **effort 非対応**（どの値もエラー） |
+| Haiku 4.5 / Sonnet 4.5 | **effort 非対応**（`auto` 以外はエラー。`auto` = `--effort` フラグ自体を省略してモデル既定にリセット） |
 
 * `xhigh` は Opus 4.7+/Fable 5 専用。`max` は Opus 4.6 以降・Sonnet 4.6 で可。
+* Haiku 4.5 / Sonnet 4.5 では `agent.effort = "auto"` を指定すると `--effort` フラグを渡さず起動する（effort 非対応モデルを使う場合の逃げ道）。
 * 不正な model×effort 組合せは起動前の設定検証（`loadConfig`）で fatal エラーとして報告される（セッションは開始しない）。
 
 状態 DB（`looppilot-os.db`）は `looppilot-os.toml` と同じディレクトリに作られます。

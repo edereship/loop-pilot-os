@@ -96,6 +96,8 @@ verify_timeout_minutes = 15      # VERIFY セッションのタイムアウト
 max_recovery_attempts = 2        # ci_failed/merge_conflict の自動修正上限（尽きたら abandon）
 transient_retry_attempts = 1     # N1: 一時的エラーのリトライ回数（0 で無効）
 
+# ↓ 既存の [linear] セクションに追記（[linear.states] より前）。
+#   新しい [linear] テーブルとして末尾に追加すると TOML の重複テーブルエラーになるため注意。
 [linear]
 needs_human_label = "needs-human"  # abandon 時に付与するトリアージ用ラベル名
 
