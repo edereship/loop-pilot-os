@@ -141,6 +141,7 @@ export interface VerifyJudgmentPromptArgs {
   acceptance: string | null;
   diff: string;
   evidence: string;
+  hasRunRecipe?: boolean;
 }
 
 function fenceFor(content: string): string {
@@ -150,7 +151,7 @@ function fenceFor(content: string): string {
 }
 
 export function buildVerifyJudgmentPrompt(args: VerifyJudgmentPromptArgs): string {
-  const { acceptance, diff, evidence } = args;
+  const { acceptance, diff, evidence, hasRunRecipe } = args;
   const blocks: string[] = [];
 
   blocks.push(
@@ -159,7 +160,7 @@ export function buildVerifyJudgmentPrompt(args: VerifyJudgmentPromptArgs): strin
       "You will be given acceptance criteria, the actual code diff, and evidence collected by a separate verifier.",
       "",
       "Your judgment must follow these rules:",
-      "1. If ANY objective oracle (build, test, type check, lint) shows a failure, the verdict is **fail**.",
+      `1. If ANY objective oracle (build, test, type check, lint${hasRunRecipe ? ", acceptance check" : ""}) shows a failure, the verdict is **fail**.`,
       "2. If all objective oracles pass, judge whether the acceptance criteria are satisfied by the diff.",
       "3. Both conditions must hold for a **pass** verdict.",
     ].join("\n"),

@@ -6407,7 +6407,7 @@ describe("VERIFY (ES-491)", () => {
     expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
   });
 
-  it("crash recovery: verify not completed → halt", async () => {
+  it("crash recovery: verify not completed → resumes VERIFY", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designReviewer: planner });
@@ -6429,10 +6429,19 @@ describe("VERIFY (ES-491)", () => {
     h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
     const srLogs = h.store.getSelfReviewLogsForSession(session.id);
     h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    // Allow recovery to proceed: verifyAgent throws (no outcome queued → fail-open pass),
+    // then HANDOFF creates a PR, and MONITOR resolves merged.
+    h.monitor.verdicts = [{ kind: "merged" }];
 
     await h.orch.run();
 
-    expect(h.logs.some(l => l.includes("verify gate incomplete"))).toBe(true);
+    // Recovery resumed VERIFY instead of halting for manual review.
+    expect(h.logs.some(l => l.includes("resuming VERIFY"))).toBe(true);
+    // Verify ran and logged a fail-open pass (verifyAgent had no outcome queued → threw).
+    const verifyLogs = h.store.getVerifyLogsForSession(session.id);
+    expect(verifyLogs).toHaveLength(1);
+    expect(verifyLogs[0].outcome).toBe("passed");
+    expect(verifyLogs[0].errorDetail).toContain("fail-open");
   });
 
   it("verify.enabled = false → skips verify, no verify_log entries", async () => {

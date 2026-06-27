@@ -402,8 +402,8 @@ export class Orchestrator {
     return CONTINUE;
   }
 
-  /** Returns null to proceed to HANDOFF, or a RunControl to halt the session. */
-  private async checkVerifyGateForRecovery(session: TaskSessionRow): Promise<RunControl | null> {
+  /** Returns null to proceed to HANDOFF, "resume_verify" to re-run VERIFY, or a RunControl to halt. */
+  private async checkVerifyGateForRecovery(session: TaskSessionRow): Promise<RunControl | null | "resume_verify"> {
     if (!this.config.verify.enabled) return null;
     const vrLogs = this.store.getVerifyLogsForSession(session.id);
     const lastVrLog = vrLogs.at(-1);
@@ -417,12 +417,8 @@ export class Orchestrator {
       this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
       return null;
     }
-    const detail =
-      `crash recovery: verify required but not completed; ` +
-      `manual review needed: ` +
-      `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
-    this.log(`recovery: halting — verify gate incomplete (${session.linearIdentifier})`);
-    return await this.stopSession(session, "exception", detail);
+    this.log(`recovery: verify incomplete; resuming VERIFY (${session.linearIdentifier})`);
+    return "resume_verify";
   }
 
   /** claimed/implementing/handing_off（および PR 番号欠落 in_review）の回復（カーネル §8）。 */
@@ -540,7 +536,7 @@ export class Orchestrator {
             // review, SHA unreadable, uncommitted changes, no diff remaining, etc.).
             this.log(`recovery: self-review completed (${lastSrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
             const verifyGate = await this.checkVerifyGateForRecovery(session);
-            if (verifyGate !== null) return verifyGate;
+            if (verifyGate !== null && verifyGate !== "resume_verify") return verifyGate;
             const recoveredIssue: EligibleIssue = {
               id: session.linearIssueId,
               identifier: session.linearIdentifier,
@@ -550,6 +546,13 @@ export class Orchestrator {
               sortOrder: 0,
               url: session.issueUrl,
             };
+            if (verifyGate === "resume_verify") {
+              const vr = await this.verify(session, recoveredIssue, null);
+              if (vr.control === "halt") return HALT;
+              if ("verifyFailed" in vr) {
+                return await this.stopSession(session, "verify_failed", `verify failed in recovery: ${vr.reasons.join("; ")}`);
+              }
+            }
             const handoffResult = await this.handoff(session, recoveredIssue);
             if ("prNumber" in handoffResult) return CONTINUE;
             return handoffResult;
@@ -567,7 +570,7 @@ export class Orchestrator {
         // Clean committed work, no open PR: resume from HANDOFF.
         // Self-review is disabled, so proceed directly.
         const verifyGate = await this.checkVerifyGateForRecovery(session);
-        if (verifyGate !== null) return verifyGate;
+        if (verifyGate !== null && verifyGate !== "resume_verify") return verifyGate;
         const recoveredIssue: EligibleIssue = {
           id: session.linearIssueId,
           identifier: session.linearIdentifier,
@@ -577,6 +580,13 @@ export class Orchestrator {
           sortOrder: 0,
           url: session.issueUrl,
         };
+        if (verifyGate === "resume_verify") {
+          const vr = await this.verify(session, recoveredIssue, null);
+          if (vr.control === "halt") return HALT;
+          if ("verifyFailed" in vr) {
+            return await this.stopSession(session, "verify_failed", `verify failed in recovery: ${vr.reasons.join("; ")}`);
+          }
+        }
         const handoffResult = await this.handoff(session, recoveredIssue);
         if ("prNumber" in handoffResult) {
           return CONTINUE;
@@ -1013,6 +1023,10 @@ export class Orchestrator {
         if (vr.control === "halt") return;
         if (this.store.getSession(session.id).state === "stopped") break implementLoop;
         if ("verifyFailed" in vr) {
+          if (this.interrupted) {
+            await this.haltForInterrupt();
+            return;
+          }
           verifyReasons = vr.reasons;
           continue implementLoop;
         }
@@ -2591,6 +2605,33 @@ export class Orchestrator {
       // non-fatal
     }
 
+    // Guard: reject a SHA from the wrong branch. If the implementation agent left the
+    // worktree on another branch or detached HEAD, cleanupVerifierWorktree would reset
+    // session.branch to commits that were never on it (ES-491 Finding 3).
+    if (preVerifySha !== null) {
+      try {
+        const branchCheckRes = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        const currentBranch = branchCheckRes.code === 0 ? branchCheckRes.stdout.trim() : null;
+        if (currentBranch !== session.branch) {
+          this.log(`verify: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}"); stopping`);
+          this.store.updateVerifyLog(logRow.id, {
+            endedAt: this.clock(), outcome: "error", costUsd: 0,
+            errorDetail: `guard:wrong branch before verify: "${currentBranch ?? "unknown"}" (expected "${session.branch}")`,
+          });
+          return await this.stopSession(session, "exception", `verify: worktree on wrong branch "${currentBranch ?? "unknown"}" (expected "${session.branch}")`);
+        }
+      } catch (err) {
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error", costUsd: 0,
+          errorDetail: `guard:branch check failed: ${errMsg(err)}`,
+        });
+        return await this.stopSession(session, "exception", `verify: branch check failed: ${errMsg(err)}`);
+      }
+    }
+
     // ── Evidence collection (Claude verifyAgent) ──
     const evidencePrompt = buildVerifyEvidencePrompt({
       issue,
@@ -2613,6 +2654,12 @@ export class Orchestrator {
       evidenceCostUsd = eo.costUsd;
 
       if (eo.kind === "interrupted") {
+        await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+        const freshSessInterrupted = this.store.getSession(session.id);
+        this.store.updateSession(session.id, {
+          verifyAttempts: attempt,
+          costUsd: (freshSessInterrupted.costUsd ?? 0) + evidenceCostUsd,
+        });
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "error",
           costUsd: evidenceCostUsd, errorDetail: "interrupted",
@@ -2719,6 +2766,7 @@ export class Orchestrator {
       acceptance,
       diff: diff.slice(0, 100_000),
       evidence: evidenceText.slice(0, 50_000),
+      hasRunRecipe: !!this.config.verify.runRecipe,
     });
 
     let judgmentOutcome: PlanOutcome;
