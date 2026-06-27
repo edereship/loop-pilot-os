@@ -3248,8 +3248,8 @@ export class Orchestrator {
         }
         // Abandon completed cleanup and wants the loop to continue to next task.
         if (result.kind === "continued") {
-          this.store.updateSession(session.id, { recoveryAction: result.action });
           this.store.updateSession(session.id, {
+            recoveryAction: result.action,
             state: "stopped",
             failureReason: reason,
             stopDetail: detail,
@@ -3409,7 +3409,7 @@ export class Orchestrator {
             endedAt: this.clock(),
             ...patch,
           });
-          const skipDetail = `${session.linearIdentifier} stopped (${reason})${detail ? `: ${detail}` : ""}`;
+          const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
           return CONTINUE;
