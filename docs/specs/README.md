@@ -31,9 +31,10 @@
 | `requirements.md` | 要求 | プロダクト全体 | Linear「要求仕様書」を反映。以後 repo が正本 |
 | `design-spec-v1-core-loop.md` | 要件定義 | コアループ（SELECT→…→DONE） | v1 設計仕様のスナップショット |
 
-> ドッグフード対象 = LoopPilot OS 自身。よって要件定義の領域はループのフェーズ（SELECT/CLAIM/IMPLEMENT/HANDOFF/MONITOR/DONE）や v2 機能（A1/A2/B1/R1）に概ね揃う。
+> ドッグフード対象 = LoopPilot OS 自身。よって要件定義の領域はループのフェーズ（GROOM/SELECT/CLAIM/DESIGN/DESIGN REVIEW/IMPLEMENT/SELF-REVIEW/HANDOFF/MONITOR/DONE）や v2/v3 機能（A1/A2/B1/R1・GROOM/横断メモリ）に概ね揃う。
 
 ## 関連
 
-* ロードマップ & v2/v3+ スコープ（living）: Linear「[LoopPilot OS ロードマップ & スコープ（v2 / v3+）](https://linear.app/team-yubune/document/looppilot-os-ロードマップ-and-スコープv2-v3-3f38a59ae90d)」
+* ロードマップ & v2/v3+ スコープ（living）: Linear「[LoopPilot OS ロードマップ & スコープ（v2 / v3+）](https://linear.app/edereship/document/looppilot-os-ロードマップ-and-スコープv2-v3-3f38a59ae90d)」
+* 各機能の設計ドキュメント（v2/v3/v3.5 の HOW）: `docs/superpowers/specs/`（例: `2026-06-22-v3-pm-autonomy-design.md`, `2026-06-27-v35-self-driving-hardening-design.md`）
 * 運用モード = ship-and-correct（薄いチケットも人間ゲートで止めず妥当解釈で出荷、ズレは事後チケットで修正）。

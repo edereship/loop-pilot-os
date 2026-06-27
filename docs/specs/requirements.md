@@ -4,7 +4,7 @@
 > 正本（canonical）: **このファイル（repo `docs/specs/requirements.md`）**。
 > 編集: **人間のみ・PR 経由**（ループ／PM は編集しない）。
 > セッション注入: **毎セッション必ず全文**（B1 グラウンディングの不変の錨）。
-> Linear「[要求仕様書](https://linear.app/team-yubune/document/要求仕様書-88a47519ecd8)」（doc id `d40333ef-b115-446e-9a21-152c1d0cf1c2`）は**議論・提案の入口**として残すが二重の正本にしない（drift 防止）。確定はここへ PR で反映する。
+> Linear「[要求仕様書](https://linear.app/edereship/document/要求仕様書-88a47519ecd8)」（doc id `d40333ef-b115-446e-9a21-152c1d0cf1c2`）は**議論・提案の入口**として残すが二重の正本にしない（drift 防止）。確定はここへ PR で反映する。
 > 最終反映: 2026-06-07
 
 ## 自律型プロダクト開発オーケストレーター
