@@ -59,6 +59,9 @@ function makeConfig(over: Partial<{
       groomBoardBudgetChars: 10000,
       selfReviewTimeoutMinutes: 15,
       maxCostUsdPerSelfReview: 2,
+      maxVerifyAttempts: 2,
+      maxCostUsdPerVerify: 2,
+      verifyTimeoutMinutes: 15,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -69,6 +72,7 @@ function makeConfig(over: Partial<{
     notify: { progress: over.notifyProgress ?? false },
     groom: { enabled: over.groomEnabled ?? false },
     selfReview: { enabled: true },
+    verify: { enabled: true, runRecipe: "" },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
     linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
     pm: undefined,
@@ -92,6 +96,7 @@ interface Harness {
   store: SqliteStore;
   source: FakeTaskSource;
   agent: FakeAgentRunner;
+  verifyAgent: FakeAgentRunner;
   git: FakeGitPr;
   monitor: FakeMonitor;
   notifier: FakeNotifier;
@@ -104,7 +109,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -170,11 +175,13 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const selfReviewAgent = opts?.selfReviewAgent ?? agent;
+  const verifyAgent = opts?.verifyAgent ?? new FakeAgentRunner();
   const orch = new Orchestrator({
     config,
     source,
     agent,
     selfReviewAgent,
+    verifyAgent,
     git,
     monitor,
     notifier,
@@ -205,7 +212,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       knownLabels: ["looppilot-os"],
     } : null,
   });
-  return { orch, store, source, agent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
+  return { orch, store, source, agent, verifyAgent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
 }
 
 describe("Orchestrator 正常系 — 1チケット完走（仕様 §5 SELECT→CLAIM→IMPLEMENT→HANDOFF→MONITOR→DONE）", () => {
@@ -299,6 +306,7 @@ describe("Orchestrator 正常系 — フェーズ順序（仕様 §5 状態機�
       "hasUncommittedChanges", // IMPLEMENT 後条件（先に残骸チェック）
       "hasCommitsWithDiff",    // IMPLEMENT 後条件（次に実差分チェック）
       "discardUncommittedChanges", // SELF-REVIEW exception cleanup (no outcome queued → non-fatal)
+      "discardUncommittedChanges", // VERIFY cleanupVerifierWorktree (no outcome queued → fail-open)
       "findOpenPrForBranch",   // HANDOFF（既存PR確認）
       "pushAndOpenPr",         // HANDOFF（新規PR）
       "addLabel",              // HANDOFF（ゲートラベル）
@@ -704,6 +712,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       source,
       agent,
       selfReviewAgent: agent,
+      verifyAgent: new FakeAgentRunner(),
       git,
       monitor,
       notifier,
@@ -2564,6 +2573,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
       source,
       agent,
       selfReviewAgent: agent,
+      verifyAgent: new FakeAgentRunner(),
       git,
       monitor,
       notifier,
@@ -3096,7 +3106,7 @@ describe("Orchestrator.interruptablePause", () => {
     inlineMemoryRunner3.on(["git", "add", "docs/memory/"], { code: 0 });
     inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
-      config, source, agent, selfReviewAgent: agent, git, monitor, notifier, store,
+      config, source, agent, selfReviewAgent: agent, verifyAgent: new FakeAgentRunner(), git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null, designer: null,
       codebaseSummaryGenerator: async () => "",
@@ -4629,6 +4639,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       source,
       agent: new FakeAgentRunner(),
       selfReviewAgent: new FakeAgentRunner(),
+      verifyAgent: new FakeAgentRunner(),
       git: new FakeGitPr(),
       monitor: new FakeMonitor(),
       notifier,
@@ -4766,6 +4777,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       source,
       agent: new FakeAgentRunner(),
       selfReviewAgent: new FakeAgentRunner(),
+      verifyAgent: new FakeAgentRunner(),
       git: new FakeGitPr(),
       monitor: new FakeMonitor(),
       notifier,
@@ -4853,6 +4865,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       source,
       agent,
       selfReviewAgent: agent,
+      verifyAgent: new FakeAgentRunner(),
       git: new FakeGitPr(),
       monitor,
       notifier,
@@ -4918,6 +4931,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       source,
       agent: new FakeAgentRunner(),
       selfReviewAgent: new FakeAgentRunner(),
+      verifyAgent: new FakeAgentRunner(),
       git: new FakeGitPr(),
       monitor: new FakeMonitor(),
       notifier,
@@ -6061,5 +6075,36 @@ describe("Orchestrator per-phase model/effort config (ES-486 Task 4)", () => {
     const reviewCtx = reviewPlanner.contexts[0];
     expect(reviewCtx.model).toBe("gpt-5.5");
     expect(reviewCtx.effort).toBe("high");
+  });
+});
+
+describe("VERIFY (ES-491)", () => {
+  it("verify pass → proceeds to HANDOFF", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Test\n5 passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].verifyAttempts).toBe(1);
+
+    const verifyLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(verifyLogs).toHaveLength(1);
+    expect(verifyLogs[0].verdict).toBe("pass");
+    expect(verifyLogs[0].outcome).toBe("passed");
   });
 });

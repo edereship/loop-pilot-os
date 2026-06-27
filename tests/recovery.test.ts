@@ -46,6 +46,9 @@ function makeConfig(over: Partial<{
       groomBoardBudgetChars: 10000,
       selfReviewTimeoutMinutes: 15,
       maxCostUsdPerSelfReview: 2,
+      maxVerifyAttempts: 2,
+      maxCostUsdPerVerify: 2,
+      verifyTimeoutMinutes: 15,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -55,6 +58,7 @@ function makeConfig(over: Partial<{
     notify: { progress: false },
     groom: { enabled: false },
     selfReview: { enabled: true },
+    verify: { enabled: true, runRecipe: "" },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
   } as unknown as Config;
 }
@@ -127,6 +131,7 @@ function makeHarness(config: Config): Harness {
     source,
     agent,
     selfReviewAgent: agent,
+    verifyAgent: new FakeAgentRunner(),
     git,
     monitor,
     notifier,

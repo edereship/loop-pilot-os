@@ -30,6 +30,8 @@ import { parseDesignReviewOutput } from "./design-review-parser.js";
 import { buildDesignReviewPrompt } from "./design-review-prompt.js";
 import { buildSelfReviewPrompt } from "./self-review-prompt.js";
 import { parseSelfReviewOutput } from "./self-review-parser.js";
+import { buildVerifyEvidencePrompt, buildVerifyJudgmentPrompt } from "./verify-prompt.js";
+import { parseVerifyOutput } from "./verify-parser.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
 import { executeRecoveryTurn, executeAbandon } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
@@ -68,6 +70,7 @@ export interface OrchestratorDeps {
   source: TaskSource;
   agent: AgentRunner;
   selfReviewAgent: AgentRunner;
+  verifyAgent: AgentRunner;
   git: GitPrManager;
   monitor: LoopPilotMonitor;
   notifier: Notifier;
@@ -101,6 +104,7 @@ export class Orchestrator {
   private readonly source: TaskSource;
   private readonly agent: AgentRunner;
   private readonly selfReviewAgent: AgentRunner;
+  private readonly verifyAgent: AgentRunner;
   private readonly git: GitPrManager;
   private readonly monitor: LoopPilotMonitor;
   private readonly notifier: Notifier;
@@ -128,6 +132,7 @@ export class Orchestrator {
     this.source = deps.source;
     this.agent = deps.agent;
     this.selfReviewAgent = deps.selfReviewAgent;
+    this.verifyAgent = deps.verifyAgent;
     this.git = deps.git;
     this.monitor = deps.monitor;
     this.notifier = deps.notifier;
@@ -952,30 +957,41 @@ export class Orchestrator {
         return;
       }
 
-      // 5) IMPLEMENT (was 4)
-      const impl = await this.implement(session, issue, planBrief);
-      if (impl.control === "halt") return;
-      // Policy-driven abandon: session stopped, skip remaining phases (ES-490)
+      // 5) IMPLEMENT → SELF-REVIEW → VERIFY loop (ES-491)
+      // On verify fail (under attempt cap), reasons are injected into the next IMPLEMENT.
+      let verifyReasons: string[] | null = null;
+      implementLoop:
+      for (;;) {
+        // 5.1) IMPLEMENT
+        const impl = await this.implement(session, issue, planBrief, verifyReasons);
+        if (impl.control === "halt") return;
+        if (this.store.getSession(session.id).state === "stopped") break implementLoop;
+
+        // 5.5) SELF-REVIEW (ES-473)
+        if (this.config.selfReview.enabled) {
+          const sr = await this.selfReview(session, issue, planBrief);
+          if (sr.control === "halt") return;
+          if (this.store.getSession(session.id).state === "stopped") break implementLoop;
+        }
+
+        if (this.interrupted) {
+          await this.haltForInterrupt();
+          return;
+        }
+
+        // 5.7) VERIFY (ES-491)
+        if (!this.config.verify.enabled) break implementLoop;
+
+        const vr = await this.verify(session, issue, planBrief);
+        if (vr.control === "halt") return;
+        if (this.store.getSession(session.id).state === "stopped") break implementLoop;
+        if ("verifyFailed" in vr) {
+          verifyReasons = vr.reasons;
+          continue implementLoop;
+        }
+        break implementLoop; // pass → HANDOFF
+      }
       if (this.store.getSession(session.id).state === "stopped") continue;
-
-      // 5.5) SELF-REVIEW (ES-473)
-      if (this.config.selfReview.enabled) {
-        const sr = await this.selfReview(session, issue, planBrief);
-        if (sr.control === "halt") return;
-        // Policy-driven abandon: session stopped, skip remaining phases (ES-490)
-        if (this.store.getSession(session.id).state === "stopped") continue;
-      }
-
-      // Safe point: honor a stop request that arrived before or during self-review.
-      // selfReview() may return CONTINUE even if requestStop() was called
-      // while the agent was running (the agent returned a normal outcome).
-      // Deferring to this point (rather than checking before self-review) ensures
-      // the session always has a self_review_log entry on graceful stop, making it
-      // recoverable on the next startup (ES-473 Finding 2).
-      if (this.interrupted) {
-        await this.haltForInterrupt();
-        return;
-      }
 
       // 6) HANDOFF (was 5)
       const handoff = await this.handoff(session, issue);
@@ -1898,7 +1914,12 @@ export class Orchestrator {
   }
 
   // ---- IMPLEMENT（仕様 §5.3） ----
-  private async implement(session: TaskSessionRow, issue: EligibleIssue, planBrief: PlanBrief | null = null): Promise<RunControl> {
+  private async implement(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+    planBrief: PlanBrief | null = null,
+    verifyReasons: string[] | null = null,
+  ): Promise<RunControl> {
     this.store.updateSession(session.id, { state: "implementing" });
     const digest = this.config.digest.enabled
       ? this.store.recentMergedSummaries(this.config.digest.recentMergedCount)
@@ -1932,11 +1953,16 @@ export class Orchestrator {
       },
       memoryBudgetChars: this.config.memory.injectBudgetChars,
     });
+    let finalPrompt = prompt;
+    if (verifyReasons !== null && verifyReasons.length > 0) {
+      finalPrompt += "\n\n# VERIFY Feedback (previous attempt failed)\n\nFix the following issues found during acceptance verification:\n\n" +
+        verifyReasons.map((r, i) => `${i + 1}. ${r}`).join("\n");
+    }
     let outcome: AgentOutcome;
     try {
       outcome = await this.agent.runSession({
         worktreePath,
-        prompt,
+        prompt: finalPrompt,
         maxCostUsd: this.config.safety.maxCostUsdPerSession,
         hardTimeoutMs: this.config.safety.sessionHardTimeoutMinutes * 60_000,
       });
@@ -2448,6 +2474,258 @@ export class Orchestrator {
     // All guards passed: finalize the log with the correct outcome.
     this.store.updateSelfReviewLog(logRow.id, { endedAt: this.clock(), outcome: reviewOutcome });
     return CONTINUE;
+  }
+
+  // ---- VERIFY — worktree cleanup helper (ES-491) ----
+  private async cleanupVerifierWorktree(
+    worktreePath: string,
+    branch: string,
+    postImplSha: string | null,
+  ): Promise<void> {
+    await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
+    if (postImplSha === null) return;
+    try {
+      const branchRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      if (branchRes.code === 0 && branchRes.stdout.trim() !== branch) {
+        const checkoutRes = await this.runner.run(
+          "git", ["-C", worktreePath, "checkout", branch],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        if (checkoutRes.code !== 0) {
+          this.log(`verify: cleanup checkout to ${branch} failed (exit ${checkoutRes.code})`);
+          return;
+        }
+      }
+      const resetRes = await this.runner.run(
+        "git", ["-C", worktreePath, "reset", "--hard", postImplSha],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      if (resetRes.code !== 0) {
+        this.log(`verify: cleanup reset to ${postImplSha} failed (exit ${resetRes.code})`);
+      }
+    } catch (err) {
+      this.log(`verify: cleanup failed: ${errMsg(err)}`);
+    }
+  }
+
+  // ---- VERIFY (ES-491) ----
+  private async verify(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+    planBrief: PlanBrief | null,
+  ): Promise<RunControl | { control: "continue"; verifyFailed: true; reasons: string[] }> {
+    const worktreePath = session.worktreePath as string;
+
+    let specContent: SpecContent | null = null;
+    const specDir = this.config.product.specDir;
+    if (specDir !== undefined && this.specLoader !== null) {
+      try {
+        specContent = this.specLoader(worktreePath, specDir);
+      } catch {
+        // non-fatal for verify
+      }
+    }
+
+    const freshSession = this.store.getSession(session.id);
+    const attempt = freshSession.verifyAttempts + 1;
+    const logRow = this.store.insertVerifyLog({
+      runId: this.runId,
+      sessionId: session.id,
+      attempt,
+      startedAt: this.clock(),
+    });
+
+    // Record post-IMPLEMENT SHA for worktree protection.
+    // ⚠️ This is the SHA AFTER implementation — NOT pre-work. We preserve
+    // implementation commits and only strip verifier pollution.
+    let postImplSha: string | null = null;
+    try {
+      const shaRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      if (shaRes.code === 0 && shaRes.stdout.trim()) {
+        postImplSha = shaRes.stdout.trim();
+      }
+    } catch {
+      // non-fatal
+    }
+
+    // ── Evidence collection (Claude verifyAgent) ──
+    const evidencePrompt = buildVerifyEvidencePrompt({
+      issue,
+      brief: planBrief,
+      specContent,
+      defaultBranch: this.config.repo.defaultBranch,
+      specDir: this.config.product.specDir,
+    });
+
+    let evidenceText: string;
+    let evidenceCostUsd = 0;
+    try {
+      const eo = await this.verifyAgent.runSession({
+        worktreePath,
+        prompt: evidencePrompt,
+        maxCostUsd: this.config.safety.maxCostUsdPerVerify,
+        hardTimeoutMs: this.config.safety.verifyTimeoutMinutes * 60_000,
+      });
+      evidenceCostUsd = eo.costUsd;
+
+      if (eo.kind === "interrupted") {
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error",
+          costUsd: evidenceCostUsd, errorDetail: "interrupted",
+        });
+        await this.haltForInterrupt();
+        return HALT;
+      }
+
+      if (eo.kind === "cost_exceeded" || eo.kind === "error") {
+        const errDetail = eo.kind === "error" ? eo.message : "cost exceeded";
+        this.log(`verify: evidence agent ${eo.kind} (fail-open): ${errDetail}`);
+        await this.cleanupVerifierWorktree(worktreePath, session.branch, postImplSha);
+        this.store.updateSession(session.id, { verifyAttempts: attempt });
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "passed",
+          costUsd: evidenceCostUsd, errorDetail: `fail-open: evidence ${errDetail}`,
+        });
+        return CONTINUE;
+      }
+
+      evidenceText = eo.fullResult ?? eo.summary;
+    } catch (err) {
+      this.log(`verify: evidence agent exception (fail-open): ${errMsg(err)}`);
+      await this.cleanupVerifierWorktree(worktreePath, session.branch, postImplSha);
+      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "passed",
+        costUsd: 0, errorDetail: `fail-open: evidence exception: ${errMsg(err)}`,
+      });
+      return CONTINUE;
+    }
+
+    // ── Worktree cleanup ──
+    await this.cleanupVerifierWorktree(worktreePath, session.branch, postImplSha);
+
+    // ── Judgment (Codex planner) ──
+    if (this.planner === null) {
+      this.log("verify: no planner configured (fail-open)");
+      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "passed",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd, errorDetail: "fail-open: no planner",
+      });
+      return CONTINUE;
+    }
+
+    const acceptance = planBrief?.sections?.acceptance ?? null;
+    let diff = "";
+    try {
+      const diffRes = await this.runner.run(
+        "git", ["-C", worktreePath, "diff", `origin/${this.config.repo.defaultBranch}...HEAD`],
+        { cwd: worktreePath, timeoutMs: 60_000 },
+      );
+      if (diffRes.code === 0) diff = diffRes.stdout;
+    } catch {
+      // non-fatal: judge will see empty diff
+    }
+
+    const judgmentPrompt = buildVerifyJudgmentPrompt({
+      acceptance,
+      diff: diff.slice(0, 100_000),
+      evidence: evidenceText.slice(0, 50_000),
+    });
+
+    let judgmentOutcome: PlanOutcome;
+    try {
+      judgmentOutcome = await this.planner.run({
+        worktreePath,
+        prompt: judgmentPrompt,
+        timeoutMs: this.config.safety.codexTimeoutMinutes * 60_000,
+        model: this.config.pm?.model,
+        effort: this.config.pm?.effort.verify,
+      });
+    } catch (err) {
+      this.log(`verify: judge exception (fail-open): ${errMsg(err)}`);
+      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "passed",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd,
+        errorDetail: `fail-open: judge exception: ${errMsg(err)}`,
+      });
+      return CONTINUE;
+    }
+
+    if (judgmentOutcome.kind === "interrupted") {
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "error",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd, errorDetail: "interrupted",
+      });
+      await this.haltForInterrupt();
+      return HALT;
+    }
+
+    if (judgmentOutcome.kind === "error") {
+      this.log(`verify: judge error (fail-open): ${judgmentOutcome.message}`);
+      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "passed",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd,
+        errorDetail: `fail-open: judge error: ${judgmentOutcome.message}`,
+      });
+      return CONTINUE;
+    }
+
+    // ── Parse verdict ──
+    const parsed = parseVerifyOutput(judgmentOutcome.text);
+
+    if (parsed.kind === "parse_error") {
+      this.log("verify: parse error (fail-open)");
+      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "passed",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd,
+        errorDetail: `fail-open: parse error: ${parsed.raw.slice(0, 200)}`,
+      });
+      return CONTINUE;
+    }
+
+    const { verdict, reasons } = parsed.value;
+    this.store.updateVerifyLog(logRow.id, {
+      endedAt: this.clock(),
+      verdict,
+      reasonCount: reasons.length,
+      evidence: evidenceText.slice(0, 50_000),
+      outcome: verdict === "pass" ? "passed" : "failed",
+      costUsd: evidenceCostUsd,
+    });
+    this.store.updateSession(session.id, { verifyAttempts: attempt });
+
+    this.log(`verify: attempt ${attempt} → ${verdict}${reasons.length > 0 ? `: ${reasons.join("; ")}` : ""}`);
+
+    if (verdict === "pass") {
+      return CONTINUE;
+    }
+
+    // Fail: check attempt cap
+    if (attempt >= this.config.safety.maxVerifyAttempts) {
+      this.log(`verify: max attempts (${this.config.safety.maxVerifyAttempts}) reached`);
+      return await this.stopSession(
+        session,
+        "verify_failed",
+        `verify failed after ${attempt} attempts: ${reasons.join("; ")}`,
+      );
+    }
+
+    return { control: "continue", verifyFailed: true, reasons };
   }
 
   // ---- HANDOFF（仕様 §5.4） ----
