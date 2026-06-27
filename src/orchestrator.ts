@@ -3454,11 +3454,11 @@ export class Orchestrator {
         };
         const result = await executeAbandon(this.recoveryTurn, freshAbandon, onAbandonStarting);
         if (result.kind === "continued") {
-          this.store.updateSession(session.id, { recoveryAction: "abandon" });
           this.store.updateSession(session.id, {
+            recoveryAction: "abandon",
             state: "stopped",
             failureReason: reason,
-            stopDetail: detail,
+            stopDetail: effectiveDetail,
             endedAt: this.clock(),
             ...patch,
           });
