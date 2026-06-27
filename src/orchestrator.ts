@@ -788,7 +788,7 @@ export class Orchestrator {
       try {
         eligible = await this.source.getAllEligible([
           ...this.store.activeIssueIds(),
-          ...this.store.excludedIssueIds(this.runId),
+          ...this.store.excludedIssueIds(),
         ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
@@ -3158,6 +3158,19 @@ export class Orchestrator {
         policy = "recover";
       }
     }
+    // Override: handoff_failed with handoff_transition_pending sentinel → recover
+    // handoff_failed is normally halt, but pre-ES-490 sessions may have a
+    // handoff_transition_pending: marker meaning the recovery action already succeeded
+    // (label added, restart-review posted) and only the Linear in_review transition
+    // remains. Allow recovery to consume the sentinel and retry the transition rather
+    // than halting every daemon start (ES-490 Finding 1).
+    if (reason === "handoff_failed") {
+      const freshForHandoff = this.store.getSession(session.id);
+      if (freshForHandoff.stopDetail !== null &&
+          freshForHandoff.stopDetail.startsWith("handoff_transition_pending:")) {
+        policy = "recover";
+      }
+    }
     // --- workflow_setup_failed cost exhaustion marker (pre-existing) ---
     const isWorkflowCostExhaustion =
       reason === "workflow_setup_failed" &&
@@ -3265,6 +3278,32 @@ export class Orchestrator {
           this.store.updateSession(session.id, { recoveryAction: result.action });
         }
         if (result.kind === "recovered") {
+          // For handoff_failed: the recovery action (label add + restart-review comment)
+          // already completed in a prior attempt. Now retry the Linear in_review transition
+          // that originally failed. If it still fails, re-encode the sentinel so the next
+          // daemon start retries via stoppedSessionsWithFailedRecovery without halting now
+          // (ES-490 Finding 1).
+          if (reason === "handoff_failed") {
+            let handoffTransitionErr: string | null = null;
+            try {
+              await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
+            } catch (err) {
+              handoffTransitionErr = errMsg(err);
+            }
+            if (handoffTransitionErr !== null) {
+              effectiveDetail = `handoff_transition_pending:${result.action}`;
+              effectiveDetail = `${effectiveDetail} (recovery failed: ${handoffTransitionErr})`;
+              this.store.updateSession(session.id, {
+                state: "stopped",
+                failureReason: reason,
+                stopDetail: effectiveDetail,
+                endedAt: this.clock(),
+                ...patch,
+              });
+              this.log(`${session.linearIdentifier} handoff in_review transition still failing: ${effectiveDetail}`);
+              return CONTINUE;
+            }
+          }
           const recoveryCost = result.costUsd;
           const refreshed = this.store.getSession(session.id);
           // recoveryAttempted is included here (not in the earlier gate) so a crash between
@@ -3447,7 +3486,9 @@ export class Orchestrator {
         const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
         await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
         this.log(skipDetail);
-        if (todoRevertErr !== null && opts.haltIfRevertFailed) {
+        if (todoRevertErr !== null) {
+          // Ticket is stuck In Progress with no active session — halt so operators can
+          // intervene rather than leaving orphaned work invisible to SELECT (ES-490 Finding 2).
           await this.notifier.notify({ kind: "halted", reason, detail: skipDetail });
           await this.commitMemoryBeforeHalt();
           this.store.setRunState(this.runId, "halted", skipDetail);

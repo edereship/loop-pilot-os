@@ -864,7 +864,7 @@ describe("excludedIssueIds (ES-490)", () => {
       now: "2026-01-01T00:00:03.000Z",
     });
 
-    const excluded = store.excludedIssueIds(run.id);
+    const excluded = store.excludedIssueIds();
     expect(excluded).toContain("issue-A");
     expect(excluded).toContain("issue-B");
     expect(excluded).not.toContain("issue-C");
@@ -881,17 +881,17 @@ describe("excludedIssueIds (ES-490)", () => {
     // Both recovery_action='abandon' AND failure_reason='design_rejected'
     store.updateSession(s1.id, { state: "stopped", failureReason: "design_rejected", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    const excluded = store.excludedIssueIds(run.id);
+    const excluded = store.excludedIssueIds();
     expect(excluded).toEqual(["issue-A"]);
   });
 
   it("returns empty array when no excluded sessions", () => {
     const store = newStore();
-    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
-    expect(store.excludedIssueIds(run.id)).toEqual([]);
+    store.createRun(3, "2026-01-01T00:00:00.000Z");
+    expect(store.excludedIssueIds()).toEqual([]);
   });
 
-  it("excludes sessions from a different run", () => {
+  it("excludes abandoned sessions across daemon restarts (ES-490 Finding 3)", () => {
     const store = newStore();
     const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s = store.createSession({
@@ -901,8 +901,10 @@ describe("excludedIssueIds (ES-490)", () => {
     });
     store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
-    expect(store.excludedIssueIds(run2.id)).not.toContain("issue-A");
+    // run_id is no longer part of the exclusion filter — abandoned sessions are permanently
+    // excluded until a human changes the ticket state in Linear (ES-490 Finding 3).
+    store.createRun(3, "2026-01-02T00:00:00.000Z");
+    expect(store.excludedIssueIds()).toContain("issue-A");
   });
 });
 

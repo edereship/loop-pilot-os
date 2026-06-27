@@ -825,14 +825,14 @@ export class SqliteStore {
     return rows.map((r) => r.id);
   }
 
-  excludedIssueIds(runId: number): string[] {
+  excludedIssueIds(): string[] {
     const rows = this.db
       .prepare(
         `SELECT DISTINCT linear_issue_id AS id FROM task_session
-         WHERE state = 'stopped' AND run_id = ?
+         WHERE state = 'stopped'
            AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')`,
       )
-      .all(runId) as Array<{ id: string }>;
+      .all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }
 
