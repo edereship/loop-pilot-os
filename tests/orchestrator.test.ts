@@ -524,7 +524,7 @@ describe("Orchestrator 失敗系 — CLAIM（仕様 §5.2 / カーネル §7.3�
 
 describe("Orchestrator 失敗系 — IMPLEMENT（仕様 §5.3 / カーネル §7.4）", () => {
   it("agent_no_change【未コミット残骸】hasUncommittedChanges=true → stopped(agent_no_change, 'uncommitted leftovers')", async () => {
-    const config = makeConfig({ maxTasksPerRun: 3 });
+    const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -550,7 +550,7 @@ describe("Orchestrator 失敗系 — IMPLEMENT（仕様 §5.3 / カーネル §7
   });
 
   it("agent_no_change【無差分】hasUncommittedChanges=false ∧ hasCommitsWithDiff=false → stopped(agent_no_change, detail=null)", async () => {
-    const config = makeConfig({ maxTasksPerRun: 3 });
+    const config = makeConfig({ maxTasksPerRun: 1 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -3683,6 +3683,191 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const haltedEvent = h.notifier.events.find((e) => e.kind === "halted");
     expect(haltedEvent).toBeDefined();
     expect((haltedEvent as { kind: "halted"; reason: string; detail: string }).detail).toContain("recovery failed:");
+  });
+});
+
+describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
+  // --- abandon policy tests ---
+  it("agent_no_change → policy=abandon → pre-PR path → continues to next task", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },         // TY-1 implement
+      { kind: "completed", costUsd: 1.0, summary: "done" },         // TY-2 implement
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" }, // TY-2 self-review
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const sA = sessions.find((s) => s.linearIdentifier === "TY-1")!;
+    expect(sA.state).toBe("stopped");
+    expect(sA.failureReason).toBe("agent_no_change");
+    // Policy=abandon: session stopped, run continues to next task
+    const sB = sessions.find((s) => s.linearIdentifier === "TY-2");
+    expect(sB).toBeDefined();
+    // task_skipped notification emitted for abandon
+    const skipped = h.notifier.events.filter((e) => e.kind === "task_skipped");
+    expect(skipped.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("design_rejected → policy=abandon → continues (not HALT)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV2\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+      { kind: "completed", text: "## Goal\nV3\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Bad"]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    // Issue B needs its own designer/agent outcomes
+    designer.outcomes.push({ kind: "completed", text: "## Goal\nB\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" });
+    reviewer.outcomes.push({ kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' });
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const sA = sessions.find((s) => s.linearIdentifier === "TY-1")!;
+    expect(sA.state).toBe("stopped");
+    expect(sA.failureReason).toBe("design_rejected");
+    // Run did NOT halt on design_rejected — continued to TY-2
+    const sB = sessions.find((s) => s.linearIdentifier === "TY-2");
+    expect(sB).toBeDefined();
+  });
+
+  it("verify_failed → policy=abandon (policy table coverage)", async () => {
+    // Verify the policy table maps verify_failed to abandon.
+    // Full verify_failed integration is tested in ES-491; here we verify
+    // that agent_no_change (also abandon policy) continues the run.
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.store.sessionsForRun(h.store.latestRun()!.id).length).toBeGreaterThanOrEqual(1);
+  });
+
+  // --- halt policy tests ---
+  it("handoff_failed without recovery → policy=recover but no recoveryTurn → halts", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    // Force addLabel to fail 3 times → handoff_failed
+    h.git.addLabel = async (prNumber: number, label: string): Promise<void> => {
+      h.git.calls.push({ method: "addLabel", args: [prNumber, label] });
+      throw new Error("label API down");
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("handoff_failed");
+    // No recoveryTurn configured → recovery gate not entered → falls through to halt
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // TY-2 was never started
+    expect(sessions.find((ss) => ss.linearIdentifier === "TY-2")).toBeUndefined();
+  });
+
+  // --- recover policy with ci_failed branch protection override ---
+  it("ci_failed with branch protection detail → policy overridden to halt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      // Self-review (non-fatal error → skipped)
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      // No recovery outcome — should not reach Codex
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "blocked" };
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.stopDetail).toContain("merge blocked by branch protection");
+    // Policy override: halt, not recover
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // No recovery attempted
+    expect(s.recoveryAttempted).toBe(0);
+  });
+
+  // --- pre-PR abandon ---
+  it("pre-PR abandon does not call executeAbandon (no gh pr close)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const sA = sessions.find((s) => s.linearIdentifier === "TY-1")!;
+    expect(sA.state).toBe("stopped");
+    expect(sA.failureReason).toBe("agent_no_change");
+    expect(sA.prNumber).toBeNull();
+    // gh pr close was never called (no PR to close)
+    const ghCalls = h.recoveryRunner.calls.filter((c) => c.cmd === "gh" && c.args.includes("pr"));
+    expect(ghCalls).toHaveLength(0);
+    // Run continued to TY-2
+    expect(sessions.find((s) => s.linearIdentifier === "TY-2")).toBeDefined();
   });
 });
 

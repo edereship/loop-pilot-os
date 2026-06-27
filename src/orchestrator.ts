@@ -24,14 +24,14 @@ import type {
   GroomAction,
   BoardState,
 } from "./types.js";
-import { classifyStopReason } from "./stop-reason.js";
+import { classifyStopReason, FAILURE_POLICY } from "./stop-reason.js";
 import { buildPlanPrompt, parseBrief } from "./plan-brief.js";
 import { parseDesignReviewOutput } from "./design-review-parser.js";
 import { buildDesignReviewPrompt } from "./design-review-prompt.js";
 import { buildSelfReviewPrompt } from "./self-review-prompt.js";
 import { parseSelfReviewOutput } from "./self-review-parser.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
-import { executeRecoveryTurn } from "./recovery-turn.js";
+import { executeRecoveryTurn, executeAbandon } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
@@ -972,11 +972,15 @@ export class Orchestrator {
       // 5) IMPLEMENT (was 4)
       const impl = await this.implement(session, issue, planBrief);
       if (impl.control === "halt") return;
+      // Policy-driven abandon: session stopped, skip remaining phases (ES-490)
+      if (this.store.getSession(session.id).state === "stopped") continue;
 
       // 5.5) SELF-REVIEW (ES-473)
       if (this.config.selfReview.enabled) {
         const sr = await this.selfReview(session, issue, planBrief);
         if (sr.control === "halt") return;
+        // Policy-driven abandon: session stopped, skip remaining phases (ES-490)
+        if (this.store.getSession(session.id).state === "stopped") continue;
       }
 
       // Safe point: honor a stop request that arrived before or during self-review.
@@ -3152,14 +3156,26 @@ export class Orchestrator {
     let patch = extraPatch;
     // Effective stop detail — may be augmented with recovery failure message (Finding 3).
     let effectiveDetail = detail;
-    // --- Recovery gate (ES-450) ---
-    // pr_closed is terminal — the PR is gone, so fix_code/rebase/restart_review would
-    // post comments or push to a closed PR then flip the session back to in_review where
-    // it will not be monitored again. Only escalate/abandon apply, and retrying them on
-    // every daemon start is not useful. Skip recovery entirely for this reason.
-    // workflow_setup_failed with "fix agent exceeded cost limit" detail is also terminal:
-    // AgentWorkflowRecovery already hit the cost cap, so another fix agent would exceed it
-    // again immediately. Treat this the same as cost_exceeded (ES-450 Finding 1).
+    // --- Resolve effective policy (ES-490) ---
+    let policy = FAILURE_POLICY[reason];
+    // Override: ci_failed with branch protection detail → halt (spec D-10)
+    if (reason === "ci_failed" && detail !== null && detail.startsWith("merge blocked by branch protection")) {
+      policy = "halt";
+    }
+    // Override: pr_closed with partial abandon markers → recover
+    // pr_closed is normally terminal (no PR to push to), but a partial abandon
+    // (crash mid-abandon or failed cleanup) left the ticket dirty — recovery
+    // can complete the cleanup (ES-450 Finding 4).
+    if (reason === "pr_closed") {
+      const freshForOverride = this.store.getSession(session.id);
+      if ((freshForOverride.stopDetail !== null && freshForOverride.stopDetail.startsWith("abandon_in_progress")) ||
+          (freshForOverride.stopDetail !== null &&
+           (freshForOverride.stopDetail.startsWith("recovery failed: ") ||
+            freshForOverride.stopDetail.includes(" (recovery failed: ")))) {
+        policy = "recover";
+      }
+    }
+    // --- workflow_setup_failed cost exhaustion marker (pre-existing) ---
     const isWorkflowCostExhaustion =
       reason === "workflow_setup_failed" &&
       detail !== null &&
@@ -3169,7 +3185,7 @@ export class Orchestrator {
     if (isWorkflowCostExhaustion) {
       this.store.updateSession(session.id, { recoveryAttempted: 1 });
     }
-    if (reason !== "cost_exceeded" && !isWorkflowCostExhaustion && this.recoveryTurn !== null && this.planner !== null) {
+    if (policy === "recover" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
       // pr_closed is normally terminal (no PR to push to / restart). Exception: a partial
       // abandon (crash mid-abandon with stopDetail="abandon_in_progress") left the ticket
@@ -3421,7 +3437,76 @@ export class Orchestrator {
         // escalated / failed → fall through to normal stop
       }
     }
-    // --- Original stop logic (unchanged) ---
+    // --- Policy: "abandon" (ES-490) ---
+    if (policy === "abandon") {
+      const freshAbandon = this.store.getSession(session.id);
+      if (freshAbandon.prNumber !== null && this.recoveryTurn !== null) {
+        // Post-PR abandon: use executeAbandon (closes PR, deletes branch, reverts ticket)
+        const capturedDetail = effectiveDetail;
+        const onAbandonStarting = () => {
+          const inner = extractInnerStopDetail(capturedDetail ?? "");
+          const isExhausted =
+            inner.startsWith("auto-restart limit exceeded") ||
+            inner.startsWith("quota retry limit exceeded");
+          this.store.updateSession(session.id, {
+            stopDetail: isExhausted ? `abandon_in_progress:${inner}` : "abandon_in_progress",
+          });
+        };
+        const result = await executeAbandon(this.recoveryTurn, freshAbandon, onAbandonStarting);
+        if (result.kind === "continued") {
+          this.store.updateSession(session.id, { recoveryAction: "abandon" });
+          this.store.updateSession(session.id, {
+            state: "stopped",
+            failureReason: reason,
+            stopDetail: detail,
+            endedAt: this.clock(),
+            ...patch,
+          });
+          const skipDetail = `${session.linearIdentifier} stopped (${reason})${detail ? `: ${detail}` : ""}`;
+          await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
+          this.log(skipDetail);
+          return CONTINUE;
+        }
+        // executeAbandon failed — fall through to halt with failure info
+        if (result.kind === "failed" && result.message) {
+          effectiveDetail = effectiveDetail
+            ? `${effectiveDetail} (abandon failed: ${result.message})`
+            : `abandon failed: ${result.message}`;
+        }
+        // Fall through to halt (abandon cleanup failed)
+      } else {
+        // Pre-PR abandon: discard worktree + revert ticket to Todo
+        if (session.worktreePath) {
+          await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+        }
+        let todoRevertErr: string | null = null;
+        try {
+          await this.source.transition(session.linearIssueId, "todo");
+        } catch (err) {
+          todoRevertErr = errMsg(err);
+          this.log(`policy-abandon: todo revert failed (ticket may be stuck): ${todoRevertErr}`);
+        }
+        this.store.updateSession(session.id, {
+          state: "stopped",
+          failureReason: reason,
+          stopDetail: effectiveDetail,
+          endedAt: this.clock(),
+          recoveryAction: "abandon",
+          ...patch,
+        });
+        const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+        await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
+        this.log(skipDetail);
+        if (todoRevertErr !== null && opts.haltIfRevertFailed) {
+          await this.notifier.notify({ kind: "halted", reason, detail: skipDetail });
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", skipDetail);
+          return HALT;
+        }
+        return CONTINUE;
+      }
+    }
+    // --- Policy: "halt" (default fall-through) ---
     this.store.updateSession(session.id, {
       state: "stopped",
       failureReason: reason,
@@ -3430,24 +3515,6 @@ export class Orchestrator {
       ...patch,
     });
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
-
-    // design_rejected is a ticket-level issue — one ticket's design couldn't
-    // satisfy the reviewer after max attempts. Continue to the next task.
-    // Exception: if the todo revert failed, the ticket is stuck In Progress and
-    // knownIssueIds() will prevent startup orphan recovery from fixing it — halt
-    // so operators can intervene rather than continuing with a stuck ticket (ES-458).
-    if (reason === "design_rejected") {
-      await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: haltDetail });
-      this.log(haltDetail);
-      if (opts.haltIfRevertFailed) {
-        await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
-        await this.commitMemoryBeforeHalt();
-        this.store.setRunState(this.runId, "halted", haltDetail);
-        return HALT;
-      }
-      return CONTINUE;
-    }
-
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     await this.commitMemoryBeforeHalt();
     this.store.setRunState(this.runId, "halted", haltDetail);
