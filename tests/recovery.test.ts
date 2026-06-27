@@ -637,7 +637,10 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     // When the last self-review log has outcome "error" (nonfatal: cost cap, agent
     // exception, parse error, or interrupted), recovery must resume HANDOFF — exactly
     // as the main flow does (it returns CONTINUE for all these cases).
+    // verify is disabled here because this test focuses on self-review recovery; the
+    // verify gate is covered separately in the VERIFY describe block (ES-491).
     const config = makeConfig({ maxTasksPerRun: 3 });
+    (config as { verify: { enabled: boolean; runRecipe: string } }).verify.enabled = false;
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
       h.store,
@@ -674,8 +677,11 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
 
   it("implementing + no PR + clean commits + selfReview.disabled → skips self-review, resumes HANDOFF (ES-473 Finding 1)", async () => {
     // When selfReview is disabled, recovery can safely proceed to HANDOFF.
+    // verify is also disabled because this test focuses on selfReview.disabled recovery;
+    // the verify gate is covered separately in the VERIFY describe block (ES-491).
     const config = makeConfig({ maxTasksPerRun: 3 });
     (config as { selfReview: { enabled: boolean } }).selfReview.enabled = false;
+    (config as { verify: { enabled: boolean; runRecipe: string } }).verify.enabled = false;
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
       h.store,

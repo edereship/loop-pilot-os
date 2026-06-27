@@ -516,6 +516,29 @@ export class Orchestrator {
             // errorDetail (fatal guard paths that called stopSession() — branch wrong before/after
             // review, SHA unreadable, uncommitted changes, no diff remaining, etc.).
             this.log(`recovery: self-review completed (${lastSrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
+            // ── VERIFY gate check (ES-491) ──
+            if (this.config.verify.enabled) {
+              const vrLogs = this.store.getVerifyLogsForSession(session.id);
+              const lastVrLog = vrLogs.at(-1);
+              if (lastVrLog?.outcome === "passed") {
+                this.log(`recovery: verify completed (${lastVrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
+                // fall through to HANDOFF
+              } else if (
+                lastVrLog?.outcome === "error" &&
+                lastVrLog.errorDetail != null &&
+                lastVrLog.errorDetail !== "interrupted"
+              ) {
+                this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
+                // fall through to HANDOFF
+              } else {
+                const verifyHaltDetail =
+                  `crash recovery: verify required but not completed; ` +
+                  `manual review needed: ` +
+                  `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+                this.log(`recovery: halting — verify gate incomplete (${session.linearIdentifier})`);
+                return await this.stopSession(session, "exception", verifyHaltDetail);
+              }
+            }
             const recoveredIssue: EligibleIssue = {
               id: session.linearIssueId,
               identifier: session.linearIdentifier,
@@ -541,6 +564,29 @@ export class Orchestrator {
         }
         // Clean committed work, no open PR: resume from HANDOFF.
         // Self-review is disabled, so proceed directly.
+        // ── VERIFY gate check (ES-491) ──
+        if (this.config.verify.enabled) {
+          const vrLogs = this.store.getVerifyLogsForSession(session.id);
+          const lastVrLog = vrLogs.at(-1);
+          if (lastVrLog?.outcome === "passed") {
+            this.log(`recovery: verify completed (${lastVrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
+            // fall through to HANDOFF
+          } else if (
+            lastVrLog?.outcome === "error" &&
+            lastVrLog.errorDetail != null &&
+            lastVrLog.errorDetail !== "interrupted"
+          ) {
+            this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
+            // fall through to HANDOFF
+          } else {
+            const verifyHaltDetail =
+              `crash recovery: verify required but not completed; ` +
+              `manual review needed: ` +
+              `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+            this.log(`recovery: halting — verify gate incomplete (${session.linearIdentifier})`);
+            return await this.stopSession(session, "exception", verifyHaltDetail);
+          }
+        }
         const recoveredIssue: EligibleIssue = {
           id: session.linearIssueId,
           identifier: session.linearIdentifier,

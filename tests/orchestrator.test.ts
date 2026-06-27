@@ -6275,4 +6275,103 @@ describe("VERIFY (ES-491)", () => {
     const ty2 = sessions.find(s => s.linearIdentifier === "TY-2")!;
     expect(ty2.state).toBe("merged");
   });
+
+  it("worktree protection resets to post-IMPLEMENT SHA (preserves impl commits)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    // Provide a real SHA for the post-IMPLEMENT capture: git -C /wt/ty-1 rev-parse HEAD.
+    // The default [-C] handler returns "" for this variant, so we register a more specific stub.
+    h.memoryRunner.on(["git", "-C", "/wt/ty-1", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "evidence collected" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // cleanupVerifierWorktree must have called git reset --hard <postImplSha>.
+    // Calls are { cmd, args, opts }; the reset is: git -C /wt/ty-1 reset --hard abc1234.
+    const resetCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "git" && c.args.includes("reset") && c.args.includes("--hard"),
+    );
+    expect(resetCalls.length).toBeGreaterThanOrEqual(1);
+    const resetWithSha = resetCalls.find(c => c.args.includes("abc1234"));
+    expect(resetWithSha).toBeDefined();
+  });
+
+  it("crash recovery: verify passed → resumes HANDOFF", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner });
+
+    // Simulate a prior run that crashed after VERIFY passed but before HANDOFF.
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing" });
+    // Self-review passed.
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    // Verify passed.
+    h.store.insertVerifyLog({ runId: priorRun.id, sessionId: session.id, attempt: 1, startedAt: "2026-06-05T00:01:00.000Z" });
+    const vrLogs = h.store.getVerifyLogsForSession(session.id);
+    h.store.updateVerifyLog(vrLogs[0].id, { endedAt: "2026-06-05T00:02:00.000Z", outcome: "passed", verdict: "pass" });
+
+    // FakeGitPr defaults: hasCommitsWithDiff → true, hasUncommittedChanges → false.
+    // Crash recovery path requires commits and a clean worktree to resume HANDOFF.
+
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Recovery must have handed off: pushAndOpenPr should have been called.
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
+  });
+
+  it("crash recovery: verify not completed → halt", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner });
+
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing" });
+    // Self-review passed but NO verify_log entries — crashed before VERIFY started.
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+
+    await h.orch.run();
+
+    expect(h.logs.some(l => l.includes("verify gate incomplete"))).toBe(true);
+  });
 });
