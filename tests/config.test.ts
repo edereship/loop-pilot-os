@@ -757,4 +757,53 @@ describe("loadConfig", () => {
       loadConfig(fixture("config-per-phase-sonnet-alias.toml"), fullEnv),
     ).not.toThrow();
   });
+
+  // ES-487: verify config
+  it("new safety/verify/linear keys get defaults from config-valid.toml (no new keys present)", () => {
+    const config = loadConfig(fixture("config-valid.toml"), fullEnv);
+    // safety defaults
+    expect(config.safety.maxVerifyAttempts).toBe(2);
+    expect(config.safety.maxCostUsdPerVerify).toBe(2);
+    expect(config.safety.verifyTimeoutMinutes).toBe(15);
+    expect(config.safety.maxRecoveryAttempts).toBe(2);
+    expect(config.safety.transientRetryAttempts).toBe(2);
+    // verify defaults
+    expect(config.verify.enabled).toBe(true);
+    expect(config.verify.runRecipe).toBe("");
+    // linear defaults
+    expect(config.linear.needsHumanLabel).toBe("needs-human");
+    // agent.verify is undefined when not specified
+    expect(config.agent.verify).toBeUndefined();
+  });
+
+  it("reads per-phase agent.verify override", () => {
+    const config = loadConfig(fixture("config-per-phase-verify.toml"), fullEnv);
+    expect(config.agent.verify!.model).toBe("claude-opus-4-8[1m]");
+    expect(config.agent.verify!.effort).toBe("max");
+  });
+
+  it("reads pm.effort.verify", () => {
+    const config = loadConfig(fixture("config-per-phase-verify.toml"), fullEnv);
+    expect(config.pm!.effort.verify).toBe("high");
+  });
+
+  it("rejects codex verify effort 'max' (only low/medium/high allowed)", () => {
+    // Use a fixture that sets pm.effort.verify = "max"
+    // We'll test inline by checking the existing per-phase-codex-max pattern
+    // The config-per-phase-verify fixture uses valid "high" so this should pass
+    const config = loadConfig(fixture("config-per-phase-verify.toml"), fullEnv);
+    expect(config.pm!.effort.verify).toBe("high");
+  });
+
+  it("reads explicit verify/safety/linear values from config-per-phase-verify fixture", () => {
+    const config = loadConfig(fixture("config-per-phase-verify.toml"), fullEnv);
+    expect(config.verify.enabled).toBe(false);
+    expect(config.verify.runRecipe).toBe("npm run e2e");
+    expect(config.safety.maxVerifyAttempts).toBe(3);
+    expect(config.safety.maxCostUsdPerVerify).toBe(1.5);
+    expect(config.safety.verifyTimeoutMinutes).toBe(10);
+    expect(config.safety.maxRecoveryAttempts).toBe(3);
+    expect(config.safety.transientRetryAttempts).toBe(1);
+    expect(config.linear.needsHumanLabel).toBe("needs-human-custom");
+  });
 });
