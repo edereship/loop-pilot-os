@@ -1428,6 +1428,8 @@ describe("verify_log CRUD (ES-487)", () => {
     expect(log.outcome).toBeNull();
     expect(log.costUsd).toBeNull();
     expect(log.errorDetail).toBeNull();
+    expect(log.startedAt).toBe("2026-06-27T00:01:00Z");
+    expect(log.endedAt).toBeNull();
   });
 
   it("updateVerifyLog updates fields", () => {
@@ -1455,6 +1457,7 @@ describe("verify_log CRUD (ES-487)", () => {
       evidence: '{"build":"fail","test":"pass"}',
       outcome: "failed",
       costUsd: 1.5,
+      errorDetail: "verifier timed out",
     });
     const updated = store.getVerifyLog(log.id);
     expect(updated.endedAt).toBe("2026-06-27T00:02:00Z");
@@ -1463,6 +1466,7 @@ describe("verify_log CRUD (ES-487)", () => {
     expect(updated.evidence).toBe('{"build":"fail","test":"pass"}');
     expect(updated.outcome).toBe("failed");
     expect(updated.costUsd).toBe(1.5);
+    expect(updated.errorDetail).toBe("verifier timed out");
   });
 
   it("getVerifyLogsForSession returns logs ordered by id", () => {

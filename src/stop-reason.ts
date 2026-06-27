@@ -16,7 +16,7 @@ export const FAILURE_POLICY = {
   ci_failed: "recover",
   merge_conflict: "recover",
   looppilot_stopped: "recover",
-} satisfies Record<FailureReason, FailurePolicy>;
+} as const satisfies Record<FailureReason, FailurePolicy>;
 
 export type StopReasonCategory =
   | "auto_restart"
