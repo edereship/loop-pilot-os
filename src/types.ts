@@ -24,7 +24,8 @@ export type FailureReason =
   | "claim_failed"
   | "handoff_failed"
   | "workflow_setup_failed"
-  | "design_rejected";
+  | "design_rejected"
+  | "verify_failed";
 
 // ---- ドメイン ----
 export interface EligibleIssue {
@@ -79,6 +80,8 @@ export interface TaskSessionRow {
   doneTransitionPending: number; // 0 or 1 — whether transition(done) is still pending (ES-462)
   designReviewAttempts: number; // number of DESIGN REVIEW turns attempted for this session (ES-477)
   selfReviewCostUsd: number | null; // cost of the self-review turn (ES-473)
+  verifyAttempts: number;          // number of VERIFY attempts for this session (ES-487)
+  recoveryTurnAttempts: number;    // durable counter for ci_failed/merge_conflict recovery turns (ES-487)
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -330,6 +333,29 @@ export interface SelfReviewLogRow {
   issueCount: number;
   summary: string | null;
   outcome: SelfReviewOutcome | null;
+  costUsd: number | null;
+  errorDetail: string | null;
+}
+
+// ---- VERIFY (ES-487) ----
+export interface VerifyVerdict {
+  verdict: "pass" | "fail";
+  reasons: string[];
+}
+
+export type VerifyOutcome = "passed" | "failed" | "error";
+
+export interface VerifyLogRow {
+  id: number;
+  runId: number;
+  sessionId: number;
+  attempt: number;
+  startedAt: string;
+  endedAt: string | null;
+  verdict: "pass" | "fail" | null;
+  reasonCount: number;
+  evidence: string | null;
+  outcome: VerifyOutcome | null;
   costUsd: number | null;
   errorDetail: string | null;
 }

@@ -12,6 +12,8 @@ import type {
   DesignReviewOutcome,
   SelfReviewLogRow,
   SelfReviewOutcome,
+  VerifyLogRow,
+  VerifyOutcome,
 } from "./types.js";
 
 // ---- カーネル §4 のスキーマ（一字一句） ----
@@ -103,6 +105,20 @@ CREATE TABLE IF NOT EXISTS self_review_log (
   cost_usd REAL,
   error_detail TEXT
 );
+CREATE TABLE IF NOT EXISTS verify_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES run(id),
+  session_id INTEGER NOT NULL REFERENCES task_session(id),
+  attempt INTEGER NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  verdict TEXT CHECK (verdict IN ('pass','fail')),
+  reason_count INTEGER NOT NULL DEFAULT 0,
+  evidence TEXT,
+  outcome TEXT CHECK (outcome IN ('passed','failed','error')),
+  cost_usd REAL,
+  error_detail TEXT
+);
 CREATE TABLE IF NOT EXISTS run_lock (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   pid INTEGER NOT NULL,
@@ -170,6 +186,8 @@ interface RawSessionRow {
   done_transition_pending: number;
   design_review_attempts: number;
   self_review_cost_usd: number | null;
+  verify_attempts: number;
+  recovery_turn_attempts: number;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -202,6 +220,8 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     doneTransitionPending: r.done_transition_pending,
     designReviewAttempts: r.design_review_attempts,
     selfReviewCostUsd: r.self_review_cost_usd,
+    verifyAttempts: r.verify_attempts,
+    recoveryTurnAttempts: r.recovery_turn_attempts,
   };
 }
 
@@ -292,6 +312,37 @@ function toSelfReviewLogRow(r: RawSelfReviewLogRow): SelfReviewLogRow {
   };
 }
 
+interface RawVerifyLogRow {
+  id: number;
+  run_id: number;
+  session_id: number;
+  attempt: number;
+  started_at: string;
+  ended_at: string | null;
+  verdict: string | null;
+  reason_count: number;
+  evidence: string | null;
+  outcome: string | null;
+  cost_usd: number | null;
+  error_detail: string | null;
+}
+function toVerifyLogRow(r: RawVerifyLogRow): VerifyLogRow {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    sessionId: r.session_id,
+    attempt: r.attempt,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    verdict: r.verdict as "pass" | "fail" | null,
+    reasonCount: r.reason_count,
+    evidence: r.evidence,
+    outcome: r.outcome as VerifyOutcome | null,
+    costUsd: r.cost_usd,
+    errorDetail: r.error_detail,
+  };
+}
+
 // ---- patch キー → DB 列名の対応（部分更新の SET 句生成に使う） ----
 const GROOM_LOG_PATCH_COLUMNS: Record<string, string> = {
   endedAt: "ended_at",
@@ -327,6 +378,8 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   doneTransitionPending: "done_transition_pending",
   designReviewAttempts: "design_review_attempts",
   selfReviewCostUsd: "self_review_cost_usd",
+  verifyAttempts: "verify_attempts",
+  recoveryTurnAttempts: "recovery_turn_attempts",
 };
 const DESIGN_REVIEW_LOG_PATCH_COLUMNS: Record<string, string> = {
   endedAt: "ended_at",
@@ -340,6 +393,15 @@ const SELF_REVIEW_LOG_PATCH_COLUMNS: Record<string, string> = {
   verdict: "verdict",
   issueCount: "issue_count",
   summary: "summary",
+  outcome: "outcome",
+  costUsd: "cost_usd",
+  errorDetail: "error_detail",
+};
+const VERIFY_LOG_PATCH_COLUMNS: Record<string, string> = {
+  endedAt: "ended_at",
+  verdict: "verdict",
+  reasonCount: "reason_count",
+  evidence: "evidence",
   outcome: "outcome",
   costUsd: "cost_usd",
   errorDetail: "error_detail",
@@ -440,6 +502,16 @@ export class SqliteStore {
     if (!columns.has("self_review_cost_usd")) {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN self_review_cost_usd REAL`,
+      );
+    }
+    if (!columns.has("verify_attempts")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN verify_attempts INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!columns.has("recovery_turn_attempts")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN recovery_turn_attempts INTEGER NOT NULL DEFAULT 0`,
       );
     }
     if (!columns.has("issue_url")) {
@@ -647,6 +719,8 @@ export class SqliteStore {
         | "doneTransitionPending"
         | "designReviewAttempts"
         | "selfReviewCostUsd"
+        | "verifyAttempts"
+        | "recoveryTurnAttempts"
       >
     >,
   ): void {
@@ -1139,5 +1213,72 @@ export class SqliteStore {
       .prepare(`SELECT * FROM self_review_log WHERE session_id = ? ORDER BY id ASC`)
       .all(sessionId) as RawSelfReviewLogRow[];
     return rows.map(toSelfReviewLogRow);
+  }
+
+  // ---- verify_log (ES-487) ----
+  insertVerifyLog(s: {
+    runId: number;
+    sessionId: number;
+    attempt: number;
+    startedAt: string;
+  }): VerifyLogRow {
+    const info = this.db
+      .prepare(
+        `INSERT INTO verify_log (run_id, session_id, attempt, started_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(s.runId, s.sessionId, s.attempt, s.startedAt);
+    return this.getVerifyLog(Number(info.lastInsertRowid));
+  }
+
+  getVerifyLog(id: number): VerifyLogRow {
+    const row = this.db
+      .prepare(`SELECT * FROM verify_log WHERE id = ?`)
+      .get(id) as RawVerifyLogRow | undefined;
+    if (row === undefined) {
+      throw new Error(`verify_log not found: id=${id}`);
+    }
+    return toVerifyLogRow(row);
+  }
+
+  updateVerifyLog(
+    id: number,
+    patch: Partial<Pick<VerifyLogRow,
+      | "endedAt"
+      | "verdict"
+      | "reasonCount"
+      | "evidence"
+      | "outcome"
+      | "costUsd"
+      | "errorDetail"
+    >>,
+  ): void {
+    const setClauses: string[] = [];
+    const values: Array<string | number | null> = [];
+    for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
+      const column = VERIFY_LOG_PATCH_COLUMNS[key as string];
+      if (column === undefined) {
+        throw new Error(`updateVerifyLog: unknown patch key "${String(key)}"`);
+      }
+      const raw = patch[key];
+      if (raw === undefined) continue;
+      setClauses.push(`${column} = ?`);
+      values.push(raw as string | number | null);
+    }
+    if (setClauses.length === 0) return;
+    values.push(id);
+    const info = this.db
+      .prepare(`UPDATE verify_log SET ${setClauses.join(", ")} WHERE id = ?`)
+      .run(...values);
+    if (info.changes !== 1) {
+      throw new Error(`updateVerifyLog affected ${info.changes} rows for id=${id}`);
+    }
+  }
+
+  getVerifyLogsForSession(sessionId: number): VerifyLogRow[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM verify_log WHERE session_id = ? ORDER BY id ASC`)
+      .all(sessionId) as RawVerifyLogRow[];
+    return rows.map(toVerifyLogRow);
   }
 }

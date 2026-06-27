@@ -19,9 +19,10 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       team: "TY",
       project: "LoopPilot OS",
       optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
       states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" },
     },
-    agent: { model: "opus", effort: "max", permissionMode: "acceptEdits", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined },
+    agent: { model: "opus", effort: "max", permissionMode: "acceptEdits", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined, verify: undefined },
     pm: undefined,
     handoff: { branchPrefix: "looppilot", prBodyTemplate: "Implements {identifier}" },
     looppilot: { gateLabel: "loop-pilot", stateCommentAuthors: ["github-actions[bot]"] },
@@ -44,6 +45,11 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       groomBoardBudgetChars: 10000,
       selfReviewTimeoutMinutes: 15,
       maxCostUsdPerSelfReview: 2,
+      maxVerifyAttempts: 2,
+      maxCostUsdPerVerify: 2,
+      verifyTimeoutMinutes: 15,
+      maxRecoveryAttempts: 2,
+      transientRetryAttempts: 2,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300, idleTimeoutMinutes: 120 },
     digest: { recentMergedCount: 5, enabled: true },
@@ -51,6 +57,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     groom: { enabled: true },
     selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
+    verify: { enabled: true, runRecipe: "" },
     rateLimit: { reprobeMinutes: 15, capHours: 6, claudePatterns: [], codexPatterns: [] },
     linearApiKey: "lin_api_test",
     slackWebhookUrl: undefined,
@@ -646,7 +653,7 @@ describe("runPreflight", () => {
   // ES-385: bypassPermissions + root (uid 0) → NG
   it("bypassPermissions + root 実行は NG（ES-385 非 root preflight）", async () => {
     const cfg = makeConfig({
-      agent: { model: "opus", effort: "max", permissionMode: "bypassPermissions", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined },
+      agent: { model: "opus", effort: "max", permissionMode: "bypassPermissions", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined, verify: undefined },
     });
     const errors = await runPreflight({ config: cfg, runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch(), getuid: () => 0 });
     expect(errors.some((e) => e.includes("root") && e.includes("bypassPermissions"))).toBe(true);
@@ -655,7 +662,7 @@ describe("runPreflight", () => {
   // ES-385: bypassPermissions + 非 root → OK
   it("bypassPermissions + 非 root は OK（ES-385）", async () => {
     const cfg = makeConfig({
-      agent: { model: "opus", effort: "max", permissionMode: "bypassPermissions", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined },
+      agent: { model: "opus", effort: "max", permissionMode: "bypassPermissions", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined, verify: undefined },
     });
     const errors = await runPreflight({ config: cfg, runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch(), getuid: () => 1000 });
     expect(errors.filter((e) => e.includes("root"))).toEqual([]);
@@ -670,7 +677,7 @@ describe("runPreflight", () => {
   // ES-385: getuid 未提供（Windows/非 POSIX）→ root チェックスキップ
   it("getuid 未提供時は root チェックスキップ（ES-385）", async () => {
     const cfg = makeConfig({
-      agent: { model: "opus", effort: "max", permissionMode: "bypassPermissions", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined },
+      agent: { model: "opus", effort: "max", permissionMode: "bypassPermissions", allowedTools: "Edit,Write,Read,Glob,Grep,Bash", extraArgs: [], design: undefined, implement: undefined, selfReview: undefined, recovery: undefined, verify: undefined },
     });
     const errors = await runPreflight({ config: cfg, runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
     expect(errors.filter((e) => e.includes("root"))).toEqual([]);

@@ -26,6 +26,7 @@ const rawSchema = z.object({
     team: z.string(),
     project: z.string(),
     opt_in_label: z.string(),
+    needs_human_label: z.string().default("needs-human"),
     states: z.object({
       todo: z.string(),
       in_progress: z.string(),
@@ -60,6 +61,10 @@ const rawSchema = z.object({
       model: z.string().optional(),
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     }).strict().optional(),
+    verify: z.object({
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+    }).strict().optional(),
   }).strict(),
   // Codex (PM) per-phase effort (ES-486). Absent → Codex gets no -m/-c flags (backward compat).
   // effort fields use z.string() so loadConfig can produce error messages that include the
@@ -72,6 +77,7 @@ const rawSchema = z.object({
       select: z.string().default("low"),
       design_review: z.string().default("high"),
       recovery: z.string().default("high"),
+      verify: z.string().default("high"),
     }).strict().optional(),
   }).strict().optional(),
   handoff: z.object({
@@ -103,6 +109,11 @@ const rawSchema = z.object({
     groom_board_budget_chars: z.number().int().positive().default(10000),
     self_review_timeout_minutes: z.number().positive().default(15),
     max_cost_usd_per_self_review: z.number().positive().default(2),
+    max_verify_attempts: z.number().int().positive().default(2),
+    max_cost_usd_per_verify: z.number().positive().default(2),
+    verify_timeout_minutes: z.number().positive().default(15),
+    max_recovery_attempts: z.number().int().positive().default(2),
+    transient_retry_attempts: z.number().int().nonnegative().default(2),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -125,6 +136,10 @@ const rawSchema = z.object({
   memory: z.object({
     max_chars_per_file: z.number().int().positive().default(8000),
     inject_budget_chars: z.number().int().positive().default(6000),
+  }).strict().optional(),
+  verify: z.object({
+    enabled: z.boolean().default(true),
+    run_recipe: z.string().default(""),
   }).strict().optional(),
   rate_limit: z.object({
     reprobe_minutes: z.number().positive().default(15),
@@ -152,6 +167,7 @@ export interface Config {
     team: string;
     project: string;
     optInLabel: string;
+    needsHumanLabel: string;
     states: {
       todo: string;
       inProgress: string;
@@ -169,6 +185,7 @@ export interface Config {
     implement: { model: string; effort: string } | undefined;
     selfReview: { model: string; effort: string } | undefined;
     recovery: { model: string; effort: string } | undefined;
+    verify: { model: string; effort: string } | undefined;
   };
   pm: {
     model: string;
@@ -177,6 +194,7 @@ export interface Config {
       select: string | undefined;
       designReview: string | undefined;
       recovery: string | undefined;
+      verify: string | undefined;
     };
   } | undefined;
   handoff: {
@@ -206,6 +224,11 @@ export interface Config {
     groomBoardBudgetChars: number;
     selfReviewTimeoutMinutes: number;
     maxCostUsdPerSelfReview: number;
+    maxVerifyAttempts: number;
+    maxCostUsdPerVerify: number;
+    verifyTimeoutMinutes: number;
+    maxRecoveryAttempts: number;
+    transientRetryAttempts: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -228,6 +251,10 @@ export interface Config {
   memory: {
     maxCharsPerFile: number;
     injectBudgetChars: number;
+  };
+  verify: {
+    enabled: boolean;
+    runRecipe: string;
   };
   rateLimit: {
     reprobeMinutes: number;
@@ -714,6 +741,7 @@ export function loadConfig(
         ["select", pmEffort.select],
         ["design_review", pmEffort.design_review],
         ["recovery", pmEffort.recovery],
+        ["verify", pmEffort.verify],
       ] as [string, string][]) {
         if (!VALID_CODEX_EFFORT.includes(value)) {
           errors.push(
@@ -731,6 +759,7 @@ export function loadConfig(
       ["agent.implement", result.data.agent.implement],
       ["agent.self_review", result.data.agent.self_review],
       ["agent.recovery", result.data.agent.recovery],
+      ["agent.verify", result.data.agent.verify],
     ];
     for (const [phasePath, rawPhase] of phaseEntries) {
       if (rawPhase !== undefined) {
@@ -795,6 +824,7 @@ export function loadConfig(
       team: raw.linear.team,
       project: raw.linear.project,
       optInLabel: raw.linear.opt_in_label,
+      needsHumanLabel: raw.linear.needs_human_label,
       states: {
         todo: raw.linear.states.todo,
         inProgress: raw.linear.states.in_progress,
@@ -820,6 +850,9 @@ export function loadConfig(
       recovery: raw.agent.recovery
         ? { model: raw.agent.recovery.model ?? raw.agent.model, effort: raw.agent.recovery.effort ?? effectiveEffort }
         : undefined,
+      verify: raw.agent.verify
+        ? { model: raw.agent.verify.model ?? raw.agent.model, effort: raw.agent.verify.effort ?? effectiveEffort }
+        : undefined,
     },
     pm: raw.pm !== undefined
       ? {
@@ -829,6 +862,7 @@ export function loadConfig(
             select: raw.pm.effort?.select,
             designReview: raw.pm.effort?.design_review,
             recovery: raw.pm.effort?.recovery,
+            verify: raw.pm.effort?.verify,
           },
         }
       : undefined,
@@ -859,6 +893,11 @@ export function loadConfig(
       groomBoardBudgetChars: raw.safety.groom_board_budget_chars,
       selfReviewTimeoutMinutes: raw.safety.self_review_timeout_minutes,
       maxCostUsdPerSelfReview: raw.safety.max_cost_usd_per_self_review,
+      maxVerifyAttempts: raw.safety.max_verify_attempts,
+      maxCostUsdPerVerify: raw.safety.max_cost_usd_per_verify,
+      verifyTimeoutMinutes: raw.safety.verify_timeout_minutes,
+      maxRecoveryAttempts: raw.safety.max_recovery_attempts,
+      transientRetryAttempts: raw.safety.transient_retry_attempts,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
@@ -881,6 +920,10 @@ export function loadConfig(
     memory: {
       maxCharsPerFile: raw.memory?.max_chars_per_file ?? 8000,
       injectBudgetChars: raw.memory?.inject_budget_chars ?? 6000,
+    },
+    verify: {
+      enabled: raw.verify?.enabled ?? true,
+      runRecipe: raw.verify?.run_recipe ?? "",
     },
     rateLimit: {
       reprobeMinutes: raw.rate_limit?.reprobe_minutes ?? 15,

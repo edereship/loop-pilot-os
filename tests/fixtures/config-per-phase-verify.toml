@@ -9,6 +9,7 @@ remote = "owner/name"
 team = "TY"
 project = "LoopPilot OS"
 opt_in_label = "ai-ok"
+needs_human_label = "needs-human-custom"
 [linear.states]
 todo = "Todo"
 in_progress = "In Progress"
@@ -16,16 +17,22 @@ in_review = "In Review"
 done = "Done"
 
 [agent]
-model = "opus"
+model = "claude-opus-4-6[1m]"
+effort = "high"
 allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"
+
+[agent.verify]
+model = "claude-opus-4-8[1m]"
+effort = "max"
 
 [pm]
 model = "gpt-5.5"
 [pm.effort]
-groom = "max"
-select = "low"
+groom = "high"
+select = "medium"
 design_review = "high"
-verify = "max"
+recovery = "high"
+verify = "high"
 
 [handoff]
 branch_prefix = "looppilot"
@@ -38,6 +45,11 @@ state_comment_authors = ["github-actions[bot]"]
 [safety]
 max_tasks_per_run = 3
 max_cost_usd_per_session = 10.0
+max_verify_attempts = 3
+max_cost_usd_per_verify = 1.5
+verify_timeout_minutes = 10
+max_recovery_attempts = 3
+transient_retry_attempts = 1
 
 [loop]
 monitor_poll_seconds = 60
@@ -45,5 +57,9 @@ idle_recheck_seconds = 300
 
 [digest]
 recent_merged_count = 5
+
+[verify]
+enabled = false
+run_recipe = "npm run e2e"
 
 [notify]
