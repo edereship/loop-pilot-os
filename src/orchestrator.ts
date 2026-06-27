@@ -47,6 +47,8 @@ export interface IGroomBoardFetcher {
   getOptInIssueIds(): Promise<Set<string>>;
   /** Returns identifiers of issues currently in in_progress or in_review state. */
   getActiveIssueIds(): Promise<Set<string>>;
+  /** Returns identifiers of issues carrying the needs-human label (ES-492). */
+  getNeedsHumanIssueIds(needsHumanLabel: string): Promise<Set<string>>;
   /** Clear any per-cycle cache so fresh data is fetched in the next call. */
   refresh(): void;
 }
@@ -1516,6 +1518,7 @@ export class Orchestrator {
         const doneIds = await this.groomDeps.boardFetcher.getDoneIssueIds();
         const optInIds = await this.groomDeps.boardFetcher.getOptInIssueIds();
         const activeIds = await this.groomDeps.boardFetcher.getActiveIssueIds();
+        const needsHumanIds = await this.groomDeps.boardFetcher.getNeedsHumanIssueIds(this.config.linear.needsHumanLabel);
         validationCtx = {
           projectIssueIds: projectIds,
           allIssueIds: projectIds,
@@ -1523,6 +1526,7 @@ export class Orchestrator {
           optInIssueIds: optInIds,
           doneIssueIds: doneIds,
           activeIssueIds: activeIds,
+          needsHumanIssueIds: needsHumanIds,
           maxCharsPerFile: this.config.memory.maxCharsPerFile,
           knownLabels: this.groomDeps.knownLabels,
         };

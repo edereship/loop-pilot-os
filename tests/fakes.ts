@@ -449,6 +449,11 @@ export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
     this._maybeThrow("getActiveIssueIds");
     return this.activeIssueIds;
   }
+
+  async getNeedsHumanIssueIds(_needsHumanLabel: string): Promise<Set<string>> {
+    this.calls.push("getNeedsHumanIssueIds");
+    return new Set();
+  }
 }
 
 // ---- FakeGroomLinearClient ----

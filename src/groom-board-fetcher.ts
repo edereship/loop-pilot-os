@@ -244,4 +244,13 @@ export class GroomBoardFetcher {
         .map((n) => n.identifier),
     );
   }
+
+  async getNeedsHumanIssueIds(needsHumanLabel: string): Promise<Set<string>> {
+    const nodes = await this.ensureFetched();
+    return new Set(
+      nodes
+        .filter((n) => n.labels.nodes.some((l) => l.name === needsHumanLabel))
+        .map((n) => n.identifier),
+    );
+  }
 }
