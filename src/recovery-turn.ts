@@ -526,7 +526,7 @@ async function executeRestartReview(
   return { kind: "recovered", action: "restart_review", costUsd: 0 };
 }
 
-async function executeAbandon(
+export async function executeAbandon(
   deps: RecoveryTurnDeps,
   session: TaskSessionRow,
   onAbandonStarting?: () => void,

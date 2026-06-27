@@ -788,8 +788,7 @@ export class Orchestrator {
       try {
         eligible = await this.source.getAllEligible([
           ...this.store.activeIssueIds(),
-          ...this.store.abandonedIssueIds(this.runId),
-          ...this.store.designRejectedIssueIds(this.runId),
+          ...this.store.excludedIssueIds(this.runId),
         ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;

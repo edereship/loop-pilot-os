@@ -836,40 +836,63 @@ describe("recovery columns (ES-450)", () => {
   });
 });
 
-describe("abandonedIssueIds (ES-450 Finding 2)", () => {
-  it("returns empty array when no abandoned sessions", () => {
-    const store = new SqliteStore(":memory:");
-    openStores.push(store);
+describe("excludedIssueIds (ES-490)", () => {
+  it("returns union of abandoned and design_rejected issue ids", () => {
+    const store = newStore();
     const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
-    expect(store.abandonedIssueIds(run.id)).toEqual([]);
+
+    // Abandoned session (recovery_action='abandon')
+    const s1 = store.createSession({
+      runId: run.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s1.id, { state: "stopped", failureReason: "ci_failed", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    // Design-rejected session (failure_reason='design_rejected')
+    const s2 = store.createSession({
+      runId: run.id, linearIssueId: "issue-B", linearIdentifier: "TY-2",
+      issueTitle: "B", branch: "b2", worktreePath: "/wt2",
+      now: "2026-01-01T00:00:02.000Z",
+    });
+    store.updateSession(s2.id, { state: "stopped", failureReason: "design_rejected", endedAt: "2026-01-01T02:00:00.000Z" });
+
+    // Active session — should NOT appear
+    store.createSession({
+      runId: run.id, linearIssueId: "issue-C", linearIdentifier: "TY-3",
+      issueTitle: "C", branch: "b3", worktreePath: "/wt3",
+      now: "2026-01-01T00:00:03.000Z",
+    });
+
+    const excluded = store.excludedIssueIds(run.id);
+    expect(excluded).toContain("issue-A");
+    expect(excluded).toContain("issue-B");
+    expect(excluded).not.toContain("issue-C");
   });
 
-  it("returns issue IDs for stopped sessions with recovery_action=abandon in the given run", () => {
-    const store = new SqliteStore(":memory:");
-    openStores.push(store);
+  it("deduplicates when both conditions match", () => {
+    const store = newStore();
     const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s1 = store.createSession({
       runId: run.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
       issueTitle: "A", branch: "b1", worktreePath: "/wt1",
       now: "2026-01-01T00:00:01.000Z",
     });
-    store.updateSession(s1.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+    // Both recovery_action='abandon' AND failure_reason='design_rejected'
+    store.updateSession(s1.id, { state: "stopped", failureReason: "design_rejected", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    const s2 = store.createSession({
-      runId: run.id, linearIssueId: "issue-B", linearIdentifier: "TY-2",
-      issueTitle: "B", branch: "b2", worktreePath: "/wt2",
-      now: "2026-01-01T00:00:02.000Z",
-    });
-    store.updateSession(s2.id, { state: "stopped", recoveryAction: "escalate", endedAt: "2026-01-01T02:00:00.000Z" });
-
-    const ids = store.abandonedIssueIds(run.id);
-    expect(ids).toContain("issue-A");
-    expect(ids).not.toContain("issue-B");
+    const excluded = store.excludedIssueIds(run.id);
+    expect(excluded).toEqual(["issue-A"]);
   });
 
-  it("excludes sessions abandoned in a different run (allows retry in later runs)", () => {
-    const store = new SqliteStore(":memory:");
-    openStores.push(store);
+  it("returns empty array when no excluded sessions", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    expect(store.excludedIssueIds(run.id)).toEqual([]);
+  });
+
+  it("excludes sessions from a different run", () => {
+    const store = newStore();
     const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s = store.createSession({
       runId: run1.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
@@ -879,72 +902,7 @@ describe("abandonedIssueIds (ES-450 Finding 2)", () => {
     store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
     const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
-    // A new run should not exclude the ticket abandoned in run1 (revert-to-Todo is now effective)
-    expect(store.abandonedIssueIds(run2.id)).not.toContain("issue-A");
-  });
-
-  it("excludes merged sessions even if they have recovery_action=abandon", () => {
-    const store = new SqliteStore(":memory:");
-    openStores.push(store);
-    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
-    const s = store.createSession({
-      runId: run.id, linearIssueId: "issue-C", linearIdentifier: "TY-3",
-      issueTitle: "C", branch: "b3", worktreePath: "/wt3",
-      now: "2026-01-01T00:00:01.000Z",
-    });
-    store.updateSession(s.id, { state: "merged", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
-
-    expect(store.abandonedIssueIds(run.id)).toEqual([]);
-  });
-});
-
-describe("designRejectedIssueIds (ES-458 Finding 2)", () => {
-  it("returns empty array when no design-rejected sessions", () => {
-    const store = new SqliteStore(":memory:");
-    openStores.push(store);
-    expect(store.designRejectedIssueIds(0)).toEqual([]);
-  });
-
-  it("returns issue IDs for stopped sessions with failure_reason=design_rejected", () => {
-    const store = new SqliteStore(":memory:");
-    openStores.push(store);
-    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
-    const s1 = store.createSession({
-      runId: run.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
-      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
-      now: "2026-01-01T00:00:01.000Z",
-    });
-    store.updateSession(s1.id, { state: "stopped", failureReason: "design_rejected", endedAt: "2026-01-01T01:00:00.000Z" });
-
-    const s2 = store.createSession({
-      runId: run.id, linearIssueId: "issue-B", linearIdentifier: "TY-2",
-      issueTitle: "B", branch: "b2", worktreePath: "/wt2",
-      now: "2026-01-01T00:00:02.000Z",
-    });
-    store.updateSession(s2.id, { state: "stopped", failureReason: "exception", endedAt: "2026-01-01T02:00:00.000Z" });
-
-    const ids = store.designRejectedIssueIds(run.id);
-    expect(ids).toContain("issue-A");
-    expect(ids).not.toContain("issue-B");
-  });
-
-  it("does not exclude design-rejected tickets from previous runs (operator can re-enable by revising the ticket)", () => {
-    const store = new SqliteStore(":memory:");
-    openStores.push(store);
-    const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
-    const s = store.createSession({
-      runId: run1.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
-      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
-      now: "2026-01-01T00:00:01.000Z",
-    });
-    store.updateSession(s.id, { state: "stopped", failureReason: "design_rejected", endedAt: "2026-01-01T01:00:00.000Z" });
-
-    // Issue was design-rejected in run1 — still excluded within that run
-    expect(store.designRejectedIssueIds(run1.id)).toContain("issue-A");
-
-    // In a new run the exclusion is lifted so an operator's ticket revision takes effect
-    const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
-    expect(store.designRejectedIssueIds(run2.id)).not.toContain("issue-A");
+    expect(store.excludedIssueIds(run2.id)).not.toContain("issue-A");
   });
 });
 
