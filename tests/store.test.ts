@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SqliteStore } from "../src/store.js";
-import type { TaskSessionRow, GroomLogRow } from "../src/types.js";
+import type { TaskSessionRow, GroomLogRow, VerifyLogRow } from "../src/types.js";
 
 // テスト間で開いたストアを確実に閉じる（:memory: でもハンドルを解放する）
 let openStores: SqliteStore[] = [];
@@ -1396,5 +1396,143 @@ describe("self_review_log CRUD", () => {
     });
     expect(store.getSelfReviewLogsForSession(session.id)).toEqual([]);
     store.close();
+  });
+});
+
+describe("verify_log CRUD (ES-487)", () => {
+  it("insertVerifyLog creates a row and getVerifyLog retrieves it", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-27T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-27T00:00:00Z",
+    });
+    const log = store.insertVerifyLog({
+      runId: run.id,
+      sessionId: session.id,
+      attempt: 1,
+      startedAt: "2026-06-27T00:01:00Z",
+    });
+    expect(log.id).toBeGreaterThan(0);
+    expect(log.runId).toBe(run.id);
+    expect(log.sessionId).toBe(session.id);
+    expect(log.attempt).toBe(1);
+    expect(log.verdict).toBeNull();
+    expect(log.reasonCount).toBe(0);
+    expect(log.evidence).toBeNull();
+    expect(log.outcome).toBeNull();
+    expect(log.costUsd).toBeNull();
+    expect(log.errorDetail).toBeNull();
+  });
+
+  it("updateVerifyLog updates fields", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-27T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-27T00:00:00Z",
+    });
+    const log = store.insertVerifyLog({
+      runId: run.id,
+      sessionId: session.id,
+      attempt: 1,
+      startedAt: "2026-06-27T00:01:00Z",
+    });
+    store.updateVerifyLog(log.id, {
+      endedAt: "2026-06-27T00:02:00Z",
+      verdict: "fail",
+      reasonCount: 2,
+      evidence: '{"build":"fail","test":"pass"}',
+      outcome: "failed",
+      costUsd: 1.5,
+    });
+    const updated = store.getVerifyLog(log.id);
+    expect(updated.endedAt).toBe("2026-06-27T00:02:00Z");
+    expect(updated.verdict).toBe("fail");
+    expect(updated.reasonCount).toBe(2);
+    expect(updated.evidence).toBe('{"build":"fail","test":"pass"}');
+    expect(updated.outcome).toBe("failed");
+    expect(updated.costUsd).toBe(1.5);
+  });
+
+  it("getVerifyLogsForSession returns logs ordered by id", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-27T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-27T00:00:00Z",
+    });
+    store.insertVerifyLog({ runId: run.id, sessionId: session.id, attempt: 1, startedAt: "2026-06-27T00:01:00Z" });
+    store.insertVerifyLog({ runId: run.id, sessionId: session.id, attempt: 2, startedAt: "2026-06-27T00:03:00Z" });
+    const logs = store.getVerifyLogsForSession(session.id);
+    expect(logs).toHaveLength(2);
+    expect(logs[0].attempt).toBe(1);
+    expect(logs[1].attempt).toBe(2);
+  });
+
+  it("getVerifyLogsForSession returns empty array when no logs", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-27T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-27T00:00:00Z",
+    });
+    expect(store.getVerifyLogsForSession(session.id)).toEqual([]);
+  });
+});
+
+describe("task_session.verifyAttempts/recoveryTurnAttempts migration (ES-487)", () => {
+  it("defaults verifyAttempts and recoveryTurnAttempts to 0 for new sessions", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-27T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-27T00:00:00Z",
+    });
+    expect(session.verifyAttempts).toBe(0);
+    expect(session.recoveryTurnAttempts).toBe(0);
+  });
+
+  it("updateSession can patch verifyAttempts and recoveryTurnAttempts", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-06-27T00:00:00Z");
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "TY-1",
+      issueTitle: "Test",
+      branch: "br",
+      worktreePath: "/wt/test",
+      now: "2026-06-27T00:00:00Z",
+    });
+    store.updateSession(session.id, { verifyAttempts: 2, recoveryTurnAttempts: 1 });
+    const updated = store.getSession(session.id);
+    expect(updated.verifyAttempts).toBe(2);
+    expect(updated.recoveryTurnAttempts).toBe(1);
   });
 });

@@ -93,6 +93,7 @@ function fakeSession(overrides: Partial<TaskSessionRow> = {}): TaskSessionRow {
     recoveryAttempted: 0, recoveryAction: null,
     doneTransitionPending: 0, designReviewAttempts: 0,
     selfReviewCostUsd: null,
+    verifyAttempts: 0, recoveryTurnAttempts: 0,
     ...overrides,
   };
 }
