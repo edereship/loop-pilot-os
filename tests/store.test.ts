@@ -836,12 +836,15 @@ describe("recovery columns (ES-450)", () => {
   });
 });
 
-describe("excludedIssueIds (ES-490)", () => {
-  it("returns union of abandoned and design_rejected issue ids", () => {
+describe("excludedIssueIds (ES-492)", () => {
+  // ES-492: abandon/design_rejected exclusion is now handled by the needs-human
+  // label on the Linear side. excludedIssueIds() always returns [] so label
+  // removal in Linear re-enables the issue without a DB change.
+
+  it("returns [] even when abandoned sessions exist", () => {
     const store = newStore();
     const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
 
-    // Abandoned session (recovery_action='abandon')
     const s1 = store.createSession({
       runId: run.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
       issueTitle: "A", branch: "b1", worktreePath: "/wt1",
@@ -849,7 +852,6 @@ describe("excludedIssueIds (ES-490)", () => {
     });
     store.updateSession(s1.id, { state: "stopped", failureReason: "ci_failed", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    // Design-rejected session (failure_reason='design_rejected')
     const s2 = store.createSession({
       runId: run.id, linearIssueId: "issue-B", linearIdentifier: "TY-2",
       issueTitle: "B", branch: "b2", worktreePath: "/wt2",
@@ -857,20 +859,10 @@ describe("excludedIssueIds (ES-490)", () => {
     });
     store.updateSession(s2.id, { state: "stopped", failureReason: "design_rejected", endedAt: "2026-01-01T02:00:00.000Z" });
 
-    // Active session — should NOT appear
-    store.createSession({
-      runId: run.id, linearIssueId: "issue-C", linearIdentifier: "TY-3",
-      issueTitle: "C", branch: "b3", worktreePath: "/wt3",
-      now: "2026-01-01T00:00:03.000Z",
-    });
-
-    const excluded = store.excludedIssueIds();
-    expect(excluded).toContain("issue-A");
-    expect(excluded).toContain("issue-B");
-    expect(excluded).not.toContain("issue-C");
+    expect(store.excludedIssueIds()).toEqual([]);
   });
 
-  it("deduplicates when both conditions match", () => {
+  it("returns [] regardless of session state", () => {
     const store = newStore();
     const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s1 = store.createSession({
@@ -878,20 +870,18 @@ describe("excludedIssueIds (ES-490)", () => {
       issueTitle: "A", branch: "b1", worktreePath: "/wt1",
       now: "2026-01-01T00:00:01.000Z",
     });
-    // Both recovery_action='abandon' AND failure_reason='design_rejected'
     store.updateSession(s1.id, { state: "stopped", failureReason: "design_rejected", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    const excluded = store.excludedIssueIds();
-    expect(excluded).toEqual(["issue-A"]);
+    expect(store.excludedIssueIds()).toEqual([]);
   });
 
-  it("returns empty array when no excluded sessions", () => {
+  it("returns empty array when no sessions", () => {
     const store = newStore();
     store.createRun(3, "2026-01-01T00:00:00.000Z");
     expect(store.excludedIssueIds()).toEqual([]);
   });
 
-  it("excludes abandoned sessions across daemon restarts (ES-490 Finding 3)", () => {
+  it("returns [] for abandoned sessions across daemon restarts", () => {
     const store = newStore();
     const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s = store.createSession({
@@ -901,10 +891,8 @@ describe("excludedIssueIds (ES-490)", () => {
     });
     store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    // run_id is no longer part of the exclusion filter — abandoned sessions are permanently
-    // excluded until a human changes the ticket state in Linear (ES-490 Finding 3).
     store.createRun(3, "2026-01-02T00:00:00.000Z");
-    expect(store.excludedIssueIds()).toContain("issue-A");
+    expect(store.excludedIssueIds()).toEqual([]);
   });
 });
 

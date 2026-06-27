@@ -2,8 +2,8 @@
   "data": {
     "issues": {
       "nodes": [
-        { "id": "i-known", "identifier": "TY-100", "title": "Tracked WIP", "description": "", "priority": 2, "sortOrder": 3, "url": "https://linear.app/ty/issue/TY-100" },
-        { "id": "i-orphan", "identifier": "TY-101", "title": "Orphan WIP", "description": "", "priority": 1, "sortOrder": 4, "url": "https://linear.app/ty/issue/TY-101" }
+        { "id": "i-known", "identifier": "TY-100", "title": "Tracked WIP", "description": "", "priority": 2, "sortOrder": 3, "url": "https://linear.app/ty/issue/TY-100", "labels": { "nodes": [] } },
+        { "id": "i-orphan", "identifier": "TY-101", "title": "Orphan WIP", "description": "", "priority": 1, "sortOrder": 4, "url": "https://linear.app/ty/issue/TY-101", "labels": { "nodes": [] } }
       ]
     }
   }

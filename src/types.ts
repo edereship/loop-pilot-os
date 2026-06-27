@@ -95,6 +95,8 @@ export interface TaskSource {
   findOrphanedInProgress(knownIssueIds: string[]): Promise<EligibleIssue[]>;
   /** チケットに Markdown コメントを投稿する（§1.6 監査書き戻し） */
   postComment(issueId: string, body: string): Promise<void>;
+  /** チケットにラベルを付与する（ES-492 needs-human トリアージ） */
+  addLabel(issueId: string, labelName: string): Promise<void>;
 }
 
 export interface SessionContext {

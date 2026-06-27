@@ -3274,6 +3274,8 @@ export class Orchestrator {
             stopDetail: detail,
             endedAt: this.clock(),
           });
+          // ES-492: Add needs-human label so SELECT filters this ticket out until a human reviews.
+          await bestEffort(() => this.source.addLabel(session.linearIssueId, this.config.linear.needsHumanLabel));
           return CONTINUE;
         }
         // Only record the recovery action for non-failed outcomes. A failed abandon must
@@ -3463,6 +3465,8 @@ export class Orchestrator {
             ...patch,
           });
           const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+          // ES-492: Add needs-human label so SELECT filters this ticket out until a human reviews.
+          await bestEffort(() => this.source.addLabel(session.linearIssueId, this.config.linear.needsHumanLabel));
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
           return CONTINUE;
@@ -3519,6 +3523,8 @@ export class Orchestrator {
           this.store.setRunState(this.runId, "halted", skipDetail);
           return HALT;
         }
+        // ES-492: Add needs-human label so SELECT filters this ticket out until a human reviews.
+        await bestEffort(() => this.source.addLabel(session.linearIssueId, this.config.linear.needsHumanLabel));
         return CONTINUE;
       }
     }

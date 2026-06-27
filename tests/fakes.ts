@@ -127,10 +127,12 @@ export class FakeTaskSource implements TaskSource {
   orphans: EligibleIssue[] = [];
   /** postComment の呼び出し記録 */
   comments: Array<{ issueId: string; body: string }> = [];
+  /** addLabel の呼び出し記録 */
+  labelAdds: Array<{ issueId: string; labelName: string }> = [];
   /** メソッド名 → 次の1回だけ throw させるエラー */
   private failOnce = new Map<string, Error>();
 
-  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment" | "getAllEligible", error?: Error): void {
+  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment" | "getAllEligible" | "addLabel", error?: Error): void {
     this.failOnce.set(method, error ?? new Error(`FakeTaskSource.${method} injected failure`));
   }
 
@@ -166,6 +168,11 @@ export class FakeTaskSource implements TaskSource {
     this.comments.push({ issueId, body });
   }
 
+  async addLabel(issueId: string, labelName: string): Promise<void> {
+    this.takeFailure("addLabel");
+    this.labelAdds.push({ issueId, labelName });
+  }
+
   async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
     this.eligibleCalls.push([...excludeIds]);
     this.takeFailure("getAllEligible");
@@ -176,8 +183,11 @@ export class FakeTaskSource implements TaskSource {
     for (const t of this.transitions) {
       lastTransition.set(t.issueId, t.state);
     }
+    // ES-492: Mimic label-based exclusion — issues with addLabel records are filtered out.
+    const labeled = new Set(this.labelAdds.map((l) => l.issueId));
     return this.queue.filter((i) => {
       if (exclude.has(i.id)) return false;
+      if (labeled.has(i.id)) return false;
       const state = lastTransition.get(i.id);
       // No transition recorded = still in original todo state
       // Transitioned back to todo = eligible again (e.g. after claim rollback)

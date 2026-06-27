@@ -14,7 +14,7 @@ const ELIGIBLE_QUERY = `query Eligible($projectId: ID, $todoStateId: ID!, $label
     project: { id: { eq: $projectId } },
     state: { id: { eq: $todoStateId } },
     labels: { name: { eq: $label } }
-  }) { nodes { id identifier title description priority sortOrder url } }
+  }) { nodes { id identifier title description priority sortOrder url labels(first: 50) { nodes { name } } } }
 }`;
 
 const ELIGIBLE_QUERY_PAGINATED = `query EligiblePaginated($projectId: ID, $todoStateId: ID!, $label: String!, $after: String) {
@@ -22,7 +22,12 @@ const ELIGIBLE_QUERY_PAGINATED = `query EligiblePaginated($projectId: ID, $todoS
     project: { id: { eq: $projectId } },
     state: { id: { eq: $todoStateId } },
     labels: { name: { eq: $label } }
-  }) { nodes { id identifier title description priority sortOrder url } pageInfo { hasNextPage endCursor } }
+  }) { nodes { id identifier title description priority sortOrder url labels(first: 50) { nodes { name } } } pageInfo { hasNextPage endCursor } }
+}`;
+
+// ES-492: needs-human ラベル付与 mutation。
+const ISSUE_ADD_LABEL_MUTATION = `mutation IssueAddLabel($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) { success }
 }`;
 
 // カーネル §5.5: 遷移 mutation。一字一句一致。
@@ -67,6 +72,7 @@ interface IssueNode {
   priority: number;
   sortOrder: number;
   url: string;
+  labels: { nodes: Array<{ name: string }> };
 }
 
 interface IssuesData {
@@ -151,6 +157,8 @@ export interface LinearTaskSourceOptions {
   projectId: string;
   stateIds: Record<TicketState, string>;
   optInLabel: string;
+  needsHumanLabel: string;
+  needsHumanLabelId: string;
   fetchFn: FetchFn;
 }
 
@@ -159,6 +167,8 @@ export class LinearTaskSource implements TaskSource {
   private readonly projectId: string;
   private readonly stateIds: Record<TicketState, string>;
   private readonly optInLabel: string;
+  private readonly needsHumanLabel: string;
+  private readonly needsHumanLabelId: string;
   private readonly fetchFn: FetchFn;
 
   constructor(opts: LinearTaskSourceOptions) {
@@ -166,6 +176,8 @@ export class LinearTaskSource implements TaskSource {
     this.projectId = opts.projectId;
     this.stateIds = opts.stateIds;
     this.optInLabel = opts.optInLabel;
+    this.needsHumanLabel = opts.needsHumanLabel;
+    this.needsHumanLabelId = opts.needsHumanLabelId;
     this.fetchFn = opts.fetchFn;
   }
 
@@ -215,6 +227,7 @@ export class LinearTaskSource implements TaskSource {
     const exclude = new Set(excludeIds);
     const nodes = (await this.queryByState(this.stateIds.todo))
       .filter((n) => !exclude.has(n.id))
+      .filter((n) => !n.labels.nodes.some((l) => l.name === this.needsHumanLabel))
       .sort(compareIssues);
     const first = nodes[0];
     return first ? toEligible(first) : null;
@@ -224,6 +237,7 @@ export class LinearTaskSource implements TaskSource {
     const exclude = new Set(excludeIds);
     return (await this.queryAllByState(this.stateIds.todo))
       .filter((n) => !exclude.has(n.id))
+      .filter((n) => !n.labels.nodes.some((l) => l.name === this.needsHumanLabel))
       .sort(compareIssues)
       .map(toEligible);
   }
@@ -259,6 +273,21 @@ export class LinearTaskSource implements TaskSource {
     );
     if (!data.commentCreate.success) {
       throw new Error(`Linear commentCreate failed for ${issueId}`);
+    }
+  }
+
+  async addLabel(issueId: string, labelName: string): Promise<void> {
+    if (labelName !== this.needsHumanLabel) {
+      throw new Error(`addLabel only supports needs-human label, got "${labelName}"`);
+    }
+    const data = await graphql<{ issueAddLabel: { success: boolean } }>(
+      this.fetchFn,
+      this.apiKey,
+      ISSUE_ADD_LABEL_MUTATION,
+      { id: issueId, labelId: this.needsHumanLabelId },
+    );
+    if (!data.issueAddLabel.success) {
+      throw new Error(`issueAddLabel failed for ${issueId}`);
     }
   }
 }

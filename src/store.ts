@@ -826,19 +826,9 @@ export class SqliteStore {
   }
 
   excludedIssueIds(): string[] {
-    const rows = this.db
-      .prepare(
-        // Only the latest session per issue is checked: an old abandoned row must not
-        // block a ticket that was later re-processed successfully, and the human-triage
-        // reintroduction mechanism (needs-human label, ES-490 Finding 4 / spec D-02)
-        // can only clear the exclusion through a newer session or a Linear label change.
-        `SELECT DISTINCT linear_issue_id AS id FROM task_session
-         WHERE state = 'stopped'
-           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')
-           AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)`,
-      )
-      .all() as Array<{ id: string }>;
-    return rows.map((r) => r.id);
+    // Abandon/design_rejected exclusion is now handled by the needs-human label
+    // on the Linear side (ES-492). Label removal re-enables the issue.
+    return [];
   }
 
   knownIssueIds(): string[] {

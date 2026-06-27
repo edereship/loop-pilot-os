@@ -70,7 +70,7 @@ function makeConfig(over: Partial<{
     groom: { enabled: over.groomEnabled ?? false },
     selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
-    linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
+    linear: { optInLabel: "looppilot-os", needsHumanLabel: "needs-human", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
     pm: undefined,
   } as unknown as Config;
 }
@@ -3438,10 +3438,10 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
 
     await h.orch.run();
 
-    // Second SELECT must include issue-A in the exclude list (abandoned ticket blocked)
+    // ES-492: Label-based exclusion — addLabel is called on abandon so SELECT filters the ticket.
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
+    // A second SELECT was triggered (the loop continued after abandon).
     expect(h.source.eligibleCalls.length).toBeGreaterThanOrEqual(2);
-    const secondSelectExcluded = h.source.eligibleCalls[1];
-    expect(secondSelectExcluded).toContain("issue-A");
   });
 
   // ES-450 Finding (iteration 8): pr_closed is terminal — recovery must not run even when
