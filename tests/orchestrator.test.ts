@@ -6182,4 +6182,97 @@ describe("VERIFY (ES-491)", () => {
     expect(verifyLogs[0].outcome).toBe("passed");
     expect(verifyLogs[0].errorDetail).toContain("fail-open: no planner");
   });
+
+  it("verify fail → re-implement with reasons → verify pass", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    // 1st judgment: fail, 2nd judgment: pass
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"fail","reasons":["test suite has 2 failures"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    // 1 issue → SELECT skipped (eligible.length === 1), planner consumed only by VERIFY
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // 1st IMPLEMENT + 1st SELF-REVIEW (error=fail-open) + 2nd IMPLEMENT (fix) + 2nd SELF-REVIEW (error=fail-open)
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 1.0, summary: "fixed based on verify feedback" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    // 1st evidence (fail attempt) + 2nd evidence (pass attempt)
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Test\n2 failures" },
+      { kind: "completed", costUsd: 0.4, summary: "## Test\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].verifyAttempts).toBe(2);
+
+    // Second IMPLEMENT prompt should contain verify failure reasons
+    // h.agent.contexts holds all runSession calls (both IMPLEMENT and SELF-REVIEW)
+    // IMPLEMENT prompts do not include "self-review"; SR prompts do
+    const implPrompts = h.agent.contexts.filter(c => !c.prompt.includes("self-review"));
+    expect(implPrompts[1].prompt).toContain("test suite has 2 failures");
+
+    const verifyLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(verifyLogs).toHaveLength(2);
+    expect(verifyLogs[0].verdict).toBe("fail");
+    expect(verifyLogs[1].verdict).toBe("pass");
+  });
+
+  it("max_verify_attempts exceeded → verify_failed → abandon → loop continues", async () => {
+    // maxTasksPerRun: 2 so the loop can process TY-2 after TY-1 is abandoned
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const planner = new FakePlanRunner();
+    // 3 outcomes:
+    //   [0] SELECT: 2 eligible → selectWithPm called; non-identifier JSON → falls back to TY-1
+    //   [1] VERIFY attempt 1 for TY-1: fail
+    //   [2] VERIFY attempt 2 for TY-1: fail → max attempts (2) → verify_failed
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"fail","reasons":["tests fail"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"fail","reasons":["tests fail"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"fail","reasons":["still failing"]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    // TY-1: IMPL1 + SR1(fail-open) + IMPL2(fix) + SR2(fail-open)
+    // TY-2: IMPL + SR(fail-open)
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 1.0, summary: "fixed" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      // TY-2
+      { kind: "completed", costUsd: 1.0, summary: "B done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    // Evidence for TY-1's 2 verify attempts; TY-2's verifyAgent throws (empty) → fail-open
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "evidence 1" },
+      { kind: "completed", costUsd: 0.4, summary: "evidence 2" },
+    ];
+    // TY-2 monitor (TY-1 never reaches HANDOFF/MONITOR)
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const runId = h.store.latestRun()!.id;
+    const sessions = h.store.sessionsForRun(runId);
+
+    // TY-1: abandoned after verify_failed at max attempts
+    const ty1 = sessions.find(s => s.linearIdentifier === "TY-1")!;
+    expect(ty1.state).toBe("stopped");
+    expect(ty1.failureReason).toBe("verify_failed");
+    expect(ty1.verifyAttempts).toBe(2);
+
+    // TY-2: proceeds normally; verifyAgent throws (no evidence queued) → fail-open → merged
+    const ty2 = sessions.find(s => s.linearIdentifier === "TY-2")!;
+    expect(ty2.state).toBe("merged");
+  });
 });
