@@ -1,3 +1,23 @@
+import type { FailureReason } from "./types.js";
+
+export type FailurePolicy = "halt" | "recover" | "abandon";
+
+export const FAILURE_POLICY = {
+  claim_failed: "halt",
+  handoff_failed: "halt",
+  exception: "halt",
+  monitor_never_engaged: "halt",
+  workflow_setup_failed: "halt",
+  cost_exceeded: "halt",
+  pr_closed: "halt",
+  agent_no_change: "abandon",
+  design_rejected: "abandon",
+  verify_failed: "abandon",
+  ci_failed: "recover",
+  merge_conflict: "recover",
+  looppilot_stopped: "recover",
+} satisfies Record<FailureReason, FailurePolicy>;
+
 export type StopReasonCategory =
   | "auto_restart"
   | "quota_wait"

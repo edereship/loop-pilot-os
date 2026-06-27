@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { classifyStopReason } from "../src/stop-reason.js";
+import { classifyStopReason, FAILURE_POLICY } from "../src/stop-reason.js";
+import type { FailureReason } from "../src/types.js";
 
 describe("classifyStopReason", () => {
   it.each([
@@ -39,5 +40,58 @@ describe("classifyStopReason", () => {
 
   it("falls back to human_required for null stopReason", () => {
     expect(classifyStopReason(null)).toBe("human_required");
+  });
+});
+
+describe("FAILURE_POLICY", () => {
+  const ALL_FAILURE_REASONS: FailureReason[] = [
+    "agent_no_change",
+    "cost_exceeded",
+    "exception",
+    "monitor_never_engaged",
+    "looppilot_stopped",
+    "ci_failed",
+    "merge_conflict",
+    "pr_closed",
+    "claim_failed",
+    "handoff_failed",
+    "workflow_setup_failed",
+    "design_rejected",
+    "verify_failed",
+  ];
+
+  it("covers every FailureReason member", () => {
+    for (const reason of ALL_FAILURE_REASONS) {
+      expect(FAILURE_POLICY[reason]).toBeDefined();
+    }
+  });
+
+  it("maps halt reasons correctly", () => {
+    const haltReasons: FailureReason[] = [
+      "claim_failed", "handoff_failed", "exception",
+      "monitor_never_engaged", "workflow_setup_failed",
+      "cost_exceeded", "pr_closed",
+    ];
+    for (const r of haltReasons) {
+      expect(FAILURE_POLICY[r]).toBe("halt");
+    }
+  });
+
+  it("maps abandon reasons correctly", () => {
+    const abandonReasons: FailureReason[] = [
+      "agent_no_change", "design_rejected", "verify_failed",
+    ];
+    for (const r of abandonReasons) {
+      expect(FAILURE_POLICY[r]).toBe("abandon");
+    }
+  });
+
+  it("maps recover reasons correctly", () => {
+    const recoverReasons: FailureReason[] = [
+      "ci_failed", "merge_conflict", "looppilot_stopped",
+    ];
+    for (const r of recoverReasons) {
+      expect(FAILURE_POLICY[r]).toBe("recover");
+    }
   });
 });
