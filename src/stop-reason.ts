@@ -4,7 +4,7 @@ export type FailurePolicy = "halt" | "recover" | "abandon";
 
 export const FAILURE_POLICY = {
   claim_failed: "halt",
-  handoff_failed: "recover",
+  handoff_failed: "halt",
   exception: "halt",
   monitor_never_engaged: "halt",
   workflow_setup_failed: "halt",

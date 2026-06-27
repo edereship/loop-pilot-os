@@ -3475,11 +3475,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(recoveryEvents).toHaveLength(0);
   });
 
-  // ES-450 Finding 1 (iteration 9): when handoff_failed recovery succeeds, addLabel and
-  // transition(in_review) must be retried before flipping to in_review so the gate label is
-  // present and LoopPilot can engage — without the retry the PR lacks the label and the run
-  // later stops as monitor_never_engaged instead of recovering the transient handoff failure.
-  it("handoff_failed recovery retries addLabel and transition(in_review) before flipping to in_review", async () => {
+  // ES-490: handoff_failed → policy=halt. Even when a planner is configured (recovery
+  // capability is available), halt policy overrides and no recovery turn is attempted.
+  it("handoff_failed with planner → policy=halt, no recovery (ES-490)", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designer: planner });
@@ -3487,34 +3485,34 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
     // Force PR creation to #100
     h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
-    // addLabel fails for the initial handoff (3 retries) but succeeds on recovery retry.
-    let addLabelCalls = 0;
+    // addLabel always fails → handoff_failed
     h.git.addLabel = async (prNumber: number, label: string): Promise<void> => {
       h.git.calls.push({ method: "addLabel", args: [prNumber, label] });
-      addLabelCalls++;
-      if (addLabelCalls <= 3) throw new Error("gh: label not found");
-      // 4th+ call (from recovery retry) succeeds
+      throw new Error("gh: label not found");
     };
+    // PLAN outcome only — no recovery outcome because halt policy means recovery is never attempted
     planner.outcomes = [
       { kind: "completed", text: "## Plan\nDo the thing" },
-      // Recovery codex chooses restart_review
-      { kind: "completed", text: '{"action":"restart_review"}' },
     ];
-    // After recovery flips to in_review, monitor immediately merges
-    h.monitor.verdicts = [{ kind: "merged" }];
+    // No h.monitor.verdicts — session won't reach monitor
 
     await h.orch.run();
 
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
-    expect(s.recoveryAction).toBe("restart_review");
-    // addLabel was retried in the recovery path (calls > 3 initial failures)
-    expect(addLabelCalls).toBeGreaterThan(3);
-    // transition(in_review) was retried during recovery before the session flipped
-    expect(h.source.transitions).toContainEqual({ issueId: "issue-A", state: "in_review" });
-    // Session fully recovered and merged
-    expect(s.state).toBe("merged");
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("handoff_failed");
+    // Run halted due to halt policy
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // No recovery notifications
+    const recoveryEvents = h.notifier.events.filter(
+      (e) => e.kind === "recovery_started" || e.kind === "recovery_succeeded",
+    );
+    expect(recoveryEvents).toHaveLength(0);
+    // Recovery was not attempted
+    expect(s.recoveryAttempted).toBe(0);
   });
 
   // ES-450 Finding (iteration 8): failed abandon must not record recovery_action so
@@ -3778,7 +3776,7 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
   });
 
   // --- halt policy tests ---
-  it("handoff_failed without recovery → policy=recover but no recoveryTurn → halts", async () => {
+  it("handoff_failed → policy=halt → stops run (ES-490)", async () => {
     const config = makeConfig({ maxTasksPerRun: 2 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
@@ -3796,7 +3794,7 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     const s = sessions[0];
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("handoff_failed");
-    // No recoveryTurn configured → recovery gate not entered → falls through to halt
+    // halt policy → run halted without attempting recovery
     const run = h.store.latestRun()!;
     expect(run.state).toBe("halted");
     // TY-2 was never started

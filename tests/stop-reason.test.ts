@@ -68,7 +68,7 @@ describe("FAILURE_POLICY", () => {
 
   it("maps halt reasons correctly", () => {
     const haltReasons: FailureReason[] = [
-      "claim_failed", "exception",
+      "claim_failed", "handoff_failed", "exception",
       "monitor_never_engaged", "workflow_setup_failed",
       "cost_exceeded", "pr_closed",
     ];
@@ -88,7 +88,7 @@ describe("FAILURE_POLICY", () => {
 
   it("maps recover reasons correctly", () => {
     const recoverReasons: FailureReason[] = [
-      "ci_failed", "merge_conflict", "looppilot_stopped", "handoff_failed",
+      "ci_failed", "merge_conflict", "looppilot_stopped",
     ];
     for (const r of recoverReasons) {
       expect(FAILURE_POLICY[r]).toBe("recover");
