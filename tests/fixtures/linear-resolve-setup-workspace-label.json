@@ -15,7 +15,8 @@
       ] }
     },
     "issueLabels": { "nodes": [
-      { "id": "label-aiok-ws", "name": "ai-ok" }
+      { "id": "label-aiok-ws", "name": "ai-ok" },
+      { "id": "label-nh-ws", "name": "needs-human" }
     ], "pageInfo": { "hasNextPage": false, "endCursor": null } }
   }
 }

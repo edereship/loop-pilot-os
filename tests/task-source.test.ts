@@ -253,6 +253,7 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     );
@@ -267,8 +268,9 @@ describe("resolveLinearSetup", () => {
         done: "state-done",
       },
       optInLabelId: "label-aiok",
-      labelMap: new Map([["bug", "label-bug"], ["ai-ok", "label-aiok"]]),
-      knownLabels: ["ai-ok", "bug"],
+      needsHumanLabelId: "label-nh",
+      labelMap: new Map([["bug", "label-bug"], ["ai-ok", "label-aiok"], ["needs-human", "label-nh"]]),
+      knownLabels: ["ai-ok", "bug", "needs-human"],
     });
     expect(calls[0].headers.Authorization).toBe("lin_api_test");
   });
@@ -294,6 +296,7 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     );
@@ -319,6 +322,7 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     );
@@ -343,6 +347,7 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     ).then(
@@ -377,6 +382,7 @@ describe("resolveLinearSetup", () => {
             done: "Done",
           },
           optInLabel: "ai-ok",
+          needsHumanLabel: "needs-human",
         },
         fetchFn,
       ),
@@ -415,7 +421,7 @@ describe("resolveLinearSetup", () => {
       ...Array(51).fill(infiniteLabelPage),
     ]);
     await expect(
-      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok" }, fetchFn),
+      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok", needsHumanLabel: "needs-human" }, fetchFn),
     ).rejects.toThrow(/exceeded 50 pages.*possible infinite pagination/);
   });
 
@@ -451,7 +457,7 @@ describe("resolveLinearSetup", () => {
       ...Array(51).fill(infiniteLabelPage),
     ]);
     await expect(
-      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok" }, fetchFn),
+      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok", needsHumanLabel: "needs-human" }, fetchFn),
     ).rejects.toThrow(/exceeded 50 pages.*possible infinite pagination/);
   });
 
@@ -473,10 +479,93 @@ describe("resolveLinearSetup", () => {
             done: "Done",
           },
           optInLabel: "ai-ok",
+          needsHumanLabel: "needs-human",
         },
         fetchFn,
       ),
     ).rejects.toThrow(/Linear GraphQL error/i);
+  });
+
+  it("resolves needsHumanLabel from team labels", async () => {
+    const { fetchFn } = makeFetch([
+      {
+        body: {
+          data: {
+            viewer: { id: "user-1", name: "Bot" },
+            teams: { nodes: [{ id: "team-uuid-1", key: "ENG" }] },
+          },
+        },
+      },
+      {
+        body: {
+          data: {
+            team: {
+              id: "team-uuid-1", key: "ENG",
+              states: { nodes: [
+                { id: "st-todo", name: "Todo" },
+                { id: "st-wip", name: "In Progress" },
+                { id: "st-rev", name: "In Review" },
+                { id: "st-done", name: "Done" },
+              ] },
+              labels: { nodes: [
+                { id: "lbl-opt", name: "ai-ok" },
+                { id: "lbl-nh", name: "needs-human" },
+              ], pageInfo: { hasNextPage: false, endCursor: null } },
+              projects: { nodes: [{ id: "proj-1", name: "P" }] },
+            },
+            issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        },
+      },
+    ]);
+    const result = await resolveLinearSetup("key", {
+      teamKey: "ENG",
+      projectName: "P",
+      stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" },
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+    }, fetchFn);
+    expect(result.needsHumanLabelId).toBe("lbl-nh");
+  });
+
+  it("throws when needsHumanLabel is missing", async () => {
+    const { fetchFn } = makeFetch([
+      {
+        body: {
+          data: {
+            viewer: { id: "user-1", name: "Bot" },
+            teams: { nodes: [{ id: "team-uuid-1", key: "ENG" }] },
+          },
+        },
+      },
+      {
+        body: {
+          data: {
+            team: {
+              id: "team-uuid-1", key: "ENG",
+              states: { nodes: [
+                { id: "st-todo", name: "Todo" },
+                { id: "st-wip", name: "In Progress" },
+                { id: "st-rev", name: "In Review" },
+                { id: "st-done", name: "Done" },
+              ] },
+              labels: { nodes: [
+                { id: "lbl-opt", name: "ai-ok" },
+              ], pageInfo: { hasNextPage: false, endCursor: null } },
+              projects: { nodes: [{ id: "proj-1", name: "P" }] },
+            },
+            issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        },
+      },
+    ]);
+    await expect(resolveLinearSetup("key", {
+      teamKey: "ENG",
+      projectName: "P",
+      stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" },
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+    }, fetchFn)).rejects.toThrow(/needs-human/);
   });
 });
 

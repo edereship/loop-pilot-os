@@ -337,6 +337,7 @@ export interface LinearSetupRequest {
   projectName: string;
   stateNames: Record<TicketState, string>;
   optInLabel: string;
+  needsHumanLabel: string;
 }
 
 export interface ResolvedLinearSetup {
@@ -345,6 +346,7 @@ export interface ResolvedLinearSetup {
   projectId: string;
   stateIds: Record<TicketState, string>;
   optInLabelId: string;
+  needsHumanLabelId: string;
   labelMap: Map<string, string>;   // label name → id (team + workspace)
   knownLabels: string[];           // known label names for GROOM prompt
 }
@@ -410,6 +412,13 @@ export async function resolveLinearSetup(
     missing.push(`label "${req.optInLabel}"`);
   }
 
+  const needsHumanLabelEntry =
+    teamLabels.find((l) => l.name === req.needsHumanLabel) ??
+    wsLabels.find((l) => l.name === req.needsHumanLabel);
+  if (!needsHumanLabelEntry) {
+    missing.push(`label "${req.needsHumanLabel}"`);
+  }
+
   if (missing.length > 0) {
     throw new Error(
       `Linear setup resolution failed; not found: ${missing.join(", ")}`,
@@ -435,6 +444,7 @@ export async function resolveLinearSetup(
     projectId: project!.id,
     stateIds,
     optInLabelId: label!.id,
+    needsHumanLabelId: needsHumanLabelEntry!.id,
     labelMap,
     knownLabels,
   };

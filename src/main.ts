@@ -130,6 +130,7 @@ async function runLoop(configPath: string): Promise<number> {
       projectName: config.linear.project,
       stateNames,
       optInLabel: config.linear.optInLabel,
+      needsHumanLabel: config.linear.needsHumanLabel,
     };
     const linearSetup = await resolveLinearSetup(
       config.linearApiKey,
