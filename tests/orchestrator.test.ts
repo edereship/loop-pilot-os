@@ -170,6 +170,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       const slug = wtPath.replace(/^\/wt\//, "");
       return { code: 0, stdout: `looppilot/${slug}-x\n` };
     }
+    if (args.includes("rev-parse") && args.includes("HEAD")) {
+      return { code: 0, stdout: "abc1234\n" };
+    }
     return { code: 0, stdout: "" };
   });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
@@ -4834,6 +4837,9 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
         const slug = wtPath.replace(/^\/wt\//, "");
         return { code: 0, stdout: `looppilot/${slug}-x\n` };
       }
+      if (args.includes("rev-parse") && args.includes("HEAD")) {
+        return { code: 0, stdout: "abc1234\n" };
+      }
       return { code: 0, stdout: "" };
     });
 
@@ -5541,6 +5547,21 @@ describe("Self-Review (ES-473)", () => {
       { kind: "completed", costUsd: 0.5, summary: '```json\n{"verdict":"pass","issues":["Fixed missing validation"],"summary":"Fixed 1 issue."}\n```' },
     ];
     h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    // Self-review claims to have fixed issues (issues.length > 0), so HEAD must move
+    // to satisfy the SHA consistency guard. Use a counter so the second rev-parse HEAD
+    // call (post-review) returns a different SHA than the first (pre-review).
+    let headCallCount = 0;
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        return { code: 0, stdout: "looppilot/ty-1-x\n" };
+      }
+      if (args.includes("rev-parse") && args.includes("HEAD")) {
+        headCallCount++;
+        return { code: 0, stdout: headCallCount <= 1 ? "sha-before\n" : "sha-after\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
 
     await h.orch.run();
 

@@ -6,10 +6,11 @@ export interface VerifyEvidencePromptArgs {
   specContent: SpecContent | null;
   defaultBranch: string;
   specDir?: string;
+  runRecipe?: string;
 }
 
 export function buildVerifyEvidencePrompt(args: VerifyEvidencePromptArgs): string {
-  const { issue, brief, specContent, defaultBranch, specDir } = args;
+  const { issue, brief, specContent, defaultBranch, specDir, runRecipe } = args;
   const blocks: string[] = [];
 
   blocks.push(
@@ -97,6 +98,7 @@ export function buildVerifyEvidencePrompt(args: VerifyEvidencePromptArgs): strin
       "   - **Test**: Run the test suite.",
       "   - **Type check**: Run the type checker (e.g. `tsc --noEmit`).",
       "   - **Lint**: Run the linter.",
+      ...(runRecipe ? [`   - **Acceptance check**: Run the configured acceptance check: \`${runRecipe}\`.`] : []),
       "3. Compare the implementation against the acceptance criteria above.",
       `4. If relevant, read the product specifications in \`${specDir ?? "docs/specs/"}\`.`,
       "5. Do NOT fix, modify, or change any code — only observe and report.",
@@ -118,6 +120,11 @@ export function buildVerifyEvidencePrompt(args: VerifyEvidencePromptArgs): strin
       "## Lint",
       "[paste full lint output or summary]",
       "",
+      ...(runRecipe ? [
+        "## Acceptance Check",
+        "[paste full acceptance check output or summary]",
+        "",
+      ] : []),
       ...(hasAcceptanceContext
         ? [
             "## Acceptance Criteria Assessment",

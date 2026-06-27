@@ -124,6 +124,9 @@ function makeHarness(config: Config): Harness {
       const slug = wtPath.replace(/^\/wt\//, "");
       return { code: 0, stdout: `looppilot/${slug}-x\n` };
     }
+    if (args.includes("rev-parse") && args.includes("HEAD")) {
+      return { code: 0, stdout: "abc1234\n" };
+    }
     return { code: 0, stdout: "" };
   });
   const orch = new Orchestrator({

@@ -413,7 +413,7 @@ export class Orchestrator {
     }
     if (lastVrLog?.outcome === "error" &&
         lastVrLog.errorDetail != null &&
-        lastVrLog.errorDetail !== "interrupted") {
+        lastVrLog.errorDetail.startsWith("fail-open:")) {
       this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
       return null;
     }
@@ -1015,6 +1015,11 @@ export class Orchestrator {
         if ("verifyFailed" in vr) {
           verifyReasons = vr.reasons;
           continue implementLoop;
+        }
+        // VERIFY is read-only: honor a stop request before the mutating HANDOFF phase.
+        if (this.interrupted) {
+          await this.haltForInterrupt();
+          return;
         }
         break implementLoop; // pass → HANDOFF
       }
@@ -1997,34 +2002,36 @@ export class Orchestrator {
       return await this.stopSession(session, "exception", errMsg(err));
     }
 
+    // Accumulate cost so verify-fix retries do not overwrite prior IMPLEMENT + VERIFY costs.
+    const priorCostUsd = this.store.getSession(session.id).costUsd ?? 0;
     if (outcome.kind === "interrupted") {
-      this.store.updateSession(session.id, { costUsd: outcome.costUsd });
+      this.store.updateSession(session.id, { costUsd: priorCostUsd + outcome.costUsd });
       await this.haltForInterrupt();
       return HALT;
     }
     if (outcome.kind === "cost_exceeded") {
-      this.store.updateSession(session.id, { costUsd: outcome.costUsd });
+      this.store.updateSession(session.id, { costUsd: priorCostUsd + outcome.costUsd });
       await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
-      return await this.stopSession(session, "cost_exceeded", null, { costUsd: outcome.costUsd });
+      return await this.stopSession(session, "cost_exceeded", null, { costUsd: priorCostUsd + outcome.costUsd });
     }
     if (outcome.kind === "error") {
-      this.store.updateSession(session.id, { costUsd: outcome.costUsd });
-      return await this.stopSession(session, "exception", outcome.message, { costUsd: outcome.costUsd });
+      this.store.updateSession(session.id, { costUsd: priorCostUsd + outcome.costUsd });
+      return await this.stopSession(session, "exception", outcome.message, { costUsd: priorCostUsd + outcome.costUsd });
     }
     // completed: まず cost と summary を永続化（仕様 §7 IMPLEMENT 後条件）
-    this.store.updateSession(session.id, { costUsd: outcome.costUsd, agentSummary: outcome.summary });
+    this.store.updateSession(session.id, { costUsd: priorCostUsd + outcome.costUsd, agentSummary: outcome.summary });
     // Wrap post-agent git checks: if git status/log fails (e.g. worktree disappeared or
     // index lock), the throw must not escape uncaught — it would crash the daemon without
     // calling stopSession and leave the session stuck in "implementing".
     try {
       if (await this.git.hasUncommittedChanges(worktreePath)) {
-        return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: outcome.costUsd });
+        return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: priorCostUsd + outcome.costUsd });
       }
       if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
-        return await this.stopSession(session, "agent_no_change", null, { costUsd: outcome.costUsd });
+        return await this.stopSession(session, "agent_no_change", null, { costUsd: priorCostUsd + outcome.costUsd });
       }
     } catch (err) {
-      return await this.stopSession(session, "exception", errMsg(err), { costUsd: outcome.costUsd });
+      return await this.stopSession(session, "exception", errMsg(err), { costUsd: priorCostUsd + outcome.costUsd });
     }
     return CONTINUE;
   }
@@ -2510,7 +2517,7 @@ export class Orchestrator {
     preVerifySha: string | null,
   ): Promise<boolean> {
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
-    if (preVerifySha === null) return true;
+    if (preVerifySha === null) return false;
     try {
       const branchRes = await this.runner.run(
         "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
@@ -2591,6 +2598,7 @@ export class Orchestrator {
       specContent,
       defaultBranch: this.config.repo.defaultBranch,
       specDir: this.config.product.specDir,
+      runRecipe: this.config.verify.runRecipe,
     });
 
     let evidenceText: string;
@@ -2616,12 +2624,20 @@ export class Orchestrator {
       if (eo.kind === "cost_exceeded" || eo.kind === "error") {
         const errDetail = eo.kind === "error" ? eo.message : "cost exceeded";
         this.log(`verify: evidence agent ${eo.kind} (fail-open): ${errDetail}`);
-        await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+        const cleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
         const freshSess = this.store.getSession(session.id);
         this.store.updateSession(session.id, {
           verifyAttempts: attempt,
           costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
         });
+        if (!cleanupOk) {
+          this.store.updateVerifyLog(logRow.id, {
+            endedAt: this.clock(), outcome: "error",
+            costUsd: evidenceCostUsd,
+            errorDetail: `worktree cleanup failed after evidence ${errDetail}`,
+          });
+          return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
+        }
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "passed",
           costUsd: evidenceCostUsd, errorDetail: `fail-open: evidence ${errDetail}`,
@@ -2632,12 +2648,20 @@ export class Orchestrator {
       evidenceText = eo.fullResult ?? eo.summary;
     } catch (err) {
       this.log(`verify: evidence agent exception (fail-open): ${errMsg(err)}`);
-      await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+      const cleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
       const freshSess = this.store.getSession(session.id);
       this.store.updateSession(session.id, {
         verifyAttempts: attempt,
         costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
       });
+      if (!cleanupOk) {
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error",
+          costUsd: 0,
+          errorDetail: `worktree cleanup failed after evidence exception: ${errMsg(err)}`,
+        });
+        return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
+      }
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         costUsd: 0, errorDetail: `fail-open: evidence exception: ${errMsg(err)}`,
@@ -2708,11 +2732,21 @@ export class Orchestrator {
       });
     } catch (err) {
       this.log(`verify: judge exception (fail-open): ${errMsg(err)}`);
-      const freshSess = this.store.getSession(session.id);
+      const judgeExcCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+      const freshSessJudgeExc = this.store.getSession(session.id);
       this.store.updateSession(session.id, {
         verifyAttempts: attempt,
-        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+        costUsd: (freshSessJudgeExc.costUsd ?? 0) + evidenceCostUsd,
       });
+      if (!judgeExcCleanupOk) {
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error",
+          evidence: evidenceText.slice(0, 50_000),
+          costUsd: evidenceCostUsd,
+          errorDetail: `worktree cleanup failed after judge exception: ${errMsg(err)}`,
+        });
+        return await this.stopSession(session, "exception", "verify: worktree cleanup failed after judgment");
+      }
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         evidence: evidenceText.slice(0, 50_000),
@@ -2730,6 +2764,23 @@ export class Orchestrator {
       });
       await this.haltForInterrupt();
       return HALT;
+    }
+
+    // Cleanup judgment worktree pollution before processing any non-interrupted verdict.
+    const judgmentCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+    if (!judgmentCleanupOk) {
+      const freshSessJudgeClean = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSessJudgeClean.costUsd ?? 0) + evidenceCostUsd,
+      });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "error",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd,
+        errorDetail: "worktree cleanup failed after judgment",
+      });
+      return await this.stopSession(session, "exception", "verify: worktree cleanup failed after judgment");
     }
 
     if (judgmentOutcome.kind === "error") {
