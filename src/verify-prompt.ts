@@ -27,6 +27,13 @@ export function buildVerifyEvidencePrompt(args: VerifyEvidencePromptArgs): strin
   if (acceptance) {
     blocks.push(["# Acceptance Criteria", "", acceptance].join("\n"));
   }
+  // When sections couldn't be parsed (e.g. after restart with a malformed brief) the
+  // acceptance criteria may still be present inside the ticket description, which is
+  // already included in the Ticket block below.  Track this so the output instructions
+  // still request an assessment even though we have no dedicated criteria block.
+  const hasAcceptanceContext =
+    acceptance !== null ||
+    (brief !== null && brief.sections === null && issue.description.trim().length > 0);
 
   if (specContent) {
     blocks.push(["# Product Requirements", "", specContent.requirements].join("\n"));
@@ -88,7 +95,7 @@ export function buildVerifyEvidencePrompt(args: VerifyEvidencePromptArgs): strin
       "## Lint",
       "[paste full lint output or summary]",
       "",
-      ...(acceptance
+      ...(hasAcceptanceContext
         ? [
             "## Acceptance Criteria Assessment",
             "[For each criterion, state whether it is met and why]",
@@ -128,7 +135,10 @@ export function buildVerifyJudgmentPrompt(args: VerifyJudgmentPromptArgs): strin
     blocks.push("# Acceptance Criteria\n\n(No explicit acceptance criteria provided. Judge based on objective oracles only.)");
   }
 
-  blocks.push(["# Code Diff", "", "```", diff, "```"].join("\n"));
+  // Use a 4-backtick fence so that any ``` sequence appearing on a diff context line
+  // (e.g. " ``` " in a Markdown file) cannot close the outer block and inject content
+  // into the surrounding prompt.
+  blocks.push(["# Code Diff", "", "````", diff, "````"].join("\n"));
 
   blocks.push(["# Verification Evidence", "", evidence].join("\n"));
 

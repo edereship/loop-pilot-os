@@ -91,4 +91,13 @@ describe("parseVerifyOutput", () => {
     const result = parseVerifyOutput(input);
     expect(result).toEqual({ kind: "ok", value: { verdict: "pass", reasons: [] } });
   });
+
+  it("parses compact single-line fenced JSON (no newline after json tag)", () => {
+    const input = '```json {"verdict":"fail","reasons":["tests fail"]} ```';
+    const result = parseVerifyOutput(input);
+    expect(result).toEqual({
+      kind: "ok",
+      value: { verdict: "fail", reasons: ["tests fail"] },
+    });
+  });
 });

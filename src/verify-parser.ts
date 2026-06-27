@@ -31,13 +31,16 @@ export function parseVerifyOutput(text: string): VerifyParseResult {
 }
 
 function* extractJsonCandidates(text: string): Generator<string> {
-  const fencePattern = /```json\s*\n([\s\S]*?)\n\s*```/g;
+  // Accept both multiline and compact single-line fenced blocks:
+  //   ```json\n{...}\n```   (standard)
+  //   ```json {...} ```     (compact — produced by some judge responses)
+  const fencePattern = /```json[ \t]*([\s\S]*?)[ \t]*```/g;
   let lastFenceMatch: string | null = null;
   let m: RegExpExecArray | null;
   while ((m = fencePattern.exec(text)) !== null) {
     lastFenceMatch = m[1];
   }
-  if (lastFenceMatch !== null) { yield lastFenceMatch; return; }
+  if (lastFenceMatch !== null) { yield lastFenceMatch.trim(); return; }
 
   const lines = text.split("\n");
 

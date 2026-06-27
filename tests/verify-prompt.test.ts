@@ -100,6 +100,20 @@ describe("buildVerifyEvidencePrompt", () => {
     });
     expect(result).toContain("custom/specs/");
   });
+
+  it("includes acceptance criteria assessment instruction when brief sections are null (fallback to description)", () => {
+    const noBrief: PlanBrief = { raw: "", sections: null };
+    const result = buildVerifyEvidencePrompt({ issue, brief: noBrief, specContent: null, defaultBranch: "main" });
+    // No dedicated # Acceptance Criteria block (criteria live in the ticket description already)
+    expect(result).not.toMatch(/^# Acceptance Criteria$/m);
+    // But the assessment instruction must still appear so the verifier checks the ticket description
+    expect(result).toContain("## Acceptance Criteria Assessment");
+  });
+
+  it("omits acceptance criteria assessment instruction when brief is null", () => {
+    const result = buildVerifyEvidencePrompt({ issue, brief: null, specContent: null, defaultBranch: "main" });
+    expect(result).not.toContain("## Acceptance Criteria Assessment");
+  });
 });
 
 describe("buildVerifyJudgmentPrompt", () => {
@@ -162,5 +176,17 @@ describe("buildVerifyJudgmentPrompt", () => {
     });
     expect(result).toContain('"verdict"');
     expect(result).toContain("No explicit acceptance criteria provided");
+  });
+
+  it("wraps diff in a 4-backtick fence so embedded ``` lines cannot close it", () => {
+    const diffWithFence = "context line\n ``` embedded fence\nmore context";
+    const result = buildVerifyJudgmentPrompt({
+      acceptance: "Criteria",
+      diff: diffWithFence,
+      evidence: "evidence",
+    });
+    expect(result).toContain("embedded fence");
+    // The outer fence must use 4+ backticks so a 3-backtick sequence in the diff is safe
+    expect(result).toMatch(/````/);
   });
 });
