@@ -888,20 +888,12 @@ export class Orchestrator {
           // address the rejection — halt with design_rejected rather than silently
           // proceeding to IMPLEMENT without an approved design.
           if (designReviewReasons !== undefined && (planBrief === null || planBrief.raw.length === 0)) {
-            await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
-            let todoRevertErrA: string | null = null;
-            try {
-              await this.source.transition(issue.id, "todo");
-            } catch (err) {
-              todoRevertErrA = errMsg(err);
-              this.log(`designReview: todo revert failed after redesign failure (ticket may be stuck In Progress): ${todoRevertErrA}`);
-            }
             const baseDetailA = `redesign agent failed to produce a brief after rejection: ${designReviewReasons.join("; ")}`;
             const ctrl = await this.stopSession(
               session, "design_rejected",
-              todoRevertErrA !== null ? `${baseDetailA}; todo revert failed: ${todoRevertErrA}` : baseDetailA,
+              baseDetailA,
               {},
-              { haltIfRevertFailed: todoRevertErrA !== null },
+              { haltIfRevertFailed: true },
             );
             if (ctrl.control === "halt") return;
             designRejected = true;
@@ -927,18 +919,9 @@ export class Orchestrator {
 
           designAttempt++;
           if (designAttempt > maxRedesigns) {
-            await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
-            let todoRevertErr: string | null = null;
-            try {
-              await this.source.transition(issue.id, "todo");
-            } catch (err) {
-              todoRevertErr = errMsg(err);
-              this.log(`designReview: todo revert failed after max redesigns exceeded (ticket may be stuck In Progress): ${todoRevertErr}`);
-            }
             const lastReasons = review.reasons.length > 0 ? review.reasons.join("; ") : "(no reasons provided)";
-            const baseDetail = `design review rejected after ${maxRedesigns} redesign attempts: ${lastReasons}`;
-            const detail = todoRevertErr !== null ? `${baseDetail}; todo revert failed: ${todoRevertErr}` : baseDetail;
-            const ctrl = await this.stopSession(session, "design_rejected", detail, {}, { haltIfRevertFailed: todoRevertErr !== null });
+            const detail = `design review rejected after ${maxRedesigns} redesign attempts: ${lastReasons}`;
+            const ctrl = await this.stopSession(session, "design_rejected", detail, {}, { haltIfRevertFailed: true });
             if (ctrl.control === "halt") return;
             designRejected = true;
             break;
@@ -3333,52 +3316,13 @@ export class Orchestrator {
             }
             recoveryUpdate.pendingRestartReason = pendingReason;
           }
-          // handoff_failed + any action that restarts review: transition the Linear ticket
-          // to In Review now that recovery is confirmed to succeed. fix_code and rebase also
-          // push changes and post /restart-review, so they need the same transition.
-          // Deferred from the pre-recovery block so the ticket stays in its prior state on
-          // escalation or failure (ES-450 Finding 5).
-          // If the transition fails, do NOT reactivate — fall through to normal stop so the
-          // next startup can retry the transition (ES-450 Finding 4).
-          if (reason === "handoff_failed" && (
-            result.action === "restart_review" ||
-            result.action === "fix_code" ||
-            result.action === "rebase"
-          )) {
-            let handoffErr: string | null = null;
-            try {
-              await retry(3, () => this.source.transition(session.linearIssueId, "in_review"));
-            } catch (err) {
-              handoffErr = err instanceof Error ? err.message : String(err);
-              this.log(`recovery: handoff_failed post-recovery transition(in_review) failed: ${handoffErr}`);
-            }
-            if (handoffErr !== null) {
-              // Build failure detail with a sentinel encoding the completed action so the
-              // next retry skips Codex and directly retries only the transition — avoids
-              // duplicate mutations or a different recovery choice (ES-450 Finding 1).
-              if (recoveryCost > 0) {
-                const freshened2 = this.store.getSession(session.id);
-                patch = { ...patch, costUsd: (freshened2.costUsd ?? 0) + recoveryCost };
-              }
-              effectiveDetail = `handoff_transition_pending:${result.action} (recovery failed: linear transition(in_review) failed: ${handoffErr})`;
-            } else {
-              this.store.updateSession(session.id, recoveryUpdate);
-              await this.notifier.notify({
-                kind: "recovery_succeeded",
-                identifier: session.linearIdentifier,
-                action: result.action,
-              });
-              return CONTINUE;
-            }
-          } else {
-            this.store.updateSession(session.id, recoveryUpdate);
-            await this.notifier.notify({
-              kind: "recovery_succeeded",
-              identifier: session.linearIdentifier,
-              action: result.action,
-            });
-            return CONTINUE;
-          }
+          this.store.updateSession(session.id, recoveryUpdate);
+          await this.notifier.notify({
+            kind: "recovery_succeeded",
+            identifier: session.linearIdentifier,
+            action: result.action,
+          });
+          return CONTINUE;
         }
         // failed: preserve any recovery agent cost and carry the failure message forward so
         // operators see what the recovery attempt tried and why it failed (ES-450 Finding 3).
@@ -3440,6 +3384,9 @@ export class Orchestrator {
     // --- Policy: "abandon" (ES-490) ---
     if (policy === "abandon") {
       const freshAbandon = this.store.getSession(session.id);
+      // Forward-looking: no current abandon-policy reason reaches here (all are
+      // pre-HANDOFF, so prNumber is always null). Will be exercised when recovery
+      // loop exhaustion falls back to abandon (ES-493).
       if (freshAbandon.prNumber !== null && this.recoveryTurn !== null) {
         // Post-PR abandon: use executeAbandon (closes PR, deletes branch, reverts ticket)
         const capturedDetail = effectiveDetail;
@@ -3485,6 +3432,9 @@ export class Orchestrator {
         } catch (err) {
           todoRevertErr = errMsg(err);
           this.log(`policy-abandon: todo revert failed (ticket may be stuck): ${todoRevertErr}`);
+          effectiveDetail = effectiveDetail
+            ? `${effectiveDetail}; todo revert failed: ${todoRevertErr}`
+            : `todo revert failed: ${todoRevertErr}`;
         }
         this.store.updateSession(session.id, {
           state: "stopped",

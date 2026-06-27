@@ -3750,10 +3750,10 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     expect(sB).toBeDefined();
   });
 
-  it("verify_failed → policy=abandon (policy table coverage)", async () => {
-    // Verify the policy table maps verify_failed to abandon.
-    // Full verify_failed integration is tested in ES-491; here we verify
-    // that agent_no_change (also abandon policy) continues the run.
+  it("abandon-policy reasons continue the run (agent_no_change proxy)", async () => {
+    // Verify that reasons with policy=abandon (e.g. agent_no_change) continue the run.
+    // Full verify_failed integration is tested in ES-491; here we use
+    // agent_no_change as a proxy since it shares the same abandon policy.
     const config = makeConfig({ maxTasksPerRun: 2 });
     const designer = new FakePlanRunner();
     const h = makeHarness(config, { designer });
