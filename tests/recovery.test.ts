@@ -640,7 +640,7 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     // verify is disabled here because this test focuses on self-review recovery; the
     // verify gate is covered separately in the VERIFY describe block (ES-491).
     const config = makeConfig({ maxTasksPerRun: 3 });
-    (config as { verify: { enabled: boolean; runRecipe: string } }).verify.enabled = false;
+    (config as any).verify = { enabled: false, runRecipe: "" };
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
       h.store,
@@ -681,7 +681,7 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     // the verify gate is covered separately in the VERIFY describe block (ES-491).
     const config = makeConfig({ maxTasksPerRun: 3 });
     (config as { selfReview: { enabled: boolean } }).selfReview.enabled = false;
-    (config as { verify: { enabled: boolean; runRecipe: string } }).verify.enabled = false;
+    (config as any).verify = { enabled: false, runRecipe: "" };
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
       h.store,

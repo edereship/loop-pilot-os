@@ -6413,4 +6413,97 @@ describe("VERIFY (ES-491)", () => {
 
     expect(h.logs.some(l => l.includes("verify gate incomplete"))).toBe(true);
   });
+
+  it("verify.enabled = false → skips verify, no verify_log entries", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: false, runRecipe: "" };
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].verifyAttempts).toBe(0);
+
+    const verifyLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(verifyLogs).toHaveLength(0);
+  });
+
+  it("verify evidence agent interrupted → HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [{ kind: "interrupted", costUsd: 0.1 }];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+
+    const sessions = h.store.sessionsForRun(run.id);
+    const verifyLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(verifyLogs).toHaveLength(1);
+    expect(verifyLogs[0].outcome).toBe("error");
+    expect(verifyLogs[0].errorDetail).toBe("interrupted");
+  });
+
+  it("verify judge interrupted → HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [{ kind: "interrupted" }];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Test\n5 passed" },
+    ];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("user_interrupt");
+
+    const sessions = h.store.sessionsForRun(run.id);
+    const verifyLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(verifyLogs).toHaveLength(1);
+    expect(verifyLogs[0].outcome).toBe("error");
+    expect(verifyLogs[0].errorDetail).toBe("interrupted");
+  });
+
+  it("verify evidence agent cost_exceeded → fail-open pass", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [{ kind: "cost_exceeded", costUsd: 2.0 }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+
+    const verifyLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(verifyLogs).toHaveLength(1);
+    expect(verifyLogs[0].outcome).toBe("passed");
+    expect(verifyLogs[0].errorDetail).toContain("fail-open");
+  });
 });
