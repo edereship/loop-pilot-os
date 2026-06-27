@@ -6407,7 +6407,7 @@ describe("VERIFY (ES-491)", () => {
     expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
   });
 
-  it("crash recovery: verify not completed → resumes VERIFY", async () => {
+  it("crash recovery: verify not completed → resumes VERIFY (with acceptance criteria)", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designReviewer: planner });
@@ -6425,6 +6425,8 @@ describe("VERIFY (ES-491)", () => {
       now: "2026-06-05T00:00:00.000Z",
     });
     h.store.updateSession(session.id, { state: "implementing" });
+    // Store a plan brief with acceptance criteria so VERIFY can be resumed.
+    h.store.updateSession(session.id, { planBrief: "## Acceptance Criteria\nThe feature works." });
     // Self-review passed but NO verify_log entries — crashed before VERIFY started.
     h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
     const srLogs = h.store.getSelfReviewLogsForSession(session.id);
@@ -6442,6 +6444,151 @@ describe("VERIFY (ES-491)", () => {
     expect(verifyLogs).toHaveLength(1);
     expect(verifyLogs[0].outcome).toBe("passed");
     expect(verifyLogs[0].errorDetail).toContain("fail-open");
+  });
+
+  it("crash recovery: verify not completed, no acceptance criteria → halts for human review", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner });
+
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing" });
+    // No planBrief set — acceptance criteria unavailable.
+    // Self-review passed but NO verify_log entries — crashed before VERIFY started.
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+
+    await h.orch.run();
+
+    // Recovery must halt because there are no acceptance criteria for VERIFY.
+    expect(h.logs.some(l => l.includes("no acceptance criteria for VERIFY"))).toBe(true);
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions.some(s => s.state === "stopped")).toBe(true);
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("crash recovery: verify failed → resumes IMPLEMENT before re-running VERIFY", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    // Use a dedicated selfReviewAgent so h.agent counts only IMPLEMENT calls.
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent });
+
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing", verifyAttempts: 1 });
+    h.store.updateSession(session.id, { planBrief: "## Acceptance Criteria\nThe feature works." });
+    // Self-review log passed before the crash.
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    // Prior VERIFY attempt failed — crashed before IMPLEMENT fix could run.
+    h.store.insertVerifyLog({ runId: priorRun.id, sessionId: session.id, attempt: 1, startedAt: "2026-06-05T00:01:00.000Z" });
+    const vrLogs = h.store.getVerifyLogsForSession(session.id);
+    h.store.updateVerifyLog(vrLogs[0].id, {
+      endedAt: "2026-06-05T00:02:00.000Z", outcome: "failed",
+      verdict: "fail", reasonCount: 1,
+    });
+    // IMPLEMENT fix succeeds; selfReviewAgent has no outcomes → throws (non-fatal) → proceed;
+    // then verifyAgent has no outcomes → throws → fail-open pass → HANDOFF → MONITOR merged.
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed the verify failure" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Recovery must have logged "resuming IMPLEMENT then VERIFY", not "resuming VERIFY".
+    expect(h.logs.some(l => l.includes("prior verify failed") && l.includes("resuming IMPLEMENT"))).toBe(true);
+    // IMPLEMENT must have run (h.agent was called exactly once for the fix).
+    expect(h.agent.callCount).toBe(1);
+    // Verify ran again after the fix and logged a fail-open pass (verifyAgent had no outcomes).
+    const allVrLogs = h.store.getVerifyLogsForSession(session.id);
+    expect(allVrLogs.length).toBeGreaterThanOrEqual(2);
+    expect(allVrLogs[allVrLogs.length - 1]!.outcome).toBe("passed");
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
+  });
+
+  it("verify-fix IMPLEMENT cost_exceeded → preserves worktree (prior commits not discarded)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const selfReviewAgent = new FakeAgentRunner(); // separate so h.agent only counts IMPLEMENT calls
+    const verifyAgent = new FakeAgentRunner();
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent, verifyAgent });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "desc" })];
+    // Iteration 1: IMPLEMENT succeeds; VERIFY fails (planner returns fail verdict).
+    // Iteration 2: IMPLEMENT (fix) hits cost_exceeded.
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "cost_exceeded", costUsd: 0.5 },
+    ];
+    // selfReviewAgent: no outcomes → throws on each call → non-fatal, CONTINUE
+    // verifyAgent: evidence collection succeeds on iteration 1
+    verifyAgent.outcomes = [{ kind: "completed", costUsd: 0.1, summary: "evidence gathered" }];
+    // planner: fail verdict on first judgment → reasons injected into 2nd IMPLEMENT
+    planner.outcomes = [{ kind: "completed", text: '{"verdict":"fail","reasons":["criterion not met"]}' }];
+
+    await h.orch.run();
+
+    // Session stopped due to cost_exceeded.
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("stopped");
+    expect(sessions[0]!.failureReason).toBe("cost_exceeded");
+    // discardWorktree must NOT have been called: the verify-fix retry preserves prior commits.
+    expect(h.git.calls.filter(c => c.method === "discardWorktree")).toHaveLength(0);
+  });
+
+  it("verify judge error during interrupt → logs error/interrupted, not passed", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const selfReviewAgent = new FakeAgentRunner(); // separate so selfReview doesn't drain h.agent
+    const verifyAgent = new FakeAgentRunner();
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent, verifyAgent });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "desc" })];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    // selfReviewAgent: no outcomes → throws → non-fatal, CONTINUE
+    // verifyAgent: evidence collection succeeds
+    verifyAgent.outcomes = [{ kind: "completed", costUsd: 0.1, summary: "evidence gathered" }];
+    // Override planner.run: set interrupted=true and return a judge error, simulating an
+    // interrupt that raced with the Codex child process surfacing as kind:"error".
+    planner.run = async (_ctx) => {
+      (h.orch as any).interrupted = true;
+      return { kind: "error", message: "judge process killed" };
+    };
+
+    await h.orch.run();
+
+    // The run must be halted (haltForInterrupt was called).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // The verify log must record error/interrupted, NOT a fail-open pass.
+    const sessions = h.store.sessionsForRun(run.id);
+    const vrLogs = h.store.getVerifyLogsForSession(sessions[0]!.id);
+    expect(vrLogs).toHaveLength(1);
+    expect(vrLogs[0]!.outcome).toBe("error");
+    expect(vrLogs[0]!.errorDetail).toBe("interrupted");
   });
 
   it("verify.enabled = false → skips verify, no verify_log entries", async () => {

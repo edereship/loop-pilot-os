@@ -402,8 +402,10 @@ export class Orchestrator {
     return CONTINUE;
   }
 
-  /** Returns null to proceed to HANDOFF, "resume_verify" to re-run VERIFY, or a RunControl to halt. */
-  private async checkVerifyGateForRecovery(session: TaskSessionRow): Promise<RunControl | null | "resume_verify"> {
+  /** Returns null to proceed to HANDOFF, "resume_verify" to re-run VERIFY,
+   * "resume_implement" to re-run IMPLEMENT then VERIFY (when a prior verify attempt
+   * already recorded a failure), or a RunControl to halt. */
+  private async checkVerifyGateForRecovery(session: TaskSessionRow): Promise<RunControl | null | "resume_verify" | "resume_implement"> {
     if (!this.config.verify.enabled) return null;
     const vrLogs = this.store.getVerifyLogsForSession(session.id);
     const lastVrLog = vrLogs.at(-1);
@@ -416,6 +418,13 @@ export class Orchestrator {
         lastVrLog.errorDetail.startsWith("fail-open:")) {
       this.log(`recovery: verify completed with error (fail-open); resuming HANDOFF (${session.linearIdentifier})`);
       return null;
+    }
+    // A prior verify attempt already failed and recorded its outcome. Do not re-run VERIFY
+    // on the same unchanged code — that would waste an attempt without injecting failure
+    // reasons. Re-enter at IMPLEMENT so the agent has a chance to address the failure first.
+    if (lastVrLog?.outcome === "failed") {
+      this.log(`recovery: prior verify failed; resuming IMPLEMENT then VERIFY (${session.linearIdentifier})`);
+      return "resume_implement";
     }
     this.log(`recovery: verify incomplete; resuming VERIFY (${session.linearIdentifier})`);
     return "resume_verify";
@@ -536,7 +545,7 @@ export class Orchestrator {
             // review, SHA unreadable, uncommitted changes, no diff remaining, etc.).
             this.log(`recovery: self-review completed (${lastSrLog.outcome}); resuming HANDOFF (${session.linearIdentifier})`);
             const verifyGate = await this.checkVerifyGateForRecovery(session);
-            if (verifyGate !== null && verifyGate !== "resume_verify") return verifyGate;
+            if (verifyGate !== null && verifyGate !== "resume_verify" && verifyGate !== "resume_implement") return verifyGate;
             const recoveredIssue: EligibleIssue = {
               id: session.linearIssueId,
               identifier: session.linearIdentifier,
@@ -546,9 +555,27 @@ export class Orchestrator {
               sortOrder: 0,
               url: session.issueUrl,
             };
-            if (verifyGate === "resume_verify") {
+            if (verifyGate === "resume_verify" || verifyGate === "resume_implement") {
               const recoveredBrief = session.planBrief ? parseBrief(session.planBrief) : null;
-              let verifyReasons: string[] | null = null;
+              // VERIFY requires acceptance criteria to evaluate against. With an empty ticket
+              // description (crash recovery always sets description to ""), running VERIFY
+              // without a brief or without parseable acceptance criteria would let it pass on
+              // build/test/lint evidence alone, bypassing the acceptance gate.
+              if (!recoveredBrief?.sections?.acceptance) {
+                const briefStatus = session.planBrief ? "unparseable" : "missing";
+                const detail =
+                  `crash recovery: cannot resume VERIFY — no acceptance criteria available (brief ${briefStatus}); ` +
+                  `manual review needed: ` +
+                  `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+                this.log(`recovery: halting — no acceptance criteria for VERIFY (${session.linearIdentifier})`);
+                return await this.stopSession(session, "exception", detail);
+              }
+              // When recovering from a prior failed verify attempt, seed verifyReasons with a
+              // placeholder so the loop enters IMPLEMENT first rather than re-running VERIFY on
+              // unchanged code (which would waste an attempt without injecting failure reasons).
+              let verifyReasons: string[] | null = verifyGate === "resume_implement"
+                ? ["(previous verify attempt failed before crash; exact reasons unavailable — re-check full implementation)"]
+                : null;
               verifyFixLoop: for (;;) {
                 if (verifyReasons !== null) {
                   const impl = await this.implement(session, recoveredIssue, recoveredBrief, verifyReasons);
@@ -600,7 +627,7 @@ export class Orchestrator {
         // Clean committed work, no open PR: resume from HANDOFF.
         // Self-review is disabled, so proceed directly.
         const verifyGate = await this.checkVerifyGateForRecovery(session);
-        if (verifyGate !== null && verifyGate !== "resume_verify") return verifyGate;
+        if (verifyGate !== null && verifyGate !== "resume_verify" && verifyGate !== "resume_implement") return verifyGate;
         const recoveredIssue: EligibleIssue = {
           id: session.linearIssueId,
           identifier: session.linearIdentifier,
@@ -610,9 +637,27 @@ export class Orchestrator {
           sortOrder: 0,
           url: session.issueUrl,
         };
-        if (verifyGate === "resume_verify") {
+        if (verifyGate === "resume_verify" || verifyGate === "resume_implement") {
           const recoveredBrief = session.planBrief ? parseBrief(session.planBrief) : null;
-          let verifyReasons: string[] | null = null;
+          // VERIFY requires acceptance criteria to evaluate against. With an empty ticket
+          // description (crash recovery always sets description to ""), running VERIFY
+          // without a brief or without parseable acceptance criteria would let it pass on
+          // build/test/lint evidence alone, bypassing the acceptance gate.
+          if (!recoveredBrief?.sections?.acceptance) {
+            const briefStatus = session.planBrief ? "unparseable" : "missing";
+            const detail =
+              `crash recovery: cannot resume VERIFY — no acceptance criteria available (brief ${briefStatus}); ` +
+              `manual review needed: ` +
+              `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
+            this.log(`recovery: halting — no acceptance criteria for VERIFY (${session.linearIdentifier})`);
+            return await this.stopSession(session, "exception", detail);
+          }
+          // When recovering from a prior failed verify attempt, seed verifyReasons with a
+          // placeholder so the loop enters IMPLEMENT first rather than re-running VERIFY on
+          // unchanged code (which would waste an attempt without injecting failure reasons).
+          let verifyReasons: string[] | null = verifyGate === "resume_implement"
+            ? ["(previous verify attempt failed before crash; exact reasons unavailable — re-check full implementation)"]
+            : null;
           verifyFixLoop: for (;;) {
             if (verifyReasons !== null) {
               const impl = await this.implement(session, recoveredIssue, recoveredBrief, verifyReasons);
@@ -2085,7 +2130,11 @@ export class Orchestrator {
     }
     if (outcome.kind === "cost_exceeded") {
       this.store.updateSession(session.id, { costUsd: priorCostUsd + outcome.costUsd });
-      await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
+      // When retrying after a VERIFY failure, the branch already holds the prior implementation.
+      // Preserve those commits for human recovery rather than discarding the whole worktree.
+      if (verifyReasons === null) {
+        await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
+      }
       return await this.stopSession(session, "cost_exceeded", null, { costUsd: priorCostUsd + outcome.costUsd });
     }
     if (outcome.kind === "error") {
@@ -2913,6 +2962,25 @@ export class Orchestrator {
     }
 
     if (judgmentOutcome.kind === "error") {
+      // If an interrupt landed while the judge was running, the child process may surface as
+      // kind:"error" rather than kind:"interrupted". Do not record a fail-open pass in that
+      // case — the operator interrupted verification, so writing "passed" would let recovery
+      // skip the VERIFY gate and proceed to HANDOFF without a real judgment.
+      if (this.interrupted) {
+        const freshSessInt = this.store.getSession(session.id);
+        this.store.updateSession(session.id, {
+          verifyAttempts: attempt,
+          costUsd: (freshSessInt.costUsd ?? 0) + evidenceCostUsd,
+        });
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error",
+          evidence: evidenceText.slice(0, 50_000),
+          costUsd: evidenceCostUsd,
+          errorDetail: "interrupted",
+        });
+        await this.haltForInterrupt();
+        return HALT;
+      }
       this.log(`verify: judge error (fail-open): ${judgmentOutcome.message}`);
       const freshSess = this.store.getSession(session.id);
       this.store.updateSession(session.id, {
