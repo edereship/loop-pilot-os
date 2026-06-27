@@ -40,7 +40,7 @@ function* extractJsonCandidates(text: string): Generator<string> {
   while ((m = fencePattern.exec(text)) !== null) {
     lastFenceMatch = m[1];
   }
-  if (lastFenceMatch !== null) { yield lastFenceMatch.trim(); return; }
+  if (lastFenceMatch !== null) { yield lastFenceMatch.trim(); }
 
   const lines = text.split("\n");
 

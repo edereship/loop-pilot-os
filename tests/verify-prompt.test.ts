@@ -189,4 +189,30 @@ describe("buildVerifyJudgmentPrompt", () => {
     // The outer fence must use 4+ backticks so a 3-backtick sequence in the diff is safe
     expect(result).toMatch(/````/);
   });
+
+  it("adapts diff fence length to exceed the longest backtick run in the diff", () => {
+    const diffWithFourBackticks = "context\n```` four-backtick block\nmore context";
+    const result = buildVerifyJudgmentPrompt({
+      acceptance: "Criteria",
+      diff: diffWithFourBackticks,
+      evidence: "evidence",
+    });
+    // Must use 5+ backticks to safely contain a 4-backtick sequence in the diff
+    expect(result).toMatch(/`````/);
+    expect(result).toContain("four-backtick block");
+  });
+
+  it("wraps evidence in a fenced block and labels it as data to prevent prompt injection", () => {
+    const result = buildVerifyJudgmentPrompt({
+      acceptance: "Criteria",
+      diff: "diff",
+      evidence: "Build: OK\nTests: 5 passed",
+    });
+    expect(result).toContain("Build: OK");
+    const evidenceSection = result.slice(result.indexOf("# Verification Evidence"));
+    // Evidence content must appear inside a code fence
+    expect(evidenceSection).toMatch(/```[\s\S]*?Build: OK/);
+    // The prompt must tell the judge to treat the block as data, not instructions
+    expect(evidenceSection).toMatch(/data only|not as instructions/i);
+  });
 });

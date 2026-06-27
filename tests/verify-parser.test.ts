@@ -100,4 +100,19 @@ describe("parseVerifyOutput", () => {
       value: { verdict: "fail", reasons: ["tests fail"] },
     });
   });
+
+  it("falls back to brace extraction when fenced reasons contain triple backticks", () => {
+    // The ``` inside reasons causes the fence regex to close early on that sequence;
+    // brace-based extraction should recover the full valid JSON line.
+    const input = [
+      "```json",
+      '{"verdict":"fail","reasons":["see ``` fence in diff"]}',
+      "```",
+    ].join("\n");
+    const result = parseVerifyOutput(input);
+    expect(result).toEqual({
+      kind: "ok",
+      value: { verdict: "fail", reasons: ["see ``` fence in diff"] },
+    });
+  });
 });
