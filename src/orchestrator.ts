@@ -3158,16 +3158,22 @@ export class Orchestrator {
         policy = "recover";
       }
     }
-    // Override: handoff_failed with handoff_transition_pending sentinel → recover
-    // handoff_failed is normally halt, but pre-ES-490 sessions may have a
-    // handoff_transition_pending: marker meaning the recovery action already succeeded
-    // (label added, restart-review posted) and only the Linear in_review transition
-    // remains. Allow recovery to consume the sentinel and retry the transition rather
-    // than halting every daemon start (ES-490 Finding 1).
+    // Override: handoff_failed with retryable sentinel → recover
+    // handoff_failed is normally halt, but stoppedSessionsWithFailedRecovery feeds back
+    // sessions whose prior recovery partially succeeded. All three sentinel prefixes reach
+    // executeRecoveryTurn's deterministic shortcut paths:
+    //   - handoff_transition_pending: → skip Codex, retry Linear in_review transition
+    //   - fix_pushed_restart_pending  → skip Codex, retry /restart-review comment only
+    //   - abandon_in_progress         → skip Codex, resume cleanup (branch delete / ticket)
+    // Without this extension only handoff_transition_pending: re-enters recovery; the other
+    // two keep the default halt policy and never retry (ES-490 Finding 1).
     if (reason === "handoff_failed") {
       const freshForHandoff = this.store.getSession(session.id);
-      if (freshForHandoff.stopDetail !== null &&
-          freshForHandoff.stopDetail.startsWith("handoff_transition_pending:")) {
+      if (freshForHandoff.stopDetail !== null && (
+          freshForHandoff.stopDetail.startsWith("handoff_transition_pending:") ||
+          freshForHandoff.stopDetail.startsWith("fix_pushed_restart_pending") ||
+          freshForHandoff.stopDetail.startsWith("abandon_in_progress")
+      )) {
         policy = "recover";
       }
     }
@@ -3300,8 +3306,16 @@ export class Orchestrator {
                 endedAt: this.clock(),
                 ...patch,
               });
-              this.log(`${session.linearIdentifier} handoff in_review transition still failing: ${effectiveDetail}`);
-              return CONTINUE;
+              // The PR is live in GitHub but the Linear ticket is stuck in handoff_failed.
+              // Silently continuing leaves the PR unmonitored with no operator signal.
+              // Halt so the next daemon startup runs stoppedSessionsWithFailedRecovery and
+              // retries the transition via the handoff_transition_pending: sentinel
+              // (ES-490 Finding 2).
+              this.log(`${session.linearIdentifier} handoff in_review transition still failing — halting: ${effectiveDetail}`);
+              await this.notifier.notify({ kind: "halted", reason, detail: effectiveDetail });
+              await this.commitMemoryBeforeHalt();
+              this.store.setRunState(this.runId, "halted", effectiveDetail);
+              return HALT;
             }
           }
           const recoveryCost = result.costUsd;
@@ -3453,11 +3467,22 @@ export class Orchestrator {
           this.log(skipDetail);
           return CONTINUE;
         }
-        // executeAbandon failed — fall through to halt with failure info
+        // executeAbandon failed — fall through to halt with failure info.
+        // Reconstruct the abandon_in_progress sentinel (same logic as onAbandonStarting)
+        // so the halt path persists it to stop_detail. Without this, effectiveDetail still
+        // holds the original pre-abandon detail, overwriting the sentinel that onAbandonStarting
+        // already wrote to the DB. stoppedSessionsWithFailedRecovery matches on
+        // LIKE 'abandon_in_progress%' and will retry cleanup on the next daemon start
+        // (ES-490 Finding 3).
         if (result.kind === "failed" && result.message) {
-          effectiveDetail = effectiveDetail
-            ? `${effectiveDetail} (abandon failed: ${result.message})`
-            : `abandon failed: ${result.message}`;
+          const innerFailed = extractInnerStopDetail(capturedDetail ?? "");
+          const isExhaustedFailed =
+            innerFailed.startsWith("auto-restart limit exceeded") ||
+            innerFailed.startsWith("quota retry limit exceeded");
+          const abandonSentinel = isExhaustedFailed
+            ? `abandon_in_progress:${innerFailed}`
+            : "abandon_in_progress";
+          effectiveDetail = `${abandonSentinel} (abandon failed: ${result.message})`;
         }
         // Fall through to halt (abandon cleanup failed)
       } else {
