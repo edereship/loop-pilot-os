@@ -46,6 +46,9 @@ function makeConfig(over: Partial<{
       groomBoardBudgetChars: 10000,
       selfReviewTimeoutMinutes: 15,
       maxCostUsdPerSelfReview: 2,
+      maxVerifyAttempts: 2,
+      maxCostUsdPerVerify: 2,
+      verifyTimeoutMinutes: 15,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -55,6 +58,7 @@ function makeConfig(over: Partial<{
     notify: { progress: false },
     groom: { enabled: false },
     selfReview: { enabled: true },
+    verify: { enabled: true, runRecipe: "" },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
   } as unknown as Config;
 }
@@ -120,6 +124,9 @@ function makeHarness(config: Config): Harness {
       const slug = wtPath.replace(/^\/wt\//, "");
       return { code: 0, stdout: `looppilot/${slug}-x\n` };
     }
+    if (args.includes("rev-parse") && args.includes("HEAD")) {
+      return { code: 0, stdout: "abc1234\n" };
+    }
     return { code: 0, stdout: "" };
   });
   const orch = new Orchestrator({
@@ -127,6 +134,7 @@ function makeHarness(config: Config): Harness {
     source,
     agent,
     selfReviewAgent: agent,
+    verifyAgent: new FakeAgentRunner(),
     git,
     monitor,
     notifier,
@@ -632,7 +640,10 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
     // When the last self-review log has outcome "error" (nonfatal: cost cap, agent
     // exception, parse error, or interrupted), recovery must resume HANDOFF — exactly
     // as the main flow does (it returns CONTINUE for all these cases).
+    // verify is disabled here because this test focuses on self-review recovery; the
+    // verify gate is covered separately in the VERIFY describe block (ES-491).
     const config = makeConfig({ maxTasksPerRun: 3 });
+    (config as any).verify = { enabled: false, runRecipe: "" };
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
       h.store,
@@ -669,8 +680,11 @@ describe("回復 — implementing + no PR: commit-aware cleanup (Finding 3)", ()
 
   it("implementing + no PR + clean commits + selfReview.disabled → skips self-review, resumes HANDOFF (ES-473 Finding 1)", async () => {
     // When selfReview is disabled, recovery can safely proceed to HANDOFF.
+    // verify is also disabled because this test focuses on selfReview.disabled recovery;
+    // the verify gate is covered separately in the VERIFY describe block (ES-491).
     const config = makeConfig({ maxTasksPerRun: 3 });
     (config as { selfReview: { enabled: boolean } }).selfReview.enabled = false;
+    (config as any).verify = { enabled: false, runRecipe: "" };
     const h = makeHarness(config);
     const crashed = seedCrashedSession(
       h.store,
