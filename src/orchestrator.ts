@@ -422,7 +422,18 @@ export class Orchestrator {
     // A prior verify attempt already failed and recorded its outcome. Do not re-run VERIFY
     // on the same unchanged code — that would waste an attempt without injecting failure
     // reasons. Re-enter at IMPLEMENT so the agent has a chance to address the failure first.
+    // Guard: if the session already used all attempts (crash window was between the
+    // verifyAttempts DB write and the stopSession("verify_failed") call), abandon now
+    // rather than granting another IMPLEMENT→VERIFY cycle beyond the configured cap.
     if (lastVrLog?.outcome === "failed") {
+      if (session.verifyAttempts >= this.config.safety.maxVerifyAttempts) {
+        this.log(`recovery: verify_failed — max attempts (${this.config.safety.maxVerifyAttempts}) already used; abandoning (${session.linearIdentifier})`);
+        return await this.stopSession(
+          session,
+          "verify_failed",
+          `recovery: verify failed after ${session.verifyAttempts} attempts`,
+        );
+      }
       this.log(`recovery: prior verify failed; resuming IMPLEMENT then VERIFY (${session.linearIdentifier})`);
       return "resume_implement";
     }
@@ -2109,12 +2120,17 @@ export class Orchestrator {
       finalPrompt += "\n\n# VERIFY Feedback (previous attempt failed)\n\nFix the following issues found during acceptance verification:\n\n" +
         verifyReasons.map((r, i) => `${i + 1}. ${r}`).join("\n");
     }
+    // Enforce the per-session budget across all IMPLEMENT attempts (including verify-fix
+    // retries). Without this, each retry received the full budget regardless of what
+    // prior IMPLEMENT+VERIFY cycles already spent.
+    const priorCostForBudget = this.store.getSession(session.id).costUsd ?? 0;
+    const remainingBudget = Math.max(0, this.config.safety.maxCostUsdPerSession - priorCostForBudget);
     let outcome: AgentOutcome;
     try {
       outcome = await this.agent.runSession({
         worktreePath,
         prompt: finalPrompt,
-        maxCostUsd: this.config.safety.maxCostUsdPerSession,
+        maxCostUsd: remainingBudget,
         hardTimeoutMs: this.config.safety.sessionHardTimeoutMinutes * 60_000,
       });
     } catch (err) {
@@ -2801,6 +2817,18 @@ export class Orchestrator {
           });
           return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
         }
+        // Mirror the judge-error interrupt guard: if a stop request landed while the evidence
+        // agent was running and it surfaced as kind:"error" rather than kind:"interrupted",
+        // record error/interrupted instead of writing a fail-open pass that crash recovery
+        // would treat as gate-satisfied.
+        if (eo.kind === "error" && this.interrupted) {
+          this.store.updateVerifyLog(logRow.id, {
+            endedAt: this.clock(), outcome: "error",
+            costUsd: evidenceCostUsd, errorDetail: "interrupted",
+          });
+          await this.haltForInterrupt();
+          return HALT;
+        }
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "passed",
           costUsd: evidenceCostUsd, errorDetail: `fail-open: evidence ${errDetail}`,
@@ -2866,7 +2894,10 @@ export class Orchestrator {
       return CONTINUE;
     }
 
-    const acceptance = planBrief?.sections?.acceptance ?? null;
+    // Use brief acceptance criteria when available; fall back to the ticket description so
+    // the judge can evaluate against real criteria even when the design brief is missing or
+    // unparseable (rather than passing solely on build/test/lint evidence).
+    const acceptance = planBrief?.sections?.acceptance ?? (issue.description.trim() || null);
     let diff = "";
     try {
       const diffRes = await this.runner.run(
