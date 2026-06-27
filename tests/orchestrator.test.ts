@@ -6347,6 +6347,45 @@ describe("VERIFY (ES-491)", () => {
     expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
   });
 
+  it("crash recovery: verify error (fail-open) → resumes HANDOFF", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner });
+
+    // Simulate a prior run that crashed after VERIFY error (fail-open) but before HANDOFF.
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing" });
+    // Self-review passed.
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    // Verify error (fail-open).
+    h.store.insertVerifyLog({ runId: priorRun.id, sessionId: session.id, attempt: 1, startedAt: "2026-06-05T00:01:00.000Z" });
+    const vrLogs = h.store.getVerifyLogsForSession(session.id);
+    h.store.updateVerifyLog(vrLogs[0].id, { endedAt: "2026-06-05T00:02:00.000Z", outcome: "error", errorDetail: "fail-open: evidence cost exceeded" });
+
+    // FakeGitPr defaults: hasCommitsWithDiff → true, hasUncommittedChanges → false.
+    // Crash recovery path requires commits and a clean worktree to resume HANDOFF.
+
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // Recovery must have handed off: pushAndOpenPr should have been called.
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
+  });
+
   it("crash recovery: verify not completed → halt", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
