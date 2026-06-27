@@ -84,7 +84,7 @@ describe("状態語彙ユニオン（仕様 §7）", () => {
     expect(all.map(ensureExhaustive).length).toBe(4);
   });
 
-  it("FailureReason は仕様 §7 の 12 種の失敗理由を網羅する", () => {
+  it("FailureReason は仕様 §7 の 13 種の失敗理由を網羅する", () => {
     const all = [
       "agent_no_change",
       "cost_exceeded",
