@@ -200,6 +200,8 @@ export async function executeRecoveryTurn(
       worktreePath: session.worktreePath ?? config.repo.path,
       prompt,
       timeoutMs: config.safety.codexTimeoutMinutes * 60_000,
+      model: config.pm?.model,
+      effort: config.pm?.effort.recovery,
     });
     if (outcome.kind === "error") {
       log(`recovery: codex error: ${outcome.message}`);

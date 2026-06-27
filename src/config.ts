@@ -41,7 +41,39 @@ const rawSchema = z.object({
     permission_mode: z.enum([
       "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions",
     ]).default("acceptEdits"),
+    // Per-phase overrides (ES-486). Each field is individually optional; omitted fields
+    // fall back to the parent agent.model/effort. E.g. [agent.design] model = "opus" with
+    // no effort key inherits agent.effort.
+    design: z.object({
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+    }).strict().optional(),
+    implement: z.object({
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+    }).strict().optional(),
+    self_review: z.object({
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+    }).strict().optional(),
+    recovery: z.object({
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+    }).strict().optional(),
   }).strict(),
+  // Codex (PM) per-phase effort (ES-486). Absent → Codex gets no -m/-c flags (backward compat).
+  // effort fields use z.string() so loadConfig can produce error messages that include the
+  // received value (Zod v4 enum errors omit it). Validation of "low"|"medium"|"high" is done
+  // manually in loadConfig after schema parse.
+  pm: z.object({
+    model: z.string().default("gpt-5.5"),
+    effort: z.object({
+      groom: z.string().default("medium"),
+      select: z.string().default("low"),
+      design_review: z.string().default("high"),
+      recovery: z.string().default("high"),
+    }).strict().optional(),
+  }).strict().optional(),
   handoff: z.object({
     branch_prefix: z.string(),
     pr_body_template: z.string(),
@@ -133,7 +165,20 @@ export interface Config {
     extraArgs: string[];
     effort: string;
     permissionMode: string;
+    design: { model: string; effort: string } | undefined;
+    implement: { model: string; effort: string } | undefined;
+    selfReview: { model: string; effort: string } | undefined;
+    recovery: { model: string; effort: string } | undefined;
   };
+  pm: {
+    model: string;
+    effort: {
+      groom: string | undefined;
+      select: string | undefined;
+      designReview: string | undefined;
+      recovery: string | undefined;
+    };
+  } | undefined;
   handoff: {
     branchPrefix: string;
     prBodyTemplate: string;
@@ -426,6 +471,80 @@ function isAliasPinnedToUnknownModel(model: string, env: NodeJS.ProcessEnv): boo
   return false;
 }
 
+/**
+ * Per-phase model/effort pair validation (ES-486).
+ * Applies the same allowlist and capability checks as the global agent.model/effort validation,
+ * but scoped to a specific per-phase block (e.g. "agent.design", "agent.recovery").
+ * phasePath is used as the error message prefix; ".effort" is appended automatically.
+ */
+function validatePhaseModelEffort(
+  phasePath: string,
+  model: string,
+  effort: string,
+  env: NodeJS.ProcessEnv,
+  errors: string[],
+): void {
+  const effortAlwaysEnabled = env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
+  const hasEffortEnvVar = modelHasEffortCapabilityEnvVar(model, env);
+  const skipEffortChecks = effortAlwaysEnabled || hasEffortEnvVar;
+  const skipXhighCheck = effortAlwaysEnabled || modelHasXhighEffortCapabilityEnvVar(model, env);
+  const skipMaxCheck = effortAlwaysEnabled ||
+    modelHasMaxEffortCapabilityEnvVar(model, env) ||
+    modelSupportsEffort(model);
+  const aliasPinnedToUnknown = !skipEffortChecks && isAliasPinnedToUnknownModel(model, env);
+  const isThirdParty = isThirdPartyProviderContext(env);
+  const normalizedModel = normalizeModelForCapabilityCheck(model);
+
+  if (!skipEffortChecks && effort !== "auto" && (!modelSupportsEffort(model) || aliasPinnedToUnknown)) {
+    errors.push(
+      `${phasePath}.effort: model "${model}" does not support effort levels; ` +
+        `set ${phasePath}.effort = "auto" or use a supported model (Fable 5, Opus 4.x, Sonnet 4.6)`,
+    );
+  }
+
+  // Bedrock/Vertex/Foundry では "sonnet" ベアエイリアスが Sonnet 4.5 に解決される
+  // 可能性があるため、明示的な non-auto effort は拒否する。
+  if (!skipEffortChecks && isThirdParty && normalizedModel === "sonnet" && effort !== "auto") {
+    errors.push(
+      `${phasePath}.effort: model "sonnet" may resolve to Sonnet 4.5 on Bedrock/Vertex/Foundry which does not support effort; ` +
+        `pin to a versioned model (e.g., claude-sonnet-4-6) or set ${phasePath}.effort = "auto"`,
+    );
+  }
+
+  // "opusplan" は実行フェーズで Sonnet を使用するため、Bedrock/Vertex/Foundry では
+  // Sonnet 4.5 に解決される可能性があり "sonnet" と同様に non-auto effort を拒否する。
+  if (!skipEffortChecks && isThirdParty && normalizedModel === "opusplan" && effort !== "auto") {
+    errors.push(
+      `${phasePath}.effort: model "opusplan" execution phase may resolve to Sonnet 4.5 on Bedrock/Vertex/Foundry which does not support effort; ` +
+        `pin to a versioned model or set ${phasePath}.effort = "auto"`,
+    );
+  }
+
+  if (!skipXhighCheck && effort === "xhigh" && (skipEffortChecks || modelSupportsEffort(model)) && !modelSupportsXhigh(model)) {
+    errors.push(
+      `${phasePath}.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
+        `model "${model}" supports low/medium/high/max only`,
+    );
+  }
+
+  // Bedrock/Vertex/Foundry では "opus" ベアエイリアスが Opus 4.6 に解決される
+  // 可能性があるため、xhigh は拒否する（Opus 4.6 は xhigh 非対応）。
+  if (!skipXhighCheck && isThirdParty && normalizedModel === "opus" && effort === "xhigh") {
+    errors.push(
+      `${phasePath}.effort: effort level "xhigh" requires Fable 5 or Opus 4.7+; ` +
+        `model "opus" on Bedrock/Vertex/Foundry resolves to Opus 4.6 which supports low/medium/high/max only`,
+    );
+  }
+
+  if (!skipMaxCheck && hasEffortEnvVar && effort === "max") {
+    errors.push(
+      `${phasePath}.effort: effort level "max" requires "max_effort" capability; ` +
+        `model "${model}" declares "effort" but not "max_effort" ` +
+        `— add "max_effort" to the supported capabilities or use a lower effort level`,
+    );
+  }
+}
+
 // xhigh をサポートするのは Fable 5 と Opus 4.7+（README §model×effort 対応表）。
 // Opus 4.6 や Sonnet 4.6 は xhigh 非対応（low/medium/high/max のみ）。
 const XHIGH_SUPPORTED_MODEL_SUBSTRINGS = ["fable", "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8"];
@@ -585,6 +704,42 @@ export function loadConfig(
       );
     }
 
+    // Codex (pm) effort validation (ES-486): only low/medium/high are valid (Codex caps at high).
+    // Produces custom error messages that include the received value so tests can match on it.
+    const VALID_CODEX_EFFORT = ["low", "medium", "high"];
+    if (result.data.pm?.effort) {
+      const pmEffort = result.data.pm.effort;
+      for (const [field, value] of [
+        ["groom", pmEffort.groom],
+        ["select", pmEffort.select],
+        ["design_review", pmEffort.design_review],
+        ["recovery", pmEffort.recovery],
+      ] as [string, string][]) {
+        if (!VALID_CODEX_EFFORT.includes(value)) {
+          errors.push(
+            `pm.effort.${field}: "${value}" is not a valid Codex effort level; ` +
+              `expected one of "low", "medium", "high" (Codex reasoning effort caps at "high")`,
+          );
+        }
+      }
+    }
+
+    // Per-phase agent model/effort validation (ES-486).
+    // Validate the resolved values (with parent fallback) so partial overrides are also checked.
+    const phaseEntries: [string, { model?: string; effort?: string } | undefined][] = [
+      ["agent.design", result.data.agent.design],
+      ["agent.implement", result.data.agent.implement],
+      ["agent.self_review", result.data.agent.self_review],
+      ["agent.recovery", result.data.agent.recovery],
+    ];
+    for (const [phasePath, rawPhase] of phaseEntries) {
+      if (rawPhase !== undefined) {
+        const resolvedModel = rawPhase.model ?? result.data.agent.model;
+        const resolvedEffort = rawPhase.effort ?? effectiveEffort;
+        validatePhaseModelEffort(phasePath, resolvedModel, resolvedEffort, env, errors);
+      }
+    }
+
     if (result.data.rate_limit?.claude_patterns) {
       for (const pattern of result.data.rate_limit.claude_patterns) {
         try {
@@ -653,7 +808,30 @@ export function loadConfig(
       extraArgs: raw.agent.extra_args,
       effort: effectiveEffort,
       permissionMode: raw.agent.permission_mode,
+      design: raw.agent.design
+        ? { model: raw.agent.design.model ?? raw.agent.model, effort: raw.agent.design.effort ?? effectiveEffort }
+        : undefined,
+      implement: raw.agent.implement
+        ? { model: raw.agent.implement.model ?? raw.agent.model, effort: raw.agent.implement.effort ?? effectiveEffort }
+        : undefined,
+      selfReview: raw.agent.self_review
+        ? { model: raw.agent.self_review.model ?? raw.agent.model, effort: raw.agent.self_review.effort ?? effectiveEffort }
+        : undefined,
+      recovery: raw.agent.recovery
+        ? { model: raw.agent.recovery.model ?? raw.agent.model, effort: raw.agent.recovery.effort ?? effectiveEffort }
+        : undefined,
     },
+    pm: raw.pm !== undefined
+      ? {
+          model: raw.pm.model,
+          effort: {
+            groom: raw.pm.effort?.groom,
+            select: raw.pm.effort?.select,
+            designReview: raw.pm.effort?.design_review,
+            recovery: raw.pm.effort?.recovery,
+          },
+        }
+      : undefined,
     handoff: {
       branchPrefix: raw.handoff.branch_prefix,
       prBodyTemplate: raw.handoff.pr_body_template,

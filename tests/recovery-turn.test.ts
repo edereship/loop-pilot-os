@@ -172,6 +172,7 @@ function makeConfig(): Config {
     groom: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
     digest: { recentMergedCount: 5, enabled: true },
+    pm: undefined,
   } as unknown as Config;
 }
 
@@ -729,5 +730,22 @@ describe("executeRecoveryTurn", () => {
     const result = await executeRecoveryTurn(deps, session, "handoff_failed", "handoff_transition_pending:restart_review");
 
     expect(result).toEqual<RecoveryTurnResult>({ kind: "recovered", action: "restart_review", costUsd: 0 });
+  });
+
+  it("passes pm.model and pm.effort.recovery to the planner context", async () => {
+    const { deps, planner, agent, runner, git } = makeDeps();
+    (deps.config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
+    planner.outcomes = [{ kind: "completed", text: '{"action":"fix_code","instruction":"fix it"}' }];
+    agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "fixed" }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("status")) return { code: 0, stdout: "" };
+      return { code: 0, stdout: "" };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    git.openPrForBranch.set("looppilot/ty-1-fix", 42);
+    const session = fakeSession({ prNumber: 42 });
+    await executeRecoveryTurn(deps, session, "ci_failed", "tests failed");
+    expect(planner.contexts[0].model).toBe("gpt-5.5");
+    expect(planner.contexts[0].effort).toBe("high");
   });
 });

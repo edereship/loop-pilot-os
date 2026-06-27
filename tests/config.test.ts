@@ -677,4 +677,84 @@ describe("loadConfig", () => {
     expect(config.safety.selfReviewTimeoutMinutes).toBe(15);
     expect(config.safety.maxCostUsdPerSelfReview).toBe(2);
   });
+
+  // ES-486: per-phase model/effort config
+
+  it("pm is undefined when [pm] section is omitted (backward compat)", () => {
+    const config = loadConfig(fixture("config-valid.toml"), fullEnv);
+    expect(config.pm).toBeUndefined();
+  });
+
+  it("pm defaults model to gpt-5.5 when [pm] is present but model is omitted; effort fields are undefined without [pm.effort]", () => {
+    const config = loadConfig(fixture("config-per-phase-pm-minimal.toml"), fullEnv);
+    expect(config.pm).toBeDefined();
+    expect(config.pm!.model).toBe("gpt-5.5");
+    expect(config.pm!.effort.groom).toBeUndefined();
+    expect(config.pm!.effort.select).toBeUndefined();
+    expect(config.pm!.effort.designReview).toBeUndefined();
+    expect(config.pm!.effort.recovery).toBeUndefined();
+  });
+
+  it("reads explicit [pm] section with per-phase effort", () => {
+    const config = loadConfig(fixture("config-per-phase.toml"), fullEnv);
+    expect(config.pm).toBeDefined();
+    expect(config.pm!.model).toBe("gpt-5.5");
+    expect(config.pm!.effort.groom).toBe("high");
+    expect(config.pm!.effort.select).toBe("medium");
+    expect(config.pm!.effort.designReview).toBe("high");
+    expect(config.pm!.effort.recovery).toBe("high");
+  });
+
+  it("reads per-phase agent overrides", () => {
+    const config = loadConfig(fixture("config-per-phase.toml"), fullEnv);
+    expect(config.agent.design!.model).toBe("claude-opus-4-8[1m]");
+    expect(config.agent.design!.effort).toBe("max");
+    expect(config.agent.implement!.model).toBe("claude-opus-4-6[1m]");
+    expect(config.agent.implement!.effort).toBe("high");
+    expect(config.agent.selfReview!.model).toBe("claude-opus-4-8[1m]");
+    expect(config.agent.selfReview!.effort).toBe("max");
+    expect(config.agent.recovery!.model).toBe("claude-sonnet-4-6");
+    expect(config.agent.recovery!.effort).toBe("high");
+  });
+
+  it("falls back to agent.model/effort when per-phase keys are absent", () => {
+    const config = loadConfig(fixture("config-per-phase-partial.toml"), fullEnv);
+    expect(config.agent.design!.model).toBe("claude-opus-4-8[1m]");
+    expect(config.agent.implement).toBeUndefined();
+    expect(config.agent.selfReview).toBeUndefined();
+    expect(config.agent.recovery).toBeUndefined();
+  });
+
+  it("per-phase agent block with only model inherits global effort", () => {
+    const config = loadConfig(fixture("config-per-phase-model-only.toml"), fullEnv);
+    expect(config.agent.design!.model).toBe("claude-opus-4-8[1m]");
+    expect(config.agent.design!.effort).toBe("high"); // inherited from agent.effort
+  });
+
+  it("rejects codex effort 'max' (only low/medium/high allowed)", () => {
+    expect(() => loadConfig(fixture("config-per-phase-codex-max.toml"), fullEnv))
+      .toThrow(/pm\.effort\.groom.*max/);
+  });
+
+  it("rejects per-phase agent effort for non-effort-supporting model", () => {
+    expect(() => loadConfig(fixture("config-per-phase-bad-model.toml"), fullEnv))
+      .toThrow(/agent\.recovery\.effort.*does not support effort/);
+  });
+
+  // ES-486 (review fix): per-phase 'sonnet' bare alias + explicit non-auto effort on third-party provider.
+  it("throws when per-phase 'sonnet' alias is paired with explicit non-auto effort on a third-party provider", () => {
+    expect(() =>
+      loadConfig(fixture("config-per-phase-sonnet-alias.toml"), {
+        ...fullEnv,
+        CLAUDE_CODE_USE_BEDROCK: "1",
+      }),
+    ).toThrow(/agent\.recovery\.effort/);
+  });
+
+  // ES-486 (review fix): per-phase 'sonnet' alias with non-auto effort is allowed on direct Anthropic API.
+  it("accepts per-phase 'sonnet' alias with non-auto effort when no third-party provider is set", () => {
+    expect(() =>
+      loadConfig(fixture("config-per-phase-sonnet-alias.toml"), fullEnv),
+    ).not.toThrow();
+  });
 });

@@ -251,6 +251,24 @@ describe("ClaudeAgentRunner.runSession", () => {
     expect(args.slice(-6)).toEqual(["--model", "opus", "--effort", "max", "--add-dir", "/extra"]);
   });
 
+  it("passes per-phase model (with [1m] suffix) and effort to claude CLI args", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+    const agent = new ClaudeAgentRunner(runner, {
+      model: "claude-opus-4-8[1m]",
+      effort: "max",
+      permissionMode: "acceptEdits",
+      allowedTools: "Edit,Read",
+      extraArgs: [],
+      log: () => {},
+    });
+    await agent.runSession(ctx);
+    const args = runner.calls[0]!.args;
+    const mIdx = args.indexOf("--model");
+    expect(args[mIdx + 1]).toBe("claude-opus-4-8[1m]");
+    const eIdx = args.indexOf("--effort");
+    expect(args[eIdx + 1]).toBe("max");
+  });
+
   it("subtype=success → completed{costUsd, summary=result}", async () => {
     const { runner } = runnerEmitting([INIT_LINE, ASSISTANT_TEXT_LINE, RESULT_SUCCESS_LINE]);
     const logs: string[] = [];

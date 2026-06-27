@@ -148,11 +148,7 @@ async function runLoop(configPath: string): Promise<number> {
     // *_SUPPORTED_CAPABILITIES env var も同様のオーバーライドとして扱う（loadConfig と一致）。
     // これらが未設定の場合は通常の allowlist 照合で effort 対応の有無を判定する。
     const effortAlwaysEnabled = process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === "1";
-    const effortSupported = effortAlwaysEnabled ||
-      modelHasEffortCapabilityEnvVar(config.agent.model, process.env) ||
-      modelSupportsEffort(config.agent.model);
     let stopRequested = false;
-    const effort = config.agent.effort;
     const rateLimitOpts: RateLimitOpts = {
       reprobeMinutes: config.rateLimit.reprobeMinutes,
       capHours: config.rateLimit.capHours,
@@ -161,30 +157,34 @@ async function runLoop(configPath: string): Promise<number> {
       clock: Date.now,
       isInterrupted: () => stopRequested,
     };
-    const agent = new ClaudeAgentRunner(runner, {
-      model: config.agent.model,
-      // omit --effort flag for "auto" or models that do not support effort
-      effort: effortSupported && effort !== "auto" ? effort : undefined,
-      // override CLAUDE_CODE_EFFORT_LEVEL for supported models (so inherited env cannot
-      // silently override the TOML value) and also for effort="auto" on any model (so an
-      // inherited CLAUDE_CODE_EFFORT_LEVEL=max in the shell cannot leak into the child)
-      effortEnvOverride: effortSupported || effort === "auto" ? effort : undefined,
-      permissionMode: config.agent.permissionMode,
-      allowedTools: config.agent.allowedTools,
-      extraArgs: config.agent.extraArgs,
-      log: logLine,
-      rateLimit: rateLimitOpts,
-    });
-    const designAgent = new ClaudeAgentRunner(runner, {
-      model: config.agent.model,
-      effort: effortSupported && effort !== "auto" ? effort : undefined,
-      effortEnvOverride: effortSupported || effort === "auto" ? effort : undefined,
-      permissionMode: "plan",
-      allowedTools: config.agent.allowedTools,
-      extraArgs: config.agent.extraArgs,
-      log: logLine,
-      rateLimit: rateLimitOpts,
-    });
+
+    // Build a ClaudeAgentRunner for a specific phase. When phaseConfig is set, uses
+    // the per-phase model/effort; otherwise falls back to the global agent defaults.
+    function buildPhaseAgent(
+      phaseConfig: { model: string; effort: string } | undefined,
+      permissionMode: string,
+    ): ClaudeAgentRunner {
+      const model = phaseConfig?.model ?? config.agent.model;
+      const rawEffort = phaseConfig?.effort ?? config.agent.effort;
+      const supported = effortAlwaysEnabled ||
+        modelHasEffortCapabilityEnvVar(model, process.env) ||
+        modelSupportsEffort(model);
+      return new ClaudeAgentRunner(runner, {
+        model,
+        effort: supported && rawEffort !== "auto" ? rawEffort : undefined,
+        effortEnvOverride: supported || rawEffort === "auto" ? rawEffort : undefined,
+        permissionMode,
+        allowedTools: config.agent.allowedTools,
+        extraArgs: config.agent.extraArgs,
+        log: logLine,
+        rateLimit: rateLimitOpts,
+      });
+    }
+
+    const agent = buildPhaseAgent(config.agent.implement, config.agent.permissionMode);
+    const selfReviewAgent = buildPhaseAgent(config.agent.selfReview, config.agent.permissionMode);
+    const recoveryAgent = buildPhaseAgent(config.agent.recovery, config.agent.permissionMode);
+    const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {
       maxCostUsd: config.safety.maxCostUsdPerDesign,
     });
@@ -204,7 +204,7 @@ async function runLoop(configPath: string): Promise<number> {
     });
 
     const recovery = new AgentWorkflowRecovery(
-      agent,
+      recoveryAgent,
       runner,
       config.repo.remote,
       config.safety.maxWorkflowFixAttempts,
@@ -249,6 +249,7 @@ async function runLoop(configPath: string): Promise<number> {
       config,
       source,
       agent,
+      selfReviewAgent,
       git,
       monitor,
       notifier,
@@ -266,7 +267,7 @@ async function runLoop(configPath: string): Promise<number> {
       runner,
       recoveryTurn: {
         planner: codexPlanner,
-        agent,
+        agent: recoveryAgent,
         git,
         runner,
         source,

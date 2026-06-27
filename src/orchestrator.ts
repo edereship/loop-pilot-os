@@ -67,6 +67,7 @@ export interface OrchestratorDeps {
   config: Config;
   source: TaskSource;
   agent: AgentRunner;
+  selfReviewAgent: AgentRunner;
   git: GitPrManager;
   monitor: LoopPilotMonitor;
   notifier: Notifier;
@@ -99,6 +100,7 @@ export class Orchestrator {
   private readonly config: Config;
   private readonly source: TaskSource;
   private readonly agent: AgentRunner;
+  private readonly selfReviewAgent: AgentRunner;
   private readonly git: GitPrManager;
   private readonly monitor: LoopPilotMonitor;
   private readonly notifier: Notifier;
@@ -125,6 +127,7 @@ export class Orchestrator {
     this.config = deps.config;
     this.source = deps.source;
     this.agent = deps.agent;
+    this.selfReviewAgent = deps.selfReviewAgent;
     this.git = deps.git;
     this.monitor = deps.monitor;
     this.notifier = deps.notifier;
@@ -1187,6 +1190,8 @@ export class Orchestrator {
         worktreePath,
         prompt,
         timeoutMs: this.config.safety.designReviewTimeoutMinutes * 60_000,
+        model: this.config.pm?.model,
+        effort: this.config.pm?.effort.designReview,
       });
     } catch (err) {
       this.log(`designReview: reviewer exception, treating as approve: ${errMsg(err)}`);
@@ -1423,6 +1428,8 @@ export class Orchestrator {
           worktreePath: repoPath,
           prompt,
           timeoutMs: this.config.safety.groomTimeoutMinutes * 60_000,
+          model: this.config.pm?.model,
+          effort: this.config.pm?.effort.groom,
         });
         if (outcome.kind === "interrupted") {
           try {
@@ -1851,6 +1858,8 @@ export class Orchestrator {
         worktreePath: repoPath,
         prompt,
         timeoutMs: this.config.safety.codexTimeoutMinutes * 60_000,
+        model: this.config.pm?.model,
+        effort: this.config.pm?.effort.select,
       });
     } catch (err) {
       this.log(`select: codex exception, deterministic fallback: ${errMsg(err)}`);
@@ -2107,7 +2116,7 @@ export class Orchestrator {
 
     let outcome: AgentOutcome;
     try {
-      outcome = await this.agent.runSession({
+      outcome = await this.selfReviewAgent.runSession({
         worktreePath,
         prompt,
         maxCostUsd: this.config.safety.maxCostUsdPerSelfReview,

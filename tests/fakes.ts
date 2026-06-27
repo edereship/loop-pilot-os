@@ -193,8 +193,11 @@ export class FakeAgentRunner implements AgentRunner {
   outcomes: AgentOutcome[] = [];
   /** 呼び出された SessionContext を記録 */
   contexts: SessionContext[] = [];
+  /** Total number of runSession invocations */
+  callCount = 0;
 
   async runSession(ctx: SessionContext): Promise<AgentOutcome> {
+    this.callCount++;
     this.contexts.push(ctx);
     const out = this.outcomes.shift();
     if (!out) throw new Error("FakeAgentRunner: no outcome queued");
@@ -370,10 +373,12 @@ export class FakeWorkflowRecovery implements WorkflowRecovery {
 // ---- FakePlanRunner ----
 export class FakePlanRunner implements PlanRunner {
   outcomes: PlanOutcome[] = [];
-  calls: Array<{ worktreePath: string; prompt: string; timeoutMs?: number }> = [];
+  calls: Array<{ worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }> = [];
+  contexts: Array<{ worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }> = [];
 
-  async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number }): Promise<PlanOutcome> {
+  async run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }): Promise<PlanOutcome> {
     this.calls.push(ctx);
+    this.contexts.push(ctx);
     const out = this.outcomes.shift();
     if (!out) throw new Error("FakePlanRunner: no outcome queued");
     return out;

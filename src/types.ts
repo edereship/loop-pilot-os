@@ -235,7 +235,7 @@ export type PlanOutcome =
   | { kind: "interrupted" };
 
 export interface PlanRunner {
-  run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number }): Promise<PlanOutcome>;
+  run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }): Promise<PlanOutcome>;
 }
 
 export interface BriefSections {

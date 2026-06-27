@@ -216,6 +216,8 @@ export interface CodexPlannerContext {
   worktreePath: string;
   prompt: string;
   timeoutMs?: number;
+  model?: string;
+  effort?: string;
 }
 
 export type CodexOutcome =
@@ -282,6 +284,19 @@ function hasFlagOrAlias(args: string[], longFlag: string, shortAlias: string): b
       a.startsWith(`${longFlag}=`) ||
       a.startsWith(`${shortAlias}=`),
   );
+}
+
+// Returns true when extraArgs already set a specific -c / --config key (e.g. "model_reasoning_effort").
+// Unlike hasFlagOrAlias (which checks for any occurrence of the flag), this inspects the value
+// of -c/--config entries to avoid suppressing unrelated config keys.
+function hasConfigKey(args: string[], key: string): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if ((a === "-c" || a === "--config") && i + 1 < args.length && args[i + 1]!.startsWith(`${key}=`)) return true;
+    if (a.startsWith(`-c=${key}=`) || a.startsWith(`--config=${key}=`)) return true;
+    if (a === `-c${key}=` || a.startsWith(`-c${key}=`)) return true;
+  }
+  return false;
 }
 
 // Returns true when extraArgs opt out of the default bwrap-backed sandbox,
@@ -390,6 +405,8 @@ export class CodexPlanner {
     const hasIgnoreRules = (this.opts.extraArgs ?? []).some(
       (a) => a === "--ignore-rules" || a.startsWith("--ignore-rules="),
     );
+    const hasCustomModel = hasFlagOrAlias(this.opts.extraArgs ?? [], "-m", "--model");
+    const hasCustomEffort = hasConfigKey(this.opts.extraArgs ?? [], "model_reasoning_effort");
     const promptArg = "-";
 
     const args: string[] = [
@@ -398,6 +415,8 @@ export class CodexPlanner {
       ...(hasCustomSandbox ? [] : ["--sandbox", "danger-full-access"]),
       ...(hasIgnoreUserConfig ? [] : ["--ignore-user-config"]),
       ...(hasIgnoreRules ? [] : ["--ignore-rules"]),
+      ...(!hasCustomModel && ctx.model ? ["-m", ctx.model] : []),
+      ...(!hasCustomEffort && ctx.effort ? ["-c", `model_reasoning_effort=${ctx.effort}`] : []),
       ...(this.opts.extraArgs ?? []),
       "--",
       promptArg,

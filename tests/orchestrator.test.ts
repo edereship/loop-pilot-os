@@ -71,6 +71,7 @@ function makeConfig(over: Partial<{
     selfReview: { enabled: true },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
     linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
+    pm: undefined,
   } as unknown as Config;
 }
 
@@ -103,7 +104,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -168,10 +169,12 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
+  const selfReviewAgent = opts?.selfReviewAgent ?? agent;
   const orch = new Orchestrator({
     config,
     source,
     agent,
+    selfReviewAgent,
     git,
     monitor,
     notifier,
@@ -700,6 +703,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       config,
       source,
       agent,
+      selfReviewAgent: agent,
       git,
       monitor,
       notifier,
@@ -2559,6 +2563,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
       config: specConfig,
       source,
       agent,
+      selfReviewAgent: agent,
       git,
       monitor,
       notifier,
@@ -3091,7 +3096,7 @@ describe("Orchestrator.interruptablePause", () => {
     inlineMemoryRunner3.on(["git", "add", "docs/memory/"], { code: 0 });
     inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
-      config, source, agent, git, monitor, notifier, store,
+      config, source, agent, selfReviewAgent: agent, git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null, designer: null,
       codebaseSummaryGenerator: async () => "",
@@ -4440,6 +4445,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       config,
       source,
       agent: new FakeAgentRunner(),
+      selfReviewAgent: new FakeAgentRunner(),
       git: new FakeGitPr(),
       monitor: new FakeMonitor(),
       notifier,
@@ -4576,6 +4582,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       config,
       source,
       agent: new FakeAgentRunner(),
+      selfReviewAgent: new FakeAgentRunner(),
       git: new FakeGitPr(),
       monitor: new FakeMonitor(),
       notifier,
@@ -4662,6 +4669,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       config,
       source,
       agent,
+      selfReviewAgent: agent,
       git: new FakeGitPr(),
       monitor,
       notifier,
@@ -4726,6 +4734,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       config,
       source,
       agent: new FakeAgentRunner(),
+      selfReviewAgent: new FakeAgentRunner(),
       git: new FakeGitPr(),
       monitor: new FakeMonitor(),
       notifier,
@@ -5782,5 +5791,92 @@ describe("Self-Review (ES-473)", () => {
     expect(sessions[0].failureReason).toBe("exception");
     expect(sessions[0].stopDetail).toContain("unreported commits");
     expect(h.git.calls.some((c) => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  it("self-review uses selfReviewAgent, not the implement agent", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { selfReviewAgent });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // IMPLEMENT outcome on the main agent
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    // SELF-REVIEW outcome on the dedicated selfReviewAgent
+    selfReviewAgent.outcomes.push({
+      kind: "completed", costUsd: 0.5, summary: '```json\n{"verdict":"pass","issues":[],"summary":"LGTM"}\n```',
+    });
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The implement agent should have 1 call (IMPLEMENT), selfReviewAgent should have 1 call (SELF-REVIEW)
+    expect(h.agent.callCount).toBe(1);
+    expect(selfReviewAgent.callCount).toBe(1);
+    // selfReviewAgent received the self-review prompt
+    expect(selfReviewAgent.contexts[0].prompt).toContain("self-review");
+    // Session completed successfully
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].selfReviewCostUsd).toBe(0.5);
+  });
+});
+
+describe("Orchestrator per-phase model/effort config (ES-486 Task 4)", () => {
+  it("GROOM passes pm.model and pm.effort.groom to the planner context", async () => {
+    const config = makeConfig({ groomEnabled: true });
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: new FakePlanRunner() });
+    h.source.queue = [issue("A", "TY-1")];
+    // GROOM outcome
+    planner.outcomes.push({ kind: "completed", text: '{"actions":[],"summary":"all good","blocked_issues":[]}' });
+    // SELECT outcome
+    planner.outcomes.push({ kind: "completed", text: '{"identifier":"TY-1"}' });
+    // DESIGN outcome
+    (h as any).orch["designer"]?.outcomes.push({ kind: "completed", text: "brief" });
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    h.monitor.verdicts.push({ kind: "merged" });
+    await h.orch.run();
+
+    // Check that the first planner call (GROOM) had model/effort
+    const groomCtx = planner.contexts[0];
+    expect(groomCtx.model).toBe("gpt-5.5");
+    expect(groomCtx.effort).toBe("medium");
+  });
+
+  it("SELECT passes pm.model and pm.effort.select to the planner context", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: new FakePlanRunner() });
+    h.source.queue = [issue("A", "TY-1"), issue("B", "TY-2")];
+    // SELECT outcome
+    planner.outcomes.push({ kind: "completed", text: '{"identifier":"TY-1"}' });
+    (h as any).orch["designer"]?.outcomes.push({ kind: "completed", text: "brief" });
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    h.monitor.verdicts.push({ kind: "merged" });
+    await h.orch.run();
+    // First planner call is SELECT (groom disabled by default)
+    const selectCtx = planner.contexts[0];
+    expect(selectCtx.model).toBe("gpt-5.5");
+    expect(selectCtx.effort).toBe("low");
+  });
+
+  it("DESIGN REVIEW passes pm.model and pm.effort.designReview", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).pm = { model: "gpt-5.5", effort: { groom: "medium", select: "low", designReview: "high", recovery: "high" } };
+    const selectPlanner = new FakePlanRunner();
+    const reviewPlanner = new FakePlanRunner();
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { planner: selectPlanner, designer, designReviewer: reviewPlanner });
+    h.source.queue = [issue("A", "TY-1")];
+    selectPlanner.outcomes.push({ kind: "completed", text: '{"identifier":"TY-1"}' });
+    designer.outcomes.push({ kind: "completed", text: "## Goal\ngoal\n## Change Targets\ntargets\n## Steps\nsteps\n## Acceptance Criteria\nac\n## Out of Scope\noos" });
+    reviewPlanner.outcomes.push({ kind: "completed", text: '{"verdict":"approve"}' });
+    h.agent.outcomes.push({ kind: "completed", costUsd: 1, summary: "done" });
+    h.monitor.verdicts.push({ kind: "merged" });
+    await h.orch.run();
+    const reviewCtx = reviewPlanner.contexts[0];
+    expect(reviewCtx.model).toBe("gpt-5.5");
+    expect(reviewCtx.effort).toBe("high");
   });
 });
