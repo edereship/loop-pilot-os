@@ -44,6 +44,22 @@ function* extractJsonCandidates(text: string): Generator<string> {
 
   const lines = text.split("\n");
 
+  // Compact single-line fenced block fallback: when JSON content contains backtick runs the
+  // lazy fence regex above terminates early, yielding truncated invalid JSON.  Recover by
+  // locating the outermost {} pair on the fence-opening line instead.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line.startsWith("```json")) {
+      const afterMarker = line.slice("```json".length).trimStart();
+      const jsonStart = afterMarker.indexOf("{");
+      const jsonEnd = afterMarker.lastIndexOf("}");
+      if (jsonStart !== -1 && jsonEnd > jsonStart) {
+        yield afterMarker.slice(jsonStart, jsonEnd + 1);
+      }
+      break;
+    }
+  }
+
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (line.startsWith("{") && line.endsWith("}")) {

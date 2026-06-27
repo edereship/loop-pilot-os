@@ -101,6 +101,17 @@ describe("parseVerifyOutput", () => {
     });
   });
 
+  it("parses compact fenced JSON where a reason contains triple backticks", () => {
+    // The lazy fence regex closes early at the embedded backtick run; the compact-fence
+    // fallback must recover the full JSON via outermost {} pair on the same line.
+    const input = '```json {"verdict":"fail","reasons":["bad ``` fence"]} ```';
+    const result = parseVerifyOutput(input);
+    expect(result).toEqual({
+      kind: "ok",
+      value: { verdict: "fail", reasons: ["bad ``` fence"] },
+    });
+  });
+
   it("falls back to brace extraction when fenced reasons contain triple backticks", () => {
     // The ``` inside reasons causes the fence regex to close early on that sequence;
     // brace-based extraction should recover the full valid JSON line.
