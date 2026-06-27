@@ -788,11 +788,8 @@ describe("loadConfig", () => {
   });
 
   it("rejects codex verify effort 'max' (only low/medium/high allowed)", () => {
-    // Use a fixture that sets pm.effort.verify = "max"
-    // We'll test inline by checking the existing per-phase-codex-max pattern
-    // The config-per-phase-verify fixture uses valid "high" so this should pass
-    const config = loadConfig(fixture("config-per-phase-verify.toml"), fullEnv);
-    expect(config.pm!.effort.verify).toBe("high");
+    expect(() => loadConfig(fixture("config-per-phase-codex-max.toml"), fullEnv))
+      .toThrow(/pm\.effort\.verify.*max/);
   });
 
   it("reads explicit verify/safety/linear values from config-per-phase-verify fixture", () => {

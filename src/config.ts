@@ -917,13 +917,13 @@ export function loadConfig(
     selfReview: {
       enabled: raw.self_review?.enabled ?? true,
     },
-    verify: {
-      enabled: raw.verify?.enabled ?? true,
-      runRecipe: raw.verify?.run_recipe ?? "",
-    },
     memory: {
       maxCharsPerFile: raw.memory?.max_chars_per_file ?? 8000,
       injectBudgetChars: raw.memory?.inject_budget_chars ?? 6000,
+    },
+    verify: {
+      enabled: raw.verify?.enabled ?? true,
+      runRecipe: raw.verify?.run_recipe ?? "",
     },
     rateLimit: {
       reprobeMinutes: raw.rate_limit?.reprobe_minutes ?? 15,

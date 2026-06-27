@@ -25,6 +25,7 @@ model = "gpt-5.5"
 groom = "max"
 select = "low"
 design_review = "high"
+verify = "max"
 
 [handoff]
 branch_prefix = "looppilot"
