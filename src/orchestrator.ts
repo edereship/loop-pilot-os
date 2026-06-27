@@ -2508,9 +2508,9 @@ export class Orchestrator {
     worktreePath: string,
     branch: string,
     preVerifySha: string | null,
-  ): Promise<void> {
+  ): Promise<boolean> {
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
-    if (preVerifySha === null) return;
+    if (preVerifySha === null) return true;
     try {
       const branchRes = await this.runner.run(
         "git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"],
@@ -2523,7 +2523,7 @@ export class Orchestrator {
         );
         if (checkoutRes.code !== 0) {
           this.log(`verify: cleanup checkout to ${branch} failed (exit ${checkoutRes.code})`);
-          return;
+          return false;
         }
       }
       const resetRes = await this.runner.run(
@@ -2532,9 +2532,12 @@ export class Orchestrator {
       );
       if (resetRes.code !== 0) {
         this.log(`verify: cleanup reset to ${preVerifySha} failed (exit ${resetRes.code})`);
+        return false;
       }
+      return true;
     } catch (err) {
       this.log(`verify: cleanup failed: ${errMsg(err)}`);
+      return false;
     }
   }
 
@@ -2614,7 +2617,11 @@ export class Orchestrator {
         const errDetail = eo.kind === "error" ? eo.message : "cost exceeded";
         this.log(`verify: evidence agent ${eo.kind} (fail-open): ${errDetail}`);
         await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
-        this.store.updateSession(session.id, { verifyAttempts: attempt });
+        const freshSess = this.store.getSession(session.id);
+        this.store.updateSession(session.id, {
+          verifyAttempts: attempt,
+          costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+        });
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "passed",
           costUsd: evidenceCostUsd, errorDetail: `fail-open: evidence ${errDetail}`,
@@ -2626,7 +2633,11 @@ export class Orchestrator {
     } catch (err) {
       this.log(`verify: evidence agent exception (fail-open): ${errMsg(err)}`);
       await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
-      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      const freshSess = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         costUsd: 0, errorDetail: `fail-open: evidence exception: ${errMsg(err)}`,
@@ -2635,12 +2646,31 @@ export class Orchestrator {
     }
 
     // ── Worktree cleanup ──
-    await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+    const cleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+    if (!cleanupOk) {
+      // halt: worktree may be polluted
+      const freshSess = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "error",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd,
+        errorDetail: "worktree cleanup failed after evidence collection",
+      });
+      return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
+    }
 
     // ── Judgment (Codex planner) ──
     if (this.planner === null) {
       this.log("verify: no planner configured (fail-open)");
-      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      const freshSess = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         evidence: evidenceText.slice(0, 50_000),
@@ -2678,7 +2708,11 @@ export class Orchestrator {
       });
     } catch (err) {
       this.log(`verify: judge exception (fail-open): ${errMsg(err)}`);
-      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      const freshSess = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         evidence: evidenceText.slice(0, 50_000),
@@ -2700,7 +2734,11 @@ export class Orchestrator {
 
     if (judgmentOutcome.kind === "error") {
       this.log(`verify: judge error (fail-open): ${judgmentOutcome.message}`);
-      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      const freshSess = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         evidence: evidenceText.slice(0, 50_000),
@@ -2715,7 +2753,11 @@ export class Orchestrator {
 
     if (parsed.kind === "parse_error") {
       this.log("verify: parse error (fail-open)");
-      this.store.updateSession(session.id, { verifyAttempts: attempt });
+      const freshSess = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         evidence: evidenceText.slice(0, 50_000),
@@ -2734,7 +2776,11 @@ export class Orchestrator {
       outcome: verdict === "pass" ? "passed" : "failed",
       costUsd: evidenceCostUsd,
     });
-    this.store.updateSession(session.id, { verifyAttempts: attempt });
+    const freshSess = this.store.getSession(session.id);
+    this.store.updateSession(session.id, {
+      verifyAttempts: attempt,
+      costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+    });
 
     this.log(`verify: attempt ${attempt} → ${verdict}${reasons.length > 0 ? `: ${reasons.join("; ")}` : ""}`);
 
