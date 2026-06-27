@@ -3715,6 +3715,76 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     // task_skipped notification emitted for abandon
     const skipped = h.notifier.events.filter((e) => e.kind === "task_skipped");
     expect(skipped.length).toBeGreaterThanOrEqual(1);
+    // ES-492: needs-human label was added
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
+    // ES-492: reason comment was posted (filter for the triage comment, not the design brief)
+    const comment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(comment).toBeDefined();
+    expect(comment!.body).toContain("agent_no_change");
+  });
+
+  it("abandon attaches needs-human label and posts reason comment (pre-PR)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false); // agent_no_change → abandon
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // needs-human label was added
+    expect(h.source.labelAdds).toContainEqual({
+      issueId: "issue-A",
+      labelName: "needs-human",
+    });
+    // Reason comment was posted (filter for the triage comment, not the design brief)
+    const comment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(comment).toBeDefined();
+    expect(comment!.body).toContain("agent_no_change");
+    // task_skipped notification was emitted
+    const skipped = h.notifier.events.filter(
+      (e) => e.kind === "task_skipped" && e.identifier === "TY-1",
+    );
+    expect(skipped.length).toBe(1);
+  });
+
+  it("abandon continues even if addLabel fails", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    h.source.failNext("addLabel");
+
+    await h.orch.run();
+
+    // Run continued despite addLabel failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions.length).toBeGreaterThanOrEqual(2);
   });
 
   it("design_rejected → policy=abandon → continues (not HALT)", async () => {

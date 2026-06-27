@@ -786,10 +786,7 @@ export class Orchestrator {
       // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
       let eligible: EligibleIssue[];
       try {
-        eligible = await this.source.getAllEligible([
-          ...this.store.activeIssueIds(),
-          ...this.store.excludedIssueIds(),
-        ]);
+        eligible = await this.source.getAllEligible(this.store.activeIssueIds());
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
@@ -3274,8 +3271,8 @@ export class Orchestrator {
             stopDetail: detail,
             endedAt: this.clock(),
           });
-          // ES-492: Add needs-human label so SELECT filters this ticket out until a human reviews.
-          await bestEffort(() => this.source.addLabel(session.linearIssueId, this.config.linear.needsHumanLabel));
+          // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
+          await this.applyNeedsHumanTriage(session, reason, detail);
           return CONTINUE;
         }
         // Only record the recovery action for non-failed outcomes. A failed abandon must
@@ -3465,8 +3462,8 @@ export class Orchestrator {
             ...patch,
           });
           const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
-          // ES-492: Add needs-human label so SELECT filters this ticket out until a human reviews.
-          await bestEffort(() => this.source.addLabel(session.linearIssueId, this.config.linear.needsHumanLabel));
+          // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
+          await this.applyNeedsHumanTriage(freshAbandon, reason, effectiveDetail);
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
           return CONTINUE;
@@ -3523,8 +3520,8 @@ export class Orchestrator {
           this.store.setRunState(this.runId, "halted", skipDetail);
           return HALT;
         }
-        // ES-492: Add needs-human label so SELECT filters this ticket out until a human reviews.
-        await bestEffort(() => this.source.addLabel(session.linearIssueId, this.config.linear.needsHumanLabel));
+        // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
+        await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
         return CONTINUE;
       }
     }
@@ -3580,6 +3577,37 @@ export class Orchestrator {
       return HALT;
     }
     return CONTINUE;
+  }
+
+  /**
+   * ES-492: On abandon, add the needs-human label and post a reason comment.
+   * Both operations are best-effort — failures are logged but do not affect the abandon flow.
+   */
+  private async applyNeedsHumanTriage(
+    session: TaskSessionRow,
+    reason: FailureReason,
+    detail: string | null,
+  ): Promise<void> {
+    const label = this.config.linear.needsHumanLabel;
+    try {
+      await this.source.addLabel(session.linearIssueId, label);
+    } catch (err) {
+      this.log(`needs-human: addLabel failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
+    }
+    const commentBody = [
+      `## 🛑 LoopPilot OS — abandon (needs-human)`,
+      "",
+      `**Reason:** \`${reason}\``,
+      detail ? `**Detail:** ${detail}` : "",
+      "",
+      `このチケットは \`${label}\` ラベルが付与されました。人間の確認が必要です。`,
+      `ラベルを外すと再投入されます。`,
+    ].filter(Boolean).join("\n");
+    try {
+      await this.source.postComment(session.linearIssueId, commentBody);
+    } catch (err) {
+      this.log(`needs-human: postComment failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
+    }
   }
 
   /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
