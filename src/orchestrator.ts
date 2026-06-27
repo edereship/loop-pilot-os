@@ -547,12 +547,42 @@ export class Orchestrator {
               url: session.issueUrl,
             };
             if (verifyGate === "resume_verify") {
-              const vr = await this.verify(session, recoveredIssue, null);
-              if (vr.control === "halt") return HALT;
-              if ("verifyFailed" in vr) {
-                return await this.stopSession(session, "verify_failed", `verify failed in recovery: ${vr.reasons.join("; ")}`);
+              const recoveredBrief = session.planBrief ? parseBrief(session.planBrief) : null;
+              let verifyReasons: string[] | null = null;
+              verifyFixLoop: for (;;) {
+                if (verifyReasons !== null) {
+                  const impl = await this.implement(session, recoveredIssue, recoveredBrief, verifyReasons);
+                  if (impl.control === "halt") return HALT;
+                  if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+                  if (this.config.selfReview.enabled) {
+                    const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
+                    if (sr.control === "halt") return HALT;
+                    if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+                  }
+                  if (this.interrupted) {
+                    await this.haltForInterrupt();
+                    return HALT;
+                  }
+                }
+                const vr = await this.verify(session, recoveredIssue, recoveredBrief);
+                if (vr.control === "halt") return HALT;
+                if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+                if ("verifyFailed" in vr) {
+                  if (this.interrupted) {
+                    await this.haltForInterrupt();
+                    return HALT;
+                  }
+                  verifyReasons = vr.reasons;
+                  continue verifyFixLoop;
+                }
+                if (this.interrupted) {
+                  await this.haltForInterrupt();
+                  return HALT;
+                }
+                break verifyFixLoop;
               }
             }
+            if (this.store.getSession(session.id).state === "stopped") return CONTINUE;
             const handoffResult = await this.handoff(session, recoveredIssue);
             if ("prNumber" in handoffResult) return CONTINUE;
             return handoffResult;
@@ -581,12 +611,42 @@ export class Orchestrator {
           url: session.issueUrl,
         };
         if (verifyGate === "resume_verify") {
-          const vr = await this.verify(session, recoveredIssue, null);
-          if (vr.control === "halt") return HALT;
-          if ("verifyFailed" in vr) {
-            return await this.stopSession(session, "verify_failed", `verify failed in recovery: ${vr.reasons.join("; ")}`);
+          const recoveredBrief = session.planBrief ? parseBrief(session.planBrief) : null;
+          let verifyReasons: string[] | null = null;
+          verifyFixLoop: for (;;) {
+            if (verifyReasons !== null) {
+              const impl = await this.implement(session, recoveredIssue, recoveredBrief, verifyReasons);
+              if (impl.control === "halt") return HALT;
+              if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+              if (this.config.selfReview.enabled) {
+                const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
+                if (sr.control === "halt") return HALT;
+                if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+              }
+              if (this.interrupted) {
+                await this.haltForInterrupt();
+                return HALT;
+              }
+            }
+            const vr = await this.verify(session, recoveredIssue, recoveredBrief);
+            if (vr.control === "halt") return HALT;
+            if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+            if ("verifyFailed" in vr) {
+              if (this.interrupted) {
+                await this.haltForInterrupt();
+                return HALT;
+              }
+              verifyReasons = vr.reasons;
+              continue verifyFixLoop;
+            }
+            if (this.interrupted) {
+              await this.haltForInterrupt();
+              return HALT;
+            }
+            break verifyFixLoop;
           }
         }
+        if (this.store.getSession(session.id).state === "stopped") return CONTINUE;
         const handoffResult = await this.handoff(session, recoveredIssue);
         if ("prNumber" in handoffResult) {
           return CONTINUE;
@@ -2654,12 +2714,19 @@ export class Orchestrator {
       evidenceCostUsd = eo.costUsd;
 
       if (eo.kind === "interrupted") {
-        await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+        const interruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
         const freshSessInterrupted = this.store.getSession(session.id);
         this.store.updateSession(session.id, {
           verifyAttempts: attempt,
           costUsd: (freshSessInterrupted.costUsd ?? 0) + evidenceCostUsd,
         });
+        if (!interruptCleanupOk) {
+          this.store.updateVerifyLog(logRow.id, {
+            endedAt: this.clock(), outcome: "error",
+            costUsd: evidenceCostUsd, errorDetail: "worktree cleanup failed after evidence interrupted",
+          });
+          return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
+        }
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "error",
           costUsd: evidenceCostUsd, errorDetail: "interrupted",
@@ -2805,6 +2872,20 @@ export class Orchestrator {
     }
 
     if (judgmentOutcome.kind === "interrupted") {
+      const judgeInterruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+      const freshSessJudgeInt = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSessJudgeInt.costUsd ?? 0) + evidenceCostUsd,
+      });
+      if (!judgeInterruptCleanupOk) {
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error",
+          evidence: evidenceText.slice(0, 50_000),
+          costUsd: evidenceCostUsd, errorDetail: "worktree cleanup failed after judge interrupted",
+        });
+        return await this.stopSession(session, "exception", "verify: worktree cleanup failed after judgment");
+      }
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "error",
         evidence: evidenceText.slice(0, 50_000),
