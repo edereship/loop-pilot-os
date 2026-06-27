@@ -1,8 +1,8 @@
 # 設計仕様書 v1（コアループ）
 
 > ステータス: **設計合意済み（敵対的レビュー反映済み）**
-> 日付: 2026-06-03 ／ 関連: [要求仕様書](https://linear.app/team-yubune/document/要求仕様書-88a47519ecd8)
-> Source of truth: https://linear.app/team-yubune/document/設計仕様書-v1コアループ-7a35a12d1af8 （doc id `b3057385-c2ca-480a-9c5c-d7bfefdf10cc`）
+> 日付: 2026-06-03 ／ 関連: [要求仕様書](https://linear.app/edereship/document/要求仕様書-88a47519ecd8)
+> Source of truth: https://linear.app/edereship/document/設計仕様書-v1コアループ-7a35a12d1af8 （doc id `b3057385-c2ca-480a-9c5c-d7bfefdf10cc`）
 > このファイルは Linear ドキュメントのスナップショット（2026-06-05 取得）。
 
 # 1\. 目的と v1 スコープ

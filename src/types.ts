@@ -29,7 +29,7 @@ export type FailureReason =
 // ---- ドメイン ----
 export interface EligibleIssue {
   id: string;          // Linear UUID
-  identifier: string;  // "TY-123"
+  identifier: string;  // "ES-123"
   title: string;
   description: string; // markdown（空文字あり得る）
   priority: number;    // Linear生値: 0=None,1=Urgent,2=High,3=Medium,4=Low

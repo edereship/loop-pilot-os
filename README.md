@@ -91,12 +91,12 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `repo.remote` | GitHub の `owner/name` |
 | `repo.default_branch` | 基底ブランチ（`main` とは限らない） |
 | `repo.worktree_root` | 省略時 `~/.looppilot-os/worktrees/<repoのdir名>` |
-| `linear.team` | Linear の team key（例 `TY`） |
+| `linear.team` | Linear の team key |
 | `linear.project` | Project 名（プリフライトで ID 解決・検証） |
 | `linear.opt_in_label` | AI 着手を許可するオプトインラベル名 |
 | `linear.states.{todo,in_progress,in_review,done}` | 状態名 → プリフライトで stateId に解決 |
 | `agent.model` | `claude --model` に渡すモデル（出荷既定 `claude-opus-4-6[1m]`） |
-| `agent.effort` | `claude --effort` に渡す思考レベル（`low\|medium\|high\|xhigh\|max`・既定 `max`） |
+| `agent.effort` | `claude --effort` に渡す思考レベル（`low\|medium\|high\|xhigh\|max\|auto`・既定 `max`。`auto` はモデル既定にリセット＝effort 非対応モデル向け） |
 | `agent.allowed_tools` | `claude --allowedTools`（例 `Edit,Write,Read,Glob,Grep,Bash`） |
 | `agent.permission_mode` | `claude --permission-mode` に渡す権限モード（既定 `acceptEdits`）。隔離コンテナでは `bypassPermissions` を選択（下記セキュリティモデル参照） |
 | `agent.extra_args` | 任意の追加 claude フラグ（既定なし） |
@@ -221,7 +221,7 @@ docs/memory/
 
 ## 失敗時の見方（`failure_reason` 一覧）
 
-セッションが STOPPED するとループは HALT します（逐次のため TaskSession=stopped ⇒ Run=halted の 1:1）。`status` の `failure_reason` で原因が分かります。10 種すべて（カーネル §2 / 仕様 §7）:
+セッションが STOPPED するとループは HALT します（逐次のため TaskSession=stopped ⇒ Run=halted の 1:1）。`status` の `failure_reason` で原因が分かります。12 種すべて（カーネル §2 / 仕様 §7）:
 
 | failure_reason | 意味（どのフェーズで・何が起きたか） | 主な人間の対処 |
 | -- | -- | -- |
