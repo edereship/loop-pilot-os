@@ -998,4 +998,32 @@ describe("GitPrManager.fetchCiLogs", () => {
     expect(viewCall!.args).toContain("200");
     expect(viewCall!.args).not.toContain("300");
   });
+
+  // ES-493 Iteration 9 Finding 1: gh CLI sets workflowName="" (empty string) on the
+  // ruleset 404 path. ?? treats "" as present so all unnamed workflows share key "".
+  // Using || instead ensures "" falls back to the workflowDatabaseId-based key.
+  it("keys empty-string workflowName workflows by workflowDatabaseId (ruleset 404 path)", async () => {
+    const runner = new FakeCommandRunner();
+    // Two runs where gh CLI returned workflowName="" for both but different workflowDatabaseId.
+    // Workflow 10 succeeded, workflow 20 failed. Without the fix the green run (300) would
+    // share key "" with the failing run (200) and suppress it.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success", status: "completed", workflowName: "", workflowDatabaseId: 10 },
+        { databaseId: 200, conclusion: "failure", status: "completed", workflowName: "", workflowDatabaseId: 20 },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "empty-name ruleset failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("empty-name ruleset failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the failing run (200), not the green one (300).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("300");
+  });
 });

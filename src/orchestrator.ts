@@ -4280,7 +4280,13 @@ export class Orchestrator {
             // -1 prevents a later ci_failed/merge_conflict stop from incorrectly
             // charging the non-counter prior recovery against the CI/merge budget
             // (ES-493 Iteration 7 Finding 2).
-            this.store.updateSession(session.id, { recoveryAttempted: 1, recoveryTurnAttempts: -1 });
+            // Do not overwrite a positive counter: if ci_failed/merge_conflict recovery
+            // already consumed budget (rawRecoveryAttempts > 0), preserve the count so
+            // the durable per-session cap is not bypassed (ES-493 Iteration 9 Finding 2).
+            this.store.updateSession(session.id, {
+              recoveryAttempted: 1,
+              ...(rawRecoveryAttempts > 0 ? {} : { recoveryTurnAttempts: -1 }),
+            });
           }
         }
         // Abandon completed cleanup and wants the loop to continue to next task.
@@ -4361,8 +4367,9 @@ export class Orchestrator {
               // by a non-counter recovery." The legacy shim at effectiveRecoveryAttempts
               // checks recoveryTurnAttempts===0, so -1 prevents a later ci_failed/
               // merge_conflict from incorrectly charging this against the CI/merge budget
-              // (ES-493 Iteration 7 Finding 2).
-              : { recoveryAttempted: 1, recoveryTurnAttempts: -1 }),
+              // (ES-493 Iteration 7 Finding 2). Do not overwrite a positive counter so
+              // the durable per-session cap is not bypassed (ES-493 Iteration 9 Finding 2).
+              : { recoveryAttempted: 1, ...(rawRecoveryAttempts > 0 ? {} : { recoveryTurnAttempts: -1 }) }),
           };
           if (recoveryCost > 0) {
             recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
@@ -4464,8 +4471,12 @@ export class Orchestrator {
               });
             } else {
               // -1 sentinel: see the recoveryTurnAttempts=-1 comment on the recovered path
-              // above (ES-493 Iteration 7 Finding 2).
-              this.store.updateSession(session.id, { recoveryAttempted: 1, recoveryTurnAttempts: -1 });
+              // above (ES-493 Iteration 7 Finding 2). Do not overwrite a positive counter so
+              // the durable per-session cap is not bypassed (ES-493 Iteration 9 Finding 2).
+              this.store.updateSession(session.id, {
+                recoveryAttempted: 1,
+                ...(rawRecoveryAttempts > 0 ? {} : { recoveryTurnAttempts: -1 }),
+              });
             }
           } else if (isCounterBasedRecovery) {
             // Retryable failure: increment the attempt counter so repeated failures eventually

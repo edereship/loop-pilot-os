@@ -4223,6 +4223,56 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(s.recoveryTurnAttempts).toBe(1);
   });
 
+  // ES-493 Iteration 9 Finding 2: a non-counter recovery (e.g. looppilot_stopped) must not
+  // overwrite a positive recoveryTurnAttempts set by prior counter-based (ci_failed) recovery.
+  // Without the fix, restart_review for looppilot_stopped writes recoveryTurnAttempts=-1,
+  // erasing the counter so the session receives a fresh full budget on the next ci_failed stop.
+  it("non-counter recovery (looppilot_stopped) preserves positive recoveryTurnAttempts from prior counter recovery", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session that already consumed 1 counter attempt from a prior ci_failed recovery.
+    // It is currently in_review with recoveryAttempted=0 (non-counter recovery not yet attempted).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 0,     // non-counter recovery has NOT run yet
+      recoveryTurnAttempts: 1,  // one ci_failed counter budget already consumed
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: restart_review for the looppilot_stopped stop.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+    // Monitor: startup recovery poll returns stopped (looppilot_stopped) → recovery runs
+    // → restart_review re-activates the session → second poll returns merged.
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "codex timed out" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    // recoveryTurnAttempts must still be 1. The non-counter restart_review must NOT write
+    // -1 over the existing counter — that would reset the budget and allow a fresh full
+    // max_recovery_attempts on the next ci_failed stop (ES-493 Iteration 9 Finding 2).
+    expect(s.recoveryTurnAttempts).toBe(1);
+    expect(s.recoveryAttempted).toBe(1);
+  });
+
   // ES-493 Iteration 7 Finding 3: when fix_code/rebase pushes a fix but /restart-review
   // fails for the FIRST time (isRestartCommentPending=false), the push must be counted
   // against the recovery budget — not just comment-only retries.
