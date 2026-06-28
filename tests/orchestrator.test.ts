@@ -4163,6 +4163,109 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // Confirm the session is not re-queued by stoppedSessionsWithFailedRecovery.
     expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(0);
   });
+
+  // ES-493 Iteration 7 Finding 2: a prior non-counter recovery (e.g. looppilot_stopped or
+  // handoff_failed) sets recoveryAttempted=1 with the new recoveryTurnAttempts=-1 sentinel.
+  // A later ci_failed stop must NOT fire the legacy shim and must give a full CI/merge budget.
+  it("non-counter recovery sentinel (recoveryTurnAttempts=-1) does not consume CI/merge budget", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session with the new non-counter recovery sentinel written by the fixed code:
+    // recoveryAttempted=1 (non-counter recovery ran) + recoveryTurnAttempts=-1 (sentinel).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,       // non-counter recovery ran (e.g. looppilot_stopped)
+      recoveryTurnAttempts: -1,   // sentinel: non-counter, not a legacy CI/merge attempt
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code for the first ci_failed.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the CI"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Monitor: done → ci_failed → recovery succeeds → merged.
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    // With sentinel: effectiveRecoveryAttempts=-1, counter goes -1→0.
+    // This proves the legacy shim did NOT fire (which would have given effectiveRecoveryAttempts=1
+    // and incremented to 2, consuming the full budget on the first recovery).
+    expect(s.recoveryTurnAttempts).toBe(0);
+  });
+
+  // ES-493 Iteration 7 Finding 3: when fix_code/rebase pushes a fix but /restart-review
+  // fails for the FIRST time (isRestartCommentPending=false), the push must be counted
+  // against the recovery budget — not just comment-only retries.
+  it("initial fix_push with failed restart-review comment counts against recovery budget", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      // Recovery fix agent: pushes a fix
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nFix it" },
+      // Recovery Codex: fix_code
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test"}' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // The fix is pushed successfully but the /restart-review comment fails.
+    // This is the INITIAL push (isRestartCommentPending=false), so the counter must increment.
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // fix_pushed_restart_pending sentinel must be set.
+    expect(s.stopDetail).toContain("fix_pushed_restart_pending");
+    // The initial code fix must be charged: counter incremented from 0 to 1.
+    expect(s.recoveryTurnAttempts).toBe(1);
+  });
 });
 
 describe("Orchestrator — Failure Policy Routing (ES-490)", () => {

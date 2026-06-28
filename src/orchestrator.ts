@@ -4269,7 +4269,13 @@ export class Orchestrator {
               ...(result.kind === "escalated" ? { recoveryAttempted: 1 } : {}),
             });
           } else {
-            this.store.updateSession(session.id, { recoveryAttempted: 1 });
+            // Write recoveryTurnAttempts=-1 as a sentinel indicating this
+            // recoveryAttempted=1 was set by a non-counter recovery. The legacy
+            // shim at effectiveRecoveryAttempts checks recoveryTurnAttempts===0, so
+            // -1 prevents a later ci_failed/merge_conflict stop from incorrectly
+            // charging the non-counter prior recovery against the CI/merge budget
+            // (ES-493 Iteration 7 Finding 2).
+            this.store.updateSession(session.id, { recoveryAttempted: 1, recoveryTurnAttempts: -1 });
           }
         }
         // Abandon completed cleanup and wants the loop to continue to next task.
@@ -4346,7 +4352,12 @@ export class Orchestrator {
               // against the recovery budget — no actual code fix was attempted
               // (ES-493 Finding 3).
               ? (isRestartCommentPending ? {} : { recoveryTurnAttempts: effectiveRecoveryAttempts + 1 })
-              : { recoveryAttempted: 1 }),
+              // recoveryTurnAttempts=-1 is a sentinel meaning "recoveryAttempted was set
+              // by a non-counter recovery." The legacy shim at effectiveRecoveryAttempts
+              // checks recoveryTurnAttempts===0, so -1 prevents a later ci_failed/
+              // merge_conflict from incorrectly charging this against the CI/merge budget
+              // (ES-493 Iteration 7 Finding 2).
+              : { recoveryAttempted: 1, recoveryTurnAttempts: -1 }),
           };
           if (recoveryCost > 0) {
             recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
@@ -4450,16 +4461,21 @@ export class Orchestrator {
                 recoveryAttempted: 1,
               });
             } else {
-              this.store.updateSession(session.id, { recoveryAttempted: 1 });
+              // -1 sentinel: see the recoveryTurnAttempts=-1 comment on the recovered path
+              // above (ES-493 Iteration 7 Finding 2).
+              this.store.updateSession(session.id, { recoveryAttempted: 1, recoveryTurnAttempts: -1 });
             }
           } else if (isCounterBasedRecovery) {
             // Retryable failure: increment the attempt counter so repeated failures eventually
             // reach maxRecoveryAttempts and the abandon path is taken (ES-493).
-            // Exception: when the fix was already pushed and only the /restart-review comment
-            // failed (restartCommentOnly), skip the increment so the comment retry does not
-            // consume code-fix budget — the budget must be preserved for actual code fixes
-            // (ES-493 Finding 3).
-            if (!result.restartCommentOnly) {
+            // When the fix was already pushed and the /restart-review comment failed:
+            //   - isRestartCommentPending=true  → this is a comment-only retry (no code fix
+            //     was attempted now), so skip the increment to preserve CI budget (ES-493).
+            //   - isRestartCommentPending=false → this is the INITIAL push+comment-fail: the
+            //     code fix WAS attempted and must be charged against the budget so the cap is
+            //     honoured when the restart comment is persistently flaky (ES-493 Iteration 7
+            //     Finding 3).
+            if (!result.restartCommentOnly || !isRestartCommentPending) {
               this.store.updateSession(session.id, { recoveryTurnAttempts: effectiveRecoveryAttempts + 1 });
               // When this increment reaches the cap, switch to abandon immediately so the
               // current run continues rather than halting and waiting for a daemon restart

@@ -386,10 +386,10 @@ export class GitPrManager implements GitPrManagerInterface {
         "-R", remote,
         ...refArgs,
         "--limit", "25",
-        "--json", "databaseId,conclusion,status",
+        "--json", "databaseId,conclusion,status,workflowName",
       ], { cwd: repoPath, timeoutMs: 15_000 });
       if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
-      let runs: Array<{ databaseId: number; conclusion: string | null; status: string }>;
+      let runs: Array<{ databaseId: number; conclusion: string | null; status: string; workflowName?: string }>;
       try {
         runs = JSON.parse(listResult.stdout);
       } catch {
@@ -401,11 +401,21 @@ export class GitPrManager implements GitPrManagerInterface {
       // Skip runs that have not completed yet: in-progress/queued runs export conclusion as ""
       // and would otherwise be selected before the actual failed run (ES-493 Finding 1).
       const GREEN = new Set(["success", "neutral", "skipped"]);
-      const failing = runs.find((r) =>
-        r.status === "completed" &&
-        r.conclusion !== null &&
-        r.conclusion !== "" &&
-        !GREEN.has(r.conclusion.toLowerCase()));
+      // Deduplicate by workflow: gh run list is newest-first, so the first completed run
+      // encountered per workflow is its most recent. If that latest completed run is green
+      // (e.g. a re-run succeeded), the earlier failure was superseded and must not be
+      // selected — otherwise stale logs from a fixed workflow can mask a currently-failing
+      // one (ES-493 Finding 1 / Codex Iteration 7 Finding 1).
+      const latestCompletedByWorkflow = new Map<string, typeof runs[0]>();
+      for (const r of runs) {
+        if (r.status !== "completed" || r.conclusion === null || r.conclusion === "") continue;
+        const key = r.workflowName ?? "";
+        if (!latestCompletedByWorkflow.has(key)) {
+          latestCompletedByWorkflow.set(key, r);
+        }
+      }
+      const failing = Array.from(latestCompletedByWorkflow.values()).find(
+        (r) => !GREEN.has(r.conclusion!.toLowerCase()));
       if (!failing) return null;
 
       // For actual failures, --log-failed surfaces only the failing steps.

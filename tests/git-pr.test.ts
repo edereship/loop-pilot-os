@@ -920,4 +920,54 @@ describe("GitPrManager.fetchCiLogs", () => {
     const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
     expect(result).toBeNull();
   });
+
+  // ES-493 Iteration 7 Finding 1: a workflow that failed and was later rerun successfully
+  // must not have its stale failure selected. Only the most recent completed run per workflow
+  // is considered; if it is green the workflow is treated as passing and excluded.
+  it("skips superseded failure when a later run of the same workflow succeeded (ES-493 Finding 1)", async () => {
+    const runner = new FakeCommandRunner();
+    // gh run list returns newest-first. workflow-a's latest run succeeded (rerun); the old
+    // failure is superseded. workflow-b is still failing.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success",  status: "completed", workflowName: "workflow-a" },
+        { databaseId: 100, conclusion: "failure",  status: "completed", workflowName: "workflow-a" },
+        { databaseId: 200, conclusion: "failure",  status: "completed", workflowName: "workflow-b" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "workflow-b logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("workflow-b logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // workflow-b's failing run (200) must be selected, not workflow-a's superseded failure (100).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("100");
+    expect(viewCall!.args).not.toContain("300");
+  });
+
+  it("selects the failing run even when a newer in_progress run exists for the same workflow", async () => {
+    const runner = new FakeCommandRunner();
+    // workflow-a's rerun is in_progress; the most recent COMPLETED run is still the failure.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 200, conclusion: "",        status: "in_progress", workflowName: "workflow-a" },
+        { databaseId: 100, conclusion: "failure", status: "completed",   workflowName: "workflow-a" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("100");
+  });
 });
