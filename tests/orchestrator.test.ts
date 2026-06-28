@@ -3888,6 +3888,50 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(s.recoveryAction).toBe("rebase");
     expect(s.state).toBe("merged");
   });
+
+  it("merge_conflict counter exhaustion → abandon (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "rebased 1" },
+      { kind: "completed", costUsd: 0.5, summary: "rebased 2" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"rebase","instruction":"rebase onto main"}' },
+      { kind: "completed", text: '{"action":"rebase","instruction":"rebase onto main again"}' },
+    ];
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "conflict" as const };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc\n" };
+      if (args.includes("rebase")) return { code: 0, stdout: "" };
+      return { code: 0, stdout: "" };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 0 });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("merge_conflict");
+    expect(s.recoveryAction).toBe("abandon");
+    expect(s.recoveryTurnAttempts).toBe(2);
+    expect(s.needsHumanLabelAdded).toBe(1);
+  });
 });
 
 describe("Orchestrator — Failure Policy Routing (ES-490)", () => {

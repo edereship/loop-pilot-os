@@ -4150,13 +4150,7 @@ export class Orchestrator {
         policy = "recover";
       }
     }
-    // Override: ci_failed/merge_conflict with exhausted recovery counter → abandon (ES-493)
-    if ((reason === "ci_failed" || reason === "merge_conflict") && policy === "recover") {
-      const freshCounter = this.store.getSession(session.id);
-      if (freshCounter.recoveryTurnAttempts >= this.config.safety.maxRecoveryAttempts) {
-        policy = "abandon";
-      }
-    }
+    const isCounterBasedRecovery = reason === "ci_failed" || reason === "merge_conflict";
     // --- workflow_setup_failed cost exhaustion marker (pre-existing) ---
     const isWorkflowCostExhaustion =
       reason === "workflow_setup_failed" &&
@@ -4169,6 +4163,10 @@ export class Orchestrator {
     }
     if (policy === "recover" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
+      // Counter exhaustion: override to abandon, skip recovery (ES-493)
+      if (isCounterBasedRecovery && fresh.recoveryTurnAttempts >= this.config.safety.maxRecoveryAttempts) {
+        policy = "abandon";
+      }
       // pr_closed is normally terminal (no PR to push to / restart). Exception: a partial
       // abandon (crash mid-abandon with stopDetail="abandon_in_progress") left the ticket
       // in a dirty state — recovery can complete the cleanup (ES-450 Finding 4).
@@ -4186,8 +4184,7 @@ export class Orchestrator {
          (fresh.stopDetail.startsWith("recovery failed: ") ||
           fresh.stopDetail.includes(" (recovery failed: ")))
       );
-      const isCounterBasedRecovery = reason === "ci_failed" || reason === "merge_conflict";
-      if ((reason !== "pr_closed" || isPartialAbandon) && (isCounterBasedRecovery || !fresh.recoveryAttempted) && fresh.prNumber !== null) {
+      if (policy === "recover" && (reason !== "pr_closed" || isPartialAbandon) && (isCounterBasedRecovery || !fresh.recoveryAttempted) && fresh.prNumber !== null) {
         await this.notifier.notify({
           kind: "recovery_started",
           identifier: session.linearIdentifier,
@@ -4338,7 +4335,7 @@ export class Orchestrator {
           // pendingRestartReason must match the raw verdict.stopReason used by the stale guard;
           // for exhaustion details like "auto-restart limit exceeded (4x): workflow_crashed" we
           // extract just the trailing stop reason rather than storing the full synthesized message.
-          // For done-path stops (ci_failed, merge_conflict) detail is null — fall back to reason
+          // For done-path stops (ci_failed, merge_conflict) always use reason (not detail)
           // so the done-case stale guard can detect and consume it (ES-450 Finding 1).
           if (result.action === "restart_review" || result.action === "fix_code" || result.action === "rebase") {
             let pendingReason: string;
@@ -4410,7 +4407,10 @@ export class Orchestrator {
           // does not queue it again (ES-450 Finding 1/3).
           if (result.preserveWorktree || result.nonRetryable) {
             if (isCounterBasedRecovery) {
-              this.store.updateSession(session.id, { recoveryTurnAttempts: this.config.safety.maxRecoveryAttempts });
+              this.store.updateSession(session.id, {
+                recoveryTurnAttempts: this.config.safety.maxRecoveryAttempts,
+                recoveryAttempted: 1,
+              });
             } else {
               this.store.updateSession(session.id, { recoveryAttempted: 1 });
             }
