@@ -385,21 +385,25 @@ export class GitPrManager implements GitPrManagerInterface {
         "run", "list",
         "-R", remote,
         ...refArgs,
-        "--status", "failure",
-        "--limit", "1",
-        "--json", "databaseId",
+        "--limit", "5",
+        "--json", "databaseId,conclusion",
       ], { cwd: repoPath, timeoutMs: 15_000 });
       if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
-      let runs: Array<{ databaseId: number }>;
+      let runs: Array<{ databaseId: number; conclusion: string | null }>;
       try {
         runs = JSON.parse(listResult.stdout);
       } catch {
         return null;
       }
-      if (!runs.length) return null;
+      // Filter to runs whose conclusion indicates a non-success outcome so that
+      // timed_out, cancelled, action_required, and startup_failure all surface logs —
+      // not just the failure status that the previous --status filter matched (ES-493 Finding 3).
+      const GREEN = new Set(["success", "neutral", "skipped"]);
+      const failing = runs.find((r) => r.conclusion !== null && !GREEN.has(r.conclusion.toLowerCase()));
+      if (!failing) return null;
 
       const logResult = await this.runner.run("gh", [
-        "run", "view", String(runs[0].databaseId),
+        "run", "view", String(failing.databaseId),
         "-R", remote,
         "--log-failed",
       ], { cwd: repoPath, timeoutMs: 30_000 });

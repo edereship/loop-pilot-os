@@ -4163,8 +4163,16 @@ export class Orchestrator {
     }
     if (policy === "recover" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
-      // Counter exhaustion: override to abandon, skip recovery (ES-493)
-      if (isCounterBasedRecovery && fresh.recoveryTurnAttempts >= this.config.safety.maxRecoveryAttempts) {
+      // Counter exhaustion: override to abandon, skip recovery (ES-493).
+      // Exception: when a prior fix was successfully pushed but only the /restart-review
+      // comment failed, the sentinel fix_pushed_restart_pending must still reach
+      // executeRecoveryTurn so the comment retry runs rather than abandoning a PR that
+      // already has the fix committed (ES-493 Finding 1).
+      const isRestartCommentPending = fresh.stopDetail !== null &&
+        fresh.stopDetail.startsWith("fix_pushed_restart_pending");
+      if (isCounterBasedRecovery &&
+          fresh.recoveryTurnAttempts >= this.config.safety.maxRecoveryAttempts &&
+          !isRestartCommentPending) {
         policy = "abandon";
       }
       // pr_closed is normally terminal (no PR to push to / restart). Exception: a partial
@@ -4419,6 +4427,14 @@ export class Orchestrator {
             // failures eventually reach maxRecoveryAttempts and the abandon path
             // is taken instead of retrying forever (ES-493).
             this.store.updateSession(session.id, { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 });
+            // When this increment reaches the cap and the fix has not already been pushed
+            // (restart-comment-only failures are exempted — the comment retry must run),
+            // switch to abandon immediately so the current run continues rather than halting
+            // and waiting for a daemon restart to take the exhaust→abandon path (ES-493 Finding 2).
+            if (fresh.recoveryTurnAttempts + 1 >= this.config.safety.maxRecoveryAttempts &&
+                !result.restartCommentOnly) {
+              policy = "abandon";
+            }
           }
           // Do not persist workflowHandledErrorCount in the stopped row when recovery
           // fails — except when the fix was already pushed (restartCommentOnly). In that
