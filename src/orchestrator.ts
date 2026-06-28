@@ -2179,8 +2179,12 @@ export class Orchestrator {
       try {
         specContent = this.specLoader(worktreePath, specDir);
       } catch (err) {
-        await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
-        await bestEffort(() => this.source.transition(issue.id, "todo"));
+        // When retrying after a VERIFY failure the branch already holds prior implementation
+        // commits. Preserve them for human recovery instead of discarding the worktree.
+        if (verifyReasons === null) {
+          await bestEffort(() => this.git.discardWorktree(session.branch, worktreePath));
+          await bestEffort(() => this.source.transition(issue.id, "todo"));
+        }
         return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
       }
     }
@@ -2849,17 +2853,29 @@ export class Orchestrator {
     // SHA before verification starts — includes both IMPLEMENT and SELF-REVIEW commits.
     // ⚠️ This is the SHA AFTER implementation — NOT pre-work. We preserve
     // implementation commits and only strip verifier pollution.
+    // Fatal: without the pre-verify SHA cleanupVerifierWorktree cannot reset the worktree,
+    // so every cleanup path returns false and a verifier that makes commits cannot be rolled
+    // back, leaving a polluted worktree and defeating the worktree-protection guarantee.
     let preVerifySha: string | null = null;
     try {
       const shaRes = await this.runner.run(
         "git", ["-C", worktreePath, "rev-parse", "HEAD"],
         { cwd: worktreePath, timeoutMs: 30_000 },
       );
-      if (shaRes.code === 0 && shaRes.stdout.trim()) {
-        preVerifySha = shaRes.stdout.trim();
+      if (shaRes.code !== 0 || !shaRes.stdout.trim()) {
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error", costUsd: 0,
+          errorDetail: `guard:pre-verify SHA: git exit ${shaRes.code}`,
+        });
+        return await this.stopSession(session, "exception", `verify: could not capture pre-verify HEAD SHA (exit ${shaRes.code})`);
       }
-    } catch {
-      // non-fatal
+      preVerifySha = shaRes.stdout.trim();
+    } catch (shaErr) {
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "error", costUsd: 0,
+        errorDetail: `guard:pre-verify SHA: ${errMsg(shaErr)}`,
+      });
+      return await this.stopSession(session, "exception", `verify: could not capture pre-verify HEAD SHA: ${errMsg(shaErr)}`);
     }
 
     // Guard: reject a SHA from the wrong branch. If the implementation agent left the
@@ -2913,8 +2929,9 @@ export class Orchestrator {
       if (eo.kind === "interrupted") {
         const interruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
         const freshSessInterrupted = this.store.getSession(session.id);
+        // Do NOT increment verifyAttempts: no verdict was produced; the cap must only count
+        // real failed judgments so a SIGINT does not consume a retry slot (Finding 3 ES-491).
         this.store.updateSession(session.id, {
-          verifyAttempts: attempt,
           costUsd: (freshSessInterrupted.costUsd ?? 0) + evidenceCostUsd,
         });
         if (!interruptCleanupOk) {
@@ -2936,12 +2953,12 @@ export class Orchestrator {
         const errDetail = eo.kind === "error" ? eo.message : "cost exceeded";
         this.log(`verify: evidence agent ${eo.kind} (fail-open): ${errDetail}`);
         const cleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
-        const freshSess = this.store.getSession(session.id);
-        this.store.updateSession(session.id, {
-          verifyAttempts: attempt,
-          costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
-        });
         if (!cleanupOk) {
+          const freshSessClean = this.store.getSession(session.id);
+          this.store.updateSession(session.id, {
+            verifyAttempts: attempt,
+            costUsd: (freshSessClean.costUsd ?? 0) + evidenceCostUsd,
+          });
           this.store.updateVerifyLog(logRow.id, {
             endedAt: this.clock(), outcome: "error",
             costUsd: evidenceCostUsd,
@@ -2953,7 +2970,12 @@ export class Orchestrator {
         // agent was running and it surfaced as kind:"error" or kind:"cost_exceeded" rather
         // than kind:"interrupted", record error/interrupted instead of writing a fail-open
         // pass that crash recovery would treat as gate-satisfied.
+        // Do NOT increment verifyAttempts on interrupt: no verdict was produced.
         if (this.interrupted) {
+          const freshSessInt = this.store.getSession(session.id);
+          this.store.updateSession(session.id, {
+            costUsd: (freshSessInt.costUsd ?? 0) + evidenceCostUsd,
+          });
           this.store.updateVerifyLog(logRow.id, {
             endedAt: this.clock(), outcome: "error",
             costUsd: evidenceCostUsd, errorDetail: "interrupted",
@@ -2961,6 +2983,11 @@ export class Orchestrator {
           await this.haltForInterrupt();
           return HALT;
         }
+        const freshSess = this.store.getSession(session.id);
+        this.store.updateSession(session.id, {
+          verifyAttempts: attempt,
+          costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+        });
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "passed",
           costUsd: evidenceCostUsd, errorDetail: `fail-open: evidence ${errDetail}`,
@@ -3163,8 +3190,9 @@ export class Orchestrator {
     if (judgmentOutcome.kind === "interrupted") {
       const judgeInterruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
       const freshSessJudgeInt = this.store.getSession(session.id);
+      // Do NOT increment verifyAttempts: no verdict was produced; the cap must only count
+      // real failed judgments so a SIGINT does not consume a retry slot (Finding 3 ES-491).
       this.store.updateSession(session.id, {
-        verifyAttempts: attempt,
         costUsd: (freshSessJudgeInt.costUsd ?? 0) + evidenceCostUsd,
       });
       if (!judgeInterruptCleanupOk) {
@@ -3263,8 +3291,9 @@ export class Orchestrator {
       // skip the VERIFY gate and proceed to HANDOFF without a real judgment.
       if (this.interrupted) {
         const freshSessInt = this.store.getSession(session.id);
+        // Do NOT increment verifyAttempts: no verdict was produced; the cap must only count
+        // real failed judgments so a SIGINT does not consume a retry slot (Finding 3 ES-491).
         this.store.updateSession(session.id, {
-          verifyAttempts: attempt,
           costUsd: (freshSessInt.costUsd ?? 0) + evidenceCostUsd,
         });
         this.store.updateVerifyLog(logRow.id, {
