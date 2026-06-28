@@ -1066,11 +1066,11 @@ describe("GitPrManager.fetchCiLogs", () => {
       code: 0,
       stdout: JSON.stringify([]),
     });
-    // --branch returns the pull_request workflow's failing run
+    // --branch returns the pull_request workflow's failing run (headSha matches PR head SHA)
     runner.on(["gh", "run", "list", "-R", "owner/name", "--branch"], {
       code: 0,
       stdout: JSON.stringify([
-        { databaseId: 500, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request" },
+        { databaseId: 500, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "abc123" },
       ]),
     });
     runner.on(["gh", "run", "view"], { code: 0, stdout: "pull_request workflow failure logs\n" });
@@ -1108,5 +1108,63 @@ describe("GitPrManager.fetchCiLogs", () => {
     const listCalls = runner.calls.filter((c) => c.cmd === "gh" && c.args.includes("list"));
     expect(listCalls).toHaveLength(1);
     expect(listCalls[0].args).toContain("--commit");
+  });
+
+  // Codex Finding 1: branch fallback must filter runs by headSha to avoid injecting logs
+  // from a stale failed run on an older commit of a long-lived or reused branch.
+  it("branch fallback ignores runs from older commits (stale headSha)", async () => {
+    const runner = new FakeCommandRunner();
+    // --commit headSha returns empty (pull_request merge SHA mismatch)
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([]),
+    });
+    // --branch returns two runs: one for the current head SHA and one stale run from an older commit.
+    // Without the headSha filter, the stale run (900) would be selected (it appears after the current
+    // one but is still the "most recent completed failure" for its workflow key if the current one
+    // is from a later submission that only partially shows up).
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--branch"], {
+      code: 0,
+      stdout: JSON.stringify([
+        // Stale run from a previous commit — must be excluded.
+        { databaseId: 900, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "old-sha-from-prior-commit" },
+        // Current run for the PR head commit — must be selected.
+        { databaseId: 500, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "abc123" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "current commit failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("current commit failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have selected the current-SHA run (500), not the stale one (900).
+    expect(viewCall!.args).toContain("500");
+    expect(viewCall!.args).not.toContain("900");
+  });
+
+  // Codex Finding 1: when the branch fallback finds only stale runs (none matching headSha),
+  // it must return null rather than injecting logs from an unrelated commit.
+  it("branch fallback returns null when no run matches headSha", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([]),
+    });
+    // --branch returns only a run from an older commit (different headSha).
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--branch"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 700, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "some-old-commit" },
+      ]),
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    // Must return null: no run matches the current PR head SHA.
+    expect(result).toBeNull();
   });
 });

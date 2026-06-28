@@ -4179,7 +4179,14 @@ export class Orchestrator {
       // recoveryTurnAttempts remained 0. Incorporate the legacy boolean so the prior
       // attempt counts against the new budget and the session cannot receive a full
       // fresh max_recovery_attempts budget after an upgrade (ES-493 Finding 1).
-      const rawRecoveryAttempts = isCounterBasedRecovery && fresh.recoveryAttempted && fresh.recoveryTurnAttempts === 0
+      // Only fire the shim when recoveryAction is fix_code or rebase — actions that are
+      // exclusive to counter-based (ci_failed/merge_conflict) recovery. Without this guard,
+      // legacy non-counter recoveries (looppilot_stopped/handoff_failed) that also left
+      // recoveryAttempted=1/recoveryTurnAttempts=0 would incorrectly consume a CI/merge
+      // budget slot even though no CI/merge recovery ran (Codex Finding 2).
+      const isLegacyCiMergeRecovery =
+        fresh.recoveryAction === "fix_code" || fresh.recoveryAction === "rebase";
+      const rawRecoveryAttempts = isCounterBasedRecovery && fresh.recoveryAttempted && fresh.recoveryTurnAttempts === 0 && isLegacyCiMergeRecovery
         ? 1
         : fresh.recoveryTurnAttempts;
       // The -1 sentinel means "recoveryAttempted was set by a non-counter recovery";
@@ -4267,6 +4274,15 @@ export class Orchestrator {
           if (result.costUsd !== undefined && result.costUsd > 0) {
             const freshened = this.store.getSession(session.id);
             this.store.updateSession(session.id, { costUsd: (freshened.costUsd ?? 0) + result.costUsd });
+          }
+          // Roll back the pre-persisted counter increment: the recovery was interrupted
+          // before completing any side effects, so the slot must not be consumed. Without
+          // this rollback, repeated SIGINT interruptions exhaust maxRecoveryAttempts and
+          // the next daemon abandons the PR without any completed recovery attempt
+          // (Codex Finding 3). Pre-persist was designed for crash safety (uncontrolled
+          // process death); SIGINT is a controlled shutdown where rollback is safe.
+          if (isCounterBasedRecovery && !isRestartCommentPending) {
+            this.store.updateSession(session.id, { recoveryTurnAttempts: effectiveRecoveryAttempts });
           }
           await this.haltForInterrupt();
           return HALT;

@@ -384,7 +384,7 @@ export class GitPrManager implements GitPrManagerInterface {
       // Skip runs that have not completed yet: in-progress/queued runs export conclusion as ""
       // and would otherwise be selected before the actual failed run (ES-493 Finding 1).
       const GREEN = new Set(["success", "neutral", "skipped"]);
-      type RunEntry = { databaseId: number; conclusion: string | null; status: string; workflowName?: string; workflowDatabaseId?: number; event?: string };
+      type RunEntry = { databaseId: number; conclusion: string | null; status: string; workflowName?: string; workflowDatabaseId?: number; event?: string; headSha?: string };
 
       // Fetch run list for a given ref and return the most-recent failing run, or null.
       // Deduplicate by workflow: gh run list is newest-first, so the first completed run
@@ -399,13 +399,13 @@ export class GitPrManager implements GitPrManagerInterface {
       // Include the event (push vs pull_request) in the key so that when the same workflow
       // runs for both events on the same commit, a green push run cannot suppress a failing
       // pull_request run (ES-493 Iteration 11 Finding 1).
-      const findFailingRun = async (refArgs: string[]): Promise<RunEntry | null> => {
+      const findFailingRun = async (refArgs: string[], shaFilter?: string): Promise<RunEntry | null> => {
         const listResult = await this.runner.run("gh", [
           "run", "list",
           "-R", remote,
           ...refArgs,
           "--limit", "25",
-          "--json", "databaseId,conclusion,status,workflowName,workflowDatabaseId,event",
+          "--json", "databaseId,conclusion,status,workflowName,workflowDatabaseId,event,headSha",
         ], { cwd: repoPath, timeoutMs: 15_000 });
         if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
         let runs: RunEntry[];
@@ -413,6 +413,13 @@ export class GitPrManager implements GitPrManagerInterface {
           runs = JSON.parse(listResult.stdout);
         } catch {
           return null;
+        }
+        // When doing a branch-based search, filter to runs whose headSha matches the PR
+        // head SHA so that stale runs from older commits on a long-lived branch are not
+        // selected (Codex Finding 1). Without this filter, a prior failed run from an
+        // earlier commit can be injected as CI diagnostics for the wrong failure.
+        if (shaFilter) {
+          runs = runs.filter((r) => r.headSha === shaFilter);
         }
         const latestCompletedByWorkflow = new Map<string, RunEntry>();
         for (const r of runs) {
@@ -432,7 +439,9 @@ export class GitPrManager implements GitPrManagerInterface {
       // SHA, so --commit <headSha> may miss those runs (ES-493 Finding 1).
       let failing = await findFailingRun(headSha ? ["--commit", headSha] : ["--branch", branch]);
       if (!failing && headSha) {
-        failing = await findFailingRun(["--branch", branch]);
+        // Branch fallback: filter by headSha to exclude stale runs from older commits
+        // on the same branch (Codex Finding 1).
+        failing = await findFailingRun(["--branch", branch], headSha);
       }
       if (!failing) return null;
 

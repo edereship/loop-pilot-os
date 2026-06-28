@@ -4088,6 +4088,10 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
       prNumber: 100,
       recoveryAttempted: 1,    // set by old code after a ci_failed recovery
       recoveryTurnAttempts: 0, // not yet migrated
+      // recoveryAction must identify a counter-based CI recovery so the legacy shim fires.
+      // Old code that wrote recoveryAttempted=1 for looppilot_stopped/handoff_failed used
+      // restart_review, which is excluded from the shim (Codex Finding 2).
+      recoveryAction: "fix_code",
       monitorStartedAt: "2026-06-04T00:01:00.000Z",
     });
     h.source.queue = [];
@@ -4544,6 +4548,102 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // stoppedSessionsWithFailedRecovery must now find this session.
     expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(1);
     expect(h.store.stoppedSessionsWithFailedRecovery()[0].id).toBe(seeded.id);
+  });
+
+  // Codex Finding 2: a legacy looppilot_stopped/handoff_failed recovery that left
+  // recoveryAttempted=1/recoveryTurnAttempts=0/recoveryAction=restart_review must NOT
+  // trigger the legacy shim and must not consume a CI/merge budget slot.
+  it("legacy non-counter recovery (recoveryAction=restart_review) does not consume CI/merge budget (Codex Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session in legacy state from a prior looppilot_stopped recovery:
+    // recoveryAttempted=1, recoveryTurnAttempts=0, recoveryAction=restart_review.
+    // The new code's -1 sentinel was not available when this row was written.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,        // set by old code for a looppilot_stopped recovery
+      recoveryTurnAttempts: 0,     // pre-migration (no counter written)
+      recoveryAction: "restart_review", // looppilot_stopped recovery used restart_review
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code for the ci_failed stop.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the CI"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Monitor: done → ci_failed → recovery succeeds → merged.
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    // The shim must NOT have fired (restart_review is not a counter-based action).
+    // effectiveRecoveryAttempts was 0 (not 1), so counter goes 0→1 on the single recovery.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // Exactly one recovery ran (full budget was available — the looppilot_stopped prior did not consume a slot).
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(1);
+  });
+
+  // Codex Finding 3: an interrupted ci_failed/merge_conflict recovery must roll back the
+  // pre-persisted counter increment so repeated SIGINT interruptions do not exhaust the
+  // maxRecoveryAttempts budget without any completed recovery.
+  it("counter-based recovery interrupted → recoveryTurnAttempts rolled back (Codex Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery Codex is interrupted before choosing an action.
+      { kind: "interrupted" },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // The pre-persisted increment must be rolled back: counter stays at 0 (no slot consumed).
+    expect(s.recoveryTurnAttempts).toBe(0);
+    // recoveryAttempted must stay 0 so the next daemon can retry recovery.
+    expect(s.recoveryAttempted).toBe(0);
+    // Session remains in_review and run is halted.
+    expect(s.state).toBe("in_review");
+    expect(h.store.latestRun()!.state).toBe("halted");
   });
 });
 
