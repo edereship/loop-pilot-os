@@ -4046,7 +4046,12 @@ export class Orchestrator {
           return { kind: "continue" };
         case "ci_failed": {
           const ciLogs = await this.git.fetchCiLogs(prNumber, session.branch, readiness.headSha);
-          const ctrl = await this.stopSession(session, "ci_failed", ciLogs);
+          // Prefix raw log text with "ci_log:" so it can never accidentally match the
+          // sentinel prefixes ("abandon_in_progress", "fix_pushed_restart_pending", etc.)
+          // that stopSession and executeRecoveryTurn use for control-flow decisions when
+          // the value is later persisted as stopDetail and read back on daemon restart.
+          const ciDetail = ciLogs !== null ? `ci_log:${ciLogs}` : null;
+          const ctrl = await this.stopSession(session, "ci_failed", ciDetail);
           return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
         }
         case "conflict": {

@@ -861,4 +861,23 @@ describe("GitPrManager.fetchCiLogs", () => {
     const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix");
     expect(result).toBeNull();
   });
+
+  // ES-493 Finding 1 (Codex): --limit must be high enough that the failing run is not
+  // outside the cap when there are many workflows on the same commit.
+  it("passes --limit >= 20 so the failing run is not outside the cap in busy repos", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("failure") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const listCall = runner.calls.find(
+      (c) => c.cmd === "gh" && c.args.includes("list") && c.args.includes("--limit"),
+    );
+    expect(listCall).toBeDefined();
+    const limitIdx = listCall!.args.indexOf("--limit");
+    const limitValue = parseInt(listCall!.args[limitIdx + 1], 10);
+    expect(limitValue).toBeGreaterThanOrEqual(20);
+  });
 });

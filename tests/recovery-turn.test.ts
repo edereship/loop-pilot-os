@@ -778,6 +778,47 @@ describe("executeRecoveryTurn", () => {
     expect(prompt).not.toContain("Failure Diagnostic");
   });
 
+  // Codex Finding 2: ci_log: prefix must be stripped so sentinel strings in the CI
+  // output cannot collide with control-flow sentinels stored in stopDetail.
+  it("buildRecoveryPrompt: ci_log: prefix is stripped before display", () => {
+    const prompt = buildRecoveryPrompt({
+      session: fakeSession(),
+      reason: "ci_failed" as FailureReason,
+      detail: "ci_log:FAIL src/bar.test.ts\nabandon_in_progress marker in log",
+    });
+    // The ci_log: namespace prefix must not appear in the prompt
+    expect(prompt).not.toContain("ci_log:");
+    // The actual content must still be visible to the recovery planner
+    expect(prompt).toContain("FAIL src/bar.test.ts");
+    expect(prompt).toContain("abandon_in_progress marker in log");
+  });
+
+  // Codex Finding 3: triple backticks in CI logs must not close the diagnostic fence
+  // early and inject log text into the instruction context.
+  it("buildRecoveryPrompt: triple backticks in detail use adaptive fence", () => {
+    const prompt = buildRecoveryPrompt({
+      session: fakeSession(),
+      reason: "ci_failed" as FailureReason,
+      detail: "step output\n```\nembedded fence\n```\nmore output",
+    });
+    // Content must still appear in the prompt
+    expect(prompt).toContain("embedded fence");
+    expect(prompt).toContain("more output");
+    // The outer fence must use 4+ backticks so a 3-backtick run cannot close it
+    expect(prompt).toMatch(/````/);
+  });
+
+  it("buildRecoveryPrompt: adapts fence length to longest backtick run in detail", () => {
+    const prompt = buildRecoveryPrompt({
+      session: fakeSession(),
+      reason: "ci_failed" as FailureReason,
+      detail: "output\n```` four-backtick block\nmore output",
+    });
+    // Must use 5+ backticks to safely contain a 4-backtick sequence
+    expect(prompt).toMatch(/`````/);
+    expect(prompt).toContain("four-backtick block");
+  });
+
   // ES-493 Finding 3: fix_pushed_restart_pending path → executeRestartReview failure
   // must carry restartCommentOnly=true so stopSession does not flip to abandon when
   // the counter reaches the cap (a fix is already in the PR).

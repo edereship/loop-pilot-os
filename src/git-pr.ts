@@ -385,7 +385,7 @@ export class GitPrManager implements GitPrManagerInterface {
         "run", "list",
         "-R", remote,
         ...refArgs,
-        "--limit", "5",
+        "--limit", "25",
         "--json", "databaseId,conclusion",
       ], { cwd: repoPath, timeoutMs: 15_000 });
       if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
