@@ -7072,4 +7072,186 @@ describe("VERIFY (ES-491)", () => {
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions[0].state).toBe("merged");
   });
+
+  // Codex VERIFY Finding 1: resume_verify must self-review fix commits before VERIFY.
+  it("crash recovery: resume_verify runs self-review on landed fix commits before VERIFY", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent });
+
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing", verifyAttempts: 1 });
+    h.store.updateSession(session.id, { planBrief: "## Acceptance Criteria\nThe feature works." });
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    // Prior VERIFY failed; fix commit already landed (HEAD differs from verifiedHeadSha).
+    h.store.insertVerifyLog({ runId: priorRun.id, sessionId: session.id, attempt: 1, startedAt: "2026-06-05T00:01:00.000Z" });
+    const vrLogs = h.store.getVerifyLogsForSession(session.id);
+    h.store.updateVerifyLog(vrLogs[0].id, {
+      endedAt: "2026-06-05T00:02:00.000Z", outcome: "failed",
+      verdict: "fail", reasonCount: 1, verifiedHeadSha: "oldsha000-pre-fix",
+    });
+    // selfReviewAgent returns a pass (non-fatal error would also work).
+    selfReviewAgent.outcomes = [
+      { kind: "completed", costUsd: 0.1, summary: '{"issues":[],"verdict":"pass"}' },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Self-review must have been called for the landed fix commits.
+    expect(selfReviewAgent.callCount).toBe(1);
+    // Recovery resumed VERIFY (not IMPLEMENT) because fix commits were already landed.
+    expect(h.logs.some(l => l.includes("verify-fix commit already landed") && l.includes("resuming VERIFY"))).toBe(true);
+    expect(h.agent.callCount).toBe(0);
+  });
+
+  // Codex VERIFY Finding 2: Interrupted verify log → resume VERIFY, not permanent stop.
+  it("crash recovery: interrupted verify log → resumes VERIFY instead of stopping", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner });
+
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing" });
+    h.store.updateSession(session.id, { planBrief: "## Acceptance Criteria\nThe feature works." });
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    // Verify log recorded as error with "interrupted" — graceful SIGINT during VERIFY.
+    h.store.insertVerifyLog({ runId: priorRun.id, sessionId: session.id, attempt: 1, startedAt: "2026-06-05T00:01:00.000Z" });
+    const vrLogs = h.store.getVerifyLogsForSession(session.id);
+    h.store.updateVerifyLog(vrLogs[0].id, {
+      endedAt: "2026-06-05T00:02:00.000Z", outcome: "error",
+      errorDetail: "interrupted",
+    });
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Recovery must resume VERIFY, not stop with "verifier pollution".
+    expect(h.logs.some(l => l.includes("verify interrupted (graceful)") && l.includes("resuming VERIFY"))).toBe(true);
+    expect(h.logs.some(l => l.includes("verifier pollution"))).toBe(false);
+    // VERIFY re-ran (verifyAgent had no outcomes → threw → fail-open pass) → HANDOFF.
+    const allVrLogs = h.store.getVerifyLogsForSession(session.id);
+    expect(allVrLogs.length).toBeGreaterThanOrEqual(2);
+    expect(allVrLogs[allVrLogs.length - 1]!.outcome).toBe("passed");
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
+  });
+
+  // Codex VERIFY Finding 3: verify-fix retry that removes all implementation changes → stops.
+  it("verify-fix retry that removes all implementation changes is rejected", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"fail","reasons":["criterion not met"]}\n```' },
+    ];
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 1.0, summary: "fixed by removing everything" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Test\n1 failure" },
+    ];
+    // Tree hash changes (retry DID modify code), but the diff vs base is empty.
+    let treeCalls = 0;
+    h.memoryRunner.on(["git", "-C", "/wt/ty-1", "rev-parse", "HEAD^{tree}"], () => {
+      treeCalls += 1;
+      return { code: 0, stdout: treeCalls === 1 ? "tree-before-fix\n" : "tree-after-fix-empty\n" };
+    });
+    // hasCommitsWithDiff must return true for the first IMPLEMENT (so it passes the initial
+    // no-change guard) but false for the verify-fix retry (branch has no diff against base).
+    let diffCalls = 0;
+    const origHasCommitsWithDiff = h.git.hasCommitsWithDiff.bind(h.git);
+    h.git.hasCommitsWithDiff = async (worktreePath: string) => {
+      diffCalls += 1;
+      if (diffCalls === 1) return origHasCommitsWithDiff(worktreePath);
+      return false;
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].stopDetail ?? "").toContain("verify-fix retry removed all implementation changes");
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  // Codex VERIFY Finding 4: Judge that modifies worktree → verdict rejected.
+  it("verify judge that modifies HEAD → verdict is tainted and rejected", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Test\n5 passed" },
+    ];
+    // After evidence collection, the first HEAD check returns the same SHA (no evidence
+    // contamination). After judgment, the HEAD check returns a different SHA (judge committed).
+    // Call sequence for rev-parse HEAD (excluding --abbrev-ref):
+    //   1: self-review pre-review SHA capture
+    //   2: verify preVerifySha capture
+    //   3: evidence contamination HEAD check → must match preVerifySha
+    //   4: judge contamination HEAD check → different SHA (judge committed)
+    let headCallsInWorktree = 0;
+    h.memoryRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("HEAD") && !args.includes("--abbrev-ref") && !args.includes("HEAD^{tree}")) {
+        headCallsInWorktree += 1;
+        if (headCallsInWorktree <= 3) return { code: 0, stdout: "abc1234\n" };
+        return { code: 0, stdout: "judge-modified-sha\n" };
+      }
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        const cIdx = args.indexOf("-C");
+        const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+        const slug = wtPath.replace(/^\/wt\//, "");
+        return { code: 0, stdout: `looppilot/${slug}-x\n` };
+      }
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].stopDetail ?? "").toContain("judge modified worktree");
+    const vrLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(vrLogs).toHaveLength(1);
+    expect(vrLogs[0].outcome).toBe("error");
+    expect(vrLogs[0].errorDetail).toContain("judge contaminated");
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(false);
+  });
 });

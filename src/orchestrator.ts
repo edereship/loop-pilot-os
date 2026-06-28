@@ -468,6 +468,10 @@ export class Orchestrator {
       }
       return "resume_implement";
     }
+    if (lastVrLog !== undefined && lastVrLog.outcome === "error" && lastVrLog.errorDetail === "interrupted") {
+      this.log(`recovery: verify interrupted (graceful); resuming VERIFY (${session.linearIdentifier})`);
+      return "resume_verify";
+    }
     if (lastVrLog !== undefined) {
       this.log(`recovery: verify log incomplete (possible verifier pollution); stopping (${session.linearIdentifier})`);
       return await this.stopSession(
@@ -656,6 +660,11 @@ export class Orchestrator {
                     await this.haltForInterrupt();
                     return HALT;
                   }
+                } else if (this.config.selfReview.enabled) {
+                  // resume_verify: fix commits landed but were never self-reviewed.
+                  const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
+                  if (sr.control === "halt") return HALT;
+                  if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
                 }
                 const vr = await this.verify(session, recoveredIssue, recoveredBrief);
                 if (vr.control === "halt") return HALT;
@@ -754,6 +763,11 @@ export class Orchestrator {
                 await this.haltForInterrupt();
                 return HALT;
               }
+            } else if (this.config.selfReview.enabled) {
+              // resume_verify: fix commits landed but were never self-reviewed.
+              const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
+              if (sr.control === "halt") return HALT;
+              if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
             }
             const vr = await this.verify(session, recoveredIssue, recoveredBrief);
             if (vr.control === "halt") return HALT;
@@ -2278,6 +2292,9 @@ export class Orchestrator {
         if (postTreeSha !== null && postTreeSha === preRetryTreeSha) {
           return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
         }
+        if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
+          return await this.stopSession(session, "exception", "verify-fix retry removed all implementation changes", { costUsd: priorCostUsd + outcome.costUsd });
+        }
       } else if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
         if (verifyReasons !== null) {
           return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
@@ -3167,6 +3184,46 @@ export class Orchestrator {
       return HALT;
     }
 
+    // Detect judge contamination before cleanup — if the judge mutated the worktree,
+    // its verdict was based on a tree that cleanup will discard, so the verdict is tainted.
+    let judgeContaminated = false;
+    if (preVerifySha !== null) {
+      try {
+        const postJudgeHeadRes = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        if (postJudgeHeadRes.code === 0 && postJudgeHeadRes.stdout.trim() !== preVerifySha) {
+          this.log("verify: judge modified HEAD — verdict is tainted");
+          judgeContaminated = true;
+        }
+      } catch { /* non-fatal */ }
+      if (!judgeContaminated) {
+        try {
+          const jTrackedRes = await this.runner.run(
+            "git", ["-C", worktreePath, "diff", "--quiet"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (jTrackedRes.code !== 0) {
+            this.log("verify: judge modified tracked files — verdict is tainted");
+            judgeContaminated = true;
+          }
+        } catch { /* non-fatal */ }
+      }
+      if (!judgeContaminated) {
+        try {
+          const jStagedRes = await this.runner.run(
+            "git", ["-C", worktreePath, "diff", "--cached", "--quiet"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (jStagedRes.code !== 0) {
+            this.log("verify: judge staged changes — verdict is tainted");
+            judgeContaminated = true;
+          }
+        } catch { /* non-fatal */ }
+      }
+    }
+
     // Cleanup judgment worktree pollution before processing any non-interrupted verdict.
     const judgmentCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
     if (!judgmentCleanupOk) {
@@ -3182,6 +3239,21 @@ export class Orchestrator {
         errorDetail: "worktree cleanup failed after judgment",
       });
       return await this.stopSession(session, "exception", "verify: worktree cleanup failed after judgment");
+    }
+
+    if (judgeContaminated) {
+      const freshSessJudgeTainted = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSessJudgeTainted.costUsd ?? 0) + evidenceCostUsd,
+      });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "error",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd,
+        errorDetail: "judge contaminated worktree — verdict rejected",
+      });
+      return await this.stopSession(session, "exception", "verify: judge modified worktree — verdict is tainted");
     }
 
     if (judgmentOutcome.kind === "error") {
