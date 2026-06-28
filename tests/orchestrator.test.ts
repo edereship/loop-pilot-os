@@ -6773,6 +6773,39 @@ describe("VERIFY (ES-491)", () => {
     expect(vrLogs[0]!.errorDetail).toBe("interrupted");
   });
 
+  it("verify judge exception (throw) during interrupt → logs error/interrupted, not passed", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const selfReviewAgent = new FakeAgentRunner();
+    const verifyAgent = new FakeAgentRunner();
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent, verifyAgent });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "desc" })];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    // selfReviewAgent: no outcomes → throws → non-fatal, CONTINUE
+    // verifyAgent: evidence collection succeeds
+    verifyAgent.outcomes = [{ kind: "completed", costUsd: 0.1, summary: "evidence gathered" }];
+    // Override planner.run: set interrupted=true then throw, simulating a SIGINT that caused
+    // the Codex child process to raise an exception rather than returning kind:"interrupted".
+    planner.run = async (_ctx) => {
+      (h.orch as any).interrupted = true;
+      throw new Error("judge process killed by SIGINT");
+    };
+
+    await h.orch.run();
+
+    // The run must be halted (haltForInterrupt was called).
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // The verify log must record error/interrupted, NOT a fail-open pass.
+    const sessions = h.store.sessionsForRun(run.id);
+    const vrLogs = h.store.getVerifyLogsForSession(sessions[0]!.id);
+    expect(vrLogs).toHaveLength(1);
+    expect(vrLogs[0]!.outcome).toBe("error");
+    expect(vrLogs[0]!.errorDetail).toBe("interrupted");
+    // verifyAttempts must not be incremented (no verdict was produced).
+    expect(sessions[0]!.verifyAttempts).toBe(0);
+  });
+
   it("verify.enabled = false → skips verify, no verify_log entries", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     (config as any).verify = { enabled: false, runRecipe: "" };
@@ -6815,6 +6848,36 @@ describe("VERIFY (ES-491)", () => {
     expect(verifyLogs).toHaveLength(1);
     expect(verifyLogs[0].outcome).toBe("error");
     expect(verifyLogs[0].errorDetail).toBe("interrupted");
+  });
+
+  it("verify evidence agent exception during interrupt → HALT, does not consume retry slot", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { selfReviewAgent });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.5, summary: "implemented" }];
+    // selfReviewAgent: no outcomes → throws → non-fatal, CONTINUE
+    // verifyAgent: no outcomes queued → throws exception while interrupted
+    let verifyCallCount = 0;
+    h.verifyAgent.runSession = async (_ctx) => {
+      verifyCallCount++;
+      (h.orch as any).interrupted = true;
+      throw new Error("evidence agent killed by SIGINT");
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    const sessions = h.store.sessionsForRun(run.id);
+    // Verify log must record error/interrupted, not a fail-open pass.
+    const vrLogs = h.store.getVerifyLogsForSession(sessions[0]!.id);
+    expect(vrLogs).toHaveLength(1);
+    expect(vrLogs[0]!.outcome).toBe("error");
+    expect(vrLogs[0]!.errorDetail).toBe("interrupted");
+    // verifyAttempts must not be incremented (no verdict was produced).
+    expect(sessions[0]!.verifyAttempts).toBe(0);
+    expect(verifyCallCount).toBe(1);
   });
 
   it("verify judge interrupted → HALT", async () => {

@@ -661,10 +661,18 @@ export class Orchestrator {
                     return HALT;
                   }
                 } else if (this.config.selfReview.enabled) {
-                  // resume_verify: fix commits landed but were never self-reviewed.
-                  const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
-                  if (sr.control === "halt") return HALT;
-                  if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+                  // resume_verify with verifyReasons===null: the prior self-review already
+                  // completed. Re-run self-review only when there is evidence that fix commits
+                  // landed after the last verify failure (HEAD advanced since the failed verdict),
+                  // meaning the existing self-review may not cover the new commits. For graceful
+                  // interruptions and verify-not-started recoveries the completed self-review
+                  // remains valid for the current HEAD and must not be re-run (ES-491 Finding 2).
+                  const vrLogsForSr = this.store.getVerifyLogsForSession(session.id);
+                  if (vrLogsForSr.at(-1)?.outcome === "failed") {
+                    const sr = await this.selfReview(session, recoveredIssue, recoveredBrief);
+                    if (sr.control === "halt") return HALT;
+                    if (this.store.getSession(session.id).state === "stopped") break verifyFixLoop;
+                  }
                 }
                 const vr = await this.verify(session, recoveredIssue, recoveredBrief);
                 if (vr.control === "halt") return HALT;
@@ -2294,14 +2302,14 @@ export class Orchestrator {
           // non-fatal: a failed read must not falsely flag a no-op — proceed to VERIFY.
         }
         if (postTreeSha !== null && postTreeSha === preRetryTreeSha) {
-          return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
+          return await this.stopSession(session, "agent_no_change", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
         }
         if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
           return await this.stopSession(session, "exception", "verify-fix retry removed all implementation changes", { costUsd: priorCostUsd + outcome.costUsd });
         }
       } else if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
         if (verifyReasons !== null) {
-          return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
+          return await this.stopSession(session, "agent_no_change", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
         }
         return await this.stopSession(session, "agent_no_change", null, { costUsd: priorCostUsd + outcome.costUsd });
       }
@@ -3000,11 +3008,11 @@ export class Orchestrator {
       this.log(`verify: evidence agent exception (fail-open): ${errMsg(err)}`);
       const cleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
       const freshSess = this.store.getSession(session.id);
-      this.store.updateSession(session.id, {
-        verifyAttempts: attempt,
-        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
-      });
       if (!cleanupOk) {
+        this.store.updateSession(session.id, {
+          verifyAttempts: attempt,
+          costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+        });
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "error",
           costUsd: 0,
@@ -3013,6 +3021,10 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
       }
       if (this.interrupted) {
+        // No verdict was produced; do not consume a retry slot (matches the interrupted path below).
+        this.store.updateSession(session.id, {
+          costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+        });
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "error",
           costUsd: 0, errorDetail: "interrupted",
@@ -3020,6 +3032,10 @@ export class Orchestrator {
         await this.haltForInterrupt();
         return HALT;
       }
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         costUsd: 0, errorDetail: `fail-open: evidence exception: ${errMsg(err)}`,
@@ -3165,11 +3181,11 @@ export class Orchestrator {
       this.log(`verify: judge exception (fail-open): ${errMsg(err)}`);
       const judgeExcCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
       const freshSessJudgeExc = this.store.getSession(session.id);
-      this.store.updateSession(session.id, {
-        verifyAttempts: attempt,
-        costUsd: (freshSessJudgeExc.costUsd ?? 0) + evidenceCostUsd,
-      });
       if (!judgeExcCleanupOk) {
+        this.store.updateSession(session.id, {
+          verifyAttempts: attempt,
+          costUsd: (freshSessJudgeExc.costUsd ?? 0) + evidenceCostUsd,
+        });
         this.store.updateVerifyLog(logRow.id, {
           endedAt: this.clock(), outcome: "error",
           evidence: evidenceText.slice(0, 50_000),
@@ -3178,6 +3194,24 @@ export class Orchestrator {
         });
         return await this.stopSession(session, "exception", "verify: worktree cleanup failed after judgment");
       }
+      if (this.interrupted) {
+        // No verdict was produced; do not consume a retry slot (matches the interrupted path below).
+        this.store.updateSession(session.id, {
+          costUsd: (freshSessJudgeExc.costUsd ?? 0) + evidenceCostUsd,
+        });
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error",
+          evidence: evidenceText.slice(0, 50_000),
+          costUsd: evidenceCostUsd,
+          errorDetail: "interrupted",
+        });
+        await this.haltForInterrupt();
+        return HALT;
+      }
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSessJudgeExc.costUsd ?? 0) + evidenceCostUsd,
+      });
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         evidence: evidenceText.slice(0, 50_000),
