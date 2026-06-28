@@ -3723,6 +3723,10 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     );
     expect(comment).toBeDefined();
     expect(comment!.body).toContain("agent_no_change");
+    // ES-492: DB defense-in-depth — second SELECT's excludeIds contains abandoned issue
+    const secondExcludes = h.source.eligibleCalls[1];
+    expect(secondExcludes).toBeDefined();
+    expect(secondExcludes).toContain("issue-A");
   });
 
   it("abandon attaches needs-human label and posts reason comment (pre-PR)", async () => {

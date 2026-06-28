@@ -3279,7 +3279,7 @@ export class Orchestrator {
             endedAt: this.clock(),
           });
           // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
-          await this.applyNeedsHumanTriage(session, reason, detail);
+          await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
           return CONTINUE;
         }
         // Only record the recovery action for non-failed outcomes. A failed abandon must
@@ -3542,6 +3542,14 @@ export class Orchestrator {
       endedAt: this.clock(),
       ...patch,
     });
+    // Best-effort triage on halt: if we reached here via a failed abandon (e.g. executeAbandon
+    // returned kind='failed') or a halt-policy reason, apply the label+comment so the operator
+    // sees context on the Linear ticket. For pure halt-policy reasons (claim_failed, etc.) the
+    // ticket is typically not in Todo, so the label has no SELECT effect — but the comment
+    // still provides context.
+    if (policy === "abandon") {
+      await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
+    }
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     await this.commitMemoryBeforeHalt();
