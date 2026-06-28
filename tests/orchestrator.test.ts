@@ -62,6 +62,8 @@ function makeConfig(over: Partial<{
       maxVerifyAttempts: 2,
       maxCostUsdPerVerify: 2,
       verifyTimeoutMinutes: 15,
+      maxRecoveryAttempts: 2,
+      transientRetryAttempts: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -3194,7 +3196,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493)
     expect(s.recoveryAction).toBe("fix_code");
     expect(s.state).toBe("merged");
     // Cost includes recovery agent cost
@@ -3293,7 +3295,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // Final state is stopped from pr_closed (second stop, no recovery)
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("pr_closed");
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493): merge_conflict increments counter not recoveryAttempted
     expect(s.recoveryAction).toBe("restart_review");
   });
 
@@ -3608,7 +3610,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
     expect(s.state).toBe("merged");
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493)
     expect(s.recoveryAction).toBe("fix_code");
     // Readiness was called exactly twice: once for ci_failed (poll 1) and once for
     // ready (poll 3). The stale guard on poll 2 must skip tryMerge entirely.
@@ -3648,7 +3650,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
     expect(s.state).toBe("merged");
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493)
     expect(s.recoveryAction).toBe("rebase");
     // Stale guard must skip tryMerge on poll 2 — readiness called only twice.
     expect(h.monitor.readinessCalls).toHaveLength(2);
@@ -3697,6 +3699,194 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const haltedEvent = h.notifier.events.find((e) => e.kind === "halted");
     expect(haltedEvent).toBeDefined();
     expect((haltedEvent as { kind: "halted"; reason: string; detail: string }).detail).toContain("recovery failed:");
+  });
+
+  it("ci_failed recovers up to max_recovery_attempts, then abandons (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Set CI logs on FakeGitPr so they flow into recovery prompt
+    h.git.ciLogs = "Error: npm test failed\n  FAIL src/app.test.ts\n  expect(true).toBe(false)";
+    // Agent outcomes: IMPLEMENT, SELF-REVIEW (error→skip), recovery-fix-1, recovery-fix-2
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 1" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 2" },
+    ];
+    // Planner outcomes: PLAN, recovery-codex-1 (fix_code), recovery-codex-2 (fix_code)
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nFix it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test"}' },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test again"}' },
+    ];
+    // Monitor: 3 "done" verdicts — each triggers tryMerge
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    // checkMergeReadiness always returns ci_failed
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    // Stub git operations for recovery
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Counter exhausted after 2 recoveries → abandon on 3rd ci_failed
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.recoveryAction).toBe("abandon");
+    expect(s.recoveryTurnAttempts).toBe(2);
+    // needs-human triage applied on abandon
+    expect(s.needsHumanLabelAdded).toBe(1);
+    // Ticket reverted to Todo
+    const todoTransitions = h.source.transitions.filter((t) => t.state === "todo");
+    expect(todoTransitions.length).toBeGreaterThanOrEqual(1);
+    // 2 recovery_started + 2 recovery_succeeded + 1 task_skipped
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(2);
+    const recoverySucceeded = h.notifier.events.filter((e) => e.kind === "recovery_succeeded");
+    expect(recoverySucceeded).toHaveLength(2);
+    const taskSkipped = h.notifier.events.filter((e) => e.kind === "task_skipped");
+    expect(taskSkipped).toHaveLength(1);
+  });
+
+  it("ci_failed recovery prompt includes CI logs (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.ciLogs = "FAIL src/math.test.ts > sum > adds numbers\nExpected: 6\nReceived: 5";
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix sum"}' },
+    ];
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    // The Codex recovery prompt (2nd planner call) must contain CI logs
+    expect(planner.calls.length).toBeGreaterThanOrEqual(2);
+    const recoveryPrompt = planner.calls[1].prompt;
+    expect(recoveryPrompt).toContain("FAIL src/math.test.ts");
+    expect(recoveryPrompt).toContain("Expected: 6");
+    // fetchCiLogs was called with the PR number and branch
+    const fetchCalls = h.git.calls.filter((c) => c.method === "fetchCiLogs");
+    expect(fetchCalls).toHaveLength(1);
+  });
+
+  it("recoveryTurnAttempts survives restart (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix"}' },
+    ];
+    let readinessCall = 0;
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    // After one recovery: counter is 1 and persisted in DB
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].recoveryTurnAttempts).toBe(1);
+    expect(sessions[0].state).toBe("merged");
+
+    // Verify the counter is in the raw DB (survives process restart)
+    const raw = h.store.getSession(sessions[0].id);
+    expect(raw.recoveryTurnAttempts).toBe(1);
+  });
+
+  it("merge_conflict uses recovery counter (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"rebase","instruction":"rebase onto main"}' },
+    ];
+    let readinessCall = 0;
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "conflict" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc\n" };
+      if (args.includes("rebase")) return { code: 0, stdout: "" };
+      return { code: 0, stdout: "" };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 0 });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.recoveryTurnAttempts).toBe(1);
+    expect(s.recoveryAction).toBe("rebase");
+    expect(s.state).toBe("merged");
   });
 });
 

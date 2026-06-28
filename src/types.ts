@@ -79,6 +79,7 @@ export interface TaskSessionRow {
   recoveryAttempted: number;    // 0 or 1 — whether Codex recovery was attempted
   recoveryAction: string | null; // action chosen by Codex (fix_code/rebase/restart_review/escalate/abandon)
   doneTransitionPending: number; // 0 or 1 — whether transition(done) is still pending (ES-462)
+  needsHumanLabelAdded: number; // 0 or 1 — whether the needs-human label was successfully applied (ES-492)
   designReviewAttempts: number; // number of DESIGN REVIEW turns attempted for this session (ES-477)
   selfReviewCostUsd: number | null; // cost of the self-review turn (ES-473)
   verifyAttempts: number;          // number of VERIFY attempts for this session (ES-487)

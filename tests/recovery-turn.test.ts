@@ -92,7 +92,7 @@ function fakeSession(overrides: Partial<TaskSessionRow> = {}): TaskSessionRow {
     endedAt: null, workflowFixAttempts: 0, workflowHandledErrorCount: 0,
     autoRestartAttempts: 0, quotaRetryAttempts: 0, pendingRestartReason: null,
     recoveryAttempted: 0, recoveryAction: null,
-    doneTransitionPending: 0, designReviewAttempts: 0,
+    doneTransitionPending: 0, needsHumanLabelAdded: 0, designReviewAttempts: 0,
     selfReviewCostUsd: null,
     verifyAttempts: 0, recoveryTurnAttempts: 0,
     ...overrides,

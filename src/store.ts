@@ -188,6 +188,7 @@ interface RawSessionRow {
   recovery_attempted: number;
   recovery_action: string | null;
   done_transition_pending: number;
+  needs_human_label_added: number;
   design_review_attempts: number;
   self_review_cost_usd: number | null;
   verify_attempts: number;
@@ -223,6 +224,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     recoveryAttempted: r.recovery_attempted,
     recoveryAction: r.recovery_action,
     doneTransitionPending: r.done_transition_pending,
+    needsHumanLabelAdded: r.needs_human_label_added,
     designReviewAttempts: r.design_review_attempts,
     selfReviewCostUsd: r.self_review_cost_usd,
     verifyAttempts: r.verify_attempts,

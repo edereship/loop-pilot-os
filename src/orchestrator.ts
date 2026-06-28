@@ -4045,7 +4045,8 @@ export class Orchestrator {
         case "unknown":
           return { kind: "continue" };
         case "ci_failed": {
-          const ctrl = await this.stopSession(session, "ci_failed", null);
+          const ciLogs = await this.git.fetchCiLogs(prNumber, session.branch);
+          const ctrl = await this.stopSession(session, "ci_failed", ciLogs);
           return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
         }
         case "conflict": {
@@ -4149,6 +4150,13 @@ export class Orchestrator {
         policy = "recover";
       }
     }
+    // Override: ci_failed/merge_conflict with exhausted recovery counter → abandon (ES-493)
+    if ((reason === "ci_failed" || reason === "merge_conflict") && policy === "recover") {
+      const freshCounter = this.store.getSession(session.id);
+      if (freshCounter.recoveryTurnAttempts >= this.config.safety.maxRecoveryAttempts) {
+        policy = "abandon";
+      }
+    }
     // --- workflow_setup_failed cost exhaustion marker (pre-existing) ---
     const isWorkflowCostExhaustion =
       reason === "workflow_setup_failed" &&
@@ -4178,7 +4186,8 @@ export class Orchestrator {
          (fresh.stopDetail.startsWith("recovery failed: ") ||
           fresh.stopDetail.includes(" (recovery failed: ")))
       );
-      if ((reason !== "pr_closed" || isPartialAbandon) && !fresh.recoveryAttempted && fresh.prNumber !== null) {
+      const isCounterBasedRecovery = reason === "ci_failed" || reason === "merge_conflict";
+      if ((reason !== "pr_closed" || isPartialAbandon) && (isCounterBasedRecovery || !fresh.recoveryAttempted) && fresh.prNumber !== null) {
         await this.notifier.notify({
           kind: "recovery_started",
           identifier: session.linearIdentifier,
@@ -4235,7 +4244,11 @@ export class Orchestrator {
         // and that update would leave the row stopped with recoveryAttempted=1 and
         // no active session (ES-450 Finding 2).
         if (result.kind !== "failed" && result.kind !== "recovered") {
-          this.store.updateSession(session.id, { recoveryAttempted: 1 });
+          if (isCounterBasedRecovery) {
+            this.store.updateSession(session.id, { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 });
+          } else {
+            this.store.updateSession(session.id, { recoveryAttempted: 1 });
+          }
         }
         // Abandon completed cleanup and wants the loop to continue to next task.
         if (result.kind === "continued") {
@@ -4305,7 +4318,9 @@ export class Orchestrator {
             endedAt: null,
             autoRestartAttempts: 0,
             quotaRetryAttempts: 0,
-            recoveryAttempted: 1,
+            ...(isCounterBasedRecovery
+              ? { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 }
+              : { recoveryAttempted: 1 }),
           };
           if (recoveryCost > 0) {
             recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
@@ -4394,7 +4409,11 @@ export class Orchestrator {
           // conflict), mark recovery as attempted so stoppedSessionsWithFailedRecovery
           // does not queue it again (ES-450 Finding 1/3).
           if (result.preserveWorktree || result.nonRetryable) {
-            this.store.updateSession(session.id, { recoveryAttempted: 1 });
+            if (isCounterBasedRecovery) {
+              this.store.updateSession(session.id, { recoveryTurnAttempts: this.config.safety.maxRecoveryAttempts });
+            } else {
+              this.store.updateSession(session.id, { recoveryAttempted: 1 });
+            }
           }
           // Do not persist workflowHandledErrorCount in the stopped row when recovery
           // fails — except when the fix was already pushed (restartCommentOnly). In that
