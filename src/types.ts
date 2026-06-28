@@ -87,7 +87,8 @@ export interface TaskSessionRow {
 // ---- モジュールインターフェース（仕様 §4） ----
 export interface TaskSource {
   /** 適格(Team/PJ ∧ Todo ∧ オプトインラベル)を決定的順序で。hardExcludeIds は常に除外（active issues）。
-   *  abandonedExcludeIds は needs-human ラベルが付いている間のみ有効（ラベル除去で再エントリ可、ES-492）。 */
+   *  abandonedExcludeIds は当該 run 内の DB ガード（ES-492 Finding 1）: addLabel 失敗時に再選定を防ぐ。
+   *  cross-run では needs-human ラベルが権威（次回起動時にラベル除去で再エントリ可）。 */
   getNextEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[]): Promise<EligibleIssue | null>;
   /** 適格チケットを全件返す（PM 選別ターン用）。同上の除外セマンティクス。 */
   getAllEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[]): Promise<EligibleIssue[]>;

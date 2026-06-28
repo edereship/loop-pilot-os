@@ -223,29 +223,32 @@ export class LinearTaskSource implements TaskSource {
     return all;
   }
 
-  private isEligible(node: IssueNode, hardExclude: Set<string>): boolean {
+  private isEligible(node: IssueNode, hardExclude: Set<string>, softExclude: Set<string>): boolean {
     // Hard exclusions (active issues being worked on) always apply.
     if (hardExclude.has(node.id)) return false;
-    // The needs-human label is the primary authority (ES-492): if present, triage is required.
-    // Abandoned issues (soft-excluded via DB guard) are re-eligible when this label is cleared
-    // by a human mid-run — the label absence is authoritative, so soft excludes are not checked
-    // here (ES-492 Finding 2).
+    // DB guard: within-run exclusion for abandoned/design_rejected issues (ES-492 Finding 1).
+    // Defense-in-depth when addLabel fails transiently — the label is the cross-run authority,
+    // but this guard blocks re-selection for the remainder of the current run.
+    if (softExclude.has(node.id)) return false;
+    // The needs-human label is the cross-run authority: if present, triage is required.
     return !node.labels.nodes.some((l) => l.name === this.needsHumanLabel);
   }
 
-  async getNextEligible(hardExcludeIds: string[], _abandonedExcludeIds: string[] = []): Promise<EligibleIssue | null> {
+  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue | null> {
     const hard = new Set(hardExcludeIds);
+    const soft = new Set(abandonedExcludeIds);
     const nodes = (await this.queryByState(this.stateIds.todo))
-      .filter((n) => this.isEligible(n, hard))
+      .filter((n) => this.isEligible(n, hard, soft))
       .sort(compareIssues);
     const first = nodes[0];
     return first ? toEligible(first) : null;
   }
 
-  async getAllEligible(hardExcludeIds: string[], _abandonedExcludeIds: string[] = []): Promise<EligibleIssue[]> {
+  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue[]> {
     const hard = new Set(hardExcludeIds);
+    const soft = new Set(abandonedExcludeIds);
     return (await this.queryAllByState(this.stateIds.todo))
-      .filter((n) => this.isEligible(n, hard))
+      .filter((n) => this.isEligible(n, hard, soft))
       .sort(compareIssues)
       .map(toEligible);
   }
