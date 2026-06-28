@@ -392,6 +392,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
       discardUncommittedChanges: async (_worktreePath: string): Promise<void> => {},
       getPrDiffSummary: async (_prNumber: number) => ({ title: "", body: "", diff: "" }),
       fetchDefaultBranch: async (): Promise<void> => {},
+      fetchCiLogs: async (_prNumber: number, _branch: string): Promise<string | null> => null,
     };
     const monitor: LoopPilotMonitor = {
       poll: async (_prNumber: number): Promise<MonitorVerdict> => verdict,
