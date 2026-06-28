@@ -135,6 +135,8 @@ export interface GitPrManager {
   getPrDiffSummary(prNumber: number, maxDiffChars?: number): Promise<PrDiffSummary>;
   /** Fetch the default branch from origin and reset the working tree to match it. */
   fetchDefaultBranch(): Promise<void>;
+  /** Fetch failed CI run logs for recovery prompt injection. Returns null on any failure. */
+  fetchCiLogs(prNumber: number, branch: string): Promise<string | null>;
 }
 
 /** 列挙順は precedence ではない。poll() の決定順は §5.4（merged 最優先）が正 */

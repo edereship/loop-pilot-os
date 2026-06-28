@@ -373,4 +373,39 @@ export class GitPrManager implements GitPrManagerInterface {
       );
     }
   }
+
+  async fetchCiLogs(_prNumber: number, branch: string): Promise<string | null> {
+    const MAX_LOG_CHARS = 4000;
+    const { repoPath, remote } = this.opts;
+    try {
+      const listResult = await this.runner.run("gh", [
+        "run", "list",
+        "-R", remote,
+        "--branch", branch,
+        "--status", "failure",
+        "--limit", "1",
+        "--json", "databaseId",
+      ], { cwd: repoPath, timeoutMs: 15_000 });
+      if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
+      let runs: Array<{ databaseId: number }>;
+      try {
+        runs = JSON.parse(listResult.stdout);
+      } catch {
+        return null;
+      }
+      if (!runs.length) return null;
+
+      const logResult = await this.runner.run("gh", [
+        "run", "view", String(runs[0].databaseId),
+        "-R", remote,
+        "--log-failed",
+      ], { cwd: repoPath, timeoutMs: 30_000 });
+      if (logResult.code !== 0 || !logResult.stdout.trim()) return null;
+
+      const log = logResult.stdout;
+      return log.length > MAX_LOG_CHARS ? log.slice(-MAX_LOG_CHARS) : log;
+    } catch {
+      return null;
+    }
+  }
 }

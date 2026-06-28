@@ -322,6 +322,15 @@ export class FakeGitPr implements GitPrManager {
     if (preset) return preset;
     return { title: `PR #${prNumber}`, body: "", diff: "" };
   }
+
+  /** fetchCiLogs の戻り値。既定 null */
+  ciLogs: string | null = null;
+
+  async fetchCiLogs(prNumber: number, branch: string): Promise<string | null> {
+    this.calls.push({ method: "fetchCiLogs", args: [prNumber, branch] });
+    this.takeFailure("fetchCiLogs");
+    return this.ciLogs;
+  }
 }
 
 // ---- FakeMonitor ----
