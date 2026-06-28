@@ -777,3 +777,394 @@ describe("GitPrManager — runner.run に timeoutMs が設定される (ES-465)"
     }
   });
 });
+
+describe("GitPrManager.fetchCiLogs", () => {
+  const RUN_LIST_PREFIX = ["gh", "run", "list", "-R", "owner/name"];
+  const runsJson = (conclusion: string, status = "completed") =>
+    JSON.stringify([{ databaseId: 999, conclusion, status }]);
+
+  // ES-493 Finding 1: failure conclusion → --log-failed (only failed step output)
+  it("uses --log-failed for conclusion=failure", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("failure") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "step output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("--log-failed");
+    expect(viewCall!.args).not.toContain("--log");
+  });
+
+  // ES-493 Finding 1: non-failure conclusions have no failed steps, so --log-failed
+  // returns nothing. Use --log to capture diagnostics for timed_out/cancelled/etc.
+  it("uses --log for conclusion=timed_out", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("timed_out") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "partial output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("--log");
+    expect(viewCall!.args).not.toContain("--log-failed");
+    expect(logs).toBe("partial output\n");
+  });
+
+  it("uses --log for conclusion=cancelled", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("cancelled") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "cancelled output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall!.args).toContain("--log");
+    expect(viewCall!.args).not.toContain("--log-failed");
+  });
+
+  it("uses --log for conclusion=action_required", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("action_required") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "action output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall!.args).toContain("--log");
+    expect(viewCall!.args).not.toContain("--log-failed");
+  });
+
+  it("returns null when all runs are green (no non-success conclusion)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([{ databaseId: 1, conclusion: "success" }]),
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when gh run list fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 1, stdout: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix");
+    expect(result).toBeNull();
+  });
+
+  // ES-493 Finding 1 (Codex): --limit must be high enough that the failing run is not
+  // outside the cap when there are many workflows on the same commit.
+  it("passes --limit >= 20 so the failing run is not outside the cap in busy repos", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("failure") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const listCall = runner.calls.find(
+      (c) => c.cmd === "gh" && c.args.includes("list") && c.args.includes("--limit"),
+    );
+    expect(listCall).toBeDefined();
+    const limitIdx = listCall!.args.indexOf("--limit");
+    const limitValue = parseInt(listCall!.args[limitIdx + 1], 10);
+    expect(limitValue).toBeGreaterThanOrEqual(20);
+  });
+
+  // ES-493 Finding 1 (this PR): in-progress/queued runs have conclusion="" and must be
+  // skipped so the completed failed run is selected instead.
+  it("skips in_progress run and returns logs from the completed failed run", async () => {
+    const runner = new FakeCommandRunner();
+    // First run is in_progress with empty conclusion, second is the completed failure.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 100, conclusion: "", status: "in_progress" },
+        { databaseId: 200, conclusion: "failure", status: "completed" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the completed run (200), not the in-progress one (100).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("100");
+  });
+
+  it("returns null when all runs are in_progress (no completed run)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 100, conclusion: "", status: "in_progress" },
+        { databaseId: 101, conclusion: "", status: "queued" },
+      ]),
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+    expect(result).toBeNull();
+  });
+
+  // ES-493 Iteration 7 Finding 1: a workflow that failed and was later rerun successfully
+  // must not have its stale failure selected. Only the most recent completed run per workflow
+  // is considered; if it is green the workflow is treated as passing and excluded.
+  it("skips superseded failure when a later run of the same workflow succeeded (ES-493 Finding 1)", async () => {
+    const runner = new FakeCommandRunner();
+    // gh run list returns newest-first. workflow-a's latest run succeeded (rerun); the old
+    // failure is superseded. workflow-b is still failing.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success",  status: "completed", workflowName: "workflow-a" },
+        { databaseId: 100, conclusion: "failure",  status: "completed", workflowName: "workflow-a" },
+        { databaseId: 200, conclusion: "failure",  status: "completed", workflowName: "workflow-b" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "workflow-b logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("workflow-b logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // workflow-b's failing run (200) must be selected, not workflow-a's superseded failure (100).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("100");
+    expect(viewCall!.args).not.toContain("300");
+  });
+
+  it("selects the failing run even when a newer in_progress run exists for the same workflow", async () => {
+    const runner = new FakeCommandRunner();
+    // workflow-a's rerun is in_progress; the most recent COMPLETED run is still the failure.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 200, conclusion: "",        status: "in_progress", workflowName: "workflow-a" },
+        { databaseId: 100, conclusion: "failure", status: "completed",   workflowName: "workflow-a" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("100");
+  });
+
+  // ES-493 Iteration 8 Finding 1: org/enterprise ruleset workflows may omit workflowName.
+  // Each unnamed run must be keyed by workflowDatabaseId so a green ruleset run for one
+  // workflow does not suppress a failing run of a different unnamed workflow.
+  it("keys unnamed workflows by workflowDatabaseId so distinct unnamed workflows are not grouped", async () => {
+    const runner = new FakeCommandRunner();
+    // Two unnamed workflows (workflowName absent): workflow 10 succeeded, workflow 20 failed.
+    // Without the fix both would share key "" and the newer green run (300) would suppress
+    // the failing run (200) from a completely different ruleset workflow.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success", status: "completed", workflowDatabaseId: 10 },
+        { databaseId: 200, conclusion: "failure", status: "completed", workflowDatabaseId: 20 },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "ruleset failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("ruleset failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the failing unnamed workflow run (200), not the green one (300).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("300");
+  });
+
+  // ES-493 Iteration 9 Finding 1: gh CLI sets workflowName="" (empty string) on the
+  // ruleset 404 path. ?? treats "" as present so all unnamed workflows share key "".
+  // Using || instead ensures "" falls back to the workflowDatabaseId-based key.
+  it("keys empty-string workflowName workflows by workflowDatabaseId (ruleset 404 path)", async () => {
+    const runner = new FakeCommandRunner();
+    // Two runs where gh CLI returned workflowName="" for both but different workflowDatabaseId.
+    // Workflow 10 succeeded, workflow 20 failed. Without the fix the green run (300) would
+    // share key "" with the failing run (200) and suppress it.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success", status: "completed", workflowName: "", workflowDatabaseId: 10 },
+        { databaseId: 200, conclusion: "failure", status: "completed", workflowName: "", workflowDatabaseId: 20 },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "empty-name ruleset failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("empty-name ruleset failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the failing run (200), not the green one (300).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("300");
+  });
+
+  // ES-493 Iteration 10 Finding 3: two workflow files with the same display name but
+  // different workflowDatabaseId values must not be collapsed into one bucket. Without
+  // preferring workflowDatabaseId as the primary key, a green run from workflow A could
+  // suppress a failing run from workflow B when both share the same name.
+  it("keeps distinct workflows separate when workflowName matches but workflowDatabaseId differs", async () => {
+    const runner = new FakeCommandRunner();
+    // Two workflows both named "CI" but different database IDs (different workflow files).
+    // Workflow 10 (run 300) succeeded; workflow 20 (run 200) failed. Without the fix both
+    // share key "CI" and the green run (300, first) suppresses the failing run (200).
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success", status: "completed", workflowName: "CI", workflowDatabaseId: 10 },
+        { databaseId: 200, conclusion: "failure", status: "completed", workflowName: "CI", workflowDatabaseId: 20 },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "same-name workflow failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("same-name workflow failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the failing run (200), not the green run (300).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("300");
+  });
+
+  // ES-493 Iteration 12 Finding 1: pull_request workflows use the merge commit SHA as
+  // GITHUB_SHA, not the PR head SHA. So --commit <headSha> can miss those runs.
+  // If the commit-based search finds no failing run, fall back to --branch search.
+  it("falls back to branch when commit-based list finds no failing run (pull_request merge SHA mismatch)", async () => {
+    const runner = new FakeCommandRunner();
+    // --commit headSha returns empty (no runs match — merge SHA differs from head SHA)
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([]),
+    });
+    // --branch returns the pull_request workflow's failing run (headSha matches PR head SHA)
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--branch"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 500, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "abc123" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "pull_request workflow failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("pull_request workflow failure logs\n");
+    // The view call must target the run found via branch fallback.
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("500");
+    // Both list calls must have been made: commit first, then branch.
+    const listCalls = runner.calls.filter((c) => c.cmd === "gh" && c.args.includes("list"));
+    expect(listCalls).toHaveLength(2);
+    expect(listCalls[0].args).toContain("--commit");
+    expect(listCalls[1].args).toContain("--branch");
+  });
+
+  it("does not make branch fallback call when commit-based list already found a failing run", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "failure", status: "completed", workflowName: "CI", event: "push" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "push workflow failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("push workflow failure logs\n");
+    // Only one list call: no branch fallback needed.
+    const listCalls = runner.calls.filter((c) => c.cmd === "gh" && c.args.includes("list"));
+    expect(listCalls).toHaveLength(1);
+    expect(listCalls[0].args).toContain("--commit");
+  });
+
+  // Codex Finding 1: branch fallback must filter runs by headSha to avoid injecting logs
+  // from a stale failed run on an older commit of a long-lived or reused branch.
+  it("branch fallback ignores runs from older commits (stale headSha)", async () => {
+    const runner = new FakeCommandRunner();
+    // --commit headSha returns empty (pull_request merge SHA mismatch)
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([]),
+    });
+    // --branch returns two runs: one for the current head SHA and one stale run from an older commit.
+    // Without the headSha filter, the stale run (900) would be selected (it appears after the current
+    // one but is still the "most recent completed failure" for its workflow key if the current one
+    // is from a later submission that only partially shows up).
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--branch"], {
+      code: 0,
+      stdout: JSON.stringify([
+        // Stale run from a previous commit — must be excluded.
+        { databaseId: 900, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "old-sha-from-prior-commit" },
+        // Current run for the PR head commit — must be selected.
+        { databaseId: 500, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "abc123" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "current commit failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("current commit failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have selected the current-SHA run (500), not the stale one (900).
+    expect(viewCall!.args).toContain("500");
+    expect(viewCall!.args).not.toContain("900");
+  });
+
+  // Codex Finding 1: when the branch fallback finds only stale runs (none matching headSha),
+  // it must return null rather than injecting logs from an unrelated commit.
+  it("branch fallback returns null when no run matches headSha", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([]),
+    });
+    // --branch returns only a run from an older commit (different headSha).
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--branch"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 700, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request", headSha: "some-old-commit" },
+      ]),
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    // Must return null: no run matches the current PR head SHA.
+    expect(result).toBeNull();
+  });
+});

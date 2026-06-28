@@ -62,6 +62,8 @@ function makeConfig(over: Partial<{
       maxVerifyAttempts: 2,
       maxCostUsdPerVerify: 2,
       verifyTimeoutMinutes: 15,
+      maxRecoveryAttempts: 2,
+      transientRetryAttempts: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -3194,7 +3196,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493)
     expect(s.recoveryAction).toBe("fix_code");
     expect(s.state).toBe("merged");
     // Cost includes recovery agent cost
@@ -3293,7 +3295,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // Final state is stopped from pr_closed (second stop, no recovery)
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("pr_closed");
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493): merge_conflict increments counter not recoveryAttempted
     expect(s.recoveryAction).toBe("restart_review");
   });
 
@@ -3565,6 +3567,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // ES-492 Finding 1: when recovery chose abandon but executeAbandon failed, the halt path
     // must still apply the needs-human label so SELECT filters the ticket.
     expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
+    // A retryable failed recovery (no preserveWorktree/nonRetryable) must still count toward
+    // the attempt cap so repeated failures eventually reach maxRecoveryAttempts (ES-493).
+    expect(s.recoveryTurnAttempts).toBe(1);
   });
 
   // ES-450 Finding 1 (iteration 10): stale guard must fire on the poll immediately
@@ -3608,7 +3613,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
     expect(s.state).toBe("merged");
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493)
     expect(s.recoveryAction).toBe("fix_code");
     // Readiness was called exactly twice: once for ci_failed (poll 1) and once for
     // ready (poll 3). The stale guard on poll 2 must skip tryMerge entirely.
@@ -3648,7 +3653,7 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
     expect(s.state).toBe("merged");
-    expect(s.recoveryAttempted).toBe(1);
+    expect(s.recoveryTurnAttempts).toBe(1); // counter-based (ES-493)
     expect(s.recoveryAction).toBe("rebase");
     // Stale guard must skip tryMerge on poll 2 — readiness called only twice.
     expect(h.monitor.readinessCalls).toHaveLength(2);
@@ -3697,6 +3702,993 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const haltedEvent = h.notifier.events.find((e) => e.kind === "halted");
     expect(haltedEvent).toBeDefined();
     expect((haltedEvent as { kind: "halted"; reason: string; detail: string }).detail).toContain("recovery failed:");
+    // push-after-commit failure has preserveWorktree=true → existing code forces counter to
+    // maxRecoveryAttempts (2) so the session is not retried with stale commits on disk.
+    expect(s.recoveryTurnAttempts).toBe(2);
+  });
+
+  it("ci_failed recovers up to max_recovery_attempts, then abandons (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // Set CI logs on FakeGitPr so they flow into recovery prompt
+    h.git.ciLogs = "Error: npm test failed\n  FAIL src/app.test.ts\n  expect(true).toBe(false)";
+    // Agent outcomes: IMPLEMENT, SELF-REVIEW (error→skip), recovery-fix-1, recovery-fix-2
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 1" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 2" },
+    ];
+    // Planner outcomes: PLAN, recovery-codex-1 (fix_code), recovery-codex-2 (fix_code)
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nFix it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test"}' },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test again"}' },
+    ];
+    // Monitor: 3 "done" verdicts — each triggers tryMerge
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    // checkMergeReadiness always returns ci_failed
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    // Stub git operations for recovery
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Counter exhausted after 2 recoveries → abandon on 3rd ci_failed
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.recoveryAction).toBe("abandon");
+    expect(s.recoveryTurnAttempts).toBe(2);
+    // needs-human triage applied on abandon
+    expect(s.needsHumanLabelAdded).toBe(1);
+    // Ticket reverted to Todo
+    const todoTransitions = h.source.transitions.filter((t) => t.state === "todo");
+    expect(todoTransitions.length).toBeGreaterThanOrEqual(1);
+    // 2 recovery_started + 2 recovery_succeeded + 1 task_skipped
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(2);
+    const recoverySucceeded = h.notifier.events.filter((e) => e.kind === "recovery_succeeded");
+    expect(recoverySucceeded).toHaveLength(2);
+    const taskSkipped = h.notifier.events.filter((e) => e.kind === "task_skipped");
+    expect(taskSkipped).toHaveLength(1);
+  });
+
+  it("ci_failed recovery prompt includes CI logs (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.ciLogs = "FAIL src/math.test.ts > sum > adds numbers\nExpected: 6\nReceived: 5";
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix sum"}' },
+    ];
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    // The Codex recovery prompt (2nd planner call) must contain CI logs
+    expect(planner.calls.length).toBeGreaterThanOrEqual(2);
+    const recoveryPrompt = planner.calls[1].prompt;
+    expect(recoveryPrompt).toContain("FAIL src/math.test.ts");
+    expect(recoveryPrompt).toContain("Expected: 6");
+    // fetchCiLogs was called with the PR number and branch
+    const fetchCalls = h.git.calls.filter((c) => c.method === "fetchCiLogs");
+    expect(fetchCalls).toHaveLength(1);
+  });
+
+  it("recoveryTurnAttempts survives restart (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "fixed" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix"}' },
+    ];
+    let readinessCall = 0;
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    // After one recovery: counter is 1 and persisted in DB
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].recoveryTurnAttempts).toBe(1);
+    expect(sessions[0].state).toBe("merged");
+
+    // Verify the counter is in the raw DB (survives process restart)
+    const raw = h.store.getSession(sessions[0].id);
+    expect(raw.recoveryTurnAttempts).toBe(1);
+  });
+
+  it("merge_conflict uses recovery counter (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"rebase","instruction":"rebase onto main"}' },
+    ];
+    let readinessCall = 0;
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "conflict" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc\n" };
+      if (args.includes("rebase")) return { code: 0, stdout: "" };
+      return { code: 0, stdout: "" };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 0 });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.recoveryTurnAttempts).toBe(1);
+    expect(s.recoveryAction).toBe("rebase");
+    expect(s.state).toBe("merged");
+  });
+
+  it("merge_conflict counter exhaustion → abandon (ES-493)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "rebased 1" },
+      { kind: "completed", costUsd: 0.5, summary: "rebased 2" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nDo it" },
+      { kind: "completed", text: '{"action":"rebase","instruction":"rebase onto main"}' },
+      { kind: "completed", text: '{"action":"rebase","instruction":"rebase onto main again"}' },
+    ];
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "conflict" as const };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc\n" };
+      if (args.includes("rebase")) return { code: 0, stdout: "" };
+      return { code: 0, stdout: "" };
+    });
+    h.recoveryRunner.on(["git", "push"], { code: 0 });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("merge_conflict");
+    expect(s.recoveryAction).toBe("abandon");
+    expect(s.recoveryTurnAttempts).toBe(2);
+    expect(s.needsHumanLabelAdded).toBe(1);
+  });
+
+  // ES-493 Iteration 8 Finding 3: CI diagnostics must be preserved in the compound
+  // stop_detail so the next recovery retry receives the CI log output. The ci_log:
+  // prefix survives via "ci_log:<logs> (recovery failed: <msg>)" and stripRecoveryFailedSuffix
+  // uses lastIndexOf so it strips the actual suffix even when CI output contains the pattern.
+  it("ci_failed recovery failure preserves ci_log content in compound stop_detail (ES-493 Iteration 8 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // CI output contains text that resembles a recovery-failure sentinel — lastIndexOf in
+    // stripRecoveryFailedSuffix ensures the actual appended suffix is stripped correctly.
+    h.git.ciLogs = "Error: (recovery failed: some previous test harness log line)";
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    // Make restart-review comment posting fail (no preserveWorktree → retryable).
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // CI logs must be preserved in the compound form so the next retry has the diagnostics.
+    expect(s.stopDetail).toMatch(/^ci_log:/);
+    // The recovery failure marker must still be present so the session can be retried.
+    expect(s.stopDetail).toContain("(recovery failed:");
+  });
+
+  // ES-493 Finding 3: when the fix_pushed_restart_pending shortcut retries only the
+  // /restart-review comment (no code fix), a successful comment post must NOT increment
+  // recoveryTurnAttempts — the budget must be preserved for actual code-fix attempts.
+  it("fix_pushed_restart_pending success: recoveryTurnAttempts not incremented (ES-493 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a stopped session with the fix_pushed_restart_pending sentinel and counter=1.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "stopped",
+      failureReason: "ci_failed",
+      prNumber: 100,
+      stopDetail: "fix_pushed_restart_pending (recovery failed: recovery restart-review failed: timeout)",
+      recoveryTurnAttempts: 1,
+      endedAt: "2026-06-04T00:01:00.000Z",
+    });
+    // Source queue is empty — startup recovery handles the seeded session only.
+    h.source.queue = [];
+    // Stale guard fires once (pendingRestartReason="ci_failed"), then merge succeeds.
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAction).toBe("restart_review");
+    // The comment-only retry must NOT count against the recovery budget.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // /restart-review comment was posted to the PR.
+    const commentCalls = h.git.calls.filter(
+      (c) => c.method === "postComment" && c.args[1] === "/restart-review",
+    );
+    expect(commentCalls).toHaveLength(1);
+  });
+
+  // ES-493 Finding 3 (failure path): when the fix_pushed_restart_pending shortcut
+  // fails to post the /restart-review comment, recoveryTurnAttempts must NOT be
+  // incremented — only the comment is missing, not a code fix.
+  it("fix_pushed_restart_pending failure: recoveryTurnAttempts not incremented (ES-493 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a stopped session with fix_pushed_restart_pending and counter at 1.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "stopped",
+      failureReason: "ci_failed",
+      prNumber: 100,
+      stopDetail: "fix_pushed_restart_pending (recovery failed: recovery restart-review failed: timeout)",
+      recoveryTurnAttempts: 1,
+      endedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Make postComment fail again — the shortcut path retries only the comment.
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Counter must remain at 1 — the comment-only failure must not consume code-fix budget.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // Sentinel re-encoded so next startup picks it up again.
+    expect(s.stopDetail).toContain("fix_pushed_restart_pending");
+  });
+
+  // ES-493 Finding 1: a legacy session (recoveryAttempted=1, recoveryTurnAttempts=0) must
+  // have the prior attempt counted so it cannot receive a full fresh budget after an upgrade.
+  it("legacy recoveryAttempted=1 counts against new counter budget (ES-493 Finding 1)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed an in_review session in legacy state: recoveryAttempted=1, recoveryTurnAttempts=0.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,    // set by old code after a ci_failed recovery
+      recoveryTurnAttempts: 0, // not yet migrated
+      // recoveryAction must identify a counter-based CI recovery so the legacy shim fires.
+      // Old code that wrote recoveryAttempted=1 for looppilot_stopped/handoff_failed used
+      // restart_review, which is excluded from the shim (Codex Finding 2).
+      recoveryAction: "fix_code",
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code (used on the first ci_failed).
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the test"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" }, // recovery fix agent
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Monitor: two "done" verdicts, both ci_failed on readiness.
+    // First: triggers recovery (fix_code), counter → effectiveRecoveryAttempts+1 = 2.
+    // Second: counter=2=max → abandon (no second recovery).
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Budget was already 1 (legacy), so only ONE recovery ran before abandon.
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.recoveryAction).toBe("abandon");
+    // Counter = effectiveRecoveryAttempts(1) + 1 = 2 (max), proving the prior attempt was counted.
+    expect(s.recoveryTurnAttempts).toBe(2);
+    // Exactly one recovery_started event — the legacy attempt consumed one slot.
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(1);
+  });
+
+  // ES-493 Finding 2: a ci_failed recovery that escalates must set recoveryAttempted=1 so
+  // stoppedSessionsWithFailedRecovery cannot re-queue the session, overriding the escalation.
+  it("ci_failed escalation sets recoveryAttempted=1 to block stoppedSessionsWithFailedRecovery (ES-493 Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // CI log contains "(recovery failed:" pattern — without the fix, the stored stop_detail
+    // would have ci_log:...(recovery failed:... and match stoppedSessionsWithFailedRecovery.
+    h.git.ciLogs = "Error: (recovery failed: some test harness log line)";
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery planner: escalate
+      { kind: "completed", text: '{"action":"escalate"}' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAction).toBe("escalate");
+    // Must be set so stoppedSessionsWithFailedRecovery (which requires recovery_attempted=0) skips it.
+    expect(s.recoveryAttempted).toBe(1);
+    // Confirm the session is not re-queued by stoppedSessionsWithFailedRecovery.
+    expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(0);
+  });
+
+  // ES-493 Iteration 7 Finding 2: a prior non-counter recovery (e.g. looppilot_stopped or
+  // handoff_failed) sets recoveryAttempted=1 with the new recoveryTurnAttempts=-1 sentinel.
+  // A later ci_failed stop must NOT fire the legacy shim and must give a full CI/merge budget.
+  it("non-counter recovery sentinel (recoveryTurnAttempts=-1) does not consume CI/merge budget", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session with the new non-counter recovery sentinel written by the fixed code:
+    // recoveryAttempted=1 (non-counter recovery ran) + recoveryTurnAttempts=-1 (sentinel).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,       // non-counter recovery ran (e.g. looppilot_stopped)
+      recoveryTurnAttempts: -1,   // sentinel: non-counter, not a legacy CI/merge attempt
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code for the first ci_failed.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the CI"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Monitor: done → ci_failed → recovery succeeds → merged.
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    // Sentinel -1 normalized to 0: counter goes 0→1.
+    // This proves the legacy shim did NOT fire (which would have given effectiveRecoveryAttempts=1
+    // and incremented to 2, consuming the full budget on the first recovery).
+    // With the Iteration 8 fix the -1 is now normalized before incrementing, so the result
+    // is 1 rather than 0 (ES-493 Iteration 8 Finding 2).
+    expect(s.recoveryTurnAttempts).toBe(1);
+  });
+
+  // ES-493 Iteration 9 Finding 2: a non-counter recovery (e.g. looppilot_stopped) must not
+  // overwrite a positive recoveryTurnAttempts set by prior counter-based (ci_failed) recovery.
+  // Without the fix, restart_review for looppilot_stopped writes recoveryTurnAttempts=-1,
+  // erasing the counter so the session receives a fresh full budget on the next ci_failed stop.
+  it("non-counter recovery (looppilot_stopped) preserves positive recoveryTurnAttempts from prior counter recovery", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session that already consumed 1 counter attempt from a prior ci_failed recovery.
+    // It is currently in_review with recoveryAttempted=0 (non-counter recovery not yet attempted).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 0,     // non-counter recovery has NOT run yet
+      recoveryTurnAttempts: 1,  // one ci_failed counter budget already consumed
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: restart_review for the looppilot_stopped stop.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+    // Monitor: startup recovery poll returns stopped (looppilot_stopped) → recovery runs
+    // → restart_review re-activates the session → second poll returns merged.
+    h.monitor.verdicts = [
+      { kind: "stopped", stopReason: "codex timed out" },
+      { kind: "merged" },
+    ];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    // recoveryTurnAttempts must still be 1. The non-counter restart_review must NOT write
+    // -1 over the existing counter — that would reset the budget and allow a fresh full
+    // max_recovery_attempts on the next ci_failed stop (ES-493 Iteration 9 Finding 2).
+    expect(s.recoveryTurnAttempts).toBe(1);
+    expect(s.recoveryAttempted).toBe(1);
+  });
+
+  // ES-493 Iteration 7 Finding 3: when fix_code/rebase pushes a fix but /restart-review
+  // fails for the FIRST time (isRestartCommentPending=false), the push must be counted
+  // against the recovery budget — not just comment-only retries.
+  it("initial fix_push with failed restart-review comment counts against recovery budget", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+      // Recovery fix agent: pushes a fix
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Goal\nFix it" },
+      // Recovery Codex: fix_code
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test"}' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // The fix is pushed successfully but the /restart-review comment fails.
+    // This is the INITIAL push (isRestartCommentPending=false), so the counter must increment.
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // fix_pushed_restart_pending sentinel must be set.
+    expect(s.stopDetail).toContain("fix_pushed_restart_pending");
+    // The initial code fix must be charged: counter incremented from 0 to 1.
+    expect(s.recoveryTurnAttempts).toBe(1);
+  });
+
+  // ES-493 Iteration 8 Finding 4: when the LAST allowed attempt pushes a fix but the
+  // /restart-review comment fails, the session must NOT be abandoned immediately. The
+  // fix_pushed_restart_pending sentinel lets the next daemon start retry only the comment
+  // via the isRestartCommentPending bypass, preserving the already-pushed fix.
+  it("last-allowed fix_push with failed restart-review comment preserves sentinel instead of abandoning", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a stopped session that already used one recovery attempt (counter=1 of max=2).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryTurnAttempts: 1,  // one slot used; next attempt is the last (cap=2)
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code on the last allowed attempt
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    // Fix is pushed but /restart-review comment fails — this is the last allowed attempt.
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Must NOT be abandoned: fix is already in the PR, only the comment failed.
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAction).not.toBe("abandon");
+    // fix_pushed_restart_pending sentinel must be set so the next start retries the comment.
+    expect(s.stopDetail).toContain("fix_pushed_restart_pending");
+    // Counter reaches the cap (1→2) but does not trigger abandon.
+    expect(s.recoveryTurnAttempts).toBe(2);
+  });
+
+  // ES-493 Iteration 10 Finding 1: raw CI log payloads must not be rendered verbatim in
+  // user-facing surfaces (Linear comments, notifications). When the recovery counter exhausts
+  // and the session is abandoned, the needs-human triage comment must show a concise "CI failure"
+  // label rather than the raw log body. stopDetail preserves the full "ci_log:<content>" form
+  // so recovery agents still receive CI diagnostics on the next daemon start.
+  it("ci_log payload stripped from triage comment on abandon; stopDetail preserves raw log", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed an in_review session that already used all recovery attempts (counter at cap).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryTurnAttempts: 2,  // already at cap (maxRecoveryAttempts=2) → immediate abandon
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // CI log includes raw diagnostic output that must not leak into Linear comments.
+    h.git.ciLogs = "FATAL: npm test failed\n  AssertionError: expected 1 to equal 2\n  at src/math.test.ts:5:3";
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [];  // no recovery runs (counter exhausted → immediate abandon)
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.recoveryAction).toBe("abandon");
+    // DB must retain the raw CI log for diagnostic use.
+    expect(s.stopDetail).toMatch(/^ci_log:/);
+    expect(s.stopDetail).toContain("npm test failed");
+    // Triage comment must NOT contain the raw log — only "CI failure" as the concise label.
+    const triageComment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(triageComment).toBeDefined();
+    expect(triageComment!.body).not.toContain("npm test failed");
+    expect(triageComment!.body).toContain("CI failure");
+    // task_skipped notification must also not contain the raw log.
+    const skippedEvent = h.notifier.events.find((e) => e.kind === "task_skipped");
+    expect(skippedEvent).toBeDefined();
+    expect((skippedEvent as { detail?: string }).detail).not.toContain("npm test failed");
+    expect((skippedEvent as { detail?: string }).detail).toContain("CI failure");
+  });
+
+  // ES-493 Iteration 10 Finding 2: when a prior non-counter recovery (e.g. looppilot_stopped)
+  // left recoveryAttempted=1 and the -1 sentinel, a subsequent counter-based (ci_failed) recovery
+  // that fails transiently must clear the stale flag back to 0. Without the fix,
+  // stoppedSessionsWithFailedRecovery (which requires recovery_attempted=0) cannot pick up the
+  // session on the next daemon start, silently blocking all further retries.
+  it("counter-based retry clears stale recoveryAttempted so stoppedSessionsWithFailedRecovery can retry", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session with a stale recoveryAttempted=1 from a prior non-counter recovery.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,       // stale flag from a prior looppilot_stopped recovery
+      recoveryTurnAttempts: -1,   // sentinel: -1 means non-counter set the flag
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.git.ciLogs = "test failure output";
+    // Recovery planner: fix_code for the ci_failed stop.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the test"}' },
+    ];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "applied fix" }];
+    // Provide a commit so the fix is considered pushed (not the "no commits" path).
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc123 fix the failing test\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Make the /restart-review comment fail → result.kind="failed", restartCommentOnly=true,
+    // no preserveWorktree/nonRetryable → counter increment path fires.
+    h.git.failNext("postComment");
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Counter was -1 (normalized to 0) → incremented to 1; cap is 2, so not yet abandoned.
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // The stale flag must be cleared so the daemon can retry on the next start.
+    expect(s.recoveryAttempted).toBe(0);
+    // stoppedSessionsWithFailedRecovery must now be able to find the session.
+    expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(1);
+    expect(h.store.stoppedSessionsWithFailedRecovery()[0].id).toBe(seeded.id);
+  });
+
+  // ES-493 Iteration 12 Finding 2: when counter exhaustion sets policy=abandon directly
+  // (bypassing executeRecoveryTurn) and the session has a stale recoveryAttempted=1 from
+  // a prior non-counter recovery, executeAbandon failing must not leave recovery_attempted=1.
+  // stoppedSessionsWithFailedRecovery requires recovery_attempted=0 to retry the cleanup.
+  it("cap-abandon: stale recoveryAttempted cleared before executeAbandon so failed cleanup is retryable", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed an in_review session with a stale recoveryAttempted=1 from a prior non-counter
+    // recovery AND a counter already at cap, so the next ci_failed triggers immediate abandon.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,       // stale flag from a prior looppilot_stopped recovery
+      recoveryTurnAttempts: 2,    // already at cap (maxRecoveryAttempts=2) → immediate abandon
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [];  // no recovery runs (counter exhausted → immediate abandon)
+    // Make gh pr close fail so executeAbandon returns { kind: "failed" }.
+    h.recoveryRunner.on(["gh", "pr", "close"], { code: 1, stderr: "PR not found" });
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // The stale flag must be cleared so stoppedSessionsWithFailedRecovery can retry.
+    expect(s.recoveryAttempted).toBe(0);
+    // stop_detail must match abandon_in_progress% for stoppedSessionsWithFailedRecovery.
+    expect(s.stopDetail).toMatch(/^abandon_in_progress/);
+    // stoppedSessionsWithFailedRecovery must now find this session.
+    expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(1);
+    expect(h.store.stoppedSessionsWithFailedRecovery()[0].id).toBe(seeded.id);
+  });
+
+  // Codex Finding 2: a legacy looppilot_stopped/handoff_failed recovery that left
+  // recoveryAttempted=1/recoveryTurnAttempts=0/recoveryAction=restart_review must NOT
+  // trigger the legacy shim and must not consume a CI/merge budget slot.
+  it("legacy non-counter recovery (recoveryAction=restart_review) does not consume CI/merge budget (Codex Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session in legacy state from a prior looppilot_stopped recovery:
+    // recoveryAttempted=1, recoveryTurnAttempts=0, recoveryAction=restart_review.
+    // The new code's -1 sentinel was not available when this row was written.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,        // set by old code for a looppilot_stopped recovery
+      recoveryTurnAttempts: 0,     // pre-migration (no counter written)
+      recoveryAction: "restart_review", // looppilot_stopped recovery used restart_review
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code for the ci_failed stop.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the CI"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Monitor: done → ci_failed → recovery succeeds → merged.
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+    let readinessCall = 0;
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      readinessCall += 1;
+      if (readinessCall === 1) return { ready: false, reason: "ci_failed" as const };
+      return { ready: true, headSha: `sha-${pr}` };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    // The shim must NOT have fired (restart_review is not a counter-based action).
+    // effectiveRecoveryAttempts was 0 (not 1), so counter goes 0→1 on the single recovery.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // Exactly one recovery ran (full budget was available — the looppilot_stopped prior did not consume a slot).
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(1);
+  });
+
+  // Codex Finding 3: an interrupted ci_failed/merge_conflict recovery must roll back the
+  // pre-persisted counter increment so repeated SIGINT interruptions do not exhaust the
+  // maxRecoveryAttempts budget without any completed recovery.
+  it("counter-based recovery interrupted → recoveryTurnAttempts rolled back (Codex Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "implemented" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery Codex is interrupted before choosing an action.
+      { kind: "interrupted" },
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // The pre-persisted increment must be rolled back: counter stays at 0 (no slot consumed).
+    expect(s.recoveryTurnAttempts).toBe(0);
+    // recoveryAttempted must stay 0 so the next daemon can retry recovery.
+    expect(s.recoveryAttempted).toBe(0);
+    // Session remains in_review and run is halted.
+    expect(s.state).toBe("in_review");
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  // Codex Finding 3: when fix_code is interrupted AFTER commits are pushed to the remote
+  // branch, the pre-persisted counter must NOT be rolled back — the slot is consumed even
+  // if the daemon is restarted, preventing repeated interrupted-after-push runs from
+  // bypassing the durable cap.
+  it("fix_code interrupted after push → counter NOT rolled back (Codex Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },      // implement
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },  // self-review (no queue)
+      { kind: "interrupted", costUsd: 0.2 },                            // recovery fix_code agent interrupted
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery Codex chooses fix_code.
+      { kind: "completed", text: '{"action":"fix_code","instruction":"fix the CI failure"}' },
+    ];
+    // Override the recovery runner's git -C handler so the log command reports commits
+    // ahead of origin (hasPushableCommits → true), which triggers the push path in
+    // executeFixCode and causes the interrupted result to carry hadSideEffects=true.
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix-attempt\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // The counter must NOT be rolled back: the push side effect occurred (hadSideEffects=true),
+    // so the slot is consumed and recoveryTurnAttempts stays at 1.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // Session remains in_review and run is halted.
+    expect(s.state).toBe("in_review");
+    expect(h.store.latestRun()!.state).toBe("halted");
   });
 });
 

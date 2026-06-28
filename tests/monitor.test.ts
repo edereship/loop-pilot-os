@@ -473,6 +473,7 @@ describe("GhLoopPilotMonitor.checkMergeReadiness — 決定順 ①-⑥ (§5.3)",
     expect(await monitor.checkMergeReadiness(3)).toEqual<MergeReadiness>({
       ready: false,
       reason: "ci_failed",
+      headSha: "deadbeefcafe",
     });
   });
 
@@ -486,6 +487,7 @@ describe("GhLoopPilotMonitor.checkMergeReadiness — 決定順 ①-⑥ (§5.3)",
     expect(await monitor.checkMergeReadiness(10)).toEqual<MergeReadiness>({
       ready: false,
       reason: "ci_failed",
+      headSha: "deadbeefcafe",
     });
   });
 
@@ -596,6 +598,7 @@ describe("GhLoopPilotMonitor.checkMergeReadiness — 決定順 ①-⑥ (§5.3)",
     expect(await monitor.checkMergeReadiness(10)).toEqual<MergeReadiness>({
       ready: false,
       reason: "ci_failed",
+      headSha: "deadbeefcafe",
     });
   });
 

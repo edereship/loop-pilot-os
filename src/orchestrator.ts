@@ -4045,7 +4045,13 @@ export class Orchestrator {
         case "unknown":
           return { kind: "continue" };
         case "ci_failed": {
-          const ctrl = await this.stopSession(session, "ci_failed", null);
+          const ciLogs = await this.git.fetchCiLogs(prNumber, session.branch, readiness.headSha);
+          // Prefix raw log text with "ci_log:" so it can never accidentally match the
+          // sentinel prefixes ("abandon_in_progress", "fix_pushed_restart_pending", etc.)
+          // that stopSession and executeRecoveryTurn use for control-flow decisions when
+          // the value is later persisted as stopDetail and read back on daemon restart.
+          const ciDetail = ciLogs !== null ? `ci_log:${ciLogs}` : null;
+          const ctrl = await this.stopSession(session, "ci_failed", ciDetail);
           return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
         }
         case "conflict": {
@@ -4149,6 +4155,7 @@ export class Orchestrator {
         policy = "recover";
       }
     }
+    const isCounterBasedRecovery = reason === "ci_failed" || reason === "merge_conflict";
     // --- workflow_setup_failed cost exhaustion marker (pre-existing) ---
     const isWorkflowCostExhaustion =
       reason === "workflow_setup_failed" &&
@@ -4161,6 +4168,43 @@ export class Orchestrator {
     }
     if (policy === "recover" && this.recoveryTurn !== null && this.planner !== null) {
       const fresh = this.store.getSession(session.id);
+      // Counter exhaustion: override to abandon, skip recovery (ES-493).
+      // Exception: when a prior fix was successfully pushed but only the /restart-review
+      // comment failed, the sentinel fix_pushed_restart_pending must still reach
+      // executeRecoveryTurn so the comment retry runs rather than abandoning a PR that
+      // already has the fix committed (ES-493 Finding 1).
+      const isRestartCommentPending = fresh.stopDetail !== null &&
+        fresh.stopDetail.startsWith("fix_pushed_restart_pending");
+      // Legacy sessions (pre-counter migration) set recoveryAttempted=1 while
+      // recoveryTurnAttempts remained 0. Incorporate the legacy boolean so the prior
+      // attempt counts against the new budget and the session cannot receive a full
+      // fresh max_recovery_attempts budget after an upgrade (ES-493 Finding 1).
+      // Fire the shim only when recoveryAction is fix_code or rebase. This is a HEURISTIC:
+      // it cannot perfectly distinguish a pre-ES-493 ci_failed/merge_conflict recovery from a
+      // pre-iteration-7 non-counter (looppilot_stopped/handoff_failed) recovery that also chose
+      // fix_code or rebase (Codex Finding 1 — no DB migration available to store the prior
+      // failure reason). Charging fix_code/rebase is the safer direction: it may cost the
+      // session one extra attempt vs. giving ci_failed sessions a fresh budget when they
+      // already used one slot. restart_review is deliberately excluded: (a) it was the most
+      // common looppilot_stopped action in pre-iteration-7 code so excluding it avoids the
+      // most frequent false charge (Codex Finding 2), and (b) the existing spec test confirms
+      // that looppilot_stopped → restart_review must not consume a CI/merge slot — a case that
+      // is indistinguishable in the DB from ci_failed → restart_review without migration.
+      const isLegacyCiMergeRecovery =
+        fresh.recoveryAction === "fix_code" || fresh.recoveryAction === "rebase";
+      const rawRecoveryAttempts = isCounterBasedRecovery && fresh.recoveryAttempted && fresh.recoveryTurnAttempts === 0 && isLegacyCiMergeRecovery
+        ? 1
+        : fresh.recoveryTurnAttempts;
+      // The -1 sentinel means "recoveryAttempted was set by a non-counter recovery";
+      // normalize to 0 so the non-counter prior does not delay the cap by one turn
+      // when a later counter-based recovery (ci_failed/merge_conflict) starts
+      // (ES-493 Iteration 8 Finding 2).
+      const effectiveRecoveryAttempts = rawRecoveryAttempts === -1 ? 0 : rawRecoveryAttempts;
+      if (isCounterBasedRecovery &&
+          effectiveRecoveryAttempts >= this.config.safety.maxRecoveryAttempts &&
+          !isRestartCommentPending) {
+        policy = "abandon";
+      }
       // pr_closed is normally terminal (no PR to push to / restart). Exception: a partial
       // abandon (crash mid-abandon with stopDetail="abandon_in_progress") left the ticket
       // in a dirty state — recovery can complete the cleanup (ES-450 Finding 4).
@@ -4178,7 +4222,7 @@ export class Orchestrator {
          (fresh.stopDetail.startsWith("recovery failed: ") ||
           fresh.stopDetail.includes(" (recovery failed: ")))
       );
-      if ((reason !== "pr_closed" || isPartialAbandon) && !fresh.recoveryAttempted && fresh.prNumber !== null) {
+      if (policy === "recover" && (reason !== "pr_closed" || isPartialAbandon) && (isCounterBasedRecovery || !fresh.recoveryAttempted) && fresh.prNumber !== null) {
         await this.notifier.notify({
           kind: "recovery_started",
           identifier: session.linearIdentifier,
@@ -4204,6 +4248,19 @@ export class Orchestrator {
         // Gate label handling for handoff_failed is now inside executeRecoveryTurn (after
         // parseRecoveryAction), so abandon/escalate can proceed even when the label API is
         // broken (ES-450 Finding 5).
+        // Pre-persist the attempt counter before the side-effecting recovery turn so that a
+        // daemon crash between the push/rebase and the post-turn counter write cannot allow
+        // the same stale failed PR to receive an extra recovery cycle without consuming a
+        // budget slot (ES-493 Finding 3). Skip when isRestartCommentPending: comment-only
+        // retries intentionally do not consume the budget (ES-493 Finding 3).
+        // Also clears any stale recoveryAttempted left by a prior non-counter recovery so the
+        // slot reservation is visible to stoppedSessionsWithFailedRecovery (ES-493 Finding 3).
+        if (isCounterBasedRecovery && !isRestartCommentPending) {
+          this.store.updateSession(session.id, {
+            recoveryTurnAttempts: effectiveRecoveryAttempts + 1,
+            recoveryAttempted: 0,
+          });
+        }
         let result;
         try {
           result = await executeRecoveryTurn(
@@ -4224,6 +4281,16 @@ export class Orchestrator {
             const freshened = this.store.getSession(session.id);
             this.store.updateSession(session.id, { costUsd: (freshened.costUsd ?? 0) + result.costUsd });
           }
+          // Roll back the pre-persisted counter increment only when the recovery was
+          // interrupted BEFORE any branch mutations (no push occurred). Without this
+          // rollback, repeated SIGINT interruptions before any side effects exhaust
+          // maxRecoveryAttempts and the next daemon abandons the PR without any completed
+          // recovery attempt (Codex Finding 3). When the fix agent DID push commits before
+          // the interrupt (result.hadSideEffects=true), the slot is consumed — rolling back
+          // here would let repeated interrupted-after-push runs bypass the durable cap.
+          if (isCounterBasedRecovery && !isRestartCommentPending && !result.hadSideEffects) {
+            this.store.updateSession(session.id, { recoveryTurnAttempts: effectiveRecoveryAttempts });
+          }
           await this.haltForInterrupt();
           return HALT;
         }
@@ -4235,7 +4302,28 @@ export class Orchestrator {
         // and that update would leave the row stopped with recoveryAttempted=1 and
         // no active session (ES-450 Finding 2).
         if (result.kind !== "failed" && result.kind !== "recovered") {
-          this.store.updateSession(session.id, { recoveryAttempted: 1 });
+          if (isCounterBasedRecovery) {
+            this.store.updateSession(session.id, {
+              recoveryTurnAttempts: effectiveRecoveryAttempts + 1,
+              // Escalation is a terminal decision — mark attempted so stoppedSessionsWithFailedRecovery
+              // cannot re-queue the session and override the escalation (ES-493 Finding 2).
+              ...(result.kind === "escalated" ? { recoveryAttempted: 1 } : {}),
+            });
+          } else {
+            // Write recoveryTurnAttempts=-1 as a sentinel indicating this
+            // recoveryAttempted=1 was set by a non-counter recovery. The legacy
+            // shim at effectiveRecoveryAttempts checks recoveryTurnAttempts===0, so
+            // -1 prevents a later ci_failed/merge_conflict stop from incorrectly
+            // charging the non-counter prior recovery against the CI/merge budget
+            // (ES-493 Iteration 7 Finding 2).
+            // Do not overwrite a positive counter: if ci_failed/merge_conflict recovery
+            // already consumed budget (rawRecoveryAttempts > 0), preserve the count so
+            // the durable per-session cap is not bypassed (ES-493 Iteration 9 Finding 2).
+            this.store.updateSession(session.id, {
+              recoveryAttempted: 1,
+              ...(rawRecoveryAttempts > 0 ? {} : { recoveryTurnAttempts: -1 }),
+            });
+          }
         }
         // Abandon completed cleanup and wants the loop to continue to next task.
         if (result.kind === "continued") {
@@ -4247,7 +4335,8 @@ export class Orchestrator {
             endedAt: this.clock(),
           });
           // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
-          await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
+          // Scrub raw CI log payloads before posting to Linear (ES-493 Iteration 11 Finding 2).
+          await this.applyNeedsHumanTriage(session, reason, userFacingDetail(effectiveDetail));
           return CONTINUE;
         }
         // Only record the recovery action for non-failed outcomes. A failed abandon must
@@ -4305,7 +4394,19 @@ export class Orchestrator {
             endedAt: null,
             autoRestartAttempts: 0,
             quotaRetryAttempts: 0,
-            recoveryAttempted: 1,
+            ...(isCounterBasedRecovery
+              // When a prior fix was already pushed and only the /restart-review comment
+              // was retried (fix_pushed_restart_pending shortcut), do not count this
+              // against the recovery budget — no actual code fix was attempted
+              // (ES-493 Finding 3).
+              ? (isRestartCommentPending ? {} : { recoveryTurnAttempts: effectiveRecoveryAttempts + 1 })
+              // recoveryTurnAttempts=-1 is a sentinel meaning "recoveryAttempted was set
+              // by a non-counter recovery." The legacy shim at effectiveRecoveryAttempts
+              // checks recoveryTurnAttempts===0, so -1 prevents a later ci_failed/
+              // merge_conflict from incorrectly charging this against the CI/merge budget
+              // (ES-493 Iteration 7 Finding 2). Do not overwrite a positive counter so
+              // the durable per-session cap is not bypassed (ES-493 Iteration 9 Finding 2).
+              : { recoveryAttempted: 1, ...(rawRecoveryAttempts > 0 ? {} : { recoveryTurnAttempts: -1 }) }),
           };
           if (recoveryCost > 0) {
             recoveryUpdate.costUsd = (refreshed.costUsd ?? 0) + recoveryCost;
@@ -4323,7 +4424,7 @@ export class Orchestrator {
           // pendingRestartReason must match the raw verdict.stopReason used by the stale guard;
           // for exhaustion details like "auto-restart limit exceeded (4x): workflow_crashed" we
           // extract just the trailing stop reason rather than storing the full synthesized message.
-          // For done-path stops (ci_failed, merge_conflict) detail is null — fall back to reason
+          // For done-path stops (ci_failed, merge_conflict) always use reason (not detail)
           // so the done-case stale guard can detect and consume it (ES-450 Finding 1).
           if (result.action === "restart_review" || result.action === "fix_code" || result.action === "rebase") {
             let pendingReason: string;
@@ -4385,6 +4486,12 @@ export class Orchestrator {
               : "abandon_in_progress";
           }
           if (result.message) {
+            // Preserve the ci_log: prefix so the next recovery retry receives CI diagnostics.
+            // stripRecoveryFailedSuffix uses lastIndexOf so it correctly strips the appended
+            // " (recovery failed: ...)" suffix even when CI output itself contains that pattern
+            // (ES-493 Iteration 8 Finding 3). The sentinels (fix_pushed_restart_pending,
+            // abandon_in_progress) were already written above and do not start with "ci_log:",
+            // so the compound form only applies to the unmodified ci_log: detail from fetchCiLogs.
             effectiveDetail = effectiveDetail
               ? `${effectiveDetail} (recovery failed: ${result.message})`
               : `recovery failed: ${result.message}`;
@@ -4394,7 +4501,52 @@ export class Orchestrator {
           // conflict), mark recovery as attempted so stoppedSessionsWithFailedRecovery
           // does not queue it again (ES-450 Finding 1/3).
           if (result.preserveWorktree || result.nonRetryable) {
-            this.store.updateSession(session.id, { recoveryAttempted: 1 });
+            if (isCounterBasedRecovery) {
+              this.store.updateSession(session.id, {
+                recoveryTurnAttempts: this.config.safety.maxRecoveryAttempts,
+                recoveryAttempted: 1,
+              });
+            } else {
+              // -1 sentinel: see the recoveryTurnAttempts=-1 comment on the recovered path
+              // above (ES-493 Iteration 7 Finding 2). Do not overwrite a positive counter so
+              // the durable per-session cap is not bypassed (ES-493 Iteration 9 Finding 2).
+              this.store.updateSession(session.id, {
+                recoveryAttempted: 1,
+                ...(rawRecoveryAttempts > 0 ? {} : { recoveryTurnAttempts: -1 }),
+              });
+            }
+          } else if (isCounterBasedRecovery) {
+            // Retryable failure: increment the attempt counter so repeated failures eventually
+            // reach maxRecoveryAttempts and the abandon path is taken (ES-493).
+            // When the fix was already pushed and the /restart-review comment failed:
+            //   - isRestartCommentPending=true  → this is a comment-only retry (no code fix
+            //     was attempted now), so skip the increment to preserve CI budget (ES-493).
+            //   - isRestartCommentPending=false → this is the INITIAL push+comment-fail: the
+            //     code fix WAS attempted and must be charged against the budget so the cap is
+            //     honoured when the restart comment is persistently flaky (ES-493 Iteration 7
+            //     Finding 3).
+            if (!result.restartCommentOnly || !isRestartCommentPending) {
+              this.store.updateSession(session.id, {
+                recoveryTurnAttempts: effectiveRecoveryAttempts + 1,
+                // Clear any stale recoveryAttempted flag left by a prior non-counter recovery
+                // (e.g. looppilot_stopped). stoppedSessionsWithFailedRecovery requires
+                // recovery_attempted=0 to pick up this session for retry on the next daemon
+                // start; a stale flag of 1 would silently block all retries (ES-493).
+                recoveryAttempted: 0,
+              });
+              // When this increment reaches the cap, switch to abandon immediately so the
+              // current run continues rather than halting and waiting for a daemon restart
+              // to take the exhaust→abandon path (ES-493 Finding 2).
+              // Exception: when the fix was already pushed and only the /restart-review
+              // comment failed (result.restartCommentOnly=true, isRestartCommentPending=false),
+              // do NOT abandon — the fix_pushed_restart_pending sentinel written above lets the
+              // next daemon start bypass the cap and retry only the comment without closing
+              // the PR that already contains the fix (ES-493 Iteration 8 Finding 4).
+              if (effectiveRecoveryAttempts + 1 >= this.config.safety.maxRecoveryAttempts &&
+                  !result.restartCommentOnly) {
+                policy = "abandon";
+              }
+            }
           }
           // Do not persist workflowHandledErrorCount in the stopped row when recovery
           // fails — except when the fix was already pushed (restartCommentOnly). In that
@@ -4425,6 +4577,10 @@ export class Orchestrator {
             inner.startsWith("quota retry limit exceeded");
           this.store.updateSession(session.id, {
             stopDetail: isExhausted ? `abandon_in_progress:${inner}` : "abandon_in_progress",
+            // Clear any stale recoveryAttempted flag set by a prior non-counter recovery so
+            // stoppedSessionsWithFailedRecovery (which requires recovery_attempted=0) can pick
+            // up this session and retry the cleanup if executeAbandon fails (ES-493 Finding 2).
+            recoveryAttempted: 0,
           });
         };
         const result = await executeAbandon(this.recoveryTurn, freshAbandon, onAbandonStarting);
@@ -4437,9 +4593,10 @@ export class Orchestrator {
             endedAt: this.clock(),
             ...patch,
           });
-          const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+          const displayDetail = userFacingDetail(effectiveDetail);
+          const skipDetail = `${session.linearIdentifier} stopped (${reason})${displayDetail ? `: ${displayDetail}` : ""}`;
           // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
-          await this.applyNeedsHumanTriage(freshAbandon, reason, effectiveDetail);
+          await this.applyNeedsHumanTriage(freshAbandon, reason, displayDetail);
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
           return CONTINUE;
@@ -4517,10 +4674,11 @@ export class Orchestrator {
     // abandon, policy is still "recover" — recoveryChoseAbandon tracks that case (ES-492 Finding 1).
     // For pure halt-policy reasons (claim_failed, etc.) the ticket is typically not in Todo, so
     // the label has no SELECT effect — but the comment still provides context.
+    const displayDetail = userFacingDetail(effectiveDetail);
     if (policy === "abandon" || recoveryChoseAbandon) {
-      await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
+      await this.applyNeedsHumanTriage(session, reason, displayDetail);
     }
-    const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+    const haltDetail = `${session.linearIdentifier} stopped (${reason})${displayDetail ? `: ${displayDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     await this.commitMemoryBeforeHalt();
     this.store.setRunState(this.runId, "halted", haltDetail);
@@ -4793,6 +4951,29 @@ function stripRecoveryFailedSuffix(detail: string | null): string | null {
   if (idx >= 0) return detail.slice(0, idx) || null;
   if (detail.startsWith("recovery failed: ")) return null;
   return detail;
+}
+
+/**
+ * Converts a raw stop-detail string to a human-readable form for user-facing surfaces
+ * (Linear comments, notifications, run-state). Raw CI log payloads — prefixed with
+ * "ci_log:" by checkMergeReadiness — are replaced with the label "CI failure" so that
+ * diagnostic output is only exposed to recovery agents via stopDetail, never to end-users.
+ * Compound forms are handled:
+ *   "ci_log:<raw>"                              → "CI failure"
+ *   "abandon_in_progress:ci_log:<raw>"          → "abandon_in_progress:CI failure"
+ * Non-CI-log details are returned unchanged (ES-493 Iteration 10 Finding 1).
+ * The recovery-failed suffix is NOT extracted from ci_log: content because the raw log
+ * can itself contain " (recovery failed: " text, making suffix extraction unsafe
+ * (ES-493 Iteration 11 Finding 3).
+ */
+function userFacingDetail(detail: string | null): string | null {
+  if (detail === null) return null;
+  const CI_LOG_MARKER = "ci_log:";
+  const ABANDON_PREFIX = "abandon_in_progress:";
+  const prefix = detail.startsWith(ABANDON_PREFIX) ? ABANDON_PREFIX : "";
+  const inner = prefix ? detail.slice(ABANDON_PREFIX.length) : detail;
+  if (!inner.startsWith(CI_LOG_MARKER)) return detail;
+  return `${prefix}CI failure` || null;
 }
 
 function reconstructIssue(session: TaskSessionRow): EligibleIssue {
