@@ -570,6 +570,21 @@ describe("resolveLinearSetup", () => {
       needsHumanLabel: "needs-human",
     }, fetchFn)).rejects.toThrow(/needs-human/);
   });
+
+  it("throws when opt_in_label and needs_human_label are the same (ES-492 Finding 3)", async () => {
+    // No fetch calls should be made — the clash is caught before the first API request.
+    const { fetchFn, calls } = makeFetch([]);
+    await expect(
+      resolveLinearSetup("key", {
+        teamKey: "TY",
+        projectName: "P",
+        stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" },
+        optInLabel: "ai-ok",
+        needsHumanLabel: "ai-ok",
+      }, fetchFn),
+    ).rejects.toThrow(/opt_in_label.*needs_human_label|needs_human_label.*opt_in_label|must be different/i);
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe("LinearTaskSource.postComment", () => {
@@ -808,6 +823,58 @@ describe("LinearTaskSource — needs-human label filtering", () => {
     labels = ["ai-ok"];
     result = await source.getAllEligible([]);
     expect(result).toHaveLength(1);
+  });
+
+  it("issue becomes eligible mid-run when needs-human label removed even if in abandoned-exclude set (ES-492 Finding 2)", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok"] },
+      ]),
+    });
+    // i1 is in the DB-based abandoned exclude set but the needs-human label was cleared by a human;
+    // the second param (abandonedExcludeIds) is not applied when the label is absent.
+    const result = await source.getAllEligible([], ["i1"]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("i1");
+  });
+
+  it("hard-excluded issues remain excluded regardless of label state", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok"] },
+      ]),
+    });
+    // i1 in first (hard) exclude: always excluded even without needs-human label
+    const result = await source.getAllEligible(["i1"]);
+    expect(result).toHaveLength(0);
+  });
+
+  it("abandoned-excluded issues stay out while needs-human label is still present", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok", "needs-human"] },
+      ]),
+    });
+    const result = await source.getAllEligible([], ["i1"]);
+    expect(result).toHaveLength(0);
   });
 });
 

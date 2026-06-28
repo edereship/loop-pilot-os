@@ -12,8 +12,9 @@ function makeCtx(overrides?: Partial<ValidationContext>): ValidationContext {
     doneIssueIds: new Set(["ES-5"]),
     activeIssueIds: new Set(),
     needsHumanIssueIds: new Set(),
+    needsHumanLabel: "needs-human",
     maxCharsPerFile: 8000,
-    knownLabels: ["bug", "urgent", "looppilot"],
+    knownLabels: ["bug", "urgent", "looppilot", "needs-human"],
     ...overrides,
   };
 }
@@ -670,6 +671,43 @@ describe("validateGroomActions", () => {
       const results = validateGroomActions(
         [action("create")],
         makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+  });
+
+  // ---- Rule 10: GROOM cannot add the needs-human label (ES-492 Finding 1) ----
+  describe("Rule 10: GROOM cannot add needs-human label", () => {
+    it("rejects label action that adds the needs-human label on a non-needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["needs-human"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("needs-human");
+    });
+
+    it("rejects label action adding needs-human even when issue is not in needsHumanIssueIds", () => {
+      const results = validateGroomActions(
+        [{ type: "label" as const, issueId: "ES-2", add: ["needs-human"], rationale: "test" }],
+        makeCtx({ needsHumanIssueIds: new Set() }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("needs-human");
+    });
+
+    it("allows label action that adds other known labels", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("allows label action that removes the needs-human label", () => {
+      const results = validateGroomActions(
+        [{ type: "label" as const, issueId: "ES-1", remove: ["needs-human"], rationale: "test" }],
+        makeCtx(),
       );
       expect(results[0].result).toBe("valid");
     });

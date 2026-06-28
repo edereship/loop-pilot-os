@@ -144,11 +144,12 @@ export class FakeTaskSource implements TaskSource {
     }
   }
 
-  async getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null> {
-    this.eligibleCalls.push([...excludeIds]);
+  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue | null> {
+    const allExcludeIds = [...hardExcludeIds, ...abandonedExcludeIds];
+    this.eligibleCalls.push(allExcludeIds);
     this.takeFailure("getNextEligible");
     const labeled = new Set(this.labelAdds.map((l) => l.issueId));
-    const next = this.queue.find((i) => !excludeIds.includes(i.id) && !labeled.has(i.id));
+    const next = this.queue.find((i) => !allExcludeIds.includes(i.id) && !labeled.has(i.id));
     if (!next) return null;
     this.queue = this.queue.filter((i) => i !== next);
     return next;
@@ -174,10 +175,11 @@ export class FakeTaskSource implements TaskSource {
     this.labelAdds.push({ issueId, labelName });
   }
 
-  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
-    this.eligibleCalls.push([...excludeIds]);
+  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue[]> {
+    const allExcludeIds = [...hardExcludeIds, ...abandonedExcludeIds];
+    this.eligibleCalls.push(allExcludeIds);
     this.takeFailure("getAllEligible");
-    const exclude = new Set(excludeIds);
+    const exclude = new Set(allExcludeIds);
     // Mimic real LinearTaskSource: only return issues in "todo" state.
     // Derive each issue's current state from the most recent transition.
     const lastTransition = new Map<string, TicketState>();

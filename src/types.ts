@@ -86,10 +86,11 @@ export interface TaskSessionRow {
 
 // ---- モジュールインターフェース（仕様 §4） ----
 export interface TaskSource {
-  /** 適格(Team/PJ ∧ Todo ∧ オプトインラベル)を決定的順序で。excludeIds は Store 由来 */
-  getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null>;
-  /** 適格チケットを全件返す（PM 選別ターン用）。excludeIds は Store 由来 */
-  getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]>;
+  /** 適格(Team/PJ ∧ Todo ∧ オプトインラベル)を決定的順序で。hardExcludeIds は常に除外（active issues）。
+   *  abandonedExcludeIds は needs-human ラベルが付いている間のみ有効（ラベル除去で再エントリ可、ES-492）。 */
+  getNextEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[]): Promise<EligibleIssue | null>;
+  /** 適格チケットを全件返す（PM 選別ターン用）。同上の除外セマンティクス。 */
+  getAllEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[]): Promise<EligibleIssue[]>;
   transition(issueId: string, state: TicketState): Promise<void>;
   /** In Progress なのに渡された issueIds に無いチケット（CLAIM途中クラッシュ孤児）を返す */
   findOrphanedInProgress(knownIssueIds: string[]): Promise<EligibleIssue[]>;

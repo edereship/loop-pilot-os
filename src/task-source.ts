@@ -223,24 +223,29 @@ export class LinearTaskSource implements TaskSource {
     return all;
   }
 
-  private isEligible(node: IssueNode, exclude: Set<string>): boolean {
-    return !exclude.has(node.id) &&
-      !node.labels.nodes.some((l) => l.name === this.needsHumanLabel);
+  private isEligible(node: IssueNode, hardExclude: Set<string>): boolean {
+    // Hard exclusions (active issues being worked on) always apply.
+    if (hardExclude.has(node.id)) return false;
+    // The needs-human label is the primary authority (ES-492): if present, triage is required.
+    // Abandoned issues (soft-excluded via DB guard) are re-eligible when this label is cleared
+    // by a human mid-run — the label absence is authoritative, so soft excludes are not checked
+    // here (ES-492 Finding 2).
+    return !node.labels.nodes.some((l) => l.name === this.needsHumanLabel);
   }
 
-  async getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null> {
-    const exclude = new Set(excludeIds);
+  async getNextEligible(hardExcludeIds: string[], _abandonedExcludeIds: string[] = []): Promise<EligibleIssue | null> {
+    const hard = new Set(hardExcludeIds);
     const nodes = (await this.queryByState(this.stateIds.todo))
-      .filter((n) => this.isEligible(n, exclude))
+      .filter((n) => this.isEligible(n, hard))
       .sort(compareIssues);
     const first = nodes[0];
     return first ? toEligible(first) : null;
   }
 
-  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
-    const exclude = new Set(excludeIds);
+  async getAllEligible(hardExcludeIds: string[], _abandonedExcludeIds: string[] = []): Promise<EligibleIssue[]> {
+    const hard = new Set(hardExcludeIds);
     return (await this.queryAllByState(this.stateIds.todo))
-      .filter((n) => this.isEligible(n, exclude))
+      .filter((n) => this.isEligible(n, hard))
       .sort(compareIssues)
       .map(toEligible);
   }
@@ -399,6 +404,14 @@ export async function resolveLinearSetup(
   req: LinearSetupRequest,
   fetchFn: FetchFn,
 ): Promise<ResolvedLinearSetup> {
+  // Reject identical label names up front (ES-492 Finding 3): every opt-in issue would
+  // carry the needs-human label, causing SELECT to return nothing indefinitely.
+  if (req.optInLabel === req.needsHumanLabel) {
+    throw new Error(
+      `Linear setup: opt_in_label and needs_human_label must be different (both are "${req.optInLabel}")`,
+    );
+  }
+
   // Phase 1: viewer + team keys のみ（軽量クエリ）
   const viewerData = await graphql<SetupViewerData>(fetchFn, apiKey, SETUP_VIEWER_QUERY, {});
 

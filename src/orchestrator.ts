@@ -788,10 +788,10 @@ export class Orchestrator {
       // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
       let eligible: EligibleIssue[];
       try {
-        eligible = await this.source.getAllEligible([
-          ...this.store.activeIssueIds(),
-          ...this.store.excludedIssueIds(this.runId),
-        ]);
+        eligible = await this.source.getAllEligible(
+          this.store.activeIssueIds(),
+          this.store.excludedIssueIds(this.runId),
+        );
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
@@ -1530,6 +1530,7 @@ export class Orchestrator {
           doneIssueIds: doneIds,
           activeIssueIds: activeIds,
           needsHumanIssueIds: needsHumanIds,
+          needsHumanLabel: this.config.linear.needsHumanLabel,
           maxCharsPerFile: this.config.memory.maxCharsPerFile,
           knownLabels: this.groomDeps.knownLabels,
         };
