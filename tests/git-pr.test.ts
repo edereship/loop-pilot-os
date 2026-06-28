@@ -1026,4 +1026,33 @@ describe("GitPrManager.fetchCiLogs", () => {
     expect(viewCall!.args).toContain("200");
     expect(viewCall!.args).not.toContain("300");
   });
+
+  // ES-493 Iteration 10 Finding 3: two workflow files with the same display name but
+  // different workflowDatabaseId values must not be collapsed into one bucket. Without
+  // preferring workflowDatabaseId as the primary key, a green run from workflow A could
+  // suppress a failing run from workflow B when both share the same name.
+  it("keeps distinct workflows separate when workflowName matches but workflowDatabaseId differs", async () => {
+    const runner = new FakeCommandRunner();
+    // Two workflows both named "CI" but different database IDs (different workflow files).
+    // Workflow 10 (run 300) succeeded; workflow 20 (run 200) failed. Without the fix both
+    // share key "CI" and the green run (300, first) suppresses the failing run (200).
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success", status: "completed", workflowName: "CI", workflowDatabaseId: 10 },
+        { databaseId: 200, conclusion: "failure", status: "completed", workflowName: "CI", workflowDatabaseId: 20 },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "same-name workflow failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("same-name workflow failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the failing run (200), not the green run (300).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("300");
+  });
 });

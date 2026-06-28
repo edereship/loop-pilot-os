@@ -4374,6 +4374,126 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // Counter reaches the cap (1→2) but does not trigger abandon.
     expect(s.recoveryTurnAttempts).toBe(2);
   });
+
+  // ES-493 Iteration 10 Finding 1: raw CI log payloads must not be rendered verbatim in
+  // user-facing surfaces (Linear comments, notifications). When the recovery counter exhausts
+  // and the session is abandoned, the needs-human triage comment must show a concise "CI failure"
+  // label rather than the raw log body. stopDetail preserves the full "ci_log:<content>" form
+  // so recovery agents still receive CI diagnostics on the next daemon start.
+  it("ci_log payload stripped from triage comment on abandon; stopDetail preserves raw log", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed an in_review session that already used all recovery attempts (counter at cap).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryTurnAttempts: 2,  // already at cap (maxRecoveryAttempts=2) → immediate abandon
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // CI log includes raw diagnostic output that must not leak into Linear comments.
+    h.git.ciLogs = "FATAL: npm test failed\n  AssertionError: expected 1 to equal 2\n  at src/math.test.ts:5:3";
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [];  // no recovery runs (counter exhausted → immediate abandon)
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.recoveryAction).toBe("abandon");
+    // DB must retain the raw CI log for diagnostic use.
+    expect(s.stopDetail).toMatch(/^ci_log:/);
+    expect(s.stopDetail).toContain("npm test failed");
+    // Triage comment must NOT contain the raw log — only "CI failure" as the concise label.
+    const triageComment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(triageComment).toBeDefined();
+    expect(triageComment!.body).not.toContain("npm test failed");
+    expect(triageComment!.body).toContain("CI failure");
+    // task_skipped notification must also not contain the raw log.
+    const skippedEvent = h.notifier.events.find((e) => e.kind === "task_skipped");
+    expect(skippedEvent).toBeDefined();
+    expect((skippedEvent as { detail?: string }).detail).not.toContain("npm test failed");
+    expect((skippedEvent as { detail?: string }).detail).toContain("CI failure");
+  });
+
+  // ES-493 Iteration 10 Finding 2: when a prior non-counter recovery (e.g. looppilot_stopped)
+  // left recoveryAttempted=1 and the -1 sentinel, a subsequent counter-based (ci_failed) recovery
+  // that fails transiently must clear the stale flag back to 0. Without the fix,
+  // stoppedSessionsWithFailedRecovery (which requires recovery_attempted=0) cannot pick up the
+  // session on the next daemon start, silently blocking all further retries.
+  it("counter-based retry clears stale recoveryAttempted so stoppedSessionsWithFailedRecovery can retry", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a session with a stale recoveryAttempted=1 from a prior non-counter recovery.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,       // stale flag from a prior looppilot_stopped recovery
+      recoveryTurnAttempts: -1,   // sentinel: -1 means non-counter set the flag
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.git.ciLogs = "test failure output";
+    // Recovery planner: fix_code for the ci_failed stop.
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the test"}' },
+    ];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "applied fix" }];
+    // Provide a commit so the fix is considered pushed (not the "no commits" path).
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc123 fix the failing test\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Make the /restart-review comment fail → result.kind="failed", restartCommentOnly=true,
+    // no preserveWorktree/nonRetryable → counter increment path fires.
+    h.git.failNext("postComment");
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Counter was -1 (normalized to 0) → incremented to 1; cap is 2, so not yet abandoned.
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // The stale flag must be cleared so the daemon can retry on the next start.
+    expect(s.recoveryAttempted).toBe(0);
+    // stoppedSessionsWithFailedRecovery must now be able to find the session.
+    expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(1);
+    expect(h.store.stoppedSessionsWithFailedRecovery()[0].id).toBe(seeded.id);
+  });
 });
 
 describe("Orchestrator — Failure Policy Routing (ES-490)", () => {

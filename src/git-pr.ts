@@ -413,7 +413,7 @@ export class GitPrManager implements GitPrManagerInterface {
       const latestCompletedByWorkflow = new Map<string, typeof runs[0]>();
       for (const r of runs) {
         if (r.status !== "completed" || r.conclusion === null || r.conclusion === "") continue;
-        const key = r.workflowName || (r.workflowDatabaseId != null ? `id:${r.workflowDatabaseId}` : "");
+        const key = r.workflowDatabaseId != null ? `id:${r.workflowDatabaseId}` : (r.workflowName || "");
         if (!latestCompletedByWorkflow.has(key)) {
           latestCompletedByWorkflow.set(key, r);
         }

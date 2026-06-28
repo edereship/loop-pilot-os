@@ -4489,7 +4489,14 @@ export class Orchestrator {
             //     honoured when the restart comment is persistently flaky (ES-493 Iteration 7
             //     Finding 3).
             if (!result.restartCommentOnly || !isRestartCommentPending) {
-              this.store.updateSession(session.id, { recoveryTurnAttempts: effectiveRecoveryAttempts + 1 });
+              this.store.updateSession(session.id, {
+                recoveryTurnAttempts: effectiveRecoveryAttempts + 1,
+                // Clear any stale recoveryAttempted flag left by a prior non-counter recovery
+                // (e.g. looppilot_stopped). stoppedSessionsWithFailedRecovery requires
+                // recovery_attempted=0 to pick up this session for retry on the next daemon
+                // start; a stale flag of 1 would silently block all retries (ES-493).
+                recoveryAttempted: 0,
+              });
               // When this increment reaches the cap, switch to abandon immediately so the
               // current run continues rather than halting and waiting for a daemon restart
               // to take the exhaust→abandon path (ES-493 Finding 2).
@@ -4545,9 +4552,10 @@ export class Orchestrator {
             endedAt: this.clock(),
             ...patch,
           });
-          const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+          const displayDetail = userFacingDetail(effectiveDetail);
+          const skipDetail = `${session.linearIdentifier} stopped (${reason})${displayDetail ? `: ${displayDetail}` : ""}`;
           // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
-          await this.applyNeedsHumanTriage(freshAbandon, reason, effectiveDetail);
+          await this.applyNeedsHumanTriage(freshAbandon, reason, displayDetail);
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
           return CONTINUE;
@@ -4625,10 +4633,11 @@ export class Orchestrator {
     // abandon, policy is still "recover" — recoveryChoseAbandon tracks that case (ES-492 Finding 1).
     // For pure halt-policy reasons (claim_failed, etc.) the ticket is typically not in Todo, so
     // the label has no SELECT effect — but the comment still provides context.
+    const displayDetail = userFacingDetail(effectiveDetail);
     if (policy === "abandon" || recoveryChoseAbandon) {
-      await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
+      await this.applyNeedsHumanTriage(session, reason, displayDetail);
     }
-    const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+    const haltDetail = `${session.linearIdentifier} stopped (${reason})${displayDetail ? `: ${displayDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     await this.commitMemoryBeforeHalt();
     this.store.setRunState(this.runId, "halted", haltDetail);
@@ -4901,6 +4910,29 @@ function stripRecoveryFailedSuffix(detail: string | null): string | null {
   if (idx >= 0) return detail.slice(0, idx) || null;
   if (detail.startsWith("recovery failed: ")) return null;
   return detail;
+}
+
+/**
+ * Converts a raw stop-detail string to a human-readable form for user-facing surfaces
+ * (Linear comments, notifications, run-state). Raw CI log payloads — prefixed with
+ * "ci_log:" by checkMergeReadiness — are replaced with the label "CI failure" so that
+ * diagnostic output is only exposed to recovery agents via stopDetail, never to end-users.
+ * Compound forms are handled:
+ *   "ci_log:<raw>"                              → "CI failure"
+ *   "ci_log:<raw> (recovery failed: <msg>)"     → "CI failure (recovery failed: <msg>)"
+ *   "abandon_in_progress:ci_log:<raw>"          → "abandon_in_progress:CI failure"
+ * Non-CI-log details are returned unchanged (ES-493 Iteration 10 Finding 1).
+ */
+function userFacingDetail(detail: string | null): string | null {
+  if (detail === null) return null;
+  const CI_LOG_MARKER = "ci_log:";
+  const ABANDON_PREFIX = "abandon_in_progress:";
+  const prefix = detail.startsWith(ABANDON_PREFIX) ? ABANDON_PREFIX : "";
+  const inner = prefix ? detail.slice(ABANDON_PREFIX.length) : detail;
+  if (!inner.startsWith(CI_LOG_MARKER)) return detail;
+  const recoveryIdx = inner.lastIndexOf(" (recovery failed: ");
+  const suffix = recoveryIdx >= 0 ? inner.slice(recoveryIdx) : "";
+  return `${prefix}CI failure${suffix}` || null;
 }
 
 function reconstructIssue(session: TaskSessionRow): EligibleIssue {
