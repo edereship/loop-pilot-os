@@ -329,6 +329,7 @@ describe("resolveLinearSetup", () => {
       fetchFn,
     );
     expect(resolved.optInLabelId).toBe("label-aiok-ws");
+    expect(resolved.needsHumanLabelId).toBe("label-nh-ws");
   });
 
   // 不在要素は名前を列挙して 1 回でまとめて throw。

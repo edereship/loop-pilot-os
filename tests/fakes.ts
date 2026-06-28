@@ -147,7 +147,8 @@ export class FakeTaskSource implements TaskSource {
   async getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null> {
     this.eligibleCalls.push([...excludeIds]);
     this.takeFailure("getNextEligible");
-    const next = this.queue.find((i) => !excludeIds.includes(i.id));
+    const labeled = new Set(this.labelAdds.map((l) => l.issueId));
+    const next = this.queue.find((i) => !excludeIds.includes(i.id) && !labeled.has(i.id));
     if (!next) return null;
     this.queue = this.queue.filter((i) => i !== next);
     return next;

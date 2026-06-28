@@ -3522,6 +3522,8 @@ export class Orchestrator {
         if (todoRevertErr !== null) {
           // Ticket is stuck In Progress with no active session — halt so operators can
           // intervene rather than leaving orphaned work invisible to SELECT (ES-490 Finding 2).
+          // Best-effort triage: try to label+comment so the operator sees context on the ticket.
+          await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
           await this.notifier.notify({ kind: "halted", reason, detail: skipDetail });
           await this.commitMemoryBeforeHalt();
           this.store.setRunState(this.runId, "halted", skipDetail);
@@ -3596,19 +3598,23 @@ export class Orchestrator {
     detail: string | null,
   ): Promise<void> {
     const label = this.config.linear.needsHumanLabel;
+    let labelApplied = false;
     try {
       await this.source.addLabel(session.linearIssueId, label);
+      labelApplied = true;
     } catch (err) {
       this.log(`needs-human: addLabel failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
     }
+    const statusLine = labelApplied
+      ? `\`${label}\` ラベルが付与されました。ラベルを外すと再投入されます。`
+      : `⚠️ \`${label}\` ラベルの付与に失敗しました。手動でラベルを付与してください。`;
     const commentBody = [
       `## 🛑 LoopPilot OS — abandon (needs-human)`,
       "",
       `**Reason:** \`${reason}\``,
       ...(detail ? [`**Detail:** ${detail}`] : []),
       "",
-      `このチケットは \`${label}\` ラベルが付与されました。人間の確認が必要です。`,
-      `ラベルを外すと再投入されます。`,
+      statusLine,
     ].join("\n");
     try {
       await this.source.postComment(session.linearIssueId, commentBody);

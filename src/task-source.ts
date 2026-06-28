@@ -223,11 +223,15 @@ export class LinearTaskSource implements TaskSource {
     return all;
   }
 
+  private isEligible(node: IssueNode, exclude: Set<string>): boolean {
+    return !exclude.has(node.id) &&
+      !node.labels.nodes.some((l) => l.name === this.needsHumanLabel);
+  }
+
   async getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null> {
     const exclude = new Set(excludeIds);
     const nodes = (await this.queryByState(this.stateIds.todo))
-      .filter((n) => !exclude.has(n.id))
-      .filter((n) => !n.labels.nodes.some((l) => l.name === this.needsHumanLabel))
+      .filter((n) => this.isEligible(n, exclude))
       .sort(compareIssues);
     const first = nodes[0];
     return first ? toEligible(first) : null;
@@ -236,8 +240,7 @@ export class LinearTaskSource implements TaskSource {
   async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
     const exclude = new Set(excludeIds);
     return (await this.queryAllByState(this.stateIds.todo))
-      .filter((n) => !exclude.has(n.id))
-      .filter((n) => !n.labels.nodes.some((l) => l.name === this.needsHumanLabel))
+      .filter((n) => this.isEligible(n, exclude))
       .sort(compareIssues)
       .map(toEligible);
   }

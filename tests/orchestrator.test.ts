@@ -3755,6 +3755,7 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     );
     expect(comment).toBeDefined();
     expect(comment!.body).toContain("agent_no_change");
+    expect(comment!.body).toContain("ラベルを外すと再投入されます");
     // task_skipped notification was emitted
     const skipped = h.notifier.events.filter(
       (e) => e.kind === "task_skipped" && e.identifier === "TY-1",
@@ -3785,6 +3786,12 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     // Run continued despite addLabel failure
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions.length).toBeGreaterThanOrEqual(2);
+    // Comment reflects the label failure
+    const triageComment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(triageComment).toBeDefined();
+    expect(triageComment!.body).toContain("ラベルの付与に失敗しました");
   });
 
   it("design_rejected → policy=abandon → continues (not HALT)", async () => {
