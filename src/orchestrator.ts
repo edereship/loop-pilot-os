@@ -4299,7 +4299,8 @@ export class Orchestrator {
             endedAt: this.clock(),
           });
           // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
-          await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
+          // Scrub raw CI log payloads before posting to Linear (ES-493 Iteration 11 Finding 2).
+          await this.applyNeedsHumanTriage(session, reason, userFacingDetail(effectiveDetail));
           return CONTINUE;
         }
         // Only record the recovery action for non-failed outcomes. A failed abandon must
@@ -4919,9 +4920,11 @@ function stripRecoveryFailedSuffix(detail: string | null): string | null {
  * diagnostic output is only exposed to recovery agents via stopDetail, never to end-users.
  * Compound forms are handled:
  *   "ci_log:<raw>"                              → "CI failure"
- *   "ci_log:<raw> (recovery failed: <msg>)"     → "CI failure (recovery failed: <msg>)"
  *   "abandon_in_progress:ci_log:<raw>"          → "abandon_in_progress:CI failure"
  * Non-CI-log details are returned unchanged (ES-493 Iteration 10 Finding 1).
+ * The recovery-failed suffix is NOT extracted from ci_log: content because the raw log
+ * can itself contain " (recovery failed: " text, making suffix extraction unsafe
+ * (ES-493 Iteration 11 Finding 3).
  */
 function userFacingDetail(detail: string | null): string | null {
   if (detail === null) return null;
@@ -4930,9 +4933,7 @@ function userFacingDetail(detail: string | null): string | null {
   const prefix = detail.startsWith(ABANDON_PREFIX) ? ABANDON_PREFIX : "";
   const inner = prefix ? detail.slice(ABANDON_PREFIX.length) : detail;
   if (!inner.startsWith(CI_LOG_MARKER)) return detail;
-  const recoveryIdx = inner.lastIndexOf(" (recovery failed: ");
-  const suffix = recoveryIdx >= 0 ? inner.slice(recoveryIdx) : "";
-  return `${prefix}CI failure${suffix}` || null;
+  return `${prefix}CI failure` || null;
 }
 
 function reconstructIssue(session: TaskSessionRow): EligibleIssue {

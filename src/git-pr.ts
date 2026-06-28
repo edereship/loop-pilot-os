@@ -386,10 +386,10 @@ export class GitPrManager implements GitPrManagerInterface {
         "-R", remote,
         ...refArgs,
         "--limit", "25",
-        "--json", "databaseId,conclusion,status,workflowName,workflowDatabaseId",
+        "--json", "databaseId,conclusion,status,workflowName,workflowDatabaseId,event",
       ], { cwd: repoPath, timeoutMs: 15_000 });
       if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
-      let runs: Array<{ databaseId: number; conclusion: string | null; status: string; workflowName?: string; workflowDatabaseId?: number }>;
+      let runs: Array<{ databaseId: number; conclusion: string | null; status: string; workflowName?: string; workflowDatabaseId?: number; event?: string }>;
       try {
         runs = JSON.parse(listResult.stdout);
       } catch {
@@ -410,10 +410,14 @@ export class GitPrManager implements GitPrManagerInterface {
       // numeric workflowDatabaseId as fallback so each unnamed workflow gets its own key
       // and a green ruleset run cannot suppress a failing one of a different ruleset
       // (ES-493 Iteration 8 Finding 1).
+      // Include the event (push vs pull_request) in the key so that when the same workflow
+      // runs for both events on the same commit, a green push run cannot suppress a failing
+      // pull_request run (ES-493 Iteration 11 Finding 1).
       const latestCompletedByWorkflow = new Map<string, typeof runs[0]>();
       for (const r of runs) {
         if (r.status !== "completed" || r.conclusion === null || r.conclusion === "") continue;
-        const key = r.workflowDatabaseId != null ? `id:${r.workflowDatabaseId}` : (r.workflowName || "");
+        const event = r.event ?? "";
+        const key = r.workflowDatabaseId != null ? `id:${r.workflowDatabaseId}:${event}` : `${r.workflowName || ""}:${event}`;
         if (!latestCompletedByWorkflow.has(key)) {
           latestCompletedByWorkflow.set(key, r);
         }
