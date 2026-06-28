@@ -4179,11 +4179,17 @@ export class Orchestrator {
       // recoveryTurnAttempts remained 0. Incorporate the legacy boolean so the prior
       // attempt counts against the new budget and the session cannot receive a full
       // fresh max_recovery_attempts budget after an upgrade (ES-493 Finding 1).
-      // Only fire the shim when recoveryAction is fix_code or rebase — actions that are
-      // exclusive to counter-based (ci_failed/merge_conflict) recovery. Without this guard,
-      // legacy non-counter recoveries (looppilot_stopped/handoff_failed) that also left
-      // recoveryAttempted=1/recoveryTurnAttempts=0 would incorrectly consume a CI/merge
-      // budget slot even though no CI/merge recovery ran (Codex Finding 2).
+      // Fire the shim only when recoveryAction is fix_code or rebase. This is a HEURISTIC:
+      // it cannot perfectly distinguish a pre-ES-493 ci_failed/merge_conflict recovery from a
+      // pre-iteration-7 non-counter (looppilot_stopped/handoff_failed) recovery that also chose
+      // fix_code or rebase (Codex Finding 1 — no DB migration available to store the prior
+      // failure reason). Charging fix_code/rebase is the safer direction: it may cost the
+      // session one extra attempt vs. giving ci_failed sessions a fresh budget when they
+      // already used one slot. restart_review is deliberately excluded: (a) it was the most
+      // common looppilot_stopped action in pre-iteration-7 code so excluding it avoids the
+      // most frequent false charge (Codex Finding 2), and (b) the existing spec test confirms
+      // that looppilot_stopped → restart_review must not consume a CI/merge slot — a case that
+      // is indistinguishable in the DB from ci_failed → restart_review without migration.
       const isLegacyCiMergeRecovery =
         fresh.recoveryAction === "fix_code" || fresh.recoveryAction === "rebase";
       const rawRecoveryAttempts = isCounterBasedRecovery && fresh.recoveryAttempted && fresh.recoveryTurnAttempts === 0 && isLegacyCiMergeRecovery
@@ -4275,13 +4281,14 @@ export class Orchestrator {
             const freshened = this.store.getSession(session.id);
             this.store.updateSession(session.id, { costUsd: (freshened.costUsd ?? 0) + result.costUsd });
           }
-          // Roll back the pre-persisted counter increment: the recovery was interrupted
-          // before completing any side effects, so the slot must not be consumed. Without
-          // this rollback, repeated SIGINT interruptions exhaust maxRecoveryAttempts and
-          // the next daemon abandons the PR without any completed recovery attempt
-          // (Codex Finding 3). Pre-persist was designed for crash safety (uncontrolled
-          // process death); SIGINT is a controlled shutdown where rollback is safe.
-          if (isCounterBasedRecovery && !isRestartCommentPending) {
+          // Roll back the pre-persisted counter increment only when the recovery was
+          // interrupted BEFORE any branch mutations (no push occurred). Without this
+          // rollback, repeated SIGINT interruptions before any side effects exhaust
+          // maxRecoveryAttempts and the next daemon abandons the PR without any completed
+          // recovery attempt (Codex Finding 3). When the fix agent DID push commits before
+          // the interrupt (result.hadSideEffects=true), the slot is consumed — rolling back
+          // here would let repeated interrupted-after-push runs bypass the durable cap.
+          if (isCounterBasedRecovery && !isRestartCommentPending && !result.hadSideEffects) {
             this.store.updateSession(session.id, { recoveryTurnAttempts: effectiveRecoveryAttempts });
           }
           await this.haltForInterrupt();

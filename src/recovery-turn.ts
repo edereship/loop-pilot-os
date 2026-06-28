@@ -29,7 +29,7 @@ export type RecoveryTurnResult =
   | { kind: "recovered"; action: RecoveryActionKind; costUsd: number }
   | { kind: "escalated"; action: RecoveryActionKind }
   | { kind: "failed"; action: RecoveryActionKind; message: string; costUsd?: number; preserveWorktree?: boolean; nonRetryable?: boolean; restartCommentOnly?: boolean }
-  | { kind: "interrupted"; costUsd?: number }
+  | { kind: "interrupted"; costUsd?: number; hadSideEffects?: boolean }
   | { kind: "continued"; action: RecoveryActionKind };
 
 export interface RecoveryTurnDeps {
@@ -389,6 +389,10 @@ async function executeFixCode(
             preserveWorktree: true,
           };
         }
+        // Commits were pushed to the remote branch before the interrupt — side effects occurred.
+        // The caller must NOT roll back the pre-persisted counter so the slot is consumed even
+        // if recovery is retried on the next daemon start (Codex Finding 3).
+        return { kind: "interrupted", costUsd: outcome.costUsd, hadSideEffects: true };
       }
       return { kind: "interrupted", costUsd: outcome.costUsd };
     }

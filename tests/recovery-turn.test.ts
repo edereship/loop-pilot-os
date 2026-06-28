@@ -351,7 +351,9 @@ describe("executeRecoveryTurn", () => {
 
     const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
 
-    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted", costUsd: 0.2 });
+    // Push occurred before the interrupt — hadSideEffects must be true so the orchestrator
+    // does not roll back the pre-persisted counter (Codex Finding 3).
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted", costUsd: 0.2, hadSideEffects: true });
     const pushCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
     expect(pushCall).toBeDefined();
   });
@@ -374,7 +376,9 @@ describe("executeRecoveryTurn", () => {
 
     const result = await executeRecoveryTurn(deps, fakeSession(), "ci_failed", null);
 
-    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted", costUsd: 0.15 });
+    // Push occurred (WIP commit was pushed) — hadSideEffects must be true so the orchestrator
+    // does not roll back the pre-persisted counter (Codex Finding 3).
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "interrupted", costUsd: 0.15, hadSideEffects: true });
     const addCall = runner.calls.find((c) => c.cmd === "git" && c.args.includes("add"));
     expect(addCall).toBeDefined();
     const commitCall = runner.calls.find((c) => c.cmd === "git" && c.args.includes("commit"));

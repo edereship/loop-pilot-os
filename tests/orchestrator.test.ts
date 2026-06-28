@@ -4645,6 +4645,51 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(s.state).toBe("in_review");
     expect(h.store.latestRun()!.state).toBe("halted");
   });
+
+  // Codex Finding 3: when fix_code is interrupted AFTER commits are pushed to the remote
+  // branch, the pre-persisted counter must NOT be rolled back — the slot is consumed even
+  // if the daemon is restarted, preventing repeated interrupted-after-push runs from
+  // bypassing the durable cap.
+  it("fix_code interrupted after push → counter NOT rolled back (Codex Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },      // implement
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },  // self-review (no queue)
+      { kind: "interrupted", costUsd: 0.2 },                            // recovery fix_code agent interrupted
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery Codex chooses fix_code.
+      { kind: "completed", text: '{"action":"fix_code","instruction":"fix the CI failure"}' },
+    ];
+    // Override the recovery runner's git -C handler so the log command reports commits
+    // ahead of origin (hasPushableCommits → true), which triggers the push path in
+    // executeFixCode and causes the interrupted result to carry hadSideEffects=true.
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix-attempt\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // The counter must NOT be rolled back: the push side effect occurred (hadSideEffects=true),
+    // so the slot is consumed and recoveryTurnAttempts stays at 1.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // Session remains in_review and run is halted.
+    expect(s.state).toBe("in_review");
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
 });
 
 describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
