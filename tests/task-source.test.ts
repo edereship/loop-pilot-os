@@ -66,6 +66,8 @@ function makeSource(fetchFn: FetchFn): LinearTaskSource {
     projectId: "project-uuid-1",
     stateIds: STATE_IDS,
     optInLabel: "ai-ok",
+    needsHumanLabel: "needs-human",
+    needsHumanLabelId: "lbl-nh",
     fetchFn,
   });
 }
@@ -253,6 +255,7 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     );
@@ -267,8 +270,9 @@ describe("resolveLinearSetup", () => {
         done: "state-done",
       },
       optInLabelId: "label-aiok",
-      labelMap: new Map([["bug", "label-bug"], ["ai-ok", "label-aiok"]]),
-      knownLabels: ["ai-ok", "bug"],
+      needsHumanLabelId: "label-nh",
+      labelMap: new Map([["bug", "label-bug"], ["ai-ok", "label-aiok"], ["needs-human", "label-nh"]]),
+      knownLabels: ["ai-ok", "bug", "needs-human"],
     });
     expect(calls[0].headers.Authorization).toBe("lin_api_test");
   });
@@ -294,6 +298,7 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     );
@@ -319,10 +324,12 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     );
     expect(resolved.optInLabelId).toBe("label-aiok-ws");
+    expect(resolved.needsHumanLabelId).toBe("label-nh-ws");
   });
 
   // 不在要素は名前を列挙して 1 回でまとめて throw。
@@ -343,6 +350,7 @@ describe("resolveLinearSetup", () => {
           done: "Done",
         },
         optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
       },
       fetchFn,
     ).then(
@@ -377,6 +385,7 @@ describe("resolveLinearSetup", () => {
             done: "Done",
           },
           optInLabel: "ai-ok",
+          needsHumanLabel: "needs-human",
         },
         fetchFn,
       ),
@@ -415,7 +424,7 @@ describe("resolveLinearSetup", () => {
       ...Array(51).fill(infiniteLabelPage),
     ]);
     await expect(
-      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok" }, fetchFn),
+      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok", needsHumanLabel: "needs-human" }, fetchFn),
     ).rejects.toThrow(/exceeded 50 pages.*possible infinite pagination/);
   });
 
@@ -451,7 +460,7 @@ describe("resolveLinearSetup", () => {
       ...Array(51).fill(infiniteLabelPage),
     ]);
     await expect(
-      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok" }, fetchFn),
+      resolveLinearSetup("key", { teamKey: "TY", projectName: "LoopPilot OS", stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" }, optInLabel: "ai-ok", needsHumanLabel: "needs-human" }, fetchFn),
     ).rejects.toThrow(/exceeded 50 pages.*possible infinite pagination/);
   });
 
@@ -473,10 +482,108 @@ describe("resolveLinearSetup", () => {
             done: "Done",
           },
           optInLabel: "ai-ok",
+          needsHumanLabel: "needs-human",
         },
         fetchFn,
       ),
     ).rejects.toThrow(/Linear GraphQL error/i);
+  });
+
+  it("resolves needsHumanLabel from team labels", async () => {
+    const { fetchFn } = makeFetch([
+      {
+        body: {
+          data: {
+            viewer: { id: "user-1", name: "Bot" },
+            teams: { nodes: [{ id: "team-uuid-1", key: "ENG" }] },
+          },
+        },
+      },
+      {
+        body: {
+          data: {
+            team: {
+              id: "team-uuid-1", key: "ENG",
+              states: { nodes: [
+                { id: "st-todo", name: "Todo" },
+                { id: "st-wip", name: "In Progress" },
+                { id: "st-rev", name: "In Review" },
+                { id: "st-done", name: "Done" },
+              ] },
+              labels: { nodes: [
+                { id: "lbl-opt", name: "ai-ok" },
+                { id: "lbl-nh", name: "needs-human" },
+              ], pageInfo: { hasNextPage: false, endCursor: null } },
+              projects: { nodes: [{ id: "proj-1", name: "P" }] },
+            },
+            issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        },
+      },
+    ]);
+    const result = await resolveLinearSetup("key", {
+      teamKey: "ENG",
+      projectName: "P",
+      stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" },
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+    }, fetchFn);
+    expect(result.needsHumanLabelId).toBe("lbl-nh");
+  });
+
+  it("throws when needsHumanLabel is missing", async () => {
+    const { fetchFn } = makeFetch([
+      {
+        body: {
+          data: {
+            viewer: { id: "user-1", name: "Bot" },
+            teams: { nodes: [{ id: "team-uuid-1", key: "ENG" }] },
+          },
+        },
+      },
+      {
+        body: {
+          data: {
+            team: {
+              id: "team-uuid-1", key: "ENG",
+              states: { nodes: [
+                { id: "st-todo", name: "Todo" },
+                { id: "st-wip", name: "In Progress" },
+                { id: "st-rev", name: "In Review" },
+                { id: "st-done", name: "Done" },
+              ] },
+              labels: { nodes: [
+                { id: "lbl-opt", name: "ai-ok" },
+              ], pageInfo: { hasNextPage: false, endCursor: null } },
+              projects: { nodes: [{ id: "proj-1", name: "P" }] },
+            },
+            issueLabels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        },
+      },
+    ]);
+    await expect(resolveLinearSetup("key", {
+      teamKey: "ENG",
+      projectName: "P",
+      stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" },
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+    }, fetchFn)).rejects.toThrow(/needs-human/);
+  });
+
+  it("throws when opt_in_label and needs_human_label are the same (ES-492 Finding 3)", async () => {
+    // No fetch calls should be made — the clash is caught before the first API request.
+    const { fetchFn, calls } = makeFetch([]);
+    await expect(
+      resolveLinearSetup("key", {
+        teamKey: "TY",
+        projectName: "P",
+        stateNames: { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done" },
+        optInLabel: "ai-ok",
+        needsHumanLabel: "ai-ok",
+      }, fetchFn),
+    ).rejects.toThrow(/opt_in_label.*needs_human_label|needs_human_label.*opt_in_label|must be different/i);
+    expect(calls).toHaveLength(0);
   });
 });
 
@@ -568,7 +675,7 @@ describe("LinearTaskSource.getAllEligible", () => {
       body: {
         data: {
           issues: {
-            nodes: [{ id: "i-1", identifier: "TY-1", title: "t", description: "", priority: 3, sortOrder: 1, url: "u" }],
+            nodes: [{ id: "i-1", identifier: "TY-1", title: "t", description: "", priority: 3, sortOrder: 1, url: "u", labels: { nodes: [] } }],
             pageInfo: { hasNextPage: true, endCursor: "cursor-stuck" },
           },
         },
@@ -592,5 +699,233 @@ describe("LinearTaskSource.getAllEligible", () => {
       label: "ai-ok",
       after: null,
     });
+  });
+});
+
+// ---- helpers for needs-human label tests ----
+
+function makeIssueNode(id: string, identifier: string, labelNames: string[]) {
+  return {
+    id,
+    identifier,
+    title: `${identifier} title`,
+    description: "",
+    priority: 3,
+    sortOrder: 1,
+    url: `https://linear.app/ty/issue/${identifier}`,
+    labels: { nodes: labelNames.map((name) => ({ name })) },
+  };
+}
+
+/** FetchFn that returns the given issues (with label data) for both paginated and non-paginated queries. */
+function fakeFetchWithLabels(
+  issues: Array<{ id: string; identifier: string; labels: string[] }>,
+): FetchFn {
+  const nodes = issues.map((i) => makeIssueNode(i.id, i.identifier, i.labels));
+  return async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: {
+        issues: {
+          nodes,
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    }),
+  });
+}
+
+/** FetchFn that calls getLabels() on every request to get dynamic label state. */
+function buildDynamicFetch(getLabels: () => string[]): FetchFn {
+  return async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: {
+        issues: {
+          nodes: [makeIssueNode("i-dyn", "ES-99", getLabels())],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    }),
+  });
+}
+
+/** FetchFn that captures mutation calls and returns success. */
+function captureMutationFetch(
+  calls: Array<{ variables: Record<string, unknown> }>,
+): FetchFn {
+  return async (_url, init) => {
+    const parsed = JSON.parse(init.body) as { query: string; variables: Record<string, unknown> };
+    calls.push({ variables: parsed.variables });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: { issueAddLabel: { success: true } },
+      }),
+    };
+  };
+}
+
+describe("LinearTaskSource — needs-human label filtering", () => {
+  it("getAllEligible excludes issues with needs-human label", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok"] },
+        { id: "i2", identifier: "ES-2", labels: ["ai-ok", "needs-human"] },
+      ]),
+    });
+    const result = await source.getAllEligible([]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("i1");
+  });
+
+  it("getNextEligible excludes issues with needs-human label", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok", "needs-human"] },
+        { id: "i2", identifier: "ES-2", labels: ["ai-ok"] },
+      ]),
+    });
+    const result = await source.getNextEligible([]);
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe("i2");
+  });
+
+  it("issue becomes eligible again when needs-human label is removed", async () => {
+    let labels = ["ai-ok", "needs-human"];
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: buildDynamicFetch(() => labels),
+    });
+    let result = await source.getAllEligible([]);
+    expect(result).toHaveLength(0);
+
+    labels = ["ai-ok"];
+    result = await source.getAllEligible([]);
+    expect(result).toHaveLength(1);
+  });
+
+  it("abandoned issue stays excluded within the run even when needs-human label is absent (addLabel-failure defense, ES-492 Finding 1)", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok"] },
+      ]),
+    });
+    // i1 is in the DB-based abandoned exclude set and the needs-human label is absent
+    // (simulating an addLabel failure). The DB guard blocks re-selection for the duration
+    // of this run regardless of label state. Label removal takes effect on the next run
+    // (cross-run: abandonedExcludeIds is empty when the new run starts with a fresh runId).
+    const result = await source.getAllEligible([], ["i1"]);
+    expect(result).toHaveLength(0);
+  });
+
+  it("hard-excluded issues remain excluded regardless of label state", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok"] },
+      ]),
+    });
+    // i1 in first (hard) exclude: always excluded even without needs-human label
+    const result = await source.getAllEligible(["i1"]);
+    expect(result).toHaveLength(0);
+  });
+
+  it("abandoned-excluded issues stay out while needs-human label is still present", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: fakeFetchWithLabels([
+        { id: "i1", identifier: "ES-1", labels: ["ai-ok", "needs-human"] },
+      ]),
+    });
+    const result = await source.getAllEligible([], ["i1"]);
+    expect(result).toHaveLength(0);
+  });
+});
+
+describe("LinearTaskSource.addLabel", () => {
+  it("posts issueAddLabel mutation with correct variables", async () => {
+    const calls: Array<{ variables: Record<string, unknown> }> = [];
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: captureMutationFetch(calls),
+    });
+    await source.addLabel("issue-1", "needs-human");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].variables).toEqual({ id: "issue-1", labelId: "lbl-nh" });
+  });
+
+  it("throws when labelName is not the needs-human label", async () => {
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+    });
+    await expect(source.addLabel("issue-1", "other-label")).rejects.toThrow(
+      /addLabel only supports needs-human label/,
+    );
+  });
+
+  it("throws when issueAddLabel returns success=false", async () => {
+    const { fetchFn } = makeFetch([
+      { body: { data: { issueAddLabel: { success: false } } } },
+    ]);
+    const source = new LinearTaskSource({
+      apiKey: "key",
+      projectId: "proj",
+      stateIds: STATE_IDS,
+      optInLabel: "ai-ok",
+      needsHumanLabel: "needs-human",
+      needsHumanLabelId: "lbl-nh",
+      fetchFn,
+    });
+    await expect(source.addLabel("issue-1", "needs-human")).rejects.toThrow(
+      /issueAddLabel failed/,
+    );
   });
 });

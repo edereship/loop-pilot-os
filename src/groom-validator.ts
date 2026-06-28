@@ -8,6 +8,10 @@ export interface ValidationContext {
   doneIssueIds: Set<string>;
   /** Identifiers currently in in_progress or in_review state (ES-457 Finding 2). */
   activeIssueIds: Set<string>;
+  /** Identifiers carrying the needs-human label; GROOM must not modify these (ES-492). */
+  needsHumanIssueIds: Set<string>;
+  /** The label name GROOM must never apply (ES-492 Finding 1). */
+  needsHumanLabel: string;
   maxCharsPerFile: number;
   knownLabels: string[];
 }
@@ -83,6 +87,11 @@ export function validateGroomActions(
       if (allUnknown.length > 0) {
         return { action: a, result: "rejected", reason: `Unknown label name(s): ${allUnknown.join(", ")}` };
       }
+      // Rule 10: GROOM must not apply the needs-human triage label (ES-492 Finding 1).
+      // Only the orchestrator may set it (via addLabel on an abandon/reject path).
+      if (a.add?.includes(ctx.needsHumanLabel)) {
+        return { action: a, result: "rejected", reason: `Cannot add needs-human label "${ctx.needsHumanLabel}" via GROOM; human triage labels are applied by the system only` };
+      }
     }
     if (a.type === "split") {
       if (a.subtasks.length === 0) {
@@ -128,6 +137,11 @@ export function validateGroomActions(
       // Rule 1b: opt-in label required — GROOM may only act on opted-in issues
       if (!ctx.optInIssueIds.has(issueId)) {
         return { action: a, result: "rejected", reason: `Issue ${issueId} does not have the opt-in label` };
+      }
+
+      // Rule: needs-human issue protection — GROOM must not modify triage-pending issues
+      if (ctx.needsHumanIssueIds.has(issueId)) {
+        return { action: a, result: "rejected", reason: `Issue ${issueId} has needs-human label; human triage required` };
       }
 
       // Rule 4: done issue protection (close is exempt).

@@ -2,11 +2,11 @@
   "data": {
     "issues": {
       "nodes": [
-        { "id": "i-medium", "identifier": "TY-3", "title": "Medium task", "description": "m", "priority": 3, "sortOrder": 10, "url": "https://linear.app/ty/issue/TY-3" },
-        { "id": "i-urgent", "identifier": "TY-1", "title": "Urgent task", "description": "u", "priority": 1, "sortOrder": 99, "url": "https://linear.app/ty/issue/TY-1" },
-        { "id": "i-none", "identifier": "TY-5", "title": "No priority task", "description": "", "priority": 0, "sortOrder": 1, "url": "https://linear.app/ty/issue/TY-5" },
-        { "id": "i-low", "identifier": "TY-4", "title": "Low task", "description": "l", "priority": 4, "sortOrder": 5, "url": "https://linear.app/ty/issue/TY-4" },
-        { "id": "i-high", "identifier": "TY-2", "title": "High task", "description": "h", "priority": 2, "sortOrder": 50, "url": "https://linear.app/ty/issue/TY-2" }
+        { "id": "i-medium", "identifier": "TY-3", "title": "Medium task", "description": "m", "priority": 3, "sortOrder": 10, "url": "https://linear.app/ty/issue/TY-3", "labels": { "nodes": [] } },
+        { "id": "i-urgent", "identifier": "TY-1", "title": "Urgent task", "description": "u", "priority": 1, "sortOrder": 99, "url": "https://linear.app/ty/issue/TY-1", "labels": { "nodes": [] } },
+        { "id": "i-none", "identifier": "TY-5", "title": "No priority task", "description": "", "priority": 0, "sortOrder": 1, "url": "https://linear.app/ty/issue/TY-5", "labels": { "nodes": [] } },
+        { "id": "i-low", "identifier": "TY-4", "title": "Low task", "description": "l", "priority": 4, "sortOrder": 5, "url": "https://linear.app/ty/issue/TY-4", "labels": { "nodes": [] } },
+        { "id": "i-high", "identifier": "TY-2", "title": "High task", "description": "h", "priority": 2, "sortOrder": 50, "url": "https://linear.app/ty/issue/TY-2", "labels": { "nodes": [] } }
       ],
       "pageInfo": { "hasNextPage": false, "endCursor": null }
     }

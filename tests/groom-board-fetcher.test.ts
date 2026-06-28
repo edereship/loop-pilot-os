@@ -347,4 +347,43 @@ describe("GroomBoardFetcher", () => {
     // ES-6 must appear exactly once in the blockedBy string
     expect(blocked!.blockedBy).toBe("ES-6");
   });
+
+  // ---- getNeedsHumanIssueIds (ES-492) ----
+
+  it("getNeedsHumanIssueIds returns identifiers of issues with the given label", async () => {
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: {
+          nodes: [
+            makeNode("id-1", "ES-1", stateIds.todo, { labels: [OPT_IN_LABEL, "needs-human"] }),
+            makeNode("id-2", "ES-2", stateIds.todo, { labels: [OPT_IN_LABEL] }),
+            makeNode("id-3", "ES-3", stateIds.in_progress, { labels: [OPT_IN_LABEL, "needs-human"] }),
+          ],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      }),
+    });
+
+    const ids = await fetcher.getNeedsHumanIssueIds("needs-human");
+    expect(ids).toEqual(new Set(["ES-1", "ES-3"]));
+    expect(ids.has("ES-2")).toBe(false);
+  });
+
+  it("getNeedsHumanIssueIds returns empty set when no issues have the label", async () => {
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: {
+          nodes: [
+            makeNode("id-1", "ES-1", stateIds.todo, { labels: [OPT_IN_LABEL] }),
+          ],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      }),
+    });
+
+    const ids = await fetcher.getNeedsHumanIssueIds("needs-human");
+    expect(ids.size).toBe(0);
+  });
 });

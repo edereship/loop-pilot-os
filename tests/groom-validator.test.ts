@@ -11,8 +11,10 @@ function makeCtx(overrides?: Partial<ValidationContext>): ValidationContext {
     optInIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     doneIssueIds: new Set(["ES-5"]),
     activeIssueIds: new Set(),
+    needsHumanIssueIds: new Set(),
+    needsHumanLabel: "needs-human",
     maxCharsPerFile: 8000,
-    knownLabels: ["bug", "urgent", "looppilot"],
+    knownLabels: ["bug", "urgent", "looppilot", "needs-human"],
     ...overrides,
   };
 }
@@ -611,6 +613,103 @@ describe("validateGroomActions", () => {
         makeCtx(),
       );
       expect(results.every((r) => r.result === "valid")).toBe(true);
+    });
+  });
+
+  // ---- Rule: needs-human issue protection (ES-492) ----
+  describe("Rule: needs-human issue protection", () => {
+    it("rejects reprioritize on needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { issueId: "ES-1" })],
+        makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("needs-human");
+    });
+
+    it("rejects update on needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("update", { issueId: "ES-1" })],
+        makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+    });
+
+    it("rejects close on needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("close", { issueId: "ES-1" })],
+        makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+    });
+
+    it("rejects split on needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("split", { issueId: "ES-1" })],
+        makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+    });
+
+    it("rejects label on needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1" })],
+        makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("rejected");
+    });
+
+    it("allows action on non-needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { issueId: "ES-2" })],
+        makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("allows create (no issueId) even when needs-human issues exist", () => {
+      const results = validateGroomActions(
+        [action("create")],
+        makeCtx({ needsHumanIssueIds: new Set(["ES-1"]) }),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+  });
+
+  // ---- Rule 10: GROOM cannot add the needs-human label (ES-492 Finding 1) ----
+  describe("Rule 10: GROOM cannot add needs-human label", () => {
+    it("rejects label action that adds the needs-human label on a non-needs-human issue", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["needs-human"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("needs-human");
+    });
+
+    it("rejects label action adding needs-human even when issue is not in needsHumanIssueIds", () => {
+      const results = validateGroomActions(
+        [{ type: "label" as const, issueId: "ES-2", add: ["needs-human"], rationale: "test" }],
+        makeCtx({ needsHumanIssueIds: new Set() }),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("needs-human");
+    });
+
+    it("allows label action that adds other known labels", () => {
+      const results = validateGroomActions(
+        [action("label", { issueId: "ES-1", add: ["bug"] })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("allows label action that removes the needs-human label", () => {
+      const results = validateGroomActions(
+        [{ type: "label" as const, issueId: "ES-1", remove: ["needs-human"], rationale: "test" }],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
     });
   });
 });

@@ -74,7 +74,7 @@ function makeConfig(over: Partial<{
     selfReview: { enabled: true },
     verify: { enabled: true, runRecipe: "" },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
-    linear: { optInLabel: "looppilot-os", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
+    linear: { optInLabel: "looppilot-os", needsHumanLabel: "needs-human", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
     pm: undefined,
   } as unknown as Config;
 }
@@ -3451,10 +3451,10 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
 
     await h.orch.run();
 
-    // Second SELECT must include issue-A in the exclude list (abandoned ticket blocked)
+    // ES-492: Label-based exclusion — addLabel is called on abandon so SELECT filters the ticket.
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
+    // A second SELECT was triggered (the loop continued after abandon).
     expect(h.source.eligibleCalls.length).toBeGreaterThanOrEqual(2);
-    const secondSelectExcluded = h.source.eligibleCalls[1];
-    expect(secondSelectExcluded).toContain("issue-A");
   });
 
   // ES-450 Finding (iteration 8): pr_closed is terminal — recovery must not run even when
@@ -3562,6 +3562,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // recoveryAction must NOT be 'abandon' — the cleanup did not complete, so startup
     // recovery must be able to pick this session up via stoppedSessionsWithPr.
     expect(s.recoveryAction).toBeNull();
+    // ES-492 Finding 1: when recovery chose abandon but executeAbandon failed, the halt path
+    // must still apply the needs-human label so SELECT filters the ticket.
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
   });
 
   // ES-450 Finding 1 (iteration 10): stale guard must fire on the poll immediately
@@ -3728,6 +3731,89 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     // task_skipped notification emitted for abandon
     const skipped = h.notifier.events.filter((e) => e.kind === "task_skipped");
     expect(skipped.length).toBeGreaterThanOrEqual(1);
+    // ES-492: needs-human label was added
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
+    // ES-492: reason comment was posted (filter for the triage comment, not the design brief)
+    const comment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(comment).toBeDefined();
+    expect(comment!.body).toContain("agent_no_change");
+    // ES-492: When addLabel succeeds (needs_human_label_added=1), the label is the cross-run
+    // authority — the current-run DB guard does not apply (ES-492 Finding 2). Issue-A is still
+    // excluded from the eligible list because the FakeTaskSource label simulation blocks it.
+    const secondExcludes = h.source.eligibleCalls[1];
+    expect(secondExcludes).toBeDefined();
+    expect(secondExcludes).not.toContain("issue-A");
+  });
+
+  it("abandon attaches needs-human label and posts reason comment (pre-PR)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false); // agent_no_change → abandon
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // needs-human label was added
+    expect(h.source.labelAdds).toContainEqual({
+      issueId: "issue-A",
+      labelName: "needs-human",
+    });
+    // Reason comment was posted (filter for the triage comment, not the design brief)
+    const comment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(comment).toBeDefined();
+    expect(comment!.body).toContain("agent_no_change");
+    expect(comment!.body).toContain("ラベルを外すと再投入されます");
+    // task_skipped notification was emitted
+    const skipped = h.notifier.events.filter(
+      (e) => e.kind === "task_skipped" && e.identifier === "TY-1",
+    );
+    expect(skipped.length).toBe(1);
+  });
+
+  it("abandon continues even if addLabel fails", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    h.source.failNext("addLabel");
+
+    await h.orch.run();
+
+    // Run continued despite addLabel failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions.length).toBeGreaterThanOrEqual(2);
+    // Comment reflects the label failure
+    const triageComment = h.source.comments.find(
+      (c) => c.issueId === "issue-A" && c.body.includes("abandon (needs-human)"),
+    );
+    expect(triageComment).toBeDefined();
+    expect(triageComment!.body).toContain("ラベルの付与に失敗しました");
   });
 
   it("design_rejected → policy=abandon → continues (not HALT)", async () => {

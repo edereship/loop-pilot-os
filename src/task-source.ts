@@ -14,7 +14,7 @@ const ELIGIBLE_QUERY = `query Eligible($projectId: ID, $todoStateId: ID!, $label
     project: { id: { eq: $projectId } },
     state: { id: { eq: $todoStateId } },
     labels: { name: { eq: $label } }
-  }) { nodes { id identifier title description priority sortOrder url } }
+  }) { nodes { id identifier title description priority sortOrder url labels(first: 250) { nodes { name } } } }
 }`;
 
 const ELIGIBLE_QUERY_PAGINATED = `query EligiblePaginated($projectId: ID, $todoStateId: ID!, $label: String!, $after: String) {
@@ -22,7 +22,12 @@ const ELIGIBLE_QUERY_PAGINATED = `query EligiblePaginated($projectId: ID, $todoS
     project: { id: { eq: $projectId } },
     state: { id: { eq: $todoStateId } },
     labels: { name: { eq: $label } }
-  }) { nodes { id identifier title description priority sortOrder url } pageInfo { hasNextPage endCursor } }
+  }) { nodes { id identifier title description priority sortOrder url labels(first: 250) { nodes { name } } } pageInfo { hasNextPage endCursor } }
+}`;
+
+// ES-492: needs-human ラベル付与 mutation。
+const ISSUE_ADD_LABEL_MUTATION = `mutation IssueAddLabel($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) { success }
 }`;
 
 // カーネル §5.5: 遷移 mutation。一字一句一致。
@@ -67,6 +72,7 @@ interface IssueNode {
   priority: number;
   sortOrder: number;
   url: string;
+  labels: { nodes: Array<{ name: string }> };
 }
 
 interface IssuesData {
@@ -151,6 +157,8 @@ export interface LinearTaskSourceOptions {
   projectId: string;
   stateIds: Record<TicketState, string>;
   optInLabel: string;
+  needsHumanLabel: string;
+  needsHumanLabelId: string;
   fetchFn: FetchFn;
 }
 
@@ -159,6 +167,8 @@ export class LinearTaskSource implements TaskSource {
   private readonly projectId: string;
   private readonly stateIds: Record<TicketState, string>;
   private readonly optInLabel: string;
+  private readonly needsHumanLabel: string;
+  private readonly needsHumanLabelId: string;
   private readonly fetchFn: FetchFn;
 
   constructor(opts: LinearTaskSourceOptions) {
@@ -166,6 +176,8 @@ export class LinearTaskSource implements TaskSource {
     this.projectId = opts.projectId;
     this.stateIds = opts.stateIds;
     this.optInLabel = opts.optInLabel;
+    this.needsHumanLabel = opts.needsHumanLabel;
+    this.needsHumanLabelId = opts.needsHumanLabelId;
     this.fetchFn = opts.fetchFn;
   }
 
@@ -211,19 +223,54 @@ export class LinearTaskSource implements TaskSource {
     return all;
   }
 
-  async getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null> {
-    const exclude = new Set(excludeIds);
+  private isEligible(
+    node: IssueNode,
+    hardExclude: Set<string>,
+    softExclude: Set<string>,
+    legacyExclude: Set<string>,
+    onLegacyLabelDetected?: (issueId: string) => void,
+  ): boolean {
+    // Hard exclusions (active issues being worked on) always apply.
+    if (hardExclude.has(node.id)) return false;
+    // Current-run DB guard: defense-in-depth when addLabel fails transiently (ES-492 Finding 2).
+    // Only applies when needs_human_label_added=0. Checked before label so that within-run
+    // re-selection is blocked even before the label propagates to Linear.
+    if (softExclude.has(node.id)) return false;
+    // The needs-human label is the cross-run authority: if present, triage is required.
+    const hasNeedsHumanLabel = node.labels.nodes.some((l) => l.name === this.needsHumanLabel);
+    if (hasNeedsHumanLabel) {
+      // Operator manually added the label to a legacy-excluded issue. Flip the DB bit so
+      // that a subsequent label removal re-enables the ticket (ES-492 Finding 3).
+      if (legacyExclude.has(node.id)) {
+        onLegacyLabelDetected?.(node.id);
+      }
+      return false;
+    }
+    // Cross-run legacy guard: checked AFTER the label so that manual label-add is detectable
+    // (ES-492 Finding 3). Issues here have needs_human_label_added=0 and no label in Linear;
+    // they stay excluded until the operator adds the label (triggering the callback above) and
+    // then removes it, or until a newer session supersedes the stopped one.
+    if (legacyExclude.has(node.id)) return false;
+    return true;
+  }
+
+  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], legacyExcludeIds: string[] = [], onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue | null> {
+    const hard = new Set(hardExcludeIds);
+    const soft = new Set(abandonedExcludeIds);
+    const legacy = new Set(legacyExcludeIds);
     const nodes = (await this.queryByState(this.stateIds.todo))
-      .filter((n) => !exclude.has(n.id))
+      .filter((n) => this.isEligible(n, hard, soft, legacy, onLegacyLabelDetected))
       .sort(compareIssues);
     const first = nodes[0];
     return first ? toEligible(first) : null;
   }
 
-  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
-    const exclude = new Set(excludeIds);
+  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], legacyExcludeIds: string[] = [], onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue[]> {
+    const hard = new Set(hardExcludeIds);
+    const soft = new Set(abandonedExcludeIds);
+    const legacy = new Set(legacyExcludeIds);
     return (await this.queryAllByState(this.stateIds.todo))
-      .filter((n) => !exclude.has(n.id))
+      .filter((n) => this.isEligible(n, hard, soft, legacy, onLegacyLabelDetected))
       .sort(compareIssues)
       .map(toEligible);
   }
@@ -259,6 +306,21 @@ export class LinearTaskSource implements TaskSource {
     );
     if (!data.commentCreate.success) {
       throw new Error(`Linear commentCreate failed for ${issueId}`);
+    }
+  }
+
+  async addLabel(issueId: string, labelName: string): Promise<void> {
+    if (labelName !== this.needsHumanLabel) {
+      throw new Error(`addLabel only supports needs-human label, got "${labelName}"`);
+    }
+    const data = await graphql<{ issueAddLabel: { success: boolean } }>(
+      this.fetchFn,
+      this.apiKey,
+      ISSUE_ADD_LABEL_MUTATION,
+      { id: issueId, labelId: this.needsHumanLabelId },
+    );
+    if (!data.issueAddLabel.success) {
+      throw new Error(`issueAddLabel failed for ${issueId}`);
     }
   }
 }
@@ -337,6 +399,7 @@ export interface LinearSetupRequest {
   projectName: string;
   stateNames: Record<TicketState, string>;
   optInLabel: string;
+  needsHumanLabel: string;
 }
 
 export interface ResolvedLinearSetup {
@@ -345,6 +408,7 @@ export interface ResolvedLinearSetup {
   projectId: string;
   stateIds: Record<TicketState, string>;
   optInLabelId: string;
+  needsHumanLabelId: string;
   labelMap: Map<string, string>;   // label name → id (team + workspace)
   knownLabels: string[];           // known label names for GROOM prompt
 }
@@ -365,6 +429,14 @@ export async function resolveLinearSetup(
   req: LinearSetupRequest,
   fetchFn: FetchFn,
 ): Promise<ResolvedLinearSetup> {
+  // Reject identical label names up front (ES-492 Finding 3): every opt-in issue would
+  // carry the needs-human label, causing SELECT to return nothing indefinitely.
+  if (req.optInLabel === req.needsHumanLabel) {
+    throw new Error(
+      `Linear setup: opt_in_label and needs_human_label must be different (both are "${req.optInLabel}")`,
+    );
+  }
+
   // Phase 1: viewer + team keys のみ（軽量クエリ）
   const viewerData = await graphql<SetupViewerData>(fetchFn, apiKey, SETUP_VIEWER_QUERY, {});
 
@@ -410,6 +482,13 @@ export async function resolveLinearSetup(
     missing.push(`label "${req.optInLabel}"`);
   }
 
+  const needsHumanLabelEntry =
+    teamLabels.find((l) => l.name === req.needsHumanLabel) ??
+    wsLabels.find((l) => l.name === req.needsHumanLabel);
+  if (!needsHumanLabelEntry) {
+    missing.push(`label "${req.needsHumanLabel}"`);
+  }
+
   if (missing.length > 0) {
     throw new Error(
       `Linear setup resolution failed; not found: ${missing.join(", ")}`,
@@ -435,6 +514,7 @@ export async function resolveLinearSetup(
     projectId: project!.id,
     stateIds,
     optInLabelId: label!.id,
+    needsHumanLabelId: needsHumanLabelEntry!.id,
     labelMap,
     knownLabels,
   };

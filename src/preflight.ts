@@ -1459,6 +1459,7 @@ async function checkLinear(deps: PreflightDeps, errors: string[]): Promise<void>
     projectName: config.linear.project,
     stateNames,
     optInLabel: config.linear.optInLabel,
+    needsHumanLabel: config.linear.needsHumanLabel,
   };
   try {
     // resolveLinearSetup: viewer 取得（APIキー検証）/ team・project・4状態・opt_in_label の解決。

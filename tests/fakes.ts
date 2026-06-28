@@ -127,10 +127,12 @@ export class FakeTaskSource implements TaskSource {
   orphans: EligibleIssue[] = [];
   /** postComment の呼び出し記録 */
   comments: Array<{ issueId: string; body: string }> = [];
+  /** addLabel の呼び出し記録 */
+  labelAdds: Array<{ issueId: string; labelName: string }> = [];
   /** メソッド名 → 次の1回だけ throw させるエラー */
   private failOnce = new Map<string, Error>();
 
-  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment" | "getAllEligible", error?: Error): void {
+  failNext(method: "getNextEligible" | "transition" | "findOrphanedInProgress" | "postComment" | "getAllEligible" | "addLabel", error?: Error): void {
     this.failOnce.set(method, error ?? new Error(`FakeTaskSource.${method} injected failure`));
   }
 
@@ -142,10 +144,12 @@ export class FakeTaskSource implements TaskSource {
     }
   }
 
-  async getNextEligible(excludeIds: string[]): Promise<EligibleIssue | null> {
-    this.eligibleCalls.push([...excludeIds]);
+  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], _legacyExcludeIds: string[] = [], _onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue | null> {
+    const allExcludeIds = [...hardExcludeIds, ...abandonedExcludeIds];
+    this.eligibleCalls.push(allExcludeIds);
     this.takeFailure("getNextEligible");
-    const next = this.queue.find((i) => !excludeIds.includes(i.id));
+    const labeled = new Set(this.labelAdds.map((l) => l.issueId));
+    const next = this.queue.find((i) => !allExcludeIds.includes(i.id) && !labeled.has(i.id));
     if (!next) return null;
     this.queue = this.queue.filter((i) => i !== next);
     return next;
@@ -166,18 +170,27 @@ export class FakeTaskSource implements TaskSource {
     this.comments.push({ issueId, body });
   }
 
-  async getAllEligible(excludeIds: string[]): Promise<EligibleIssue[]> {
-    this.eligibleCalls.push([...excludeIds]);
+  async addLabel(issueId: string, labelName: string): Promise<void> {
+    this.takeFailure("addLabel");
+    this.labelAdds.push({ issueId, labelName });
+  }
+
+  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], _legacyExcludeIds: string[] = [], _onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue[]> {
+    const allExcludeIds = [...hardExcludeIds, ...abandonedExcludeIds];
+    this.eligibleCalls.push(allExcludeIds);
     this.takeFailure("getAllEligible");
-    const exclude = new Set(excludeIds);
+    const exclude = new Set(allExcludeIds);
     // Mimic real LinearTaskSource: only return issues in "todo" state.
     // Derive each issue's current state from the most recent transition.
     const lastTransition = new Map<string, TicketState>();
     for (const t of this.transitions) {
       lastTransition.set(t.issueId, t.state);
     }
+    // ES-492: Mimic label-based exclusion — issues with addLabel records are filtered out.
+    const labeled = new Set(this.labelAdds.map((l) => l.issueId));
     return this.queue.filter((i) => {
       if (exclude.has(i.id)) return false;
+      if (labeled.has(i.id)) return false;
       const state = lastTransition.get(i.id);
       // No transition recorded = still in original todo state
       // Transitioned back to todo = eligible again (e.g. after claim rollback)
@@ -394,11 +407,12 @@ export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
   doneIssueIds: Set<string> = new Set();
   optInIssueIds: Set<string> = new Set();
   activeIssueIds: Set<string> = new Set();
+  needsHumanIssueIds: Set<string> = new Set();
   calls: string[] = [];
   private _failNextMethods = new Map<string, Error>();
 
   /** Make the next call to `method` throw `error` (or a generic error). */
-  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds" | "getOptInIssueIds" | "getActiveIssueIds", error?: Error): void {
+  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds" | "getOptInIssueIds" | "getActiveIssueIds" | "getNeedsHumanIssueIds", error?: Error): void {
     this._failNextMethods.set(method, error ?? new Error(`FakeGroomBoardFetcher.${method} forced failure`));
   }
 
@@ -438,6 +452,12 @@ export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
     this.calls.push("getActiveIssueIds");
     this._maybeThrow("getActiveIssueIds");
     return this.activeIssueIds;
+  }
+
+  async getNeedsHumanIssueIds(_needsHumanLabel: string): Promise<Set<string>> {
+    this.calls.push("getNeedsHumanIssueIds");
+    this._maybeThrow("getNeedsHumanIssueIds");
+    return this.needsHumanIssueIds;
   }
 }
 

@@ -130,6 +130,7 @@ async function runLoop(configPath: string): Promise<number> {
       projectName: config.linear.project,
       stateNames,
       optInLabel: config.linear.optInLabel,
+      needsHumanLabel: config.linear.needsHumanLabel,
     };
     const linearSetup = await resolveLinearSetup(
       config.linearApiKey,
@@ -142,6 +143,8 @@ async function runLoop(configPath: string): Promise<number> {
       projectId: linearSetup.projectId,
       stateIds: linearSetup.stateIds,
       optInLabel: config.linear.optInLabel,
+      needsHumanLabel: config.linear.needsHumanLabel,
+      needsHumanLabelId: linearSetup.needsHumanLabelId,
       fetchFn: timedFetch,
     });
     // CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 はカスタムモデル/ゲートウェイ向けのエスケープハッチ。

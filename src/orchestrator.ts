@@ -49,6 +49,8 @@ export interface IGroomBoardFetcher {
   getOptInIssueIds(): Promise<Set<string>>;
   /** Returns identifiers of issues currently in in_progress or in_review state. */
   getActiveIssueIds(): Promise<Set<string>>;
+  /** Returns identifiers of issues carrying the needs-human label (ES-492). */
+  getNeedsHumanIssueIds(needsHumanLabel: string): Promise<Set<string>>;
   /** Clear any per-cycle cache so fresh data is fetched in the next call. */
   refresh(): void;
 }
@@ -1037,10 +1039,12 @@ export class Orchestrator {
       // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
       let eligible: EligibleIssue[];
       try {
-        eligible = await this.source.getAllEligible([
-          ...this.store.activeIssueIds(),
-          ...this.store.excludedIssueIds(),
-        ]);
+        eligible = await this.source.getAllEligible(
+          this.store.activeIssueIds(),
+          this.store.excludedIssueIds(this.runId),
+          this.store.legacyExcludedIssueIds(),
+          (issueId) => this.store.markNeedsHumanLabelAddedByIssueId(issueId),
+        );
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
@@ -1791,6 +1795,7 @@ export class Orchestrator {
         const doneIds = await this.groomDeps.boardFetcher.getDoneIssueIds();
         const optInIds = await this.groomDeps.boardFetcher.getOptInIssueIds();
         const activeIds = await this.groomDeps.boardFetcher.getActiveIssueIds();
+        const needsHumanIds = await this.groomDeps.boardFetcher.getNeedsHumanIssueIds(this.config.linear.needsHumanLabel);
         validationCtx = {
           projectIssueIds: projectIds,
           allIssueIds: projectIds,
@@ -1798,6 +1803,8 @@ export class Orchestrator {
           optInIssueIds: optInIds,
           doneIssueIds: doneIds,
           activeIssueIds: activeIds,
+          needsHumanIssueIds: needsHumanIds,
+          needsHumanLabel: this.config.linear.needsHumanLabel,
           maxCharsPerFile: this.config.memory.maxCharsPerFile,
           knownLabels: this.groomDeps.knownLabels,
         };
@@ -4103,6 +4110,9 @@ export class Orchestrator {
     let effectiveDetail = detail;
     // --- Resolve effective policy (ES-490) ---
     let policy = FAILURE_POLICY[reason];
+    // Track when recovery chose abandon but the abandon itself failed. The original policy
+    // remains "recover" in that case, so the guard below must check this flag too (ES-492 Finding 1).
+    let recoveryChoseAbandon = false;
     // Override: ci_failed with branch protection detail → halt (spec D-10)
     if (reason === "ci_failed" && detail !== null && detail.startsWith("merge blocked by branch protection")) {
       policy = "halt";
@@ -4236,6 +4246,8 @@ export class Orchestrator {
             stopDetail: detail,
             endedAt: this.clock(),
           });
+          // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
+          await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
           return CONTINUE;
         }
         // Only record the recovery action for non-failed outcomes. A failed abandon must
@@ -4363,6 +4375,7 @@ export class Orchestrator {
           // without this the cap is lost and the session gets a fresh restart budget
           // (ES-450 Finding 4).
           if (result.action === "abandon") {
+            recoveryChoseAbandon = true;
             const innerForFailed = extractInnerStopDetail(effectiveDetail ?? "");
             const isExhaustedFailed =
               innerForFailed.startsWith("auto-restart limit exceeded") ||
@@ -4425,6 +4438,8 @@ export class Orchestrator {
             ...patch,
           });
           const skipDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
+          // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
+          await this.applyNeedsHumanTriage(freshAbandon, reason, effectiveDetail);
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
           return CONTINUE;
@@ -4476,11 +4491,15 @@ export class Orchestrator {
         if (todoRevertErr !== null) {
           // Ticket is stuck In Progress with no active session — halt so operators can
           // intervene rather than leaving orphaned work invisible to SELECT (ES-490 Finding 2).
+          // Best-effort triage: try to label+comment so the operator sees context on the ticket.
+          await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
           await this.notifier.notify({ kind: "halted", reason, detail: skipDetail });
           await this.commitMemoryBeforeHalt();
           this.store.setRunState(this.runId, "halted", skipDetail);
           return HALT;
         }
+        // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
+        await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
         return CONTINUE;
       }
     }
@@ -4492,6 +4511,15 @@ export class Orchestrator {
       endedAt: this.clock(),
       ...patch,
     });
+    // Best-effort triage on halt: if we reached here via a failed abandon (e.g. executeAbandon
+    // returned kind='failed', or recovery chose abandon but executeRecoveryTurn failed), apply
+    // the label+comment so the operator sees context on the Linear ticket. When recovery chose
+    // abandon, policy is still "recover" — recoveryChoseAbandon tracks that case (ES-492 Finding 1).
+    // For pure halt-policy reasons (claim_failed, etc.) the ticket is typically not in Todo, so
+    // the label has no SELECT effect — but the comment still provides context.
+    if (policy === "abandon" || recoveryChoseAbandon) {
+      await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
+    }
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;
     await this.notifier.notify({ kind: "halted", reason, detail: haltDetail });
     await this.commitMemoryBeforeHalt();
@@ -4536,6 +4564,42 @@ export class Orchestrator {
       return HALT;
     }
     return CONTINUE;
+  }
+
+  /**
+   * ES-492: On abandon, add the needs-human label and post a reason comment.
+   * Both operations are best-effort — failures are logged but do not affect the abandon flow.
+   */
+  private async applyNeedsHumanTriage(
+    session: TaskSessionRow,
+    reason: FailureReason,
+    detail: string | null,
+  ): Promise<void> {
+    const label = this.config.linear.needsHumanLabel;
+    let labelApplied = false;
+    try {
+      await this.source.addLabel(session.linearIssueId, label);
+      labelApplied = true;
+      this.store.markNeedsHumanLabelAdded(session.id);
+    } catch (err) {
+      this.log(`needs-human: addLabel failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
+    }
+    const statusLine = labelApplied
+      ? `\`${label}\` ラベルが付与されました。ラベルを外すと再投入されます。`
+      : `⚠️ \`${label}\` ラベルの付与に失敗しました。手動でラベルを付与してください。`;
+    const commentBody = [
+      `## 🛑 LoopPilot OS — abandon (needs-human)`,
+      "",
+      `**Reason:** \`${reason}\``,
+      ...(detail ? [`**Detail:** ${detail}`] : []),
+      "",
+      statusLine,
+    ].join("\n");
+    try {
+      await this.source.postComment(session.linearIssueId, commentBody);
+    } catch (err) {
+      this.log(`needs-human: postComment failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
+    }
   }
 
   /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */

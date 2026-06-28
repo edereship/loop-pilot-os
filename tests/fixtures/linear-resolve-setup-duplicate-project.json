@@ -10,7 +10,8 @@
         { "id": "state-done", "name": "Done" }
       ] },
       "labels": { "nodes": [
-        { "id": "label-aiok", "name": "ai-ok" }
+        { "id": "label-aiok", "name": "ai-ok" },
+        { "id": "label-nh", "name": "needs-human" }
       ], "pageInfo": { "hasNextPage": false, "endCursor": null } },
       "projects": { "nodes": [
         { "id": "project-uuid-ty", "name": "LoopPilot OS" }

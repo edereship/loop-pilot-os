@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS task_session (
   pending_restart_reason TEXT,
   recovery_attempted INTEGER NOT NULL DEFAULT 0,
   recovery_action TEXT,
-  done_transition_pending INTEGER NOT NULL DEFAULT 0
+  done_transition_pending INTEGER NOT NULL DEFAULT 0,
+  needs_human_label_added INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_session_active ON task_session(state)
   WHERE state NOT IN ('merged','stopped');
@@ -526,6 +527,11 @@ export class SqliteStore {
         `ALTER TABLE task_session ADD COLUMN issue_url TEXT NOT NULL DEFAULT ''`,
       );
     }
+    if (!columns.has("needs_human_label_added")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN needs_human_label_added INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
     if (!columns.has("issue_description")) {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN issue_description TEXT NOT NULL DEFAULT ''`,
@@ -850,20 +856,69 @@ export class SqliteStore {
     return rows.map((r) => r.id);
   }
 
-  excludedIssueIds(): string[] {
+  excludedIssueIds(runId: number): string[] {
+    // Current-run guard (ES-492 Finding 2): defense-in-depth when addLabel fails transiently
+    // within this run — blocks re-selection for the remainder of the run when the label was
+    // NOT successfully applied (needs_human_label_added=0). When the label WAS applied
+    // (needs_human_label_added=1), the Linear label is the authority: if an operator removes
+    // the label during the current run, the ticket becomes eligible again immediately.
     const rows = this.db
       .prepare(
-        // Only the latest session per issue is checked: an old abandoned row must not
-        // block a ticket that was later re-processed successfully, and the human-triage
-        // reintroduction mechanism (needs-human label, ES-490 Finding 4 / spec D-02)
-        // can only clear the exclusion through a newer session or a Linear label change.
         `SELECT DISTINCT linear_issue_id AS id FROM task_session
-         WHERE state = 'stopped'
+         WHERE run_id = ?
+           AND state = 'stopped'
            AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')
-           AND id IN (SELECT MAX(id) FROM task_session GROUP BY linear_issue_id)`,
+           AND needs_human_label_added = 0`,
+      )
+      .all(runId) as Array<{ id: string }>;
+    return rows.map((r) => r.id);
+  }
+
+  legacyExcludedIssueIds(): string[] {
+    // Cross-run legacy guard (ES-492 Finding 3): issues whose LATEST session is stopped/abandoned
+    // and where the needs-human label was never successfully applied (needs_human_label_added=0).
+    // This covers pre-ES-492 sessions and post-ES-492 transient addLabel failures, ensuring they
+    // stay excluded until either:
+    //   a) the operator manually adds the label (detected by getAllEligible → onLegacyLabelDetected
+    //      callback flips needs_human_label_added=1) and then removes it to requeue, OR
+    //   b) the session is superseded by a newer one.
+    // Kept separate from excludedIssueIds so that getAllEligible can check the Linear label FIRST
+    // for legacy-excluded issues and detect manual label additions (ES-492 Finding 3).
+    const rows = this.db
+      .prepare(
+        `SELECT ts.linear_issue_id AS id
+         FROM task_session ts
+         WHERE ts.state = 'stopped'
+           AND (ts.recovery_action = 'abandon' OR ts.failure_reason = 'design_rejected')
+           AND ts.needs_human_label_added = 0
+           AND ts.id = (
+             SELECT MAX(id) FROM task_session WHERE linear_issue_id = ts.linear_issue_id
+           )`,
       )
       .all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
+  }
+
+  markNeedsHumanLabelAdded(sessionId: number): void {
+    this.db
+      .prepare(`UPDATE task_session SET needs_human_label_added = 1 WHERE id = ?`)
+      .run(sessionId);
+  }
+
+  markNeedsHumanLabelAddedByIssueId(issueId: string): void {
+    // Flip needs_human_label_added=1 for the latest stopped/abandoned session for this issue.
+    // Called by getAllEligible's onLegacyLabelDetected callback when the operator manually adds
+    // the needs-human label to a legacy-excluded issue, so that a subsequent label removal
+    // re-enables the ticket (ES-492 Finding 3).
+    this.db
+      .prepare(
+        `UPDATE task_session SET needs_human_label_added = 1
+         WHERE linear_issue_id = ?
+           AND state = 'stopped'
+           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')
+           AND id = (SELECT MAX(id) FROM task_session WHERE linear_issue_id = ?)`,
+      )
+      .run(issueId, issueId);
   }
 
   knownIssueIds(): string[] {
