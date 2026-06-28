@@ -6794,6 +6794,35 @@ describe("VERIFY (ES-491)", () => {
     expect(vrLogs[0]!.errorDetail).toBe("interrupted");
   });
 
+  // Codex Finding 2 (ES-491): cost_exceeded during an interrupt must not write a fail-open pass.
+  it("verify evidence agent cost_exceeded during interrupt → logs error/interrupted, not passed", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const verifyAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, verifyAgent });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "desc" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    // Simulate a stop request that races with the evidence agent and causes it to
+    // return cost_exceeded (budget hit after SIGTERM) instead of kind:"interrupted".
+    verifyAgent.runSession = async (_ctx) => {
+      (h.orch as any).interrupted = true;
+      return { kind: "cost_exceeded" as const, costUsd: 2.0 };
+    };
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    const sessions = h.store.sessionsForRun(run.id);
+    const vrLogs = h.store.getVerifyLogsForSession(sessions[0]!.id);
+    expect(vrLogs).toHaveLength(1);
+    expect(vrLogs[0]!.outcome).toBe("error");
+    expect(vrLogs[0]!.errorDetail).toBe("interrupted");
+  });
+
   // Finding 4 (ES-491): Ticket description is used as fallback acceptance context when planBrief is null.
   it("verify with null planBrief uses issue description as acceptance fallback", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
@@ -6821,6 +6850,42 @@ describe("VERIFY (ES-491)", () => {
     // planner is only called for VERIFY judgment.
     expect(planner.calls).toHaveLength(1);
     expect(planner.calls[0]!.prompt).toContain(desc);
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  // Codex Finding 4 (ES-491): Empty brief acceptance section falls back to issue description.
+  it("verify with empty brief acceptance section uses issue description as fallback", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const designer = new FakePlanRunner();
+    // Designer returns a brief whose Acceptance Criteria section is empty (parseable but blank).
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo the thing.\n\n## Change Targets\n- src/foo.ts\n\n## Implementation Steps\n1. Add it\n\n## Acceptance Criteria\n\n## Out of Scope\n- nothing" },
+    ];
+    const h = makeHarness(config, { planner, designer, designReviewer: planner });
+    const desc = "The feature must pass the end-to-end acceptance test";
+    h.source.queue = [issue("issue-A", "TY-1", { description: desc })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.3, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The judgment prompt must fall back to the issue description because the brief
+    // acceptance section is empty.
+    const judgmentCall = planner.calls.find((c) => c.prompt.includes("Code Diff") || c.prompt.includes("Verification Evidence"));
+    expect(judgmentCall).toBeDefined();
+    expect(judgmentCall!.prompt).toContain(desc);
 
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions[0].state).toBe("merged");

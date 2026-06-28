@@ -2134,6 +2134,22 @@ export class Orchestrator {
     // prior IMPLEMENT+VERIFY cycles already spent.
     const priorCostForBudget = this.store.getSession(session.id).costUsd ?? 0;
     const remainingBudget = Math.max(0, this.config.safety.maxCostUsdPerSession - priorCostForBudget);
+    // For a verify-fix retry, the branch already has prior implementation commits so
+    // hasCommitsWithDiff() is always true even if the retry makes nothing. Capture the
+    // commit count before the agent runs; compare after to detect a no-op retry.
+    let preRetryCommitCount: number | null = null;
+    if (verifyReasons !== null) {
+      try {
+        const r = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-list", "--count", `origin/${this.config.repo.defaultBranch}..HEAD`],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        const n = Number.parseInt(r.stdout.trim(), 10);
+        if (r.code === 0 && Number.isFinite(n)) preRetryCommitCount = n;
+      } catch {
+        // non-fatal: guard will fall back to hasCommitsWithDiff
+      }
+    }
     let outcome: AgentOutcome;
     try {
       outcome = await this.agent.runSession({
@@ -2178,7 +2194,19 @@ export class Orchestrator {
         }
         return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: priorCostUsd + outcome.costUsd });
       }
-      if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
+      // For a verify-fix retry: if we captured the pre-agent commit count, use it to detect
+      // whether the retry agent made any new commits. hasCommitsWithDiff() is not suitable here
+      // because the prior implementation commits make it always return true.
+      if (verifyReasons !== null && preRetryCommitCount !== null) {
+        const postR = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-list", "--count", `origin/${this.config.repo.defaultBranch}..HEAD`],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        const postN = Number.parseInt(postR.stdout.trim(), 10);
+        if (postR.code === 0 && Number.isFinite(postN) && postN <= preRetryCommitCount) {
+          return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
+        }
+      } else if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
         if (verifyReasons !== null) {
           return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
         }
@@ -2833,10 +2861,10 @@ export class Orchestrator {
           return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
         }
         // Mirror the judge-error interrupt guard: if a stop request landed while the evidence
-        // agent was running and it surfaced as kind:"error" rather than kind:"interrupted",
-        // record error/interrupted instead of writing a fail-open pass that crash recovery
-        // would treat as gate-satisfied.
-        if (eo.kind === "error" && this.interrupted) {
+        // agent was running and it surfaced as kind:"error" or kind:"cost_exceeded" rather
+        // than kind:"interrupted", record error/interrupted instead of writing a fail-open
+        // pass that crash recovery would treat as gate-satisfied.
+        if (this.interrupted) {
           this.store.updateVerifyLog(logRow.id, {
             endedAt: this.clock(), outcome: "error",
             costUsd: evidenceCostUsd, errorDetail: "interrupted",
@@ -2914,6 +2942,20 @@ export class Orchestrator {
           // non-fatal
         }
       }
+      if (!verifierContaminated) {
+        try {
+          const statusRes = await this.runner.run(
+            "git", ["-C", worktreePath, "status", "--porcelain"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (statusRes.code === 0 && statusRes.stdout.split("\n").some((l) => l.startsWith("??"))) {
+            this.log("verify: verifier left untracked files — evidence is tainted");
+            verifierContaminated = true;
+          }
+        } catch {
+          // non-fatal
+        }
+      }
     }
 
     // ── Worktree cleanup ──
@@ -2966,9 +3008,10 @@ export class Orchestrator {
     }
 
     // Use brief acceptance criteria when available; fall back to the ticket description so
-    // the judge can evaluate against real criteria even when the design brief is missing or
-    // unparseable (rather than passing solely on build/test/lint evidence).
-    const acceptance = planBrief?.sections?.acceptance ?? (issue.description.trim() || null);
+    // the judge can evaluate against real criteria even when the design brief is missing,
+    // unparseable, or has an empty Acceptance Criteria section (rather than passing solely
+    // on build/test/lint evidence).
+    const acceptance = planBrief?.sections?.acceptance?.trim() || issue.description.trim() || null;
     let diff = "";
     try {
       const diffRes = await this.runner.run(
