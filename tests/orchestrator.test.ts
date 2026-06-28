@@ -3938,6 +3938,93 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(s.recoveryTurnAttempts).toBe(2);
     expect(s.needsHumanLabelAdded).toBe(1);
   });
+
+  // ES-493 Finding 2: raw CI log content must not be stored alongside the recovery-failure
+  // marker so that CI output containing sentinel text cannot falsely match
+  // stoppedSessionsWithFailedRecovery's LIKE '%(recovery failed:%' pattern.
+  it("ci_failed recovery failure strips ci_log content from stop_detail (ES-493 Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // CI output contains text that resembles a recovery-failure sentinel. Without the fix,
+    // the stored stop_detail would start with "ci_log:...(recovery failed:..." and match
+    // stoppedSessionsWithFailedRecovery's LIKE '%(recovery failed:%' on the raw CI content.
+    h.git.ciLogs = "Error: (recovery failed: some previous test harness log line)";
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      { kind: "completed", text: '{"action":"restart_review"}' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    // Make restart-review comment posting fail (no preserveWorktree → retryable).
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // Raw CI log content must be stripped so stoppedSessionsWithFailedRecovery cannot be
+    // triggered by CI output that happens to contain the sentinel pattern.
+    expect(s.stopDetail).not.toMatch(/^ci_log:/);
+    // The recovery failure marker must still be present so the session can be retried.
+    expect(s.stopDetail).toContain("recovery failed:");
+  });
+
+  // ES-493 Finding 3: when the fix_pushed_restart_pending shortcut retries only the
+  // /restart-review comment (no code fix), a successful comment post must NOT increment
+  // recoveryTurnAttempts — the budget must be preserved for actual code-fix attempts.
+  it("fix_pushed_restart_pending success: recoveryTurnAttempts not incremented (ES-493 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a stopped session with the fix_pushed_restart_pending sentinel and counter=1.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "stopped",
+      failureReason: "ci_failed",
+      prNumber: 100,
+      stopDetail: "fix_pushed_restart_pending (recovery failed: recovery restart-review failed: timeout)",
+      recoveryTurnAttempts: 1,
+      endedAt: "2026-06-04T00:01:00.000Z",
+    });
+    // Source queue is empty — startup recovery handles the seeded session only.
+    h.source.queue = [];
+    // Stale guard fires once (pendingRestartReason="ci_failed"), then merge succeeds.
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("merged");
+    expect(s.recoveryAction).toBe("restart_review");
+    // The comment-only retry must NOT count against the recovery budget.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    // /restart-review comment was posted to the PR.
+    const commentCalls = h.git.calls.filter(
+      (c) => c.method === "postComment" && c.args[1] === "/restart-review",
+    );
+    expect(commentCalls).toHaveLength(1);
+  });
 });
 
 describe("Orchestrator — Failure Policy Routing (ES-490)", () => {

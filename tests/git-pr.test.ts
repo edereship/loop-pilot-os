@@ -780,8 +780,8 @@ describe("GitPrManager — runner.run に timeoutMs が設定される (ES-465)"
 
 describe("GitPrManager.fetchCiLogs", () => {
   const RUN_LIST_PREFIX = ["gh", "run", "list", "-R", "owner/name"];
-  const runsJson = (conclusion: string) =>
-    JSON.stringify([{ databaseId: 999, conclusion }]);
+  const runsJson = (conclusion: string, status = "completed") =>
+    JSON.stringify([{ databaseId: 999, conclusion, status }]);
 
   // ES-493 Finding 1: failure conclusion → --log-failed (only failed step output)
   it("uses --log-failed for conclusion=failure", async () => {
@@ -879,5 +879,45 @@ describe("GitPrManager.fetchCiLogs", () => {
     const limitIdx = listCall!.args.indexOf("--limit");
     const limitValue = parseInt(listCall!.args[limitIdx + 1], 10);
     expect(limitValue).toBeGreaterThanOrEqual(20);
+  });
+
+  // ES-493 Finding 1 (this PR): in-progress/queued runs have conclusion="" and must be
+  // skipped so the completed failed run is selected instead.
+  it("skips in_progress run and returns logs from the completed failed run", async () => {
+    const runner = new FakeCommandRunner();
+    // First run is in_progress with empty conclusion, second is the completed failure.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 100, conclusion: "", status: "in_progress" },
+        { databaseId: 200, conclusion: "failure", status: "completed" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the completed run (200), not the in-progress one (100).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("100");
+  });
+
+  it("returns null when all runs are in_progress (no completed run)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 100, conclusion: "", status: "in_progress" },
+        { databaseId: 101, conclusion: "", status: "queued" },
+      ]),
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+    expect(result).toBeNull();
   });
 });

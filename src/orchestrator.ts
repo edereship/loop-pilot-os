@@ -4329,7 +4329,11 @@ export class Orchestrator {
             autoRestartAttempts: 0,
             quotaRetryAttempts: 0,
             ...(isCounterBasedRecovery
-              ? { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 }
+              // When a prior fix was already pushed and only the /restart-review comment
+              // was retried (fix_pushed_restart_pending shortcut), do not count this
+              // against the recovery budget — no actual code fix was attempted
+              // (ES-493 Finding 3).
+              ? (isRestartCommentPending ? {} : { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 })
               : { recoveryAttempted: 1 }),
           };
           if (recoveryCost > 0) {
@@ -4410,6 +4414,15 @@ export class Orchestrator {
               : "abandon_in_progress";
           }
           if (result.message) {
+            // Strip raw CI log content before compounding with the failure marker so that
+            // CI output cannot accidentally match the LIKE patterns used by
+            // stoppedSessionsWithFailedRecovery (e.g. if CI output contains '(recovery failed:').
+            // The sentinels (fix_pushed_restart_pending, abandon_in_progress) were already
+            // written above and do not start with "ci_log:", so this only applies to the
+            // unmodified ci_log: detail from fetchCiLogs (ES-493 Finding 2).
+            if (effectiveDetail !== null && effectiveDetail.startsWith("ci_log:")) {
+              effectiveDetail = null;
+            }
             effectiveDetail = effectiveDetail
               ? `${effectiveDetail} (recovery failed: ${result.message})`
               : `recovery failed: ${result.message}`;
