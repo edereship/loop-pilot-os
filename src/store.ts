@@ -832,25 +832,36 @@ export class SqliteStore {
   }
 
   excludedIssueIds(runId: number): string[] {
-    // Two-pronged guard (ES-492 / ES-492 Finding 1):
-    //
-    // 1. Current-run guard: defense-in-depth when addLabel fails transiently within
-    //    this run — blocks re-selection for the remainder of the run regardless of label status.
-    //
-    // 2. Legacy guard: issues whose LATEST session (across ALL runs) is stopped/abandoned
-    //    and where the needs-human label was never successfully applied (needs_human_label_added=0).
-    //    This covers pre-ES-492 sessions that never received the label, ensuring they stay
-    //    excluded until the label is backfilled or the session is superseded by a newer one.
-    //    Once the label IS applied (needs_human_label_added=1), the label on the Linear side
-    //    is the cross-run authority — a human can re-enable the ticket by removing the label.
+    // Current-run guard (ES-492 Finding 2): defense-in-depth when addLabel fails transiently
+    // within this run — blocks re-selection for the remainder of the run when the label was
+    // NOT successfully applied (needs_human_label_added=0). When the label WAS applied
+    // (needs_human_label_added=1), the Linear label is the authority: if an operator removes
+    // the label during the current run, the ticket becomes eligible again immediately.
     const rows = this.db
       .prepare(
         `SELECT DISTINCT linear_issue_id AS id FROM task_session
          WHERE run_id = ?
            AND state = 'stopped'
            AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')
-         UNION
-         SELECT ts.linear_issue_id AS id
+           AND needs_human_label_added = 0`,
+      )
+      .all(runId) as Array<{ id: string }>;
+    return rows.map((r) => r.id);
+  }
+
+  legacyExcludedIssueIds(): string[] {
+    // Cross-run legacy guard (ES-492 Finding 3): issues whose LATEST session is stopped/abandoned
+    // and where the needs-human label was never successfully applied (needs_human_label_added=0).
+    // This covers pre-ES-492 sessions and post-ES-492 transient addLabel failures, ensuring they
+    // stay excluded until either:
+    //   a) the operator manually adds the label (detected by getAllEligible → onLegacyLabelDetected
+    //      callback flips needs_human_label_added=1) and then removes it to requeue, OR
+    //   b) the session is superseded by a newer one.
+    // Kept separate from excludedIssueIds so that getAllEligible can check the Linear label FIRST
+    // for legacy-excluded issues and detect manual label additions (ES-492 Finding 3).
+    const rows = this.db
+      .prepare(
+        `SELECT ts.linear_issue_id AS id
          FROM task_session ts
          WHERE ts.state = 'stopped'
            AND (ts.recovery_action = 'abandon' OR ts.failure_reason = 'design_rejected')
@@ -859,7 +870,7 @@ export class SqliteStore {
              SELECT MAX(id) FROM task_session WHERE linear_issue_id = ts.linear_issue_id
            )`,
       )
-      .all(runId) as Array<{ id: string }>;
+      .all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }
 
@@ -867,6 +878,22 @@ export class SqliteStore {
     this.db
       .prepare(`UPDATE task_session SET needs_human_label_added = 1 WHERE id = ?`)
       .run(sessionId);
+  }
+
+  markNeedsHumanLabelAddedByIssueId(issueId: string): void {
+    // Flip needs_human_label_added=1 for the latest stopped/abandoned session for this issue.
+    // Called by getAllEligible's onLegacyLabelDetected callback when the operator manually adds
+    // the needs-human label to a legacy-excluded issue, so that a subsequent label removal
+    // re-enables the ticket (ES-492 Finding 3).
+    this.db
+      .prepare(
+        `UPDATE task_session SET needs_human_label_added = 1
+         WHERE linear_issue_id = ?
+           AND state = 'stopped'
+           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')
+           AND id = (SELECT MAX(id) FROM task_session WHERE linear_issue_id = ?)`,
+      )
+      .run(issueId, issueId);
   }
 
   knownIssueIds(): string[] {

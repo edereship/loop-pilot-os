@@ -791,6 +791,8 @@ export class Orchestrator {
         eligible = await this.source.getAllEligible(
           this.store.activeIssueIds(),
           this.store.excludedIssueIds(this.runId),
+          this.store.legacyExcludedIssueIds(),
+          (issueId) => this.store.markNeedsHumanLabelAddedByIssueId(issueId),
         );
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
@@ -3146,6 +3148,9 @@ export class Orchestrator {
     let effectiveDetail = detail;
     // --- Resolve effective policy (ES-490) ---
     let policy = FAILURE_POLICY[reason];
+    // Track when recovery chose abandon but the abandon itself failed. The original policy
+    // remains "recover" in that case, so the guard below must check this flag too (ES-492 Finding 1).
+    let recoveryChoseAbandon = false;
     // Override: ci_failed with branch protection detail → halt (spec D-10)
     if (reason === "ci_failed" && detail !== null && detail.startsWith("merge blocked by branch protection")) {
       policy = "halt";
@@ -3408,6 +3413,7 @@ export class Orchestrator {
           // without this the cap is lost and the session gets a fresh restart budget
           // (ES-450 Finding 4).
           if (result.action === "abandon") {
+            recoveryChoseAbandon = true;
             const innerForFailed = extractInnerStopDetail(effectiveDetail ?? "");
             const isExhaustedFailed =
               innerForFailed.startsWith("auto-restart limit exceeded") ||
@@ -3544,11 +3550,12 @@ export class Orchestrator {
       ...patch,
     });
     // Best-effort triage on halt: if we reached here via a failed abandon (e.g. executeAbandon
-    // returned kind='failed') or a halt-policy reason, apply the label+comment so the operator
-    // sees context on the Linear ticket. For pure halt-policy reasons (claim_failed, etc.) the
-    // ticket is typically not in Todo, so the label has no SELECT effect — but the comment
-    // still provides context.
-    if (policy === "abandon") {
+    // returned kind='failed', or recovery chose abandon but executeRecoveryTurn failed), apply
+    // the label+comment so the operator sees context on the Linear ticket. When recovery chose
+    // abandon, policy is still "recover" — recoveryChoseAbandon tracks that case (ES-492 Finding 1).
+    // For pure halt-policy reasons (claim_failed, etc.) the ticket is typically not in Todo, so
+    // the label has no SELECT effect — but the comment still provides context.
+    if (policy === "abandon" || recoveryChoseAbandon) {
       await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
     }
     const haltDetail = `${session.linearIdentifier} stopped (${reason})${effectiveDetail ? `: ${effectiveDetail}` : ""}`;

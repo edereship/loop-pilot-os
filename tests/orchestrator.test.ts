@@ -3549,6 +3549,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // recoveryAction must NOT be 'abandon' — the cleanup did not complete, so startup
     // recovery must be able to pick this session up via stoppedSessionsWithPr.
     expect(s.recoveryAction).toBeNull();
+    // ES-492 Finding 1: when recovery chose abandon but executeAbandon failed, the halt path
+    // must still apply the needs-human label so SELECT filters the ticket.
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
   });
 
   // ES-450 Finding 1 (iteration 10): stale guard must fire on the poll immediately
@@ -3723,10 +3726,12 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     );
     expect(comment).toBeDefined();
     expect(comment!.body).toContain("agent_no_change");
-    // ES-492: DB defense-in-depth — second SELECT's excludeIds contains abandoned issue
+    // ES-492: When addLabel succeeds (needs_human_label_added=1), the label is the cross-run
+    // authority — the current-run DB guard does not apply (ES-492 Finding 2). Issue-A is still
+    // excluded from the eligible list because the FakeTaskSource label simulation blocks it.
     const secondExcludes = h.source.eligibleCalls[1];
     expect(secondExcludes).toBeDefined();
-    expect(secondExcludes).toContain("issue-A");
+    expect(secondExcludes).not.toContain("issue-A");
   });
 
   it("abandon attaches needs-human label and posts reason comment (pre-PR)", async () => {

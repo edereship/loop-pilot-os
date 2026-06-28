@@ -223,32 +223,54 @@ export class LinearTaskSource implements TaskSource {
     return all;
   }
 
-  private isEligible(node: IssueNode, hardExclude: Set<string>, softExclude: Set<string>): boolean {
+  private isEligible(
+    node: IssueNode,
+    hardExclude: Set<string>,
+    softExclude: Set<string>,
+    legacyExclude: Set<string>,
+    onLegacyLabelDetected?: (issueId: string) => void,
+  ): boolean {
     // Hard exclusions (active issues being worked on) always apply.
     if (hardExclude.has(node.id)) return false;
-    // DB guard: within-run exclusion for abandoned/design_rejected issues (ES-492 Finding 1).
-    // Defense-in-depth when addLabel fails transiently — the label is the cross-run authority,
-    // but this guard blocks re-selection for the remainder of the current run.
+    // Current-run DB guard: defense-in-depth when addLabel fails transiently (ES-492 Finding 2).
+    // Only applies when needs_human_label_added=0. Checked before label so that within-run
+    // re-selection is blocked even before the label propagates to Linear.
     if (softExclude.has(node.id)) return false;
     // The needs-human label is the cross-run authority: if present, triage is required.
-    return !node.labels.nodes.some((l) => l.name === this.needsHumanLabel);
+    const hasNeedsHumanLabel = node.labels.nodes.some((l) => l.name === this.needsHumanLabel);
+    if (hasNeedsHumanLabel) {
+      // Operator manually added the label to a legacy-excluded issue. Flip the DB bit so
+      // that a subsequent label removal re-enables the ticket (ES-492 Finding 3).
+      if (legacyExclude.has(node.id)) {
+        onLegacyLabelDetected?.(node.id);
+      }
+      return false;
+    }
+    // Cross-run legacy guard: checked AFTER the label so that manual label-add is detectable
+    // (ES-492 Finding 3). Issues here have needs_human_label_added=0 and no label in Linear;
+    // they stay excluded until the operator adds the label (triggering the callback above) and
+    // then removes it, or until a newer session supersedes the stopped one.
+    if (legacyExclude.has(node.id)) return false;
+    return true;
   }
 
-  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue | null> {
+  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], legacyExcludeIds: string[] = [], onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue | null> {
     const hard = new Set(hardExcludeIds);
     const soft = new Set(abandonedExcludeIds);
+    const legacy = new Set(legacyExcludeIds);
     const nodes = (await this.queryByState(this.stateIds.todo))
-      .filter((n) => this.isEligible(n, hard, soft))
+      .filter((n) => this.isEligible(n, hard, soft, legacy, onLegacyLabelDetected))
       .sort(compareIssues);
     const first = nodes[0];
     return first ? toEligible(first) : null;
   }
 
-  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue[]> {
+  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], legacyExcludeIds: string[] = [], onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue[]> {
     const hard = new Set(hardExcludeIds);
     const soft = new Set(abandonedExcludeIds);
+    const legacy = new Set(legacyExcludeIds);
     return (await this.queryAllByState(this.stateIds.todo))
-      .filter((n) => this.isEligible(n, hard, soft))
+      .filter((n) => this.isEligible(n, hard, soft, legacy, onLegacyLabelDetected))
       .sort(compareIssues)
       .map(toEligible);
   }

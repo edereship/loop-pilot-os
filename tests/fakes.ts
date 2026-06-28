@@ -144,7 +144,7 @@ export class FakeTaskSource implements TaskSource {
     }
   }
 
-  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue | null> {
+  async getNextEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], _legacyExcludeIds: string[] = [], _onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue | null> {
     const allExcludeIds = [...hardExcludeIds, ...abandonedExcludeIds];
     this.eligibleCalls.push(allExcludeIds);
     this.takeFailure("getNextEligible");
@@ -175,7 +175,7 @@ export class FakeTaskSource implements TaskSource {
     this.labelAdds.push({ issueId, labelName });
   }
 
-  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = []): Promise<EligibleIssue[]> {
+  async getAllEligible(hardExcludeIds: string[], abandonedExcludeIds: string[] = [], _legacyExcludeIds: string[] = [], _onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue[]> {
     const allExcludeIds = [...hardExcludeIds, ...abandonedExcludeIds];
     this.eligibleCalls.push(allExcludeIds);
     this.takeFailure("getAllEligible");

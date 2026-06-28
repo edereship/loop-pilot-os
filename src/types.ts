@@ -87,11 +87,13 @@ export interface TaskSessionRow {
 // ---- モジュールインターフェース（仕様 §4） ----
 export interface TaskSource {
   /** 適格(Team/PJ ∧ Todo ∧ オプトインラベル)を決定的順序で。hardExcludeIds は常に除外（active issues）。
-   *  abandonedExcludeIds は当該 run 内の DB ガード（ES-492 Finding 1）: addLabel 失敗時に再選定を防ぐ。
-   *  cross-run では needs-human ラベルが権威（次回起動時にラベル除去で再エントリ可）。 */
-  getNextEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[]): Promise<EligibleIssue | null>;
+   *  abandonedExcludeIds は当該 run 内の DB ガード（ES-492 Finding 2）: addLabel 未適用時に再選定を防ぐ。
+   *  legacyExcludeIds は cross-run の DB ガード（ES-492 Finding 3）: ラベルチェック後に適用。
+   *  onLegacyLabelDetected は legacy 除外 issue にラベルが検出された時に呼ばれる（DB bit を更新して
+   *  次回ラベル除去で再エントリ可能にする）。cross-run では needs-human ラベルが権威。 */
+  getNextEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[], legacyExcludeIds?: string[], onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue | null>;
   /** 適格チケットを全件返す（PM 選別ターン用）。同上の除外セマンティクス。 */
-  getAllEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[]): Promise<EligibleIssue[]>;
+  getAllEligible(hardExcludeIds: string[], abandonedExcludeIds?: string[], legacyExcludeIds?: string[], onLegacyLabelDetected?: (issueId: string) => void): Promise<EligibleIssue[]>;
   transition(issueId: string, state: TicketState): Promise<void>;
   /** In Progress なのに渡された issueIds に無いチケット（CLAIM途中クラッシュ孤児）を返す */
   findOrphanedInProgress(knownIssueIds: string[]): Promise<EligibleIssue[]>;
