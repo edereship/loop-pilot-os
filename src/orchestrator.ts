@@ -4179,9 +4179,14 @@ export class Orchestrator {
       // recoveryTurnAttempts remained 0. Incorporate the legacy boolean so the prior
       // attempt counts against the new budget and the session cannot receive a full
       // fresh max_recovery_attempts budget after an upgrade (ES-493 Finding 1).
-      const effectiveRecoveryAttempts = isCounterBasedRecovery && fresh.recoveryAttempted && fresh.recoveryTurnAttempts === 0
+      const rawRecoveryAttempts = isCounterBasedRecovery && fresh.recoveryAttempted && fresh.recoveryTurnAttempts === 0
         ? 1
         : fresh.recoveryTurnAttempts;
+      // The -1 sentinel means "recoveryAttempted was set by a non-counter recovery";
+      // normalize to 0 so the non-counter prior does not delay the cap by one turn
+      // when a later counter-based recovery (ci_failed/merge_conflict) starts
+      // (ES-493 Iteration 8 Finding 2).
+      const effectiveRecoveryAttempts = rawRecoveryAttempts === -1 ? 0 : rawRecoveryAttempts;
       if (isCounterBasedRecovery &&
           effectiveRecoveryAttempts >= this.config.safety.maxRecoveryAttempts &&
           !isRestartCommentPending) {
@@ -4437,15 +4442,12 @@ export class Orchestrator {
               : "abandon_in_progress";
           }
           if (result.message) {
-            // Strip raw CI log content before compounding with the failure marker so that
-            // CI output cannot accidentally match the LIKE patterns used by
-            // stoppedSessionsWithFailedRecovery (e.g. if CI output contains '(recovery failed:').
-            // The sentinels (fix_pushed_restart_pending, abandon_in_progress) were already
-            // written above and do not start with "ci_log:", so this only applies to the
-            // unmodified ci_log: detail from fetchCiLogs (ES-493 Finding 2).
-            if (effectiveDetail !== null && effectiveDetail.startsWith("ci_log:")) {
-              effectiveDetail = null;
-            }
+            // Preserve the ci_log: prefix so the next recovery retry receives CI diagnostics.
+            // stripRecoveryFailedSuffix uses lastIndexOf so it correctly strips the appended
+            // " (recovery failed: ...)" suffix even when CI output itself contains that pattern
+            // (ES-493 Iteration 8 Finding 3). The sentinels (fix_pushed_restart_pending,
+            // abandon_in_progress) were already written above and do not start with "ci_log:",
+            // so the compound form only applies to the unmodified ci_log: detail from fetchCiLogs.
             effectiveDetail = effectiveDetail
               ? `${effectiveDetail} (recovery failed: ${result.message})`
               : `recovery failed: ${result.message}`;
@@ -4480,7 +4482,13 @@ export class Orchestrator {
               // When this increment reaches the cap, switch to abandon immediately so the
               // current run continues rather than halting and waiting for a daemon restart
               // to take the exhaust→abandon path (ES-493 Finding 2).
-              if (effectiveRecoveryAttempts + 1 >= this.config.safety.maxRecoveryAttempts) {
+              // Exception: when the fix was already pushed and only the /restart-review
+              // comment failed (result.restartCommentOnly=true, isRestartCommentPending=false),
+              // do NOT abandon — the fix_pushed_restart_pending sentinel written above lets the
+              // next daemon start bypass the cap and retry only the comment without closing
+              // the PR that already contains the fix (ES-493 Iteration 8 Finding 4).
+              if (effectiveRecoveryAttempts + 1 >= this.config.safety.maxRecoveryAttempts &&
+                  !result.restartCommentOnly) {
                 policy = "abandon";
               }
             }

@@ -386,10 +386,10 @@ export class GitPrManager implements GitPrManagerInterface {
         "-R", remote,
         ...refArgs,
         "--limit", "25",
-        "--json", "databaseId,conclusion,status,workflowName",
+        "--json", "databaseId,conclusion,status,workflowName,workflowDatabaseId",
       ], { cwd: repoPath, timeoutMs: 15_000 });
       if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
-      let runs: Array<{ databaseId: number; conclusion: string | null; status: string; workflowName?: string }>;
+      let runs: Array<{ databaseId: number; conclusion: string | null; status: string; workflowName?: string; workflowDatabaseId?: number }>;
       try {
         runs = JSON.parse(listResult.stdout);
       } catch {
@@ -406,10 +406,14 @@ export class GitPrManager implements GitPrManagerInterface {
       // (e.g. a re-run succeeded), the earlier failure was superseded and must not be
       // selected — otherwise stale logs from a fixed workflow can mask a currently-failing
       // one (ES-493 Finding 1 / Codex Iteration 7 Finding 1).
+      // Organization/enterprise ruleset workflows may omit workflowName; use the stable
+      // numeric workflowDatabaseId as fallback so each unnamed workflow gets its own key
+      // and a green ruleset run cannot suppress a failing one of a different ruleset
+      // (ES-493 Iteration 8 Finding 1).
       const latestCompletedByWorkflow = new Map<string, typeof runs[0]>();
       for (const r of runs) {
         if (r.status !== "completed" || r.conclusion === null || r.conclusion === "") continue;
-        const key = r.workflowName ?? "";
+        const key = r.workflowName ?? (r.workflowDatabaseId != null ? `id:${r.workflowDatabaseId}` : "");
         if (!latestCompletedByWorkflow.has(key)) {
           latestCompletedByWorkflow.set(key, r);
         }

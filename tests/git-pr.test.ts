@@ -970,4 +970,32 @@ describe("GitPrManager.fetchCiLogs", () => {
     expect(viewCall).toBeDefined();
     expect(viewCall!.args).toContain("100");
   });
+
+  // ES-493 Iteration 8 Finding 1: org/enterprise ruleset workflows may omit workflowName.
+  // Each unnamed run must be keyed by workflowDatabaseId so a green ruleset run for one
+  // workflow does not suppress a failing run of a different unnamed workflow.
+  it("keys unnamed workflows by workflowDatabaseId so distinct unnamed workflows are not grouped", async () => {
+    const runner = new FakeCommandRunner();
+    // Two unnamed workflows (workflowName absent): workflow 10 succeeded, workflow 20 failed.
+    // Without the fix both would share key "" and the newer green run (300) would suppress
+    // the failing run (200) from a completely different ruleset workflow.
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "success", status: "completed", workflowDatabaseId: 10 },
+        { databaseId: 200, conclusion: "failure", status: "completed", workflowDatabaseId: 20 },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "ruleset failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("ruleset failure logs\n");
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    // Must have fetched the failing unnamed workflow run (200), not the green one (300).
+    expect(viewCall!.args).toContain("200");
+    expect(viewCall!.args).not.toContain("300");
+  });
 });

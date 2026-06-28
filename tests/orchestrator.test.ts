@@ -3939,17 +3939,17 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(s.needsHumanLabelAdded).toBe(1);
   });
 
-  // ES-493 Finding 2: raw CI log content must not be stored alongside the recovery-failure
-  // marker so that CI output containing sentinel text cannot falsely match
-  // stoppedSessionsWithFailedRecovery's LIKE '%(recovery failed:%' pattern.
-  it("ci_failed recovery failure strips ci_log content from stop_detail (ES-493 Finding 2)", async () => {
+  // ES-493 Iteration 8 Finding 3: CI diagnostics must be preserved in the compound
+  // stop_detail so the next recovery retry receives the CI log output. The ci_log:
+  // prefix survives via "ci_log:<logs> (recovery failed: <msg>)" and stripRecoveryFailedSuffix
+  // uses lastIndexOf so it strips the actual suffix even when CI output contains the pattern.
+  it("ci_failed recovery failure preserves ci_log content in compound stop_detail (ES-493 Iteration 8 Finding 3)", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designer: planner });
     h.source.queue = [issue("issue-A", "TY-1")];
-    // CI output contains text that resembles a recovery-failure sentinel. Without the fix,
-    // the stored stop_detail would start with "ci_log:...(recovery failed:..." and match
-    // stoppedSessionsWithFailedRecovery's LIKE '%(recovery failed:%' on the raw CI content.
+    // CI output contains text that resembles a recovery-failure sentinel — lastIndexOf in
+    // stripRecoveryFailedSuffix ensures the actual appended suffix is stripped correctly.
     h.git.ciLogs = "Error: (recovery failed: some previous test harness log line)";
     h.agent.outcomes = [
       { kind: "completed", costUsd: 1.0, summary: "implemented" },
@@ -3974,11 +3974,10 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const s = sessions[0];
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("ci_failed");
-    // Raw CI log content must be stripped so stoppedSessionsWithFailedRecovery cannot be
-    // triggered by CI output that happens to contain the sentinel pattern.
-    expect(s.stopDetail).not.toMatch(/^ci_log:/);
+    // CI logs must be preserved in the compound form so the next retry has the diagnostics.
+    expect(s.stopDetail).toMatch(/^ci_log:/);
     // The recovery failure marker must still be present so the session can be retried.
-    expect(s.stopDetail).toContain("recovery failed:");
+    expect(s.stopDetail).toContain("(recovery failed:");
   });
 
   // ES-493 Finding 3: when the fix_pushed_restart_pending shortcut retries only the
@@ -4216,10 +4215,12 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
 
     const s = h.store.getSession(seeded.id);
     expect(s.state).toBe("merged");
-    // With sentinel: effectiveRecoveryAttempts=-1, counter goes -1→0.
+    // Sentinel -1 normalized to 0: counter goes 0→1.
     // This proves the legacy shim did NOT fire (which would have given effectiveRecoveryAttempts=1
     // and incremented to 2, consuming the full budget on the first recovery).
-    expect(s.recoveryTurnAttempts).toBe(0);
+    // With the Iteration 8 fix the -1 is now normalized before incrementing, so the result
+    // is 1 rather than 0 (ES-493 Iteration 8 Finding 2).
+    expect(s.recoveryTurnAttempts).toBe(1);
   });
 
   // ES-493 Iteration 7 Finding 3: when fix_code/rebase pushes a fix but /restart-review
@@ -4265,6 +4266,63 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(s.stopDetail).toContain("fix_pushed_restart_pending");
     // The initial code fix must be charged: counter incremented from 0 to 1.
     expect(s.recoveryTurnAttempts).toBe(1);
+  });
+
+  // ES-493 Iteration 8 Finding 4: when the LAST allowed attempt pushes a fix but the
+  // /restart-review comment fails, the session must NOT be abandoned immediately. The
+  // fix_pushed_restart_pending sentinel lets the next daemon start retry only the comment
+  // via the isRestartCommentPending bypass, preserving the already-pushed fix.
+  it("last-allowed fix_push with failed restart-review comment preserves sentinel instead of abandoning", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a stopped session that already used one recovery attempt (counter=1 of max=2).
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryTurnAttempts: 1,  // one slot used; next attempt is the last (cap=2)
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code on the last allowed attempt
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the failing test"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" },
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    // Fix is pushed but /restart-review comment fails — this is the last allowed attempt.
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Must NOT be abandoned: fix is already in the PR, only the comment failed.
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAction).not.toBe("abandon");
+    // fix_pushed_restart_pending sentinel must be set so the next start retries the comment.
+    expect(s.stopDetail).toContain("fix_pushed_restart_pending");
+    // Counter reaches the cap (1→2) but does not trigger abandon.
+    expect(s.recoveryTurnAttempts).toBe(2);
   });
 });
 
