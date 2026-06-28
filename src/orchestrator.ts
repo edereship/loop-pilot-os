@@ -436,6 +436,12 @@ export class Orchestrator {
         );
       }
       this.log(`recovery: prior verify failed; resuming IMPLEMENT then VERIFY (${session.linearIdentifier})`);
+      // Persist the effective attempt count so the next verify() call reads the correct counter
+      // rather than computing from the stale session.verifyAttempts (crash window: after the
+      // verify log was written but before the session counter was updated).
+      if (effectiveAttempts > session.verifyAttempts) {
+        this.store.updateSession(session.id, { verifyAttempts: effectiveAttempts });
+      }
       return "resume_implement";
     }
     if (lastVrLog !== undefined) {
@@ -590,12 +596,27 @@ export class Orchestrator {
                 this.log(`recovery: halting — no acceptance criteria for VERIFY (${session.linearIdentifier})`);
                 return await this.stopSession(session, "exception", detail);
               }
-              // When recovering from a prior failed verify attempt, seed verifyReasons with a
-              // placeholder so the loop enters IMPLEMENT first rather than re-running VERIFY on
-              // unchanged code (which would waste an attempt without injecting failure reasons).
-              let verifyReasons: string[] | null = verifyGate === "resume_implement"
-                ? ["(previous verify attempt failed before crash; exact reasons unavailable — re-check full implementation)"]
-                : null;
+              // When recovering from a prior failed verify attempt, seed verifyReasons with the
+              // persisted failure reasons (stored in error_detail by the verify function) so the
+              // fix agent has concrete acceptance failures. Fall back to a generic placeholder if
+              // the reasons could not be recovered (e.g. crash before they were persisted).
+              let verifyReasons: string[] | null = null;
+              if (verifyGate === "resume_implement") {
+                const vrLogsForReasons = this.store.getVerifyLogsForSession(session.id);
+                const lastFailedLog = vrLogsForReasons.filter((l) => l.outcome === "failed").at(-1);
+                let recoveredReasons: string[] | null = null;
+                if (lastFailedLog?.errorDetail) {
+                  try {
+                    const parsedReasons = JSON.parse(lastFailedLog.errorDetail) as unknown;
+                    if (Array.isArray(parsedReasons) && parsedReasons.every((r) => typeof r === "string")) {
+                      recoveredReasons = parsedReasons as string[];
+                    }
+                  } catch {
+                    // ignore: fall back to placeholder
+                  }
+                }
+                verifyReasons = recoveredReasons ?? ["(previous verify attempt failed before crash; exact reasons unavailable — re-check full implementation)"];
+              }
               verifyFixLoop: for (;;) {
                 if (verifyReasons !== null) {
                   const impl = await this.implement(session, recoveredIssue, recoveredBrief, verifyReasons);
@@ -672,12 +693,27 @@ export class Orchestrator {
             this.log(`recovery: halting — no acceptance criteria for VERIFY (${session.linearIdentifier})`);
             return await this.stopSession(session, "exception", detail);
           }
-          // When recovering from a prior failed verify attempt, seed verifyReasons with a
-          // placeholder so the loop enters IMPLEMENT first rather than re-running VERIFY on
-          // unchanged code (which would waste an attempt without injecting failure reasons).
-          let verifyReasons: string[] | null = verifyGate === "resume_implement"
-            ? ["(previous verify attempt failed before crash; exact reasons unavailable — re-check full implementation)"]
-            : null;
+          // When recovering from a prior failed verify attempt, seed verifyReasons with the
+          // persisted failure reasons (stored in error_detail by the verify function) so the
+          // fix agent has concrete acceptance failures. Fall back to a generic placeholder if
+          // the reasons could not be recovered (e.g. crash before they were persisted).
+          let verifyReasons: string[] | null = null;
+          if (verifyGate === "resume_implement") {
+            const vrLogsForReasons = this.store.getVerifyLogsForSession(session.id);
+            const lastFailedLog = vrLogsForReasons.filter((l) => l.outcome === "failed").at(-1);
+            let recoveredReasons: string[] | null = null;
+            if (lastFailedLog?.errorDetail) {
+              try {
+                const parsedReasons = JSON.parse(lastFailedLog.errorDetail) as unknown;
+                if (Array.isArray(parsedReasons) && parsedReasons.every((r) => typeof r === "string")) {
+                  recoveredReasons = parsedReasons as string[];
+                }
+              } catch {
+                // ignore: fall back to placeholder
+              }
+            }
+            verifyReasons = recoveredReasons ?? ["(previous verify attempt failed before crash; exact reasons unavailable — re-check full implementation)"];
+          }
           verifyFixLoop: for (;;) {
             if (verifyReasons !== null) {
               const impl = await this.implement(session, recoveredIssue, recoveredBrief, verifyReasons);
@@ -2138,6 +2174,7 @@ export class Orchestrator {
     // hasCommitsWithDiff() is always true even if the retry makes nothing. Capture the
     // commit count before the agent runs; compare after to detect a no-op retry.
     let preRetryCommitCount: number | null = null;
+    let preRetryHeadSha: string | null = null;
     if (verifyReasons !== null) {
       try {
         const r = await this.runner.run(
@@ -2148,6 +2185,15 @@ export class Orchestrator {
         if (r.code === 0 && Number.isFinite(n)) preRetryCommitCount = n;
       } catch {
         // non-fatal: guard will fall back to hasCommitsWithDiff
+      }
+      try {
+        const shaR = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        if (shaR.code === 0 && shaR.stdout.trim()) preRetryHeadSha = shaR.stdout.trim();
+      } catch {
+        // non-fatal
       }
     }
     let outcome: AgentOutcome;
@@ -2204,7 +2250,25 @@ export class Orchestrator {
         );
         const postN = Number.parseInt(postR.stdout.trim(), 10);
         if (postR.code === 0 && Number.isFinite(postN) && postN <= preRetryCommitCount) {
-          return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
+          // When count stayed the same the agent may have amended the existing commit rather
+          // than adding a new one. Detect this by comparing the tip SHA.
+          let amended = false;
+          if (postN === preRetryCommitCount && preRetryHeadSha !== null) {
+            try {
+              const postShaR = await this.runner.run(
+                "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+                { cwd: worktreePath, timeoutMs: 30_000 },
+              );
+              if (postShaR.code === 0 && postShaR.stdout.trim() !== preRetryHeadSha) {
+                amended = true;
+              }
+            } catch {
+              // non-fatal: conservatively treat as no change
+            }
+          }
+          if (!amended) {
+            return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
+          }
         }
       } else if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
         if (verifyReasons !== null) {
@@ -2944,6 +3008,20 @@ export class Orchestrator {
       }
       if (!verifierContaminated) {
         try {
+          const stagedDiffRes = await this.runner.run(
+            "git", ["-C", worktreePath, "diff", "--cached", "--quiet"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (stagedDiffRes.code !== 0) {
+            this.log("verify: verifier staged tracked changes — evidence is tainted");
+            verifierContaminated = true;
+          }
+        } catch {
+          // non-fatal
+        }
+      }
+      if (!verifierContaminated) {
+        try {
           const statusRes = await this.runner.run(
             "git", ["-C", worktreePath, "status", "--porcelain"],
             { cwd: worktreePath, timeoutMs: 30_000 },
@@ -3168,6 +3246,9 @@ export class Orchestrator {
       evidence: evidenceText.slice(0, 50_000),
       outcome: verdict === "pass" ? "passed" : "failed",
       costUsd: evidenceCostUsd,
+      // Persist the failure reasons so crash recovery can seed the next IMPLEMENT prompt
+      // with concrete acceptance failures rather than a generic placeholder.
+      ...(verdict === "fail" ? { errorDetail: JSON.stringify(reasons) } : {}),
     });
     const freshSess = this.store.getSession(session.id);
     this.store.updateSession(session.id, {
