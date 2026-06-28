@@ -4045,7 +4045,7 @@ export class Orchestrator {
         case "unknown":
           return { kind: "continue" };
         case "ci_failed": {
-          const ciLogs = await this.git.fetchCiLogs(prNumber, session.branch);
+          const ciLogs = await this.git.fetchCiLogs(prNumber, session.branch, readiness.headSha);
           const ctrl = await this.stopSession(session, "ci_failed", ciLogs);
           return ctrl.control === "halt" ? { kind: "halt" } : { kind: "continue" };
         }
@@ -4414,6 +4414,11 @@ export class Orchestrator {
             } else {
               this.store.updateSession(session.id, { recoveryAttempted: 1 });
             }
+          } else if (isCounterBasedRecovery) {
+            // Retryable failure: still increment the attempt counter so repeated
+            // failures eventually reach maxRecoveryAttempts and the abandon path
+            // is taken instead of retrying forever (ES-493).
+            this.store.updateSession(session.id, { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 });
           }
           // Do not persist workflowHandledErrorCount in the stopped row when recovery
           // fails — except when the fix was already pushed (restartCommentOnly). In that

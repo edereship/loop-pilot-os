@@ -374,14 +374,17 @@ export class GitPrManager implements GitPrManagerInterface {
     }
   }
 
-  async fetchCiLogs(_prNumber: number, branch: string): Promise<string | null> {
+  async fetchCiLogs(_prNumber: number, branch: string, headSha?: string): Promise<string | null> {
     const MAX_LOG_CHARS = 4000;
     const { repoPath, remote } = this.opts;
     try {
+      const refArgs: string[] = headSha
+        ? ["--commit", headSha]
+        : ["--branch", branch];
       const listResult = await this.runner.run("gh", [
         "run", "list",
         "-R", remote,
-        "--branch", branch,
+        ...refArgs,
         "--status", "failure",
         "--limit", "1",
         "--json", "databaseId",

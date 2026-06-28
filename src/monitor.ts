@@ -159,7 +159,7 @@ export class GhLoopPilotMonitor implements LoopPilotMonitor {
     const classes = checks.map(classifyCheck);
     // ② 失敗チェックあり（CheckRun: completed かつ conclusion ∉ {SUCCESS,NEUTRAL,SKIPPED} / StatusContext: FAILURE,ERROR）
     if (classes.includes("failed")) {
-      return { ready: false, reason: "ci_failed" };
+      return { ready: false, reason: "ci_failed", headSha: pr.headRefOid };
     }
     // ③ 未完了チェックあり
     if (classes.includes("pending")) {

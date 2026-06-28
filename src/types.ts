@@ -137,7 +137,7 @@ export interface GitPrManager {
   /** Fetch the default branch from origin and reset the working tree to match it. */
   fetchDefaultBranch(): Promise<void>;
   /** Fetch failed CI run logs for recovery prompt injection. Returns null on any failure. */
-  fetchCiLogs(prNumber: number, branch: string): Promise<string | null>;
+  fetchCiLogs(prNumber: number, branch: string, headSha?: string): Promise<string | null>;
 }
 
 /** 列挙順は precedence ではない。poll() の決定順は §5.4（merged 最優先）が正 */
@@ -161,7 +161,7 @@ export type MonitorVerdict =
     };
 export type MergeReadiness =
   | { ready: true; headSha: string }
-  | { ready: false; reason: "ci_pending" | "ci_failed" | "conflict" | "blocked" | "unknown" };
+  | { ready: false; reason: "ci_pending" | "ci_failed" | "conflict" | "blocked" | "unknown"; headSha?: string };
 export interface LoopPilotMonitor {
   poll(prNumber: number): Promise<MonitorVerdict>;
   checkMergeReadiness(prNumber: number): Promise<MergeReadiness>;

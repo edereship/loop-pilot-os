@@ -3567,6 +3567,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     // ES-492 Finding 1: when recovery chose abandon but executeAbandon failed, the halt path
     // must still apply the needs-human label so SELECT filters the ticket.
     expect(h.source.labelAdds).toContainEqual({ issueId: "issue-A", labelName: "needs-human" });
+    // A retryable failed recovery (no preserveWorktree/nonRetryable) must still count toward
+    // the attempt cap so repeated failures eventually reach maxRecoveryAttempts (ES-493).
+    expect(s.recoveryTurnAttempts).toBe(1);
   });
 
   // ES-450 Finding 1 (iteration 10): stale guard must fire on the poll immediately
@@ -3699,6 +3702,9 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     const haltedEvent = h.notifier.events.find((e) => e.kind === "halted");
     expect(haltedEvent).toBeDefined();
     expect((haltedEvent as { kind: "halted"; reason: string; detail: string }).detail).toContain("recovery failed:");
+    // push-after-commit failure has preserveWorktree=true → existing code forces counter to
+    // maxRecoveryAttempts (2) so the session is not retried with stale commits on disk.
+    expect(s.recoveryTurnAttempts).toBe(2);
   });
 
   it("ci_failed recovers up to max_recovery_attempts, then abandons (ES-493)", async () => {
