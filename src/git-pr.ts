@@ -402,10 +402,14 @@ export class GitPrManager implements GitPrManagerInterface {
       const failing = runs.find((r) => r.conclusion !== null && !GREEN.has(r.conclusion.toLowerCase()));
       if (!failing) return null;
 
+      // For actual failures, --log-failed surfaces only the failing steps.
+      // For timed_out/cancelled/action_required/startup_failure there are no
+      // "failed steps", so --log-failed returns nothing; use --log instead.
+      const logFlag = failing.conclusion?.toLowerCase() === "failure" ? "--log-failed" : "--log";
       const logResult = await this.runner.run("gh", [
         "run", "view", String(failing.databaseId),
         "-R", remote,
-        "--log-failed",
+        logFlag,
       ], { cwd: repoPath, timeoutMs: 30_000 });
       if (logResult.code !== 0 || !logResult.stdout.trim()) return null;
 

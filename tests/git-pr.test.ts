@@ -777,3 +777,88 @@ describe("GitPrManager — runner.run に timeoutMs が設定される (ES-465)"
     }
   });
 });
+
+describe("GitPrManager.fetchCiLogs", () => {
+  const RUN_LIST_PREFIX = ["gh", "run", "list", "-R", "owner/name"];
+  const runsJson = (conclusion: string) =>
+    JSON.stringify([{ databaseId: 999, conclusion }]);
+
+  // ES-493 Finding 1: failure conclusion → --log-failed (only failed step output)
+  it("uses --log-failed for conclusion=failure", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("failure") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "step output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("--log-failed");
+    expect(viewCall!.args).not.toContain("--log");
+  });
+
+  // ES-493 Finding 1: non-failure conclusions have no failed steps, so --log-failed
+  // returns nothing. Use --log to capture diagnostics for timed_out/cancelled/etc.
+  it("uses --log for conclusion=timed_out", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("timed_out") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "partial output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("--log");
+    expect(viewCall!.args).not.toContain("--log-failed");
+    expect(logs).toBe("partial output\n");
+  });
+
+  it("uses --log for conclusion=cancelled", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("cancelled") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "cancelled output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall!.args).toContain("--log");
+    expect(viewCall!.args).not.toContain("--log-failed");
+  });
+
+  it("uses --log for conclusion=action_required", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 0, stdout: runsJson("action_required") });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "action output\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall!.args).toContain("--log");
+    expect(viewCall!.args).not.toContain("--log-failed");
+  });
+
+  it("returns null when all runs are green (no non-success conclusion)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, {
+      code: 0,
+      stdout: JSON.stringify([{ databaseId: 1, conclusion: "success" }]),
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when gh run list fails", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(RUN_LIST_PREFIX, { code: 1, stdout: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix");
+    expect(result).toBeNull();
+  });
+});
