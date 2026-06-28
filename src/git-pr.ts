@@ -378,29 +378,15 @@ export class GitPrManager implements GitPrManagerInterface {
     const MAX_LOG_CHARS = 4000;
     const { repoPath, remote } = this.opts;
     try {
-      const refArgs: string[] = headSha
-        ? ["--commit", headSha]
-        : ["--branch", branch];
-      const listResult = await this.runner.run("gh", [
-        "run", "list",
-        "-R", remote,
-        ...refArgs,
-        "--limit", "25",
-        "--json", "databaseId,conclusion,status,workflowName,workflowDatabaseId,event",
-      ], { cwd: repoPath, timeoutMs: 15_000 });
-      if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
-      let runs: Array<{ databaseId: number; conclusion: string | null; status: string; workflowName?: string; workflowDatabaseId?: number; event?: string }>;
-      try {
-        runs = JSON.parse(listResult.stdout);
-      } catch {
-        return null;
-      }
       // Filter to runs whose conclusion indicates a non-success outcome so that
       // timed_out, cancelled, action_required, and startup_failure all surface logs —
       // not just the failure status that the previous --status filter matched (ES-493 Finding 3).
       // Skip runs that have not completed yet: in-progress/queued runs export conclusion as ""
       // and would otherwise be selected before the actual failed run (ES-493 Finding 1).
       const GREEN = new Set(["success", "neutral", "skipped"]);
+      type RunEntry = { databaseId: number; conclusion: string | null; status: string; workflowName?: string; workflowDatabaseId?: number; event?: string };
+
+      // Fetch run list for a given ref and return the most-recent failing run, or null.
       // Deduplicate by workflow: gh run list is newest-first, so the first completed run
       // encountered per workflow is its most recent. If that latest completed run is green
       // (e.g. a re-run succeeded), the earlier failure was superseded and must not be
@@ -413,17 +399,41 @@ export class GitPrManager implements GitPrManagerInterface {
       // Include the event (push vs pull_request) in the key so that when the same workflow
       // runs for both events on the same commit, a green push run cannot suppress a failing
       // pull_request run (ES-493 Iteration 11 Finding 1).
-      const latestCompletedByWorkflow = new Map<string, typeof runs[0]>();
-      for (const r of runs) {
-        if (r.status !== "completed" || r.conclusion === null || r.conclusion === "") continue;
-        const event = r.event ?? "";
-        const key = r.workflowDatabaseId != null ? `id:${r.workflowDatabaseId}:${event}` : `${r.workflowName || ""}:${event}`;
-        if (!latestCompletedByWorkflow.has(key)) {
-          latestCompletedByWorkflow.set(key, r);
+      const findFailingRun = async (refArgs: string[]): Promise<RunEntry | null> => {
+        const listResult = await this.runner.run("gh", [
+          "run", "list",
+          "-R", remote,
+          ...refArgs,
+          "--limit", "25",
+          "--json", "databaseId,conclusion,status,workflowName,workflowDatabaseId,event",
+        ], { cwd: repoPath, timeoutMs: 15_000 });
+        if (listResult.code !== 0 || !listResult.stdout.trim()) return null;
+        let runs: RunEntry[];
+        try {
+          runs = JSON.parse(listResult.stdout);
+        } catch {
+          return null;
         }
+        const latestCompletedByWorkflow = new Map<string, RunEntry>();
+        for (const r of runs) {
+          if (r.status !== "completed" || r.conclusion === null || r.conclusion === "") continue;
+          const event = r.event ?? "";
+          const key = r.workflowDatabaseId != null ? `id:${r.workflowDatabaseId}:${event}` : `${r.workflowName || ""}:${event}`;
+          if (!latestCompletedByWorkflow.has(key)) {
+            latestCompletedByWorkflow.set(key, r);
+          }
+        }
+        return Array.from(latestCompletedByWorkflow.values()).find(
+          (r) => !GREEN.has(r.conclusion!.toLowerCase())) ?? null;
+      };
+
+      // Try by commit SHA first, then fall back to branch. For pull_request workflows
+      // GitHub uses the merge commit SHA as GITHUB_SHA, which differs from the PR head
+      // SHA, so --commit <headSha> may miss those runs (ES-493 Finding 1).
+      let failing = await findFailingRun(headSha ? ["--commit", headSha] : ["--branch", branch]);
+      if (!failing && headSha) {
+        failing = await findFailingRun(["--branch", branch]);
       }
-      const failing = Array.from(latestCompletedByWorkflow.values()).find(
-        (r) => !GREEN.has(r.conclusion!.toLowerCase()));
       if (!failing) return null;
 
       // For actual failures, --log-failed surfaces only the failing steps.

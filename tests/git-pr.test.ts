@@ -1055,4 +1055,58 @@ describe("GitPrManager.fetchCiLogs", () => {
     expect(viewCall!.args).toContain("200");
     expect(viewCall!.args).not.toContain("300");
   });
+
+  // ES-493 Iteration 12 Finding 1: pull_request workflows use the merge commit SHA as
+  // GITHUB_SHA, not the PR head SHA. So --commit <headSha> can miss those runs.
+  // If the commit-based search finds no failing run, fall back to --branch search.
+  it("falls back to branch when commit-based list finds no failing run (pull_request merge SHA mismatch)", async () => {
+    const runner = new FakeCommandRunner();
+    // --commit headSha returns empty (no runs match — merge SHA differs from head SHA)
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([]),
+    });
+    // --branch returns the pull_request workflow's failing run
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--branch"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 500, conclusion: "failure", status: "completed", workflowName: "CI", event: "pull_request" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "pull_request workflow failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("pull_request workflow failure logs\n");
+    // The view call must target the run found via branch fallback.
+    const viewCall = runner.calls.find((c) => c.cmd === "gh" && c.args[1] === "view");
+    expect(viewCall).toBeDefined();
+    expect(viewCall!.args).toContain("500");
+    // Both list calls must have been made: commit first, then branch.
+    const listCalls = runner.calls.filter((c) => c.cmd === "gh" && c.args.includes("list"));
+    expect(listCalls).toHaveLength(2);
+    expect(listCalls[0].args).toContain("--commit");
+    expect(listCalls[1].args).toContain("--branch");
+  });
+
+  it("does not make branch fallback call when commit-based list already found a failing run", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "run", "list", "-R", "owner/name", "--commit"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { databaseId: 300, conclusion: "failure", status: "completed", workflowName: "CI", event: "push" },
+      ]),
+    });
+    runner.on(["gh", "run", "view"], { code: 0, stdout: "push workflow failure logs\n" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const logs = await mgr.fetchCiLogs(1, "looppilot/ty-1-fix", "abc123");
+
+    expect(logs).toBe("push workflow failure logs\n");
+    // Only one list call: no branch fallback needed.
+    const listCalls = runner.calls.filter((c) => c.cmd === "gh" && c.args.includes("list"));
+    expect(listCalls).toHaveLength(1);
+    expect(listCalls[0].args).toContain("--commit");
+  });
 });

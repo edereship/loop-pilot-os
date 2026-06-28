@@ -4235,6 +4235,19 @@ export class Orchestrator {
         // Gate label handling for handoff_failed is now inside executeRecoveryTurn (after
         // parseRecoveryAction), so abandon/escalate can proceed even when the label API is
         // broken (ES-450 Finding 5).
+        // Pre-persist the attempt counter before the side-effecting recovery turn so that a
+        // daemon crash between the push/rebase and the post-turn counter write cannot allow
+        // the same stale failed PR to receive an extra recovery cycle without consuming a
+        // budget slot (ES-493 Finding 3). Skip when isRestartCommentPending: comment-only
+        // retries intentionally do not consume the budget (ES-493 Finding 3).
+        // Also clears any stale recoveryAttempted left by a prior non-counter recovery so the
+        // slot reservation is visible to stoppedSessionsWithFailedRecovery (ES-493 Finding 3).
+        if (isCounterBasedRecovery && !isRestartCommentPending) {
+          this.store.updateSession(session.id, {
+            recoveryTurnAttempts: effectiveRecoveryAttempts + 1,
+            recoveryAttempted: 0,
+          });
+        }
         let result;
         try {
           result = await executeRecoveryTurn(
@@ -4541,6 +4554,10 @@ export class Orchestrator {
             inner.startsWith("quota retry limit exceeded");
           this.store.updateSession(session.id, {
             stopDetail: isExhausted ? `abandon_in_progress:${inner}` : "abandon_in_progress",
+            // Clear any stale recoveryAttempted flag set by a prior non-counter recovery so
+            // stoppedSessionsWithFailedRecovery (which requires recovery_attempted=0) can pick
+            // up this session and retry the cleanup if executeAbandon fails (ES-493 Finding 2).
+            recoveryAttempted: 0,
           });
         };
         const result = await executeAbandon(this.recoveryTurn, freshAbandon, onAbandonStarting);

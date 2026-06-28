@@ -4494,6 +4494,57 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(1);
     expect(h.store.stoppedSessionsWithFailedRecovery()[0].id).toBe(seeded.id);
   });
+
+  // ES-493 Iteration 12 Finding 2: when counter exhaustion sets policy=abandon directly
+  // (bypassing executeRecoveryTurn) and the session has a stale recoveryAttempted=1 from
+  // a prior non-counter recovery, executeAbandon failing must not leave recovery_attempted=1.
+  // stoppedSessionsWithFailedRecovery requires recovery_attempted=0 to retry the cleanup.
+  it("cap-abandon: stale recoveryAttempted cleared before executeAbandon so failed cleanup is retryable", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed an in_review session with a stale recoveryAttempted=1 from a prior non-counter
+    // recovery AND a counter already at cap, so the next ci_failed triggers immediate abandon.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix CI",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,       // stale flag from a prior looppilot_stopped recovery
+      recoveryTurnAttempts: 2,    // already at cap (maxRecoveryAttempts=2) → immediate abandon
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    planner.outcomes = [];  // no recovery runs (counter exhausted → immediate abandon)
+    // Make gh pr close fail so executeAbandon returns { kind: "failed" }.
+    h.recoveryRunner.on(["gh", "pr", "close"], { code: 1, stderr: "PR not found" });
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // The stale flag must be cleared so stoppedSessionsWithFailedRecovery can retry.
+    expect(s.recoveryAttempted).toBe(0);
+    // stop_detail must match abandon_in_progress% for stoppedSessionsWithFailedRecovery.
+    expect(s.stopDetail).toMatch(/^abandon_in_progress/);
+    // stoppedSessionsWithFailedRecovery must now find this session.
+    expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(1);
+    expect(h.store.stoppedSessionsWithFailedRecovery()[0].id).toBe(seeded.id);
+  });
 });
 
 describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
