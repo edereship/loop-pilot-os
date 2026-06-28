@@ -788,7 +788,10 @@ export class Orchestrator {
       // HALT+通知して人間に上げる（無人ループを無通知の Fatal 落ちさせない）。
       let eligible: EligibleIssue[];
       try {
-        eligible = await this.source.getAllEligible(this.store.activeIssueIds());
+        eligible = await this.source.getAllEligible([
+          ...this.store.activeIssueIds(),
+          ...this.store.excludedIssueIds(this.runId),
+        ]);
       } catch (err) {
         const detail = `select_failed: getAllEligible: ${errMsg(err)}`;
         await this.notifier.notify({ kind: "halted", reason: "exception", detail });
@@ -3602,11 +3605,11 @@ export class Orchestrator {
       `## 🛑 LoopPilot OS — abandon (needs-human)`,
       "",
       `**Reason:** \`${reason}\``,
-      detail ? `**Detail:** ${detail}` : "",
+      ...(detail ? [`**Detail:** ${detail}`] : []),
       "",
       `このチケットは \`${label}\` ラベルが付与されました。人間の確認が必要です。`,
       `ラベルを外すと再投入されます。`,
-    ].filter(Boolean).join("\n");
+    ].join("\n");
     try {
       await this.source.postComment(session.linearIssueId, commentBody);
     } catch (err) {

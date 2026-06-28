@@ -404,11 +404,12 @@ export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
   doneIssueIds: Set<string> = new Set();
   optInIssueIds: Set<string> = new Set();
   activeIssueIds: Set<string> = new Set();
+  needsHumanIssueIds: Set<string> = new Set();
   calls: string[] = [];
   private _failNextMethods = new Map<string, Error>();
 
   /** Make the next call to `method` throw `error` (or a generic error). */
-  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds" | "getOptInIssueIds" | "getActiveIssueIds", error?: Error): void {
+  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds" | "getOptInIssueIds" | "getActiveIssueIds" | "getNeedsHumanIssueIds", error?: Error): void {
     this._failNextMethods.set(method, error ?? new Error(`FakeGroomBoardFetcher.${method} forced failure`));
   }
 
@@ -452,7 +453,8 @@ export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
 
   async getNeedsHumanIssueIds(_needsHumanLabel: string): Promise<Set<string>> {
     this.calls.push("getNeedsHumanIssueIds");
-    return new Set();
+    this._maybeThrow("getNeedsHumanIssueIds");
+    return this.needsHumanIssueIds;
   }
 }
 

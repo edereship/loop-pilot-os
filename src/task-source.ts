@@ -14,7 +14,7 @@ const ELIGIBLE_QUERY = `query Eligible($projectId: ID, $todoStateId: ID!, $label
     project: { id: { eq: $projectId } },
     state: { id: { eq: $todoStateId } },
     labels: { name: { eq: $label } }
-  }) { nodes { id identifier title description priority sortOrder url labels(first: 50) { nodes { name } } } }
+  }) { nodes { id identifier title description priority sortOrder url labels(first: 250) { nodes { name } } } }
 }`;
 
 const ELIGIBLE_QUERY_PAGINATED = `query EligiblePaginated($projectId: ID, $todoStateId: ID!, $label: String!, $after: String) {
@@ -22,7 +22,7 @@ const ELIGIBLE_QUERY_PAGINATED = `query EligiblePaginated($projectId: ID, $todoS
     project: { id: { eq: $projectId } },
     state: { id: { eq: $todoStateId } },
     labels: { name: { eq: $label } }
-  }) { nodes { id identifier title description priority sortOrder url labels(first: 50) { nodes { name } } } pageInfo { hasNextPage endCursor } }
+  }) { nodes { id identifier title description priority sortOrder url labels(first: 250) { nodes { name } } } pageInfo { hasNextPage endCursor } }
 }`;
 
 // ES-492: needs-human ラベル付与 mutation。

@@ -837,11 +837,11 @@ describe("recovery columns (ES-450)", () => {
 });
 
 describe("excludedIssueIds (ES-492)", () => {
-  // ES-492: abandon/design_rejected exclusion is now handled by the needs-human
-  // label on the Linear side. excludedIssueIds() always returns [] so label
-  // removal in Linear re-enables the issue without a DB change.
+  // ES-492: primary exclusion is the needs-human label on the Linear side.
+  // excludedIssueIds(runId) is defense-in-depth for the CURRENT run only,
+  // so label-removal on the next daemon start re-enables the issue.
 
-  it("returns [] even when abandoned sessions exist", () => {
+  it("returns abandoned issue IDs for the current run", () => {
     const store = newStore();
     const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
 
@@ -859,10 +859,12 @@ describe("excludedIssueIds (ES-492)", () => {
     });
     store.updateSession(s2.id, { state: "stopped", failureReason: "design_rejected", endedAt: "2026-01-01T02:00:00.000Z" });
 
-    expect(store.excludedIssueIds()).toEqual([]);
+    const excluded = store.excludedIssueIds(run.id);
+    expect(excluded).toContain("issue-A");
+    expect(excluded).toContain("issue-B");
   });
 
-  it("returns [] regardless of session state", () => {
+  it("returns design_rejected issue IDs for the current run", () => {
     const store = newStore();
     const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s1 = store.createSession({
@@ -872,16 +874,16 @@ describe("excludedIssueIds (ES-492)", () => {
     });
     store.updateSession(s1.id, { state: "stopped", failureReason: "design_rejected", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    expect(store.excludedIssueIds()).toEqual([]);
+    expect(store.excludedIssueIds(run.id)).toEqual(["issue-A"]);
   });
 
   it("returns empty array when no sessions", () => {
     const store = newStore();
-    store.createRun(3, "2026-01-01T00:00:00.000Z");
-    expect(store.excludedIssueIds()).toEqual([]);
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    expect(store.excludedIssueIds(run.id)).toEqual([]);
   });
 
-  it("returns [] for abandoned sessions across daemon restarts", () => {
+  it("returns [] for abandoned sessions from a PREVIOUS run (cross-run re-entry)", () => {
     const store = newStore();
     const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s = store.createSession({
@@ -891,8 +893,8 @@ describe("excludedIssueIds (ES-492)", () => {
     });
     store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
 
-    store.createRun(3, "2026-01-02T00:00:00.000Z");
-    expect(store.excludedIssueIds()).toEqual([]);
+    const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
+    expect(store.excludedIssueIds(run2.id)).toEqual([]);
   });
 });
 

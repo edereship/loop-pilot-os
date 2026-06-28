@@ -825,10 +825,21 @@ export class SqliteStore {
     return rows.map((r) => r.id);
   }
 
-  excludedIssueIds(): string[] {
-    // Abandon/design_rejected exclusion is now handled by the needs-human label
-    // on the Linear side (ES-492). Label removal re-enables the issue.
-    return [];
+  excludedIssueIds(runId: number): string[] {
+    // Primary exclusion is the needs-human label on the Linear side (ES-492).
+    // This DB guard is defense-in-depth for the CURRENT run only: if addLabel
+    // fails transiently, the ticket is still blocked from re-selection within
+    // this run. Cross-run, the label is the authority — scoping to runId lets
+    // human label-removal re-enable the issue on the next daemon start.
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT linear_issue_id AS id FROM task_session
+         WHERE run_id = ?
+           AND state = 'stopped'
+           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')`,
+      )
+      .all(runId) as Array<{ id: string }>;
+    return rows.map((r) => r.id);
   }
 
   knownIssueIds(): string[] {
