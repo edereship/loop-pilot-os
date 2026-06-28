@@ -186,6 +186,7 @@ async function runLoop(configPath: string): Promise<number> {
 
     const agent = buildPhaseAgent(config.agent.implement, config.agent.permissionMode);
     const selfReviewAgent = buildPhaseAgent(config.agent.selfReview, config.agent.permissionMode);
+    const verifyAgent = buildPhaseAgent(config.agent.verify, config.agent.permissionMode);
     const recoveryAgent = buildPhaseAgent(config.agent.recovery, config.agent.permissionMode);
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {
@@ -253,6 +254,7 @@ async function runLoop(configPath: string): Promise<number> {
       source,
       agent,
       selfReviewAgent,
+      verifyAgent,
       git,
       monitor,
       notifier,

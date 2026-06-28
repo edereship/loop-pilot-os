@@ -57,6 +57,7 @@ export interface TaskSessionRow {
   linearIdentifier: string;
   issueTitle: string;
   issueUrl: string;
+  issueDescription: string; // persisted ticket description — acceptance fallback for VERIFY recovery (ES-491)
   branch: string;
   worktreePath: string | null;
   prNumber: number | null;
@@ -364,6 +365,7 @@ export interface VerifyLogRow {
   outcome: VerifyOutcome | null;
   costUsd: number | null;
   errorDetail: string | null;
+  verifiedHeadSha: string | null; // HEAD the judge evaluated (persisted on fail) — lets recovery detect an already-landed fix commit (ES-491)
 }
 
 // ---- DESIGN REVIEW（ES-477） ----
