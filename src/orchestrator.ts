@@ -435,6 +435,30 @@ export class Orchestrator {
           `recovery: verify failed after ${effectiveAttempts} attempts`,
         );
       }
+      // If a verify-fix IMPLEMENT already committed before the crash, HEAD has advanced past
+      // the SHA the failed judgment evaluated. Those commits have never been verified, and
+      // re-running IMPLEMENT would no-op against the already-present fix and trip the no-change
+      // guard. Resume at VERIFY to judge the landed fix instead. Fall back to re-running
+      // IMPLEMENT when the verified SHA or the current HEAD is unknown (ES-491).
+      if (lastVrLog.verifiedHeadSha !== null && session.worktreePath !== null) {
+        let currentHeadSha: string | null = null;
+        try {
+          const headRes = await this.runner.run(
+            "git", ["-C", session.worktreePath, "rev-parse", "HEAD"],
+            { cwd: session.worktreePath, timeoutMs: 30_000 },
+          );
+          if (headRes.code === 0 && headRes.stdout.trim()) currentHeadSha = headRes.stdout.trim();
+        } catch {
+          // non-fatal: fall back to resume_implement
+        }
+        if (currentHeadSha !== null && currentHeadSha !== lastVrLog.verifiedHeadSha) {
+          this.log(`recovery: verify-fix commit already landed since failed verify; resuming VERIFY (${session.linearIdentifier})`);
+          if (effectiveAttempts > session.verifyAttempts) {
+            this.store.updateSession(session.id, { verifyAttempts: effectiveAttempts });
+          }
+          return "resume_verify";
+        }
+      }
       this.log(`recovery: prior verify failed; resuming IMPLEMENT then VERIFY (${session.linearIdentifier})`);
       // Persist the effective attempt count so the next verify() call reads the correct counter
       // rather than computing from the stale session.verifyAttempts (crash window: after the
@@ -576,21 +600,22 @@ export class Orchestrator {
               id: session.linearIssueId,
               identifier: session.linearIdentifier,
               title: session.issueTitle,
-              description: "",
+              description: session.issueDescription,
               priority: 0,
               sortOrder: 0,
               url: session.issueUrl,
             };
             if (verifyGate === "resume_verify" || verifyGate === "resume_implement") {
               const recoveredBrief = session.planBrief ? parseBrief(session.planBrief) : null;
-              // VERIFY requires acceptance criteria to evaluate against. With an empty ticket
-              // description (crash recovery always sets description to ""), running VERIFY
-              // without a brief or without parseable acceptance criteria would let it pass on
-              // build/test/lint evidence alone, bypassing the acceptance gate.
-              if (!recoveredBrief?.sections?.acceptance) {
+              // VERIFY requires acceptance criteria to evaluate against. Use the brief's
+              // Acceptance Criteria when present, otherwise fall back to the persisted ticket
+              // description (mirrors the normal VERIFY path). Only halt for manual review when
+              // neither source is available — running VERIFY with no acceptance context would
+              // let it pass on build/test/lint evidence alone, bypassing the acceptance gate.
+              if (!recoveredBrief?.sections?.acceptance && session.issueDescription.trim() === "") {
                 const briefStatus = session.planBrief ? "unparseable" : "missing";
                 const detail =
-                  `crash recovery: cannot resume VERIFY — no acceptance criteria available (brief ${briefStatus}); ` +
+                  `crash recovery: cannot resume VERIFY — no acceptance criteria available (brief ${briefStatus}, no ticket description); ` +
                   `manual review needed: ` +
                   `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
                 this.log(`recovery: halting — no acceptance criteria for VERIFY (${session.linearIdentifier})`);
@@ -673,21 +698,22 @@ export class Orchestrator {
           id: session.linearIssueId,
           identifier: session.linearIdentifier,
           title: session.issueTitle,
-          description: "",
+          description: session.issueDescription,
           priority: 0,
           sortOrder: 0,
           url: session.issueUrl,
         };
         if (verifyGate === "resume_verify" || verifyGate === "resume_implement") {
           const recoveredBrief = session.planBrief ? parseBrief(session.planBrief) : null;
-          // VERIFY requires acceptance criteria to evaluate against. With an empty ticket
-          // description (crash recovery always sets description to ""), running VERIFY
-          // without a brief or without parseable acceptance criteria would let it pass on
-          // build/test/lint evidence alone, bypassing the acceptance gate.
-          if (!recoveredBrief?.sections?.acceptance) {
+          // VERIFY requires acceptance criteria to evaluate against. Use the brief's
+          // Acceptance Criteria when present, otherwise fall back to the persisted ticket
+          // description (mirrors the normal VERIFY path). Only halt for manual review when
+          // neither source is available — running VERIFY with no acceptance context would
+          // let it pass on build/test/lint evidence alone, bypassing the acceptance gate.
+          if (!recoveredBrief?.sections?.acceptance && session.issueDescription.trim() === "") {
             const briefStatus = session.planBrief ? "unparseable" : "missing";
             const detail =
-              `crash recovery: cannot resume VERIFY — no acceptance criteria available (brief ${briefStatus}); ` +
+              `crash recovery: cannot resume VERIFY — no acceptance criteria available (brief ${briefStatus}, no ticket description); ` +
               `manual review needed: ` +
               `${session.branch}, ${session.worktreePath ?? "<no worktree>"}, ${session.linearIdentifier}`;
             this.log(`recovery: halting — no acceptance criteria for VERIFY (${session.linearIdentifier})`);
@@ -1253,6 +1279,7 @@ export class Orchestrator {
       linearIdentifier: issue.identifier,
       issueTitle: issue.title,
       issueUrl: issue.url,
+      issueDescription: issue.description,
       branch: claimResult.branch,
       worktreePath: claimResult.worktreePath,
       now: this.clock(),
@@ -2171,29 +2198,22 @@ export class Orchestrator {
     const priorCostForBudget = this.store.getSession(session.id).costUsd ?? 0;
     const remainingBudget = Math.max(0, this.config.safety.maxCostUsdPerSession - priorCostForBudget);
     // For a verify-fix retry, the branch already has prior implementation commits so
-    // hasCommitsWithDiff() is always true even if the retry makes nothing. Capture the
-    // commit count before the agent runs; compare after to detect a no-op retry.
-    let preRetryCommitCount: number | null = null;
-    let preRetryHeadSha: string | null = null;
+    // hasCommitsWithDiff() is always true even if the retry changes nothing. Capture the
+    // HEAD tree-hash before the agent runs and compare it after. Any real change — a new
+    // commit, an amended tip, or squashed/rewritten history that lands fewer commits —
+    // moves the tree hash, while a true no-op leaves it identical. Comparing the resulting
+    // tree (not the commit count) avoids falsely flagging a history-rewriting fix as a
+    // no-op just because it ends up with fewer commits (ES-491).
+    let preRetryTreeSha: string | null = null;
     if (verifyReasons !== null) {
       try {
-        const r = await this.runner.run(
-          "git", ["-C", worktreePath, "rev-list", "--count", `origin/${this.config.repo.defaultBranch}..HEAD`],
+        const treeR = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-parse", "HEAD^{tree}"],
           { cwd: worktreePath, timeoutMs: 30_000 },
         );
-        const n = Number.parseInt(r.stdout.trim(), 10);
-        if (r.code === 0 && Number.isFinite(n)) preRetryCommitCount = n;
+        if (treeR.code === 0 && treeR.stdout.trim()) preRetryTreeSha = treeR.stdout.trim();
       } catch {
         // non-fatal: guard will fall back to hasCommitsWithDiff
-      }
-      try {
-        const shaR = await this.runner.run(
-          "git", ["-C", worktreePath, "rev-parse", "HEAD"],
-          { cwd: worktreePath, timeoutMs: 30_000 },
-        );
-        if (shaR.code === 0 && shaR.stdout.trim()) preRetryHeadSha = shaR.stdout.trim();
-      } catch {
-        // non-fatal
       }
     }
     let outcome: AgentOutcome;
@@ -2240,35 +2260,23 @@ export class Orchestrator {
         }
         return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: priorCostUsd + outcome.costUsd });
       }
-      // For a verify-fix retry: if we captured the pre-agent commit count, use it to detect
-      // whether the retry agent made any new commits. hasCommitsWithDiff() is not suitable here
-      // because the prior implementation commits make it always return true.
-      if (verifyReasons !== null && preRetryCommitCount !== null) {
-        const postR = await this.runner.run(
-          "git", ["-C", worktreePath, "rev-list", "--count", `origin/${this.config.repo.defaultBranch}..HEAD`],
-          { cwd: worktreePath, timeoutMs: 30_000 },
-        );
-        const postN = Number.parseInt(postR.stdout.trim(), 10);
-        if (postR.code === 0 && Number.isFinite(postN) && postN <= preRetryCommitCount) {
-          // When count stayed the same the agent may have amended the existing commit rather
-          // than adding a new one. Detect this by comparing the tip SHA.
-          let amended = false;
-          if (postN === preRetryCommitCount && preRetryHeadSha !== null) {
-            try {
-              const postShaR = await this.runner.run(
-                "git", ["-C", worktreePath, "rev-parse", "HEAD"],
-                { cwd: worktreePath, timeoutMs: 30_000 },
-              );
-              if (postShaR.code === 0 && postShaR.stdout.trim() !== preRetryHeadSha) {
-                amended = true;
-              }
-            } catch {
-              // non-fatal: conservatively treat as no change
-            }
-          }
-          if (!amended) {
-            return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
-          }
+      // For a verify-fix retry: compare the HEAD tree-hash captured before the agent ran.
+      // A differing tree means the retry changed the code (added, amended, or squashed/
+      // rewritten commits); an identical tree means it was a no-op. hasCommitsWithDiff() is
+      // unsuitable here because the prior implementation commits make it always return true.
+      if (verifyReasons !== null && preRetryTreeSha !== null) {
+        let postTreeSha: string | null = null;
+        try {
+          const postTreeR = await this.runner.run(
+            "git", ["-C", worktreePath, "rev-parse", "HEAD^{tree}"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (postTreeR.code === 0 && postTreeR.stdout.trim()) postTreeSha = postTreeR.stdout.trim();
+        } catch {
+          // non-fatal: a failed read must not falsely flag a no-op — proceed to VERIFY.
+        }
+        if (postTreeSha !== null && postTreeSha === preRetryTreeSha) {
+          return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
         }
       } else if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
         if (verifyReasons !== null) {
@@ -2978,6 +2986,12 @@ export class Orchestrator {
     // ── Detect verifier contamination before cleanup ──
     // If the verifier changed tracked files or committed, the evidence was gathered
     // from a tree that won't match the PR. Reject tainted evidence.
+    //
+    // NOTE: untracked files are NOT contamination. The verifier is explicitly instructed
+    // to run build/test/typecheck, which legitimately emit unignored artifacts (coverage
+    // reports, junit XML, generated output). Those do not change the tree being judged and
+    // are stripped by cleanupVerifierWorktree's `git clean -ffdx`. Reserve contamination for
+    // commits, tracked working-tree edits, and staged changes (ES-491 P1).
     let verifierContaminated = false;
     if (preVerifySha !== null) {
       try {
@@ -3014,20 +3028,6 @@ export class Orchestrator {
           );
           if (stagedDiffRes.code !== 0) {
             this.log("verify: verifier staged tracked changes — evidence is tainted");
-            verifierContaminated = true;
-          }
-        } catch {
-          // non-fatal
-        }
-      }
-      if (!verifierContaminated) {
-        try {
-          const statusRes = await this.runner.run(
-            "git", ["-C", worktreePath, "status", "--porcelain"],
-            { cwd: worktreePath, timeoutMs: 30_000 },
-          );
-          if (statusRes.code === 0 && statusRes.stdout.split("\n").some((l) => l.startsWith("??"))) {
-            this.log("verify: verifier left untracked files — evidence is tainted");
             verifierContaminated = true;
           }
         } catch {
@@ -3247,8 +3247,10 @@ export class Orchestrator {
       outcome: verdict === "pass" ? "passed" : "failed",
       costUsd: evidenceCostUsd,
       // Persist the failure reasons so crash recovery can seed the next IMPLEMENT prompt
-      // with concrete acceptance failures rather than a generic placeholder.
-      ...(verdict === "fail" ? { errorDetail: JSON.stringify(reasons) } : {}),
+      // with concrete acceptance failures rather than a generic placeholder. Also persist the
+      // HEAD this judgment evaluated so recovery can tell whether a verify-fix commit already
+      // landed (HEAD advanced) and resume at VERIFY rather than re-running IMPLEMENT (ES-491).
+      ...(verdict === "fail" ? { errorDetail: JSON.stringify(reasons), verifiedHeadSha: preVerifySha } : {}),
     });
     const freshSess = this.store.getSession(session.id);
     this.store.updateSession(session.id, {

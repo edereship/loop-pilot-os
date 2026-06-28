@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS task_session (
   linear_identifier TEXT NOT NULL,
   issue_title TEXT NOT NULL,
   issue_url TEXT NOT NULL DEFAULT '',
+  issue_description TEXT NOT NULL DEFAULT '',
   branch TEXT NOT NULL,
   worktree_path TEXT,
   pr_number INTEGER,
@@ -117,7 +118,8 @@ CREATE TABLE IF NOT EXISTS verify_log (
   evidence TEXT,
   outcome TEXT CHECK (outcome IN ('passed','failed','error')),
   cost_usd REAL,
-  error_detail TEXT
+  error_detail TEXT,
+  verified_head_sha TEXT
 );
 CREATE TABLE IF NOT EXISTS run_lock (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -163,6 +165,7 @@ interface RawSessionRow {
   linear_identifier: string;
   issue_title: string;
   issue_url: string;
+  issue_description: string;
   branch: string;
   worktree_path: string | null;
   pr_number: number | null;
@@ -197,6 +200,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     linearIdentifier: r.linear_identifier,
     issueTitle: r.issue_title,
     issueUrl: r.issue_url,
+    issueDescription: r.issue_description,
     branch: r.branch,
     worktreePath: r.worktree_path,
     prNumber: r.pr_number,
@@ -325,6 +329,7 @@ interface RawVerifyLogRow {
   outcome: string | null;
   cost_usd: number | null;
   error_detail: string | null;
+  verified_head_sha: string | null;
 }
 function toVerifyLogRow(r: RawVerifyLogRow): VerifyLogRow {
   return {
@@ -340,6 +345,7 @@ function toVerifyLogRow(r: RawVerifyLogRow): VerifyLogRow {
     outcome: r.outcome as VerifyOutcome | null,
     costUsd: r.cost_usd,
     errorDetail: r.error_detail,
+    verifiedHeadSha: r.verified_head_sha,
   };
 }
 
@@ -405,6 +411,7 @@ const VERIFY_LOG_PATCH_COLUMNS: Record<string, string> = {
   outcome: "outcome",
   costUsd: "cost_usd",
   errorDetail: "error_detail",
+  verifiedHeadSha: "verified_head_sha",
 };
 
 export class SqliteStore {
@@ -519,6 +526,11 @@ export class SqliteStore {
         `ALTER TABLE task_session ADD COLUMN issue_url TEXT NOT NULL DEFAULT ''`,
       );
     }
+    if (!columns.has("issue_description")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN issue_description TEXT NOT NULL DEFAULT ''`,
+      );
+    }
 
     const runColumns = new Set(
       (
@@ -560,6 +572,17 @@ export class SqliteStore {
 
     if (!runColumns.has("idle_started_at")) {
       this.db.exec(`ALTER TABLE run ADD COLUMN idle_started_at TEXT`);
+    }
+
+    const verifyLogColumns = new Set(
+      (
+        this.db.prepare(`PRAGMA table_info(verify_log)`).all() as Array<{
+          name: string;
+        }>
+      ).map((c) => c.name),
+    );
+    if (!verifyLogColumns.has("verified_head_sha")) {
+      this.db.exec(`ALTER TABLE verify_log ADD COLUMN verified_head_sha TEXT`);
     }
   }
 
@@ -657,6 +680,7 @@ export class SqliteStore {
     linearIdentifier: string;
     issueTitle: string;
     issueUrl?: string;
+    issueDescription?: string;
     branch: string;
     worktreePath: string;
     now: string;
@@ -665,8 +689,8 @@ export class SqliteStore {
       .prepare(
         `INSERT INTO task_session
            (run_id, linear_issue_id, linear_identifier, issue_title, issue_url,
-            branch, worktree_path, state, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)`,
+            issue_description, branch, worktree_path, state, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)`,
       )
       .run(
         s.runId,
@@ -674,6 +698,7 @@ export class SqliteStore {
         s.linearIdentifier,
         s.issueTitle,
         s.issueUrl ?? "",
+        s.issueDescription ?? "",
         s.branch,
         s.worktreePath,
         s.now,
@@ -1247,6 +1272,7 @@ export class SqliteStore {
       | "outcome"
       | "costUsd"
       | "errorDetail"
+      | "verifiedHeadSha"
     >>,
   ): void {
     const setClauses: string[] = [];

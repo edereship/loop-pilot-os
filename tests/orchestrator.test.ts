@@ -6531,6 +6531,188 @@ describe("VERIFY (ES-491)", () => {
     expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
   });
 
+  it("crash recovery: verify failed but fix commit already landed → resumes VERIFY, not IMPLEMENT (ES-491 F2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent });
+
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing", verifyAttempts: 1 });
+    h.store.updateSession(session.id, { planBrief: "## Acceptance Criteria\nThe feature works." });
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    // Prior VERIFY attempt failed and recorded the HEAD it judged. The verify-fix IMPLEMENT then
+    // committed a fix (HEAD advanced to the harness default "abc1234") before the crash.
+    h.store.insertVerifyLog({ runId: priorRun.id, sessionId: session.id, attempt: 1, startedAt: "2026-06-05T00:01:00.000Z" });
+    const vrLogs = h.store.getVerifyLogsForSession(session.id);
+    h.store.updateVerifyLog(vrLogs[0].id, {
+      endedAt: "2026-06-05T00:02:00.000Z", outcome: "failed",
+      verdict: "fail", reasonCount: 1, verifiedHeadSha: "oldsha000-pre-fix",
+    });
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // A fix commit landed since the failed verify → recovery resumes VERIFY (judges the landed
+    // fix) rather than re-running IMPLEMENT, which would no-op and trip the no-change guard.
+    expect(h.logs.some(l => l.includes("verify-fix commit already landed") && l.includes("resuming VERIFY"))).toBe(true);
+    expect(h.logs.some(l => l.includes("resuming IMPLEMENT"))).toBe(false);
+    // IMPLEMENT must NOT have run.
+    expect(h.agent.callCount).toBe(0);
+    // VERIFY ran (verifyAgent had no outcomes → fail-open pass) → HANDOFF.
+    const allVrLogs = h.store.getVerifyLogsForSession(session.id);
+    expect(allVrLogs.length).toBeGreaterThanOrEqual(2);
+    expect(allVrLogs[allVrLogs.length - 1]!.outcome).toBe("passed");
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
+  });
+
+  it("crash recovery: verify not completed, no brief but ticket description present → resumes VERIFY (ES-491 F4)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner });
+
+    const priorRun = h.store.createRun(1, "2026-06-05T00:00:00.000Z");
+    h.store.setRunState(priorRun.id, "halted", "daemon crashed");
+    const session = h.store.createSession({
+      runId: priorRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Title for TY-1",
+      issueUrl: "https://linear.app/issue/TY-1",
+      // No plan brief, but the ticket description carries the acceptance criteria (e.g. DESIGN
+      // disabled). Recovery must use the persisted description rather than halting.
+      issueDescription: "## Acceptance Criteria\nThe feature works end to end.",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-05T00:00:00.000Z",
+    });
+    h.store.updateSession(session.id, { state: "implementing" });
+    // No planBrief set — acceptance criteria live only in the persisted ticket description.
+    h.store.insertSelfReviewLog({ runId: priorRun.id, sessionId: session.id, startedAt: "2026-06-05T00:00:00.000Z" });
+    const srLogs = h.store.getSelfReviewLogsForSession(session.id);
+    h.store.updateSelfReviewLog(srLogs[0].id, { endedAt: "2026-06-05T00:01:00.000Z", outcome: "passed" });
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // Recovery resumed VERIFY using the ticket description as acceptance fallback.
+    expect(h.logs.some(l => l.includes("resuming VERIFY"))).toBe(true);
+    expect(h.logs.some(l => l.includes("no acceptance criteria for VERIFY"))).toBe(false);
+    const verifyLogs = h.store.getVerifyLogsForSession(session.id);
+    expect(verifyLogs).toHaveLength(1);
+    expect(verifyLogs[0].outcome).toBe("passed");
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(true);
+  });
+
+  it("verify: untracked artifacts from checks are not contamination → passes (ES-491 F1)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Test\n5 passed" },
+    ];
+    // The verifier's build/test left untracked artifacts (coverage, junit). These do not change
+    // the tree being judged and are cleaned by git clean — they must NOT taint the evidence.
+    h.memoryRunner.on(["git", "-C", "/wt/ty-1", "status", "--porcelain"], { code: 0, stdout: "?? coverage/lcov.info\n?? junit.xml\n" });
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // Untracked artifacts did not taint evidence: VERIFY judged and passed, session merged.
+    expect(sessions[0].state).toBe("merged");
+    const verifyLogs = h.store.getVerifyLogsForSession(sessions[0].id);
+    expect(verifyLogs[0].outcome).toBe("passed");
+    expect(verifyLogs[0].verdict).toBe("pass");
+    expect(verifyLogs[0].errorDetail ?? "").not.toContain("tainted");
+  });
+
+  it("verify-fix retry that rewrites history (fewer commits, changed tree) is not a no-op (ES-491 F3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    // 1st judgment fail → re-implement; 2nd judgment pass.
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"fail","reasons":["criterion not met"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 1.0, summary: "fixed — squashed into one commit" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Test\n1 failure" },
+      { kind: "completed", costUsd: 0.4, summary: "## Test\nall pass" },
+    ];
+    // The verify-fix retry rewrites history into FEWER commits but a DIFFERENT tree. The
+    // no-change guard must compare the tree hash (changed → real fix), not the commit count.
+    let treeCalls = 0;
+    h.memoryRunner.on(["git", "-C", "/wt/ty-1", "rev-parse", "HEAD^{tree}"], () => {
+      treeCalls += 1;
+      return { code: 0, stdout: treeCalls === 1 ? "tree-before-fix\n" : "tree-after-fix\n" };
+    });
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    // The retry was recognized as a real change → VERIFY re-ran and passed → merged.
+    expect(sessions[0].state).toBe("merged");
+    expect(sessions[0].stopDetail ?? "").not.toContain("made no changes");
+    expect(sessions[0].verifyAttempts).toBe(2);
+  });
+
+  it("verify-fix retry with identical tree is flagged as no-op (ES-491 F3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"fail","reasons":["criterion not met"]}\n```' },
+    ];
+    const selfReviewAgent = new FakeAgentRunner();
+    const h = makeHarness(config, { planner, designReviewer: planner, selfReviewAgent });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "completed", costUsd: 1.0, summary: "claims a fix but changed nothing" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Test\n1 failure" },
+    ];
+    // The retry left the tree identical to before → genuine no-op → must stop.
+    h.memoryRunner.on(["git", "-C", "/wt/ty-1", "rev-parse", "HEAD^{tree}"], { code: 0, stdout: "tree-unchanged\n" });
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("stopped");
+    expect(sessions[0].stopDetail ?? "").toContain("verify-fix retry made no changes");
+    expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
   it("verify-fix IMPLEMENT cost_exceeded → preserves worktree (prior commits not discarded)", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     const selfReviewAgent = new FakeAgentRunner(); // separate so h.agent only counts IMPLEMENT calls

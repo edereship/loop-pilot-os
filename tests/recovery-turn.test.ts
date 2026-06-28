@@ -81,6 +81,7 @@ function fakeSession(overrides: Partial<TaskSessionRow> = {}): TaskSessionRow {
     id: 1, runId: 1,
     linearIssueId: "issue-1", linearIdentifier: "TY-1",
     issueTitle: "Fix the bug", issueUrl: "https://linear.app/issue/TY-1",
+    issueDescription: "",
     branch: "looppilot/ty-1-fix",
     worktreePath: "/wt/ty-1", prNumber: 42,
     state: "in_review", costUsd: 1.5,
