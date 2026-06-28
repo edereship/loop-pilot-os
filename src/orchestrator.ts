@@ -426,18 +426,27 @@ export class Orchestrator {
     // verifyAttempts DB write and the stopSession("verify_failed") call), abandon now
     // rather than granting another IMPLEMENT→VERIFY cycle beyond the configured cap.
     if (lastVrLog?.outcome === "failed") {
-      if (session.verifyAttempts >= this.config.safety.maxVerifyAttempts) {
+      const effectiveAttempts = Math.max(session.verifyAttempts, lastVrLog.attempt);
+      if (effectiveAttempts >= this.config.safety.maxVerifyAttempts) {
         this.log(`recovery: verify_failed — max attempts (${this.config.safety.maxVerifyAttempts}) already used; abandoning (${session.linearIdentifier})`);
         return await this.stopSession(
           session,
           "verify_failed",
-          `recovery: verify failed after ${session.verifyAttempts} attempts`,
+          `recovery: verify failed after ${effectiveAttempts} attempts`,
         );
       }
       this.log(`recovery: prior verify failed; resuming IMPLEMENT then VERIFY (${session.linearIdentifier})`);
       return "resume_implement";
     }
-    this.log(`recovery: verify incomplete; resuming VERIFY (${session.linearIdentifier})`);
+    if (lastVrLog !== undefined) {
+      this.log(`recovery: verify log incomplete (possible verifier pollution); stopping (${session.linearIdentifier})`);
+      return await this.stopSession(
+        session,
+        "exception",
+        "recovery: incomplete verify log — verifier may have committed before crash; manual review required",
+      );
+    }
+    this.log(`recovery: verify not started; resuming VERIFY (${session.linearIdentifier})`);
     return "resume_verify";
   }
 
@@ -2164,9 +2173,15 @@ export class Orchestrator {
     // calling stopSession and leave the session stuck in "implementing".
     try {
       if (await this.git.hasUncommittedChanges(worktreePath)) {
+        if (verifyReasons !== null) {
+          return await this.stopSession(session, "exception", "verify-fix retry left uncommitted changes", { costUsd: priorCostUsd + outcome.costUsd });
+        }
         return await this.stopSession(session, "agent_no_change", "uncommitted leftovers", { costUsd: priorCostUsd + outcome.costUsd });
       }
       if (!(await this.git.hasCommitsWithDiff(worktreePath))) {
+        if (verifyReasons !== null) {
+          return await this.stopSession(session, "exception", "verify-fix retry made no changes", { costUsd: priorCostUsd + outcome.costUsd });
+        }
         return await this.stopSession(session, "agent_no_change", null, { costUsd: priorCostUsd + outcome.costUsd });
       }
     } catch (err) {
@@ -2853,11 +2868,52 @@ export class Orchestrator {
         });
         return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
       }
+      if (this.interrupted) {
+        this.store.updateVerifyLog(logRow.id, {
+          endedAt: this.clock(), outcome: "error",
+          costUsd: 0, errorDetail: "interrupted",
+        });
+        await this.haltForInterrupt();
+        return HALT;
+      }
       this.store.updateVerifyLog(logRow.id, {
         endedAt: this.clock(), outcome: "passed",
         costUsd: 0, errorDetail: `fail-open: evidence exception: ${errMsg(err)}`,
       });
       return CONTINUE;
+    }
+
+    // ── Detect verifier contamination before cleanup ──
+    // If the verifier changed tracked files or committed, the evidence was gathered
+    // from a tree that won't match the PR. Reject tainted evidence.
+    let verifierContaminated = false;
+    if (preVerifySha !== null) {
+      try {
+        const postHeadRes = await this.runner.run(
+          "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+          { cwd: worktreePath, timeoutMs: 30_000 },
+        );
+        if (postHeadRes.code === 0 && postHeadRes.stdout.trim() !== preVerifySha) {
+          this.log("verify: verifier modified HEAD — evidence is tainted");
+          verifierContaminated = true;
+        }
+      } catch {
+        // non-fatal: proceed without contamination check
+      }
+      if (!verifierContaminated) {
+        try {
+          const trackedDiffRes = await this.runner.run(
+            "git", ["-C", worktreePath, "diff", "--quiet"],
+            { cwd: worktreePath, timeoutMs: 30_000 },
+          );
+          if (trackedDiffRes.code !== 0) {
+            this.log("verify: verifier modified tracked files — evidence is tainted");
+            verifierContaminated = true;
+          }
+        } catch {
+          // non-fatal
+        }
+      }
     }
 
     // ── Worktree cleanup ──
@@ -2876,6 +2932,21 @@ export class Orchestrator {
         errorDetail: "worktree cleanup failed after evidence collection",
       });
       return await this.stopSession(session, "exception", "verify: worktree cleanup failed");
+    }
+
+    if (verifierContaminated) {
+      const freshSess = this.store.getSession(session.id);
+      this.store.updateSession(session.id, {
+        verifyAttempts: attempt,
+        costUsd: (freshSess.costUsd ?? 0) + evidenceCostUsd,
+      });
+      this.store.updateVerifyLog(logRow.id, {
+        endedAt: this.clock(), outcome: "error",
+        evidence: evidenceText.slice(0, 50_000),
+        costUsd: evidenceCostUsd,
+        errorDetail: "verifier contaminated worktree — evidence rejected",
+      });
+      return await this.stopSession(session, "exception", "verify: verifier modified worktree — evidence is tainted");
     }
 
     // ── Judgment (Codex planner) ──
