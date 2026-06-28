@@ -4025,6 +4025,144 @@ describe("Orchestrator — Codex Recovery Turn (ES-450)", () => {
     );
     expect(commentCalls).toHaveLength(1);
   });
+
+  // ES-493 Finding 3 (failure path): when the fix_pushed_restart_pending shortcut
+  // fails to post the /restart-review comment, recoveryTurnAttempts must NOT be
+  // incremented — only the comment is missing, not a code fix.
+  it("fix_pushed_restart_pending failure: recoveryTurnAttempts not incremented (ES-493 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed a stopped session with fix_pushed_restart_pending and counter at 1.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "stopped",
+      failureReason: "ci_failed",
+      prNumber: 100,
+      stopDetail: "fix_pushed_restart_pending (recovery failed: recovery restart-review failed: timeout)",
+      recoveryTurnAttempts: 1,
+      endedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Make postComment fail again — the shortcut path retries only the comment.
+    h.git.failNext("postComment");
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Counter must remain at 1 — the comment-only failure must not consume code-fix budget.
+    expect(s.recoveryTurnAttempts).toBe(1);
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    // Sentinel re-encoded so next startup picks it up again.
+    expect(s.stopDetail).toContain("fix_pushed_restart_pending");
+  });
+
+  // ES-493 Finding 1: a legacy session (recoveryAttempted=1, recoveryTurnAttempts=0) must
+  // have the prior attempt counted so it cannot receive a full fresh budget after an upgrade.
+  it("legacy recoveryAttempted=1 counts against new counter budget (ES-493 Finding 1)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Pre-seed an in_review session in legacy state: recoveryAttempted=1, recoveryTurnAttempts=0.
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix failing test",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 1,    // set by old code after a ci_failed recovery
+      recoveryTurnAttempts: 0, // not yet migrated
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    // Recovery planner: fix_code (used on the first ci_failed).
+    planner.outcomes = [
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix the test"}' },
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI" }, // recovery fix agent
+    ];
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+    // Monitor: two "done" verdicts, both ci_failed on readiness.
+    // First: triggers recovery (fix_code), counter → effectiveRecoveryAttempts+1 = 2.
+    // Second: counter=2=max → abandon (no second recovery).
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    // Budget was already 1 (legacy), so only ONE recovery ran before abandon.
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("ci_failed");
+    expect(s.recoveryAction).toBe("abandon");
+    // Counter = effectiveRecoveryAttempts(1) + 1 = 2 (max), proving the prior attempt was counted.
+    expect(s.recoveryTurnAttempts).toBe(2);
+    // Exactly one recovery_started event — the legacy attempt consumed one slot.
+    const recoveryStarted = h.notifier.events.filter((e) => e.kind === "recovery_started");
+    expect(recoveryStarted).toHaveLength(1);
+  });
+
+  // ES-493 Finding 2: a ci_failed recovery that escalates must set recoveryAttempted=1 so
+  // stoppedSessionsWithFailedRecovery cannot re-queue the session, overriding the escalation.
+  it("ci_failed escalation sets recoveryAttempted=1 to block stoppedSessionsWithFailedRecovery (ES-493 Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    // CI log contains "(recovery failed:" pattern — without the fix, the stored stop_detail
+    // would have ci_log:...(recovery failed:... and match stoppedSessionsWithFailedRecovery.
+    h.git.ciLogs = "Error: (recovery failed: some test harness log line)";
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    planner.outcomes = [
+      { kind: "completed", text: "## Plan" },
+      // Recovery planner: escalate
+      { kind: "completed", text: '{"action":"escalate"}' },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAction).toBe("escalate");
+    // Must be set so stoppedSessionsWithFailedRecovery (which requires recovery_attempted=0) skips it.
+    expect(s.recoveryAttempted).toBe(1);
+    // Confirm the session is not re-queued by stoppedSessionsWithFailedRecovery.
+    expect(h.store.stoppedSessionsWithFailedRecovery()).toHaveLength(0);
+  });
 });
 
 describe("Orchestrator — Failure Policy Routing (ES-490)", () => {

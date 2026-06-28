@@ -4175,8 +4175,15 @@ export class Orchestrator {
       // already has the fix committed (ES-493 Finding 1).
       const isRestartCommentPending = fresh.stopDetail !== null &&
         fresh.stopDetail.startsWith("fix_pushed_restart_pending");
+      // Legacy sessions (pre-counter migration) set recoveryAttempted=1 while
+      // recoveryTurnAttempts remained 0. Incorporate the legacy boolean so the prior
+      // attempt counts against the new budget and the session cannot receive a full
+      // fresh max_recovery_attempts budget after an upgrade (ES-493 Finding 1).
+      const effectiveRecoveryAttempts = isCounterBasedRecovery && fresh.recoveryAttempted && fresh.recoveryTurnAttempts === 0
+        ? 1
+        : fresh.recoveryTurnAttempts;
       if (isCounterBasedRecovery &&
-          fresh.recoveryTurnAttempts >= this.config.safety.maxRecoveryAttempts &&
+          effectiveRecoveryAttempts >= this.config.safety.maxRecoveryAttempts &&
           !isRestartCommentPending) {
         policy = "abandon";
       }
@@ -4255,7 +4262,12 @@ export class Orchestrator {
         // no active session (ES-450 Finding 2).
         if (result.kind !== "failed" && result.kind !== "recovered") {
           if (isCounterBasedRecovery) {
-            this.store.updateSession(session.id, { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 });
+            this.store.updateSession(session.id, {
+              recoveryTurnAttempts: effectiveRecoveryAttempts + 1,
+              // Escalation is a terminal decision — mark attempted so stoppedSessionsWithFailedRecovery
+              // cannot re-queue the session and override the escalation (ES-493 Finding 2).
+              ...(result.kind === "escalated" ? { recoveryAttempted: 1 } : {}),
+            });
           } else {
             this.store.updateSession(session.id, { recoveryAttempted: 1 });
           }
@@ -4333,7 +4345,7 @@ export class Orchestrator {
               // was retried (fix_pushed_restart_pending shortcut), do not count this
               // against the recovery budget — no actual code fix was attempted
               // (ES-493 Finding 3).
-              ? (isRestartCommentPending ? {} : { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 })
+              ? (isRestartCommentPending ? {} : { recoveryTurnAttempts: effectiveRecoveryAttempts + 1 })
               : { recoveryAttempted: 1 }),
           };
           if (recoveryCost > 0) {
@@ -4441,17 +4453,20 @@ export class Orchestrator {
               this.store.updateSession(session.id, { recoveryAttempted: 1 });
             }
           } else if (isCounterBasedRecovery) {
-            // Retryable failure: still increment the attempt counter so repeated
-            // failures eventually reach maxRecoveryAttempts and the abandon path
-            // is taken instead of retrying forever (ES-493).
-            this.store.updateSession(session.id, { recoveryTurnAttempts: fresh.recoveryTurnAttempts + 1 });
-            // When this increment reaches the cap and the fix has not already been pushed
-            // (restart-comment-only failures are exempted — the comment retry must run),
-            // switch to abandon immediately so the current run continues rather than halting
-            // and waiting for a daemon restart to take the exhaust→abandon path (ES-493 Finding 2).
-            if (fresh.recoveryTurnAttempts + 1 >= this.config.safety.maxRecoveryAttempts &&
-                !result.restartCommentOnly) {
-              policy = "abandon";
+            // Retryable failure: increment the attempt counter so repeated failures eventually
+            // reach maxRecoveryAttempts and the abandon path is taken (ES-493).
+            // Exception: when the fix was already pushed and only the /restart-review comment
+            // failed (restartCommentOnly), skip the increment so the comment retry does not
+            // consume code-fix budget — the budget must be preserved for actual code fixes
+            // (ES-493 Finding 3).
+            if (!result.restartCommentOnly) {
+              this.store.updateSession(session.id, { recoveryTurnAttempts: effectiveRecoveryAttempts + 1 });
+              // When this increment reaches the cap, switch to abandon immediately so the
+              // current run continues rather than halting and waiting for a daemon restart
+              // to take the exhaust→abandon path (ES-493 Finding 2).
+              if (effectiveRecoveryAttempts + 1 >= this.config.safety.maxRecoveryAttempts) {
+                policy = "abandon";
+              }
             }
           }
           // Do not persist workflowHandledErrorCount in the stopped row when recovery
