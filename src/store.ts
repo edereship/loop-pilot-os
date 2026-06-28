@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS task_session (
   pending_restart_reason TEXT,
   recovery_attempted INTEGER NOT NULL DEFAULT 0,
   recovery_action TEXT,
-  done_transition_pending INTEGER NOT NULL DEFAULT 0
+  done_transition_pending INTEGER NOT NULL DEFAULT 0,
+  needs_human_label_added INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_session_active ON task_session(state)
   WHERE state NOT IN ('merged','stopped');
@@ -519,6 +520,11 @@ export class SqliteStore {
         `ALTER TABLE task_session ADD COLUMN issue_url TEXT NOT NULL DEFAULT ''`,
       );
     }
+    if (!columns.has("needs_human_label_added")) {
+      this.db.exec(
+        `ALTER TABLE task_session ADD COLUMN needs_human_label_added INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
 
     const runColumns = new Set(
       (
@@ -826,20 +832,41 @@ export class SqliteStore {
   }
 
   excludedIssueIds(runId: number): string[] {
-    // Primary exclusion is the needs-human label on the Linear side (ES-492).
-    // This DB guard is defense-in-depth for the CURRENT run only: if addLabel
-    // fails transiently, the ticket is still blocked from re-selection within
-    // this run. Cross-run, the label is the authority — scoping to runId lets
-    // human label-removal re-enable the issue on the next daemon start.
+    // Two-pronged guard (ES-492 / ES-492 Finding 1):
+    //
+    // 1. Current-run guard: defense-in-depth when addLabel fails transiently within
+    //    this run — blocks re-selection for the remainder of the run regardless of label status.
+    //
+    // 2. Legacy guard: issues whose LATEST session (across ALL runs) is stopped/abandoned
+    //    and where the needs-human label was never successfully applied (needs_human_label_added=0).
+    //    This covers pre-ES-492 sessions that never received the label, ensuring they stay
+    //    excluded until the label is backfilled or the session is superseded by a newer one.
+    //    Once the label IS applied (needs_human_label_added=1), the label on the Linear side
+    //    is the cross-run authority — a human can re-enable the ticket by removing the label.
     const rows = this.db
       .prepare(
         `SELECT DISTINCT linear_issue_id AS id FROM task_session
          WHERE run_id = ?
            AND state = 'stopped'
-           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')`,
+           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected')
+         UNION
+         SELECT ts.linear_issue_id AS id
+         FROM task_session ts
+         WHERE ts.state = 'stopped'
+           AND (ts.recovery_action = 'abandon' OR ts.failure_reason = 'design_rejected')
+           AND ts.needs_human_label_added = 0
+           AND ts.id = (
+             SELECT MAX(id) FROM task_session WHERE linear_issue_id = ts.linear_issue_id
+           )`,
       )
       .all(runId) as Array<{ id: string }>;
     return rows.map((r) => r.id);
+  }
+
+  markNeedsHumanLabelAdded(sessionId: number): void {
+    this.db
+      .prepare(`UPDATE task_session SET needs_human_label_added = 1 WHERE id = ?`)
+      .run(sessionId);
   }
 
   knownIssueIds(): string[] {

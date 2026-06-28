@@ -883,7 +883,7 @@ describe("excludedIssueIds (ES-492)", () => {
     expect(store.excludedIssueIds(run.id)).toEqual([]);
   });
 
-  it("returns [] for abandoned sessions from a PREVIOUS run (cross-run re-entry)", () => {
+  it("returns [] for post-ES-492 abandoned sessions from a PREVIOUS run (label was applied, cross-run re-entry)", () => {
     const store = newStore();
     const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
     const s = store.createSession({
@@ -892,9 +892,51 @@ describe("excludedIssueIds (ES-492)", () => {
       now: "2026-01-01T00:00:01.000Z",
     });
     store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+    // Simulate post-ES-492: label was successfully applied, so the Linear label is
+    // the cross-run authority and a human can re-enable by removing it.
+    store.markNeedsHumanLabelAdded(s.id);
 
     const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
     expect(store.excludedIssueIds(run2.id)).toEqual([]);
+  });
+
+  it("excludes legacy abandoned sessions cross-run when label was never applied (pre-ES-492)", () => {
+    const store = newStore();
+    const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s = store.createSession({
+      runId: run1.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    // Legacy abandon: markNeedsHumanLabelAdded is never called (label was never added).
+    store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
+    expect(store.excludedIssueIds(run2.id)).toContain("issue-A");
+  });
+
+  it("legacy guard clears when a newer non-abandoned session exists for the issue", () => {
+    const store = newStore();
+    const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s1 = store.createSession({
+      runId: run1.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s1.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    // A newer session was created (e.g. after human re-enabled the ticket)
+    const run2 = store.createRun(3, "2026-01-02T00:00:00.000Z");
+    // Session in run2 is active (not stopped/abandoned), so the legacy guard should not fire.
+    store.createSession({
+      runId: run2.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b2", worktreePath: "/wt2",
+      now: "2026-01-02T00:00:01.000Z",
+    });
+
+    const run3 = store.createRun(3, "2026-01-03T00:00:00.000Z");
+    // Latest session for issue-A is the active run2 session (not stopped) — legacy guard does not apply.
+    expect(store.excludedIssueIds(run3.id)).not.toContain("issue-A");
   });
 });
 

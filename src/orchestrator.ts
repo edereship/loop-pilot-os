@@ -3611,6 +3611,7 @@ export class Orchestrator {
     try {
       await this.source.addLabel(session.linearIssueId, label);
       labelApplied = true;
+      this.store.markNeedsHumanLabelAdded(session.id);
     } catch (err) {
       this.log(`needs-human: addLabel failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
     }
