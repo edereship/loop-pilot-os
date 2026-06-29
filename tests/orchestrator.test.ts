@@ -111,7 +111,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; checkPidAlive?: (pid: number) => boolean }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -180,6 +180,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   // Process cleanup stubs for VERIFY (ES-494)
   memoryRunner.on(["lsof", "+D"], { code: 1, stdout: "" });
   memoryRunner.on(["kill", "-TERM"], { code: 0 });
+  memoryRunner.on(["kill", "-KILL"], { code: 0 });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const selfReviewAgent = opts?.selfReviewAgent ?? agent;
@@ -219,6 +220,8 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
     } : null,
+    getDescendantPids: opts?.getDescendantPids,
+    checkPidAlive: opts?.checkPidAlive,
   });
   return { orch, store, source, agent, verifyAgent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
 }
@@ -8566,7 +8569,13 @@ describe("VERIFY (ES-491)", () => {
     planner.outcomes = [
       { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
     ];
-    const h = makeHarness(config, { planner, designReviewer: planner });
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // Treat lsof PIDs as verified descendants so the descendant filter passes them through
+      getDescendantPids: () => new Set([12345, 67890]),
+      checkPidAlive: () => false, // processes exit immediately after SIGTERM
+    });
     // Override lsof stub to return PIDs
     h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: "12345\n67890\n" });
     h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
@@ -8599,8 +8608,15 @@ describe("VERIFY (ES-491)", () => {
     planner.outcomes = [
       { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
     ];
-    const h = makeHarness(config, { planner, designReviewer: planner });
     const safePid = String(process.pid + 1000);
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // safePid is the only descendant so the descendant filter passes it through;
+      // the other entries (0, 1, self-PID, non-numeric) are caught by the basic filter.
+      getDescendantPids: () => new Set([parseInt(safePid, 10)]),
+      checkPidAlive: () => false,
+    });
     h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `0\n1\n${process.pid}\nerror-msg\n${safePid}\n` });
     h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
     h.agent.outcomes = [
@@ -8707,6 +8723,82 @@ describe("VERIFY (ES-491)", () => {
 
     const sessions = store.sessionsForRun(store.latestRun()!.id);
     // Verify still completes despite lsof failure
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  it("verify: process cleanup does not kill non-descendant PIDs (Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const descendantPid = "11111";
+    const nonDescendantPid = "22222";
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // Only descendantPid is in the tree; nonDescendantPid must not be signalled.
+      getDescendantPids: () => new Set([11111]),
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${descendantPid}\n${nonDescendantPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    expect(killCalls[0].args).toContain(descendantPid);
+    expect(killCalls[0].args).not.toContain(nonDescendantPid);
+  });
+
+  it("verify: process cleanup escalates to SIGKILL when SIGTERM-ed process lingers (Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const stubbornPid = "55555";
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      getDescendantPids: () => new Set([55555]),
+      // Simulate a process that never exits voluntarily after SIGTERM.
+      checkPidAlive: (pid) => pid === 55555,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${stubbornPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sigkillCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-KILL"),
+    );
+    expect(sigkillCalls.length).toBeGreaterThanOrEqual(1);
+    expect(sigkillCalls[0].args).toContain(stubbornPid);
+
+    // Verify completes successfully despite the escalation
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions[0].state).toBe("merged");
   });
 
