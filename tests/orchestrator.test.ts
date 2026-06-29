@@ -111,7 +111,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -177,6 +177,10 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
     }
     return { code: 0, stdout: "" };
   });
+  // Process cleanup stubs for VERIFY (ES-494)
+  memoryRunner.on(["lsof", "+D"], { code: 1, stdout: "" });
+  memoryRunner.on(["kill", "-TERM"], { code: 0 });
+  memoryRunner.on(["kill", "-KILL"], { code: 0 });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const selfReviewAgent = opts?.selfReviewAgent ?? agent;
@@ -216,6 +220,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
     } : null,
+    getDescendantPids: opts?.getDescendantPids,
+    getReparentedPids: opts?.getReparentedPids,
+    checkPidAlive: opts?.checkPidAlive,
   });
   return { orch, store, source, agent, verifyAgent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
 }
@@ -8552,5 +8559,454 @@ describe("VERIFY (ES-491)", () => {
     expect(vrLogs[0].outcome).toBe("error");
     expect(vrLogs[0].errorDetail).toContain("judge contaminated");
     expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  // ---- ES-494: VERIFY run_recipe (C3) / C1 degradation / process cleanup ----
+
+  it("verify: kills orphaned processes found by lsof in worktree", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // Treat lsof PIDs as verified descendants so the descendant filter passes them through
+      getDescendantPids: () => new Set([12345, 67890]),
+      checkPidAlive: () => false, // processes exit immediately after SIGTERM
+    });
+    // Override lsof stub to return PIDs
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: "12345\n67890\n" });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    expect(killCalls[0].args).toContain("12345");
+    expect(killCalls[0].args).toContain("67890");
+  });
+
+  it("verify: process cleanup filters out PID 0, PID 1, self-PID, and non-numeric values", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const safePid = String(process.pid + 1000);
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // safePid is the only descendant so the descendant filter passes it through;
+      // the other entries (0, 1, self-PID, non-numeric) are caught by the basic filter.
+      getDescendantPids: () => new Set([parseInt(safePid, 10)]),
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `0\n1\n${process.pid}\nerror-msg\n${safePid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    expect(killCalls[0].args).toEqual(["-TERM", safePid]);
+  });
+
+  it("verify: process cleanup is best-effort — lsof failure does not halt verify", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const lsofRunner = new FakeCommandRunner();
+    lsofRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        const cIdx = args.indexOf("-C");
+        const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+        const slug = wtPath.replace(/^\/wt\//, "");
+        return { code: 0, stdout: `looppilot/${slug}-x\n` };
+      }
+      if (args.includes("rev-parse") && args.includes("HEAD")) {
+        return { code: 0, stdout: "abc1234\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+    lsofRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
+    lsofRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    lsofRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
+    lsofRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fd"], { code: 0 });
+    lsofRunner.on(["git", "checkout"], { code: 0 });
+    lsofRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
+    lsofRunner.on(["git", "reset", "--hard"], { code: 0 });
+    lsofRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+    // lsof throws to simulate command not found / failure
+    lsofRunner.on(["lsof", "+D"], (_args, _opts) => {
+      throw new Error("lsof: command not found");
+    });
+    lsofRunner.on(["kill", "-TERM"], { code: 0 });
+
+    // Build harness with custom runner that makes lsof throw
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const agent = new FakeAgentRunner();
+    const git = new FakeGitPr();
+    const monitor = new FakeMonitor();
+    const notifier = new FakeNotifier();
+    const verifyAgent = new FakeAgentRunner();
+    source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    const orch = new Orchestrator({
+      config,
+      source,
+      agent,
+      selfReviewAgent: agent,
+      verifyAgent,
+      git,
+      monitor,
+      notifier,
+      store,
+      buildPrompt: () => "PROMPT",
+      specLoader: null,
+      clock: fixedClock("2026-06-05T00:00:00.000Z"),
+      sleep: instantSleep(),
+      log: () => {},
+      recovery: new FakeWorkflowRecovery(),
+      planner,
+      designer: null,
+      designReviewer: planner,
+      codebaseSummaryGenerator: async () => "summary",
+      recoveryTurn: null,
+      runner: lsofRunner,
+      groomDeps: null,
+    });
+
+    await orch.run();
+
+    const sessions = store.sessionsForRun(store.latestRun()!.id);
+    // Verify still completes despite lsof failure
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  it("verify: process cleanup does not kill non-descendant PIDs (Finding 2)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const descendantPid = "11111";
+    const nonDescendantPid = "22222";
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // Only descendantPid is in the tree; nonDescendantPid must not be signalled.
+      getDescendantPids: () => new Set([11111]),
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${descendantPid}\n${nonDescendantPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    expect(killCalls[0].args).toContain(descendantPid);
+    expect(killCalls[0].args).not.toContain(nonDescendantPid);
+  });
+
+  it("verify: process cleanup kills reparented (orphaned) background servers not in descendant tree", async () => {
+    // Background servers started by run_recipe get reparented to init (PID 1)
+    // when the verifier agent process exits before cleanup. The descendant filter
+    // alone would drop these — the reparented filter must include them.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const reparentedPid = "33333"; // background dev server, reparented to init
+    const unrelatedPid = "44444";  // unrelated editor — not a descendant, not reparented
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // No descendants — the spawning process exited before cleanup ran
+      getDescendantPids: () => new Set<number>(),
+      // Only reparentedPid has PPID=1; unrelatedPid has a living parent
+      getReparentedPids: (pids) => new Set(pids.filter(p => p === 33333)),
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${reparentedPid}\n${unrelatedPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    // Reparented server must be killed
+    expect(killCalls[0].args).toContain(reparentedPid);
+    // Unrelated editor (not reparented, not descendant) must be spared
+    expect(killCalls[0].args).not.toContain(unrelatedPid);
+  });
+
+  it("verify: process cleanup kills children of reparented wrapper processes (ES-494 Finding 1)", async () => {
+    // Scenario: run_recipe starts 'npm run dev &'. The npm wrapper (wrapperPid) gets
+    // reparented to init (PPID=1) when the shell exits. The actual dev server (serverPid)
+    // is a child of npm — lsof finds it, but it is neither a direct orchestrator
+    // descendant nor PPID=1 itself, so the old filter would drop it. Fix: also include
+    // descendants of reparented wrappers.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const wrapperPid = 77777; // npm wrapper, reparented to init
+    const serverPid  = "88888"; // actual dev server, child of npm wrapper
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // Orchestrator has no direct descendants; wrapperPid is reparented;
+      // serverPid is a descendant of wrapperPid.
+      getDescendantPids: (rootPid) =>
+        rootPid === wrapperPid ? new Set([88888]) : new Set<number>(),
+      getReparentedPids: (pids) => new Set(pids.filter(p => p === wrapperPid)),
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${wrapperPid}\n${serverPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    // Both the reparented wrapper and its child (the actual dev server) must be killed.
+    expect(killCalls[0].args).toContain(String(wrapperPid));
+    expect(killCalls[0].args).toContain(serverPid);
+    // Session completes successfully
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  it("verify: process cleanup falls back to lsof hits when ancestry unavailable (non-Linux, ES-494 Finding 2)", async () => {
+    // On macOS (and any env without /proc), getDescendantPids returns null.
+    // Previously the cleanup was a no-op in this case. Now it must still kill
+    // the basic-filtered lsof hits so orphaned servers are cleaned up.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const orphanedPid = "99999";
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      getDescendantPids: () => null, // simulate non-Linux / /proc unavailable
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${orphanedPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    // The lsof-found orphaned process must be killed even without ancestry info
+    expect(killCalls[0].args).toContain(orphanedPid);
+    // Session completes — cleanup is best-effort, non-fatal
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  it("verify: process cleanup escalates to SIGKILL when SIGTERM-ed process lingers (Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const stubbornPid = "55555";
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      getDescendantPids: () => new Set([55555]),
+      // Simulate a process that never exits voluntarily after SIGTERM.
+      checkPidAlive: (pid) => pid === 55555,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${stubbornPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sigkillCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-KILL"),
+    );
+    expect(sigkillCalls.length).toBeGreaterThanOrEqual(1);
+    expect(sigkillCalls[0].args).toContain(stubbornPid);
+
+    // Verify completes successfully despite the escalation
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  it("verify: runRecipe set → evidence prompt includes acceptance check command", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.verifyAgent.contexts).toHaveLength(1);
+    expect(h.verifyAgent.contexts[0].prompt).toContain("npm run e2e");
+    expect(h.verifyAgent.contexts[0].prompt).toContain("Acceptance check");
+  });
+
+  it("verify: runRecipe empty → evidence prompt omits acceptance check (C1 degradation)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.verifyAgent.contexts).toHaveLength(1);
+    expect(h.verifyAgent.contexts[0].prompt).not.toContain("Acceptance check");
+    expect(h.verifyAgent.contexts[0].prompt).not.toContain("## Acceptance Check");
+  });
+
+  it("verify: runRecipe set → judgment includes acceptance check in oracle list", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(planner.contexts).toHaveLength(1);
+    expect(planner.contexts[0].prompt).toContain("acceptance check");
   });
 });

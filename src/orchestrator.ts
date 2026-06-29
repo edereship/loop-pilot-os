@@ -43,6 +43,7 @@ import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
 import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
 import { retryTransient } from "./transient-retry.js";
+import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 export interface IGroomBoardFetcher {
   getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
   getProjectIssueIds(): Promise<Set<string>>;
@@ -92,6 +93,25 @@ export interface OrchestratorDeps {
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
   groomDeps: GroomDeps | null;
+  /**
+   * Returns the set of descendant PIDs of the given root PID (injectable for
+   * testing). Returning `null` signals that the process tree cannot be
+   * determined; cleanup then falls back to killing all basic-filtered PIDs.
+   * Default: reads /proc on Linux; returns null on non-Linux platforms.
+   */
+  getDescendantPids?: (rootPid: number) => Set<number> | null;
+  /**
+   * Returns the subset of the given candidate PIDs whose parent PID is 1
+   * (reparented to init). These are background servers started by the verifier
+   * that survived after their parent exited. Injectable for testing.
+   * Default: reads /proc/<pid>/stat on Linux; returns empty set elsewhere.
+   */
+  getReparentedPids?: (pids: number[]) => Set<number>;
+  /**
+   * Checks whether a process with the given PID is currently alive (injectable
+   * for testing). Default: uses process.kill(pid, 0).
+   */
+  checkPidAlive?: (pid: number) => boolean;
 }
 
 /** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
@@ -125,6 +145,9 @@ export class Orchestrator {
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
   private readonly groomDeps: GroomDeps | null;
+  private readonly getDescendantPids: (rootPid: number) => Set<number> | null;
+  private readonly getReparentedPids: (pids: number[]) => Set<number>;
+  private readonly checkPidAlive: (pid: number) => boolean;
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
@@ -153,6 +176,9 @@ export class Orchestrator {
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
     this.groomDeps = deps.groomDeps;
+    this.getDescendantPids = deps.getDescendantPids ?? procDescendantPids;
+    this.getReparentedPids = deps.getReparentedPids ?? procReparentedPids;
+    this.checkPidAlive = deps.checkPidAlive ?? isPidAlive;
   }
 
   /** 停止要求を立てる（SIGINT ハンドラ等から呼ぶ）。次の安全点でクリーン halt する。 */
@@ -2808,7 +2834,9 @@ export class Orchestrator {
     worktreePath: string,
     branch: string,
     preVerifySha: string | null,
+    killProcesses: boolean = true,
   ): Promise<boolean> {
+    if (killProcesses) await this.killWorktreeProcesses(worktreePath);
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
     if (preVerifySha === null) return false;
     try {
@@ -2838,6 +2866,125 @@ export class Orchestrator {
     } catch (err) {
       this.log(`verify: cleanup failed: ${errMsg(err)}`);
       return false;
+    }
+  }
+
+  // ---- Process cleanup (ES-494) ----
+  private async killWorktreeProcesses(worktreePath: string): Promise<void> {
+    try {
+      // ── 1. Collect candidate PIDs ──────────────────────────────────────────
+      let rawPids: string[];
+      try {
+        const lsofResult = await this.runner.run(
+          "lsof", ["+D", worktreePath, "-t"],
+          { cwd: worktreePath, timeoutMs: 10_000 },
+        );
+        rawPids = lsofResult.stdout.trim().split("\n").filter(Boolean);
+      } catch (lsofErr) {
+        // lsof not installed; fall back to /proc cwd scan on Linux (Finding 1).
+        rawPids = procCwdPids(worktreePath);
+        if (rawPids.length === 0) {
+          this.log(
+            `verify: process cleanup skipped — lsof unavailable and /proc found no candidates: ${errMsg(lsofErr)}`,
+          );
+          return;
+        }
+      }
+
+      // ── 2. Basic PID filter ────────────────────────────────────────────────
+      const myPid = String(process.pid);
+      const basicFiltered = rawPids.filter(
+        p => /^\d+$/.test(p) && p !== "0" && p !== "1" && p !== myPid,
+      );
+      if (basicFiltered.length === 0) return;
+
+      // ── 3. Restrict to verifier-spawned descendants or reparented orphans ──
+      // When we can determine the process tree (Linux /proc), only signal
+      // processes descended from this orchestrator — not unrelated shells,
+      // editors, or test watchers that happen to have files open in the
+      // worktree. Also include reparented processes (parent PID = 1): these are
+      // background servers started by the verifier whose spawning process exited
+      // before cleanup, causing the OS to reparent them to init. Without this,
+      // long-running dev servers survive across verification attempts and can hold
+      // ports/files that poison the next run.
+      // Also include children of reparented wrappers: when run_recipe launches
+      // 'npm run dev &', the npm wrapper may be reparented to init while the actual
+      // server remains npm's child. lsof finds the server, but it is neither a
+      // direct descendant of the orchestrator nor PPID=1 itself.
+      // Fall back to the basic-filtered lsof set when the tree cannot be determined
+      // (non-Linux / /proc unreadable) — lsof +D already scopes to the worktree
+      // directory, limiting collateral risk.
+      const descendants = this.getDescendantPids(process.pid);
+      let pids: string[];
+      if (descendants !== null) {
+        const candidateNums = basicFiltered.map(p => parseInt(p, 10));
+        const reparented = this.getReparentedPids(candidateNums);
+        // Collect descendants of each reparented wrapper so that child processes
+        // of the wrapper (e.g. the actual dev server started by npm) are included.
+        const reparentedDescendants = new Set<number>();
+        for (const rp of reparented) {
+          const rpDescs = this.getDescendantPids(rp);
+          if (rpDescs) for (const d of rpDescs) reparentedDescendants.add(d);
+        }
+        pids = basicFiltered.filter(p => {
+          const pid = parseInt(p, 10);
+          return descendants.has(pid) || reparented.has(pid) || reparentedDescendants.has(pid);
+        });
+      } else {
+        // Cannot determine ancestry (non-Linux / /proc unreadable): fall back to
+        // basic-filtered lsof hits rather than skipping cleanup entirely.
+        this.log("verify: process cleanup: ancestry unavailable (non-Linux), using basic-filtered lsof hits");
+        pids = basicFiltered;
+      }
+      if (pids.length === 0) return;
+
+      this.log(
+        `verify: killing ${pids.length} orphaned process(es) in worktree: ${pids.join(",")}`,
+      );
+
+      // ── 4. SIGTERM ─────────────────────────────────────────────────────────
+      try {
+        const termResult = await this.runner.run(
+          "kill", ["-TERM", ...pids],
+          { cwd: worktreePath, timeoutMs: 5_000 },
+        );
+        if (termResult.code !== 0) {
+          this.log(
+            `verify: kill -TERM returned exit ${termResult.code} for PIDs ${pids.join(",")}`,
+          );
+        }
+      } catch (termErr) {
+        this.log(`verify: kill -TERM failed: ${errMsg(termErr)}`);
+        return;
+      }
+
+      // ── 5. Wait for exit; escalate to SIGKILL (Finding 3) ─────────────────
+      // Poll via process.kill(pid, 0) rather than a runner subprocess so the
+      // check works without any command stubs in test environments.
+      const POLL_INTERVAL_MS = 200;
+      const MAX_POLLS = 15; // up to ~3 s of waiting
+      let remaining = pids.filter(p => this.checkPidAlive(parseInt(p, 10)));
+      for (let poll = 0; poll < MAX_POLLS && remaining.length > 0; poll++) {
+        await this.sleep(POLL_INTERVAL_MS);
+        remaining = remaining.filter(p => this.checkPidAlive(parseInt(p, 10)));
+      }
+      if (remaining.length > 0) {
+        this.log(
+          `verify: ${remaining.length} process(es) still alive after SIGTERM; escalating to SIGKILL: ${remaining.join(",")}`,
+        );
+        try {
+          await this.runner.run(
+            "kill", ["-KILL", ...remaining],
+            { cwd: worktreePath, timeoutMs: 5_000 },
+          );
+        } catch (killErr) {
+          this.log(`verify: kill -KILL failed: ${errMsg(killErr)}`);
+        }
+      }
+    } catch (err) {
+      this.log(
+        `verify: process cleanup failed (best-effort, continuing): ${errMsg(err)}`,
+      );
     }
   }
 
@@ -3189,7 +3336,7 @@ export class Orchestrator {
       });
     } catch (err) {
       this.log(`verify: judge exception (fail-open): ${errMsg(err)}`);
-      const judgeExcCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+      const judgeExcCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha, false);
       const freshSessJudgeExc = this.store.getSession(session.id);
       if (!judgeExcCleanupOk) {
         this.store.updateSession(session.id, {
@@ -3232,7 +3379,7 @@ export class Orchestrator {
     }
 
     if (judgmentOutcome.kind === "interrupted") {
-      const judgeInterruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+      const judgeInterruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha, false);
       const freshSessJudgeInt = this.store.getSession(session.id);
       // Do NOT increment verifyAttempts: no verdict was produced; the cap must only count
       // real failed judgments so a SIGINT does not consume a retry slot (Finding 3 ES-491).
@@ -3297,7 +3444,7 @@ export class Orchestrator {
     }
 
     // Cleanup judgment worktree pollution before processing any non-interrupted verdict.
-    const judgmentCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+    const judgmentCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha, false);
     if (!judgmentCleanupOk) {
       const freshSessJudgeClean = this.store.getSession(session.id);
       this.store.updateSession(session.id, {
@@ -4903,6 +5050,90 @@ export function isPidAlive(pid: number): boolean {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// Scan /proc for processes whose cwd is inside worktreePath.
+// Used as a lsof fallback on Linux when lsof is not installed (Finding 1).
+function procCwdPids(worktreePath: string): string[] {
+  const pids: string[] = [];
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const cwd = readlinkSync(`/proc/${entry}/cwd`);
+        if (cwd === worktreePath || cwd.startsWith(worktreePath + "/")) {
+          pids.push(entry);
+        }
+      } catch { /* process exited or permission denied */ }
+    }
+  } catch { /* /proc not available (non-Linux) */ }
+  return pids;
+}
+
+// Build the set of all descendant PIDs of rootPid via /proc/<pid>/stat.
+// Returns null when /proc is not available (non-Linux) so the caller can fall
+// back to the basic-filtered set rather than refusing to clean up at all.
+function procDescendantPids(rootPid: number): Set<number> | null {
+  try {
+    const childrenOf = new Map<number, number[]>();
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+        // /proc/<pid>/stat format: "<pid> (<comm>) <state> <ppid> ..."
+        // comm can contain spaces and parens; find the LAST ')' to skip it.
+        const lastParen = stat.lastIndexOf(")");
+        if (lastParen < 0) continue;
+        const fields = stat.slice(lastParen + 1).trimStart().split(/\s+/);
+        // fields[0]=state  fields[1]=ppid
+        if (fields.length < 2) continue;
+        const ppid = parseInt(fields[1], 10);
+        const pid = parseInt(entry, 10);
+        if (isNaN(ppid) || isNaN(pid)) continue;
+        const children = childrenOf.get(ppid) ?? [];
+        children.push(pid);
+        childrenOf.set(ppid, children);
+      } catch { /* process exited between readdir and readFile */ }
+    }
+    const result = new Set<number>();
+    const queue = [...(childrenOf.get(rootPid) ?? [])];
+    while (queue.length > 0) {
+      const p = queue.shift()!;
+      result.add(p);
+      for (const child of (childrenOf.get(p) ?? [])) queue.push(child);
+    }
+    return result;
+  } catch {
+    return null; // /proc not available (non-Linux)
+  }
+}
+
+// Returns the subset of candidatePids whose parent PID is 1 (reparented to init).
+// These are background servers started by a verifier run whose spawning process
+// exited before process cleanup — the OS reparented them to init, so they no
+// longer appear in the orchestrator's descendant tree even though lsof can still
+// find their open file handles under the worktree.
+// A PGID check is intentionally omitted: stale orphans from a prior LoopPilot
+// session (e.g. after a crash/restart) still have PPID=1 but carry the old
+// orchestrator's PGID, not the current one. The lsof +D worktree filter already
+// limits candidates to processes with handles in the worktree, so PPID=1 alone
+// is sufficient to identify reparented worktree processes worth cleaning up.
+// Returns an empty set when /proc is not available (non-Linux).
+function procReparentedPids(candidatePids: number[]): Set<number> {
+  const result = new Set<number>();
+  for (const pid of candidatePids) {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const lastParen = stat.lastIndexOf(")");
+      if (lastParen < 0) continue;
+      const fields = stat.slice(lastParen + 1).trimStart().split(/\s+/);
+      // fields[0]=state  fields[1]=ppid
+      if (fields.length < 2) continue;
+      const ppid = parseInt(fields[1], 10);
+      if (ppid === 1) result.add(pid);
+    } catch { /* process exited between lsof and here, or /proc unavailable */ }
+  }
+  return result;
 }
 
 function describePr(prNumber: number | null): string {
