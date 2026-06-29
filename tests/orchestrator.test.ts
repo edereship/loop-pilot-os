@@ -177,6 +177,9 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
     }
     return { code: 0, stdout: "" };
   });
+  // Process cleanup stubs for VERIFY (ES-494)
+  memoryRunner.on(["lsof", "+D"], { code: 1, stdout: "" });
+  memoryRunner.on(["kill", "-TERM"], { code: 0 });
   const groomBoardFetcher = new FakeGroomBoardFetcher();
   const groomLinearClient = new FakeGroomLinearClient();
   const selfReviewAgent = opts?.selfReviewAgent ?? agent;
@@ -8552,5 +8555,231 @@ describe("VERIFY (ES-491)", () => {
     expect(vrLogs[0].outcome).toBe("error");
     expect(vrLogs[0].errorDetail).toContain("judge contaminated");
     expect(h.git.calls.some(c => c.method === "pushAndOpenPr")).toBe(false);
+  });
+
+  // ---- ES-494: VERIFY run_recipe (C3) / C1 degradation / process cleanup ----
+
+  it("verify: kills orphaned processes found by lsof in worktree", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    // Override lsof stub to return PIDs
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: "12345\n67890\n" });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    expect(killCalls[0].args).toContain("12345");
+    expect(killCalls[0].args).toContain("67890");
+  });
+
+  it("verify: process cleanup filters out PID 0, PID 1, self-PID, and non-numeric values", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    const safePid = String(process.pid + 1000);
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `0\n1\n${process.pid}\nerror-msg\n${safePid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    expect(killCalls[0].args).toEqual(["-TERM", safePid]);
+  });
+
+  it("verify: process cleanup is best-effort — lsof failure does not halt verify", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const lsofRunner = new FakeCommandRunner();
+    lsofRunner.on(["git", "-C"], (args, _opts) => {
+      if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
+        const cIdx = args.indexOf("-C");
+        const wtPath = cIdx >= 0 && cIdx + 1 < args.length ? args[cIdx + 1] : "";
+        const slug = wtPath.replace(/^\/wt\//, "");
+        return { code: 0, stdout: `looppilot/${slug}-x\n` };
+      }
+      if (args.includes("rev-parse") && args.includes("HEAD")) {
+        return { code: 0, stdout: "abc1234\n" };
+      }
+      return { code: 0, stdout: "" };
+    });
+    lsofRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
+    lsofRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    lsofRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
+    lsofRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fd"], { code: 0 });
+    lsofRunner.on(["git", "checkout"], { code: 0 });
+    lsofRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
+    lsofRunner.on(["git", "reset", "--hard"], { code: 0 });
+    lsofRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+    // lsof throws to simulate command not found / failure
+    lsofRunner.on(["lsof", "+D"], (_args, _opts) => {
+      throw new Error("lsof: command not found");
+    });
+    lsofRunner.on(["kill", "-TERM"], { code: 0 });
+
+    // Build harness with custom runner that makes lsof throw
+    const store = new SqliteStore(":memory:");
+    const source = new FakeTaskSource();
+    const agent = new FakeAgentRunner();
+    const git = new FakeGitPr();
+    const monitor = new FakeMonitor();
+    const notifier = new FakeNotifier();
+    const verifyAgent = new FakeAgentRunner();
+    source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    const orch = new Orchestrator({
+      config,
+      source,
+      agent,
+      selfReviewAgent: agent,
+      verifyAgent,
+      git,
+      monitor,
+      notifier,
+      store,
+      buildPrompt: () => "PROMPT",
+      specLoader: null,
+      clock: fixedClock("2026-06-05T00:00:00.000Z"),
+      sleep: instantSleep(),
+      log: () => {},
+      recovery: new FakeWorkflowRecovery(),
+      planner,
+      designer: null,
+      designReviewer: planner,
+      codebaseSummaryGenerator: async () => "summary",
+      recoveryTurn: null,
+      runner: lsofRunner,
+      groomDeps: null,
+    });
+
+    await orch.run();
+
+    const sessions = store.sessionsForRun(store.latestRun()!.id);
+    // Verify still completes despite lsof failure
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  it("verify: runRecipe set → evidence prompt includes acceptance check command", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.verifyAgent.contexts).toHaveLength(1);
+    expect(h.verifyAgent.contexts[0].prompt).toContain("npm run e2e");
+    expect(h.verifyAgent.contexts[0].prompt).toContain("Acceptance check");
+  });
+
+  it("verify: runRecipe empty → evidence prompt omits acceptance check (C1 degradation)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.verifyAgent.contexts).toHaveLength(1);
+    expect(h.verifyAgent.contexts[0].prompt).not.toContain("Acceptance check");
+    expect(h.verifyAgent.contexts[0].prompt).not.toContain("## Acceptance Check");
+  });
+
+  it("verify: runRecipe set → judgment includes acceptance check in oracle list", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const h = makeHarness(config, { planner, designReviewer: planner });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(planner.contexts).toHaveLength(1);
+    expect(planner.contexts[0].prompt).toContain("acceptance check");
   });
 });

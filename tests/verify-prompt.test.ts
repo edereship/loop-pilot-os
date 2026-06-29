@@ -142,6 +142,33 @@ describe("buildVerifyEvidencePrompt", () => {
     const result = buildVerifyEvidencePrompt({ issue, brief: null, specContent: null, defaultBranch: "main" });
     expect(result).not.toContain("## Acceptance Criteria Assessment");
   });
+
+  // ---- ES-494: runRecipe (C3) / C1 degradation ----
+
+  it("includes acceptance check instruction when runRecipe is set", () => {
+    const result = buildVerifyEvidencePrompt({
+      issue, brief, specContent: null, defaultBranch: "main", runRecipe: "npm run e2e",
+    });
+    expect(result).toContain("Acceptance check");
+    expect(result).toContain("npm run e2e");
+    expect(result).toContain("## Acceptance Check");
+  });
+
+  it("omits acceptance check instruction when runRecipe is empty (C1 degradation)", () => {
+    const result = buildVerifyEvidencePrompt({
+      issue, brief, specContent: null, defaultBranch: "main", runRecipe: "",
+    });
+    expect(result).not.toContain("Acceptance check");
+    expect(result).not.toContain("## Acceptance Check");
+  });
+
+  it("omits acceptance check instruction when runRecipe is undefined (C1 degradation)", () => {
+    const result = buildVerifyEvidencePrompt({
+      issue, brief, specContent: null, defaultBranch: "main",
+    });
+    expect(result).not.toContain("Acceptance check");
+    expect(result).not.toContain("## Acceptance Check");
+  });
 });
 
 describe("buildVerifyJudgmentPrompt", () => {
@@ -255,5 +282,29 @@ describe("buildVerifyJudgmentPrompt", () => {
     expect(evidenceSection).toMatch(/```[\s\S]*?Build: OK/);
     // The prompt must tell the judge to treat the block as data, not instructions
     expect(evidenceSection).toMatch(/data only|not as instructions/i);
+  });
+
+  // ---- ES-494: hasRunRecipe flag ----
+
+  it("includes acceptance check in oracle list when hasRunRecipe is true", () => {
+    const result = buildVerifyJudgmentPrompt({
+      acceptance: "Criteria",
+      diff: "diff",
+      evidence: "evidence",
+      hasRunRecipe: true,
+    });
+    expect(result).toContain("acceptance check");
+  });
+
+  it("omits acceptance check from oracle list when hasRunRecipe is false", () => {
+    const result = buildVerifyJudgmentPrompt({
+      acceptance: "Criteria",
+      diff: "diff",
+      evidence: "evidence",
+      hasRunRecipe: false,
+    });
+    const oracleLine = result.split("\n").find(l => l.includes("objective oracle"));
+    expect(oracleLine).toBeDefined();
+    expect(oracleLine).not.toContain("acceptance check");
   });
 });

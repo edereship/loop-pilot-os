@@ -2809,6 +2809,7 @@ export class Orchestrator {
     branch: string,
     preVerifySha: string | null,
   ): Promise<boolean> {
+    await this.killWorktreeProcesses(worktreePath);
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
     if (preVerifySha === null) return false;
     try {
@@ -2838,6 +2839,31 @@ export class Orchestrator {
     } catch (err) {
       this.log(`verify: cleanup failed: ${errMsg(err)}`);
       return false;
+    }
+  }
+
+  // ---- Process cleanup (ES-494) ----
+  private async killWorktreeProcesses(worktreePath: string): Promise<void> {
+    try {
+      const result = await this.runner.run(
+        "lsof", ["+D", worktreePath, "-t"],
+        { cwd: worktreePath, timeoutMs: 10_000 },
+      );
+      const myPid = String(process.pid);
+      const pids = result.stdout.trim().split("\n")
+        .filter(Boolean)
+        .filter(p => /^\d+$/.test(p) && p !== "0" && p !== "1" && p !== myPid);
+      if (pids.length === 0) return;
+      this.log(`verify: killing ${pids.length} orphaned process(es) in worktree: ${pids.join(",")}`);
+      const killResult = await this.runner.run(
+        "kill", ["-TERM", ...pids],
+        { cwd: worktreePath, timeoutMs: 5_000 },
+      );
+      if (killResult.code !== 0) {
+        this.log(`verify: kill returned exit ${killResult.code} for PIDs ${pids.join(",")}`);
+      }
+    } catch (err) {
+      this.log(`verify: process cleanup failed (best-effort, continuing): ${errMsg(err)}`);
     }
   }
 
