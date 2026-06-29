@@ -2834,8 +2834,9 @@ export class Orchestrator {
     worktreePath: string,
     branch: string,
     preVerifySha: string | null,
+    killProcesses: boolean = true,
   ): Promise<boolean> {
-    await this.killWorktreeProcesses(worktreePath);
+    if (killProcesses) await this.killWorktreeProcesses(worktreePath);
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
     if (preVerifySha === null) return false;
     try {
@@ -2918,7 +2919,10 @@ export class Orchestrator {
           return descendants.has(pid) || reparented.has(pid);
         });
       } else {
-        pids = basicFiltered;
+        // Cannot determine ancestry (non-Linux / /proc unreadable): skip cleanup
+        // entirely rather than risk SIGKILLing unrelated processes found by lsof.
+        this.log("verify: process cleanup skipped — ancestry unavailable (non-Linux)");
+        return;
       }
       if (pids.length === 0) return;
 
@@ -3320,7 +3324,7 @@ export class Orchestrator {
       });
     } catch (err) {
       this.log(`verify: judge exception (fail-open): ${errMsg(err)}`);
-      const judgeExcCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+      const judgeExcCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha, false);
       const freshSessJudgeExc = this.store.getSession(session.id);
       if (!judgeExcCleanupOk) {
         this.store.updateSession(session.id, {
@@ -3363,7 +3367,7 @@ export class Orchestrator {
     }
 
     if (judgmentOutcome.kind === "interrupted") {
-      const judgeInterruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+      const judgeInterruptCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha, false);
       const freshSessJudgeInt = this.store.getSession(session.id);
       // Do NOT increment verifyAttempts: no verdict was produced; the cap must only count
       // real failed judgments so a SIGINT does not consume a retry slot (Finding 3 ES-491).
@@ -3428,7 +3432,7 @@ export class Orchestrator {
     }
 
     // Cleanup judgment worktree pollution before processing any non-interrupted verdict.
-    const judgmentCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha);
+    const judgmentCleanupOk = await this.cleanupVerifierWorktree(worktreePath, session.branch, preVerifySha, false);
     if (!judgmentCleanupOk) {
       const freshSessJudgeClean = this.store.getSession(session.id);
       this.store.updateSession(session.id, {
@@ -5092,24 +5096,48 @@ function procDescendantPids(rootPid: number): Set<number> | null {
   }
 }
 
-// Returns the subset of candidatePids whose parent PID is 1 (reparented to init).
+// Returns the subset of candidatePids whose parent PID is 1 (reparented to init)
+// AND whose process group matches the orchestrator's process group.
 // These are background servers started by a verifier run whose spawning process
 // exited before process cleanup — the OS reparented them to init, so they no
 // longer appear in the orchestrator's descendant tree even though lsof can still
 // find their open file handles under the worktree.
+// Requiring a matching PGID guards against killing unrelated orphaned processes
+// (editors, test watchers) that happen to have PPID=1 but were never part of
+// this verifier run.
 // Returns an empty set when /proc is not available (non-Linux).
 function procReparentedPids(candidatePids: number[]): Set<number> {
   const result = new Set<number>();
+
+  // Read our own PGID for ownership verification.
+  let myPgid: number | null = null;
+  try {
+    const selfStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    const selfLp = selfStat.lastIndexOf(")");
+    if (selfLp >= 0) {
+      const selfFields = selfStat.slice(selfLp + 1).trimStart().split(/\s+/);
+      // selfFields[0]=state  [1]=ppid  [2]=pgrp
+      if (selfFields.length >= 3) {
+        const pgid = parseInt(selfFields[2], 10);
+        if (!isNaN(pgid)) myPgid = pgid;
+      }
+    }
+  } catch { /* /proc unavailable */ }
+
+  if (myPgid === null) return result; // can't verify ownership without our own PGID
+
   for (const pid of candidatePids) {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       const lastParen = stat.lastIndexOf(")");
       if (lastParen < 0) continue;
       const fields = stat.slice(lastParen + 1).trimStart().split(/\s+/);
-      // fields[0]=state  fields[1]=ppid
-      if (fields.length < 2) continue;
+      // fields[0]=state  fields[1]=ppid  fields[2]=pgrp
+      if (fields.length < 3) continue;
       const ppid = parseInt(fields[1], 10);
-      if (ppid === 1) result.add(pid);
+      const pgrp = parseInt(fields[2], 10);
+      // Must be reparented to init AND share the orchestrator's process group.
+      if (ppid === 1 && pgrp === myPgid) result.add(pid);
     } catch { /* process exited between lsof and here, or /proc unavailable */ }
   }
   return result;
