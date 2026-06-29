@@ -8808,6 +8808,96 @@ describe("VERIFY (ES-491)", () => {
     expect(killCalls[0].args).not.toContain(unrelatedPid);
   });
 
+  it("verify: process cleanup kills children of reparented wrapper processes (ES-494 Finding 1)", async () => {
+    // Scenario: run_recipe starts 'npm run dev &'. The npm wrapper (wrapperPid) gets
+    // reparented to init (PPID=1) when the shell exits. The actual dev server (serverPid)
+    // is a child of npm — lsof finds it, but it is neither a direct orchestrator
+    // descendant nor PPID=1 itself, so the old filter would drop it. Fix: also include
+    // descendants of reparented wrappers.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const wrapperPid = 77777; // npm wrapper, reparented to init
+    const serverPid  = "88888"; // actual dev server, child of npm wrapper
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // Orchestrator has no direct descendants; wrapperPid is reparented;
+      // serverPid is a descendant of wrapperPid.
+      getDescendantPids: (rootPid) =>
+        rootPid === wrapperPid ? new Set([88888]) : new Set<number>(),
+      getReparentedPids: (pids) => new Set(pids.filter(p => p === wrapperPid)),
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${wrapperPid}\n${serverPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    // Both the reparented wrapper and its child (the actual dev server) must be killed.
+    expect(killCalls[0].args).toContain(String(wrapperPid));
+    expect(killCalls[0].args).toContain(serverPid);
+    // Session completes successfully
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+  });
+
+  it("verify: process cleanup falls back to lsof hits when ancestry unavailable (non-Linux, ES-494 Finding 2)", async () => {
+    // On macOS (and any env without /proc), getDescendantPids returns null.
+    // Previously the cleanup was a no-op in this case. Now it must still kill
+    // the basic-filtered lsof hits so orphaned servers are cleaned up.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const orphanedPid = "99999";
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      getDescendantPids: () => null, // simulate non-Linux / /proc unavailable
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${orphanedPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    // The lsof-found orphaned process must be killed even without ancestry info
+    expect(killCalls[0].args).toContain(orphanedPid);
+    // Session completes — cleanup is best-effort, non-fatal
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0].state).toBe("merged");
+  });
+
   it("verify: process cleanup escalates to SIGKILL when SIGTERM-ed process lingers (Finding 3)", async () => {
     const config = makeConfig({ maxTasksPerRun: 1 });
     (config as any).verify = { enabled: true, runRecipe: "" };

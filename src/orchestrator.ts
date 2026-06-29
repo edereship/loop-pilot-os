@@ -2907,22 +2907,34 @@ export class Orchestrator {
       // before cleanup, causing the OS to reparent them to init. Without this,
       // long-running dev servers survive across verification attempts and can hold
       // ports/files that poison the next run.
-      // Fall back to the basic-filtered set when the tree cannot be determined
-      // (non-Linux / /proc unreadable).
+      // Also include children of reparented wrappers: when run_recipe launches
+      // 'npm run dev &', the npm wrapper may be reparented to init while the actual
+      // server remains npm's child. lsof finds the server, but it is neither a
+      // direct descendant of the orchestrator nor PPID=1 itself.
+      // Fall back to the basic-filtered lsof set when the tree cannot be determined
+      // (non-Linux / /proc unreadable) — lsof +D already scopes to the worktree
+      // directory, limiting collateral risk.
       const descendants = this.getDescendantPids(process.pid);
       let pids: string[];
       if (descendants !== null) {
         const candidateNums = basicFiltered.map(p => parseInt(p, 10));
         const reparented = this.getReparentedPids(candidateNums);
+        // Collect descendants of each reparented wrapper so that child processes
+        // of the wrapper (e.g. the actual dev server started by npm) are included.
+        const reparentedDescendants = new Set<number>();
+        for (const rp of reparented) {
+          const rpDescs = this.getDescendantPids(rp);
+          if (rpDescs) for (const d of rpDescs) reparentedDescendants.add(d);
+        }
         pids = basicFiltered.filter(p => {
           const pid = parseInt(p, 10);
-          return descendants.has(pid) || reparented.has(pid);
+          return descendants.has(pid) || reparented.has(pid) || reparentedDescendants.has(pid);
         });
       } else {
-        // Cannot determine ancestry (non-Linux / /proc unreadable): skip cleanup
-        // entirely rather than risk SIGKILLing unrelated processes found by lsof.
-        this.log("verify: process cleanup skipped — ancestry unavailable (non-Linux)");
-        return;
+        // Cannot determine ancestry (non-Linux / /proc unreadable): fall back to
+        // basic-filtered lsof hits rather than skipping cleanup entirely.
+        this.log("verify: process cleanup: ancestry unavailable (non-Linux), using basic-filtered lsof hits");
+        pids = basicFiltered;
       }
       if (pids.length === 0) return;
 
@@ -5096,48 +5108,29 @@ function procDescendantPids(rootPid: number): Set<number> | null {
   }
 }
 
-// Returns the subset of candidatePids whose parent PID is 1 (reparented to init)
-// AND whose process group matches the orchestrator's process group.
+// Returns the subset of candidatePids whose parent PID is 1 (reparented to init).
 // These are background servers started by a verifier run whose spawning process
 // exited before process cleanup — the OS reparented them to init, so they no
 // longer appear in the orchestrator's descendant tree even though lsof can still
 // find their open file handles under the worktree.
-// Requiring a matching PGID guards against killing unrelated orphaned processes
-// (editors, test watchers) that happen to have PPID=1 but were never part of
-// this verifier run.
+// A PGID check is intentionally omitted: stale orphans from a prior LoopPilot
+// session (e.g. after a crash/restart) still have PPID=1 but carry the old
+// orchestrator's PGID, not the current one. The lsof +D worktree filter already
+// limits candidates to processes with handles in the worktree, so PPID=1 alone
+// is sufficient to identify reparented worktree processes worth cleaning up.
 // Returns an empty set when /proc is not available (non-Linux).
 function procReparentedPids(candidatePids: number[]): Set<number> {
   const result = new Set<number>();
-
-  // Read our own PGID for ownership verification.
-  let myPgid: number | null = null;
-  try {
-    const selfStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
-    const selfLp = selfStat.lastIndexOf(")");
-    if (selfLp >= 0) {
-      const selfFields = selfStat.slice(selfLp + 1).trimStart().split(/\s+/);
-      // selfFields[0]=state  [1]=ppid  [2]=pgrp
-      if (selfFields.length >= 3) {
-        const pgid = parseInt(selfFields[2], 10);
-        if (!isNaN(pgid)) myPgid = pgid;
-      }
-    }
-  } catch { /* /proc unavailable */ }
-
-  if (myPgid === null) return result; // can't verify ownership without our own PGID
-
   for (const pid of candidatePids) {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       const lastParen = stat.lastIndexOf(")");
       if (lastParen < 0) continue;
       const fields = stat.slice(lastParen + 1).trimStart().split(/\s+/);
-      // fields[0]=state  fields[1]=ppid  fields[2]=pgrp
-      if (fields.length < 3) continue;
+      // fields[0]=state  fields[1]=ppid
+      if (fields.length < 2) continue;
       const ppid = parseInt(fields[1], 10);
-      const pgrp = parseInt(fields[2], 10);
-      // Must be reparented to init AND share the orchestrator's process group.
-      if (ppid === 1 && pgrp === myPgid) result.add(pid);
+      if (ppid === 1) result.add(pid);
     } catch { /* process exited between lsof and here, or /proc unavailable */ }
   }
   return result;
