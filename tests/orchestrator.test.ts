@@ -754,13 +754,12 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
 });
 
 describe("Orchestrator 失敗系 — HANDOFF（仕様 §5.4 / カーネル §7.5）", () => {
-  it("addLabel が 3 連続 throw → stopped(handoff_failed)。PR は作成済みなので stop_detail に PR 番号を明記する", async () => {
+  it("addLabel が決定的エラーで throw → リトライせず即 stopped(handoff_failed)。PR は作成済みなので stop_detail に PR 番号を明記する", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     h.source.queue = [issue("issue-A", "TY-1")];
     h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
     h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
-    // pushAndOpenPr は #100 を返す。addLabel をずっと失敗させる（retry 3 回）
     h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
     let addLabelCalls = 0;
     h.git.addLabel = async (prNumber: number, label: string) => {
@@ -774,15 +773,11 @@ describe("Orchestrator 失敗系 — HANDOFF（仕様 §5.4 / カーネル §7.5
     const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
     expect(s.state).toBe("stopped");
     expect(s.failureReason).toBe("handoff_failed");
-    // PR 番号は即時永続化されている
     expect(s.prNumber).toBe(100);
-    // stop_detail に PR #100 が明記される（仕様: 作成済みPRを通知に明記）
     expect(s.stopDetail).toContain("PR #100");
-    // addLabel は retry で 3 回呼ばれた
-    expect(addLabelCalls).toBe(3);
-    // transition(in_review) は addLabel が先に死ぬので呼ばれていない
+    // deterministic error → retryTransient throws immediately (no retry)
+    expect(addLabelCalls).toBe(1);
     expect(h.source.transitions).toEqual([{ issueId: "issue-A", state: "in_progress" }]);
-    // 通知列 run_started → halted(handoff_failed)
     expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "handoff_failed" });
   });
 
@@ -801,6 +796,169 @@ describe("Orchestrator 失敗系 — HANDOFF（仕様 §5.4 / カーネル §7.5
     expect(s.failureReason).toBe("handoff_failed");
     expect(s.prNumber).toBeNull();
     expect(s.stopDetail).toContain("no PR created");
+  });
+});
+
+describe("N1 ネットワーク瞬断リトライ — CLAIM transition (ES-488)", () => {
+  it("transient エラー → リトライ → 成功", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    // transition を1回 ECONNRESET で失敗させ、2回目で成功させる
+    let transitionCalls = 0;
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (id: string, state: string) => {
+      transitionCalls++;
+      if (transitionCalls === 1) throw new Error("ECONNRESET");
+      return origTransition(id, state as any);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    // transition was called: 1st ECONNRESET (retried) + 2nd in_progress (success) + in_review + done
+    expect(transitionCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it("transient エラー使い切り → claim_failed → HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    let claimTransitionCalls = 0;
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (id: string, state: string) => {
+      if (state === "in_progress") {
+        claimTransitionCalls++;
+        throw new Error("ECONNRESET");
+      }
+      return origTransition(id, state as any);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("claim_failed");
+    expect(s.stopDetail).toContain("ECONNRESET");
+    // 1 initial + 2 retries = 3 total (in_progress only)
+    expect(claimTransitionCalls).toBe(3);
+  });
+
+  it("決定的エラー → リトライせず即 claim_failed", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    let claimTransitionCalls = 0;
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (id: string, state: string) => {
+      if (state === "in_progress") {
+        claimTransitionCalls++;
+        throw new Error("HTTP 403 Forbidden");
+      }
+      return origTransition(id, state as any);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("claim_failed");
+    // deterministic → no retry (in_progress only)
+    expect(claimTransitionCalls).toBe(1);
+  });
+});
+
+describe("N1 ネットワーク瞬断リトライ — HANDOFF operations (ES-488)", () => {
+  it("findOpenPrForBranch transient → リトライ → 成功", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    let findCalls = 0;
+    const origFind = h.git.findOpenPrForBranch.bind(h.git);
+    h.git.findOpenPrForBranch = async (branch: string) => {
+      findCalls++;
+      if (findCalls === 1) throw new Error("ECONNRESET");
+      return origFind(branch);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(findCalls).toBe(2);
+  });
+
+  it("pushAndOpenPr transient → リトライ → 成功", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    // pushAndOpenPr を1回 transient で失敗させる
+    let pushCalls = 0;
+    const origPush = h.git.pushAndOpenPr.bind(h.git);
+    h.git.pushAndOpenPr = async (branch: string, wt: string, iss: any) => {
+      pushCalls++;
+      if (pushCalls === 1) throw new Error("ECONNRESET");
+      return origPush(branch, wt, iss);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(pushCalls).toBe(2);
+  });
+
+  it("addLabel transient → リトライ → 成功", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    let labelCalls = 0;
+    const origLabel = h.git.addLabel.bind(h.git);
+    h.git.addLabel = async (pr: number, label: string) => {
+      labelCalls++;
+      if (labelCalls === 1) throw new Error("ETIMEDOUT");
+      return origLabel(pr, label);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(labelCalls).toBe(2);
+  });
+
+  it("addLabel transient 使い切り → handoff_failed", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 200);
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    let labelCalls = 0;
+    h.git.addLabel = async (pr: number, label: string) => {
+      labelCalls++;
+      h.git.calls.push({ method: "addLabel", args: [pr, label] });
+      throw new Error("ECONNRESET");
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("handoff_failed");
+    // 1 initial + 2 retries = 3 total
+    expect(labelCalls).toBe(3);
   });
 });
 

@@ -5,6 +5,7 @@ import type {
   GitPrManager as GitPrManagerInterface,
   PrDiffSummary,
 } from "./types.js";
+import { isTransientError } from "./transient-retry.js";
 
 export interface GitPrManagerOptions {
   repoPath: string;
@@ -200,9 +201,8 @@ export class GitPrManager implements GitPrManagerInterface {
       { cwd: worktreePath, timeoutMs: 120_000 },
     );
     if (push.code !== 0) {
-      throw new Error(
-        `git push failed for ${branch}: ${push.stderr.trim() || `exit ${push.code}`}`,
-      );
+      const rawErr = push.stderr.trim() || `exit ${push.code}`;
+      throw new Error(`git push failed for ${branch}: ${rawErr}`, { cause: rawErr });
     }
 
     const body = renderPrBody(this.opts.prBodyTemplate, issue);
@@ -227,9 +227,18 @@ export class GitPrManager implements GitPrManagerInterface {
     );
 
     if (res.code !== 0) {
-      throw new Error(
-        `gh pr create failed for ${branch}: ${res.stderr.trim() || `exit ${res.code}`}`,
-      );
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      // Only check for server-side-created PR on transient failures.
+      // Deterministic errors (auth, validation) must not adopt stale PRs.
+      if (isTransientError(rawErr)) {
+        try {
+          const existing = await this.findOpenPrForBranch(branch);
+          if (existing !== null) return existing;
+        } catch (secondaryErr) {
+          try { this.opts.log?.(`pushAndOpenPr: idempotency check also failed: ${secondaryErr instanceof Error ? secondaryErr.message : String(secondaryErr)}`); } catch { /* log must not suppress original error */ }
+        }
+      }
+      throw new Error(`gh pr create failed for ${branch}: ${rawErr}`, { cause: rawErr });
     }
 
     const match = res.stdout.match(/\/pull\/(\d+)/);
@@ -251,9 +260,8 @@ export class GitPrManager implements GitPrManagerInterface {
       { cwd: repoPath, timeoutMs: 60_000 },
     );
     if (res.code !== 0) {
-      throw new Error(
-        `gh pr edit --add-label failed for PR #${prNumber}: ${res.stderr.trim() || `exit ${res.code}`}`,
-      );
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      throw new Error(`gh pr edit --add-label failed for PR #${prNumber}: ${rawErr}`, { cause: rawErr });
     }
   }
 
