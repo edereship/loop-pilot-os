@@ -101,6 +101,13 @@ export interface OrchestratorDeps {
    */
   getDescendantPids?: (rootPid: number) => Set<number> | null;
   /**
+   * Returns the subset of the given candidate PIDs whose parent PID is 1
+   * (reparented to init). These are background servers started by the verifier
+   * that survived after their parent exited. Injectable for testing.
+   * Default: reads /proc/<pid>/stat on Linux; returns empty set elsewhere.
+   */
+  getReparentedPids?: (pids: number[]) => Set<number>;
+  /**
    * Checks whether a process with the given PID is currently alive (injectable
    * for testing). Default: uses process.kill(pid, 0).
    */
@@ -139,6 +146,7 @@ export class Orchestrator {
   private readonly runner: CommandRunner;
   private readonly groomDeps: GroomDeps | null;
   private readonly getDescendantPids: (rootPid: number) => Set<number> | null;
+  private readonly getReparentedPids: (pids: number[]) => Set<number>;
   private readonly checkPidAlive: (pid: number) => boolean;
 
   private runId = 0;
@@ -169,6 +177,7 @@ export class Orchestrator {
     this.runner = deps.runner;
     this.groomDeps = deps.groomDeps;
     this.getDescendantPids = deps.getDescendantPids ?? procDescendantPids;
+    this.getReparentedPids = deps.getReparentedPids ?? procReparentedPids;
     this.checkPidAlive = deps.checkPidAlive ?? isPidAlive;
   }
 
@@ -2888,16 +2897,29 @@ export class Orchestrator {
       );
       if (basicFiltered.length === 0) return;
 
-      // ── 3. Restrict to verifier-spawned descendants (Finding 2) ───────────
+      // ── 3. Restrict to verifier-spawned descendants or reparented orphans ──
       // When we can determine the process tree (Linux /proc), only signal
       // processes descended from this orchestrator — not unrelated shells,
       // editors, or test watchers that happen to have files open in the
-      // worktree. Fall back to the basic-filtered set when the tree cannot be
-      // determined (non-Linux / /proc unreadable).
+      // worktree. Also include reparented processes (parent PID = 1): these are
+      // background servers started by the verifier whose spawning process exited
+      // before cleanup, causing the OS to reparent them to init. Without this,
+      // long-running dev servers survive across verification attempts and can hold
+      // ports/files that poison the next run.
+      // Fall back to the basic-filtered set when the tree cannot be determined
+      // (non-Linux / /proc unreadable).
       const descendants = this.getDescendantPids(process.pid);
-      const pids = descendants !== null
-        ? basicFiltered.filter(p => descendants.has(parseInt(p, 10)))
-        : basicFiltered;
+      let pids: string[];
+      if (descendants !== null) {
+        const candidateNums = basicFiltered.map(p => parseInt(p, 10));
+        const reparented = this.getReparentedPids(candidateNums);
+        pids = basicFiltered.filter(p => {
+          const pid = parseInt(p, 10);
+          return descendants.has(pid) || reparented.has(pid);
+        });
+      } else {
+        pids = basicFiltered;
+      }
       if (pids.length === 0) return;
 
       this.log(
@@ -5068,6 +5090,29 @@ function procDescendantPids(rootPid: number): Set<number> | null {
   } catch {
     return null; // /proc not available (non-Linux)
   }
+}
+
+// Returns the subset of candidatePids whose parent PID is 1 (reparented to init).
+// These are background servers started by a verifier run whose spawning process
+// exited before process cleanup — the OS reparented them to init, so they no
+// longer appear in the orchestrator's descendant tree even though lsof can still
+// find their open file handles under the worktree.
+// Returns an empty set when /proc is not available (non-Linux).
+function procReparentedPids(candidatePids: number[]): Set<number> {
+  const result = new Set<number>();
+  for (const pid of candidatePids) {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const lastParen = stat.lastIndexOf(")");
+      if (lastParen < 0) continue;
+      const fields = stat.slice(lastParen + 1).trimStart().split(/\s+/);
+      // fields[0]=state  fields[1]=ppid
+      if (fields.length < 2) continue;
+      const ppid = parseInt(fields[1], 10);
+      if (ppid === 1) result.add(pid);
+    } catch { /* process exited between lsof and here, or /proc unavailable */ }
+  }
+  return result;
 }
 
 function describePr(prNumber: number | null): string {

@@ -111,7 +111,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; checkPidAlive?: (pid: number) => boolean }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean }): Harness {
   const store = new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -221,6 +221,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       knownLabels: ["looppilot-os"],
     } : null,
     getDescendantPids: opts?.getDescendantPids,
+    getReparentedPids: opts?.getReparentedPids,
     checkPidAlive: opts?.checkPidAlive,
   });
   return { orch, store, source, agent, verifyAgent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
@@ -8761,6 +8762,50 @@ describe("VERIFY (ES-491)", () => {
     expect(killCalls.length).toBeGreaterThanOrEqual(1);
     expect(killCalls[0].args).toContain(descendantPid);
     expect(killCalls[0].args).not.toContain(nonDescendantPid);
+  });
+
+  it("verify: process cleanup kills reparented (orphaned) background servers not in descendant tree", async () => {
+    // Background servers started by run_recipe get reparented to init (PID 1)
+    // when the verifier agent process exits before cleanup. The descendant filter
+    // alone would drop these — the reparented filter must include them.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    (config as any).verify = { enabled: true, runRecipe: "npm run e2e" };
+    const planner = new FakePlanRunner();
+    planner.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"pass","reasons":[]}\n```' },
+    ];
+    const reparentedPid = "33333"; // background dev server, reparented to init
+    const unrelatedPid = "44444";  // unrelated editor — not a descendant, not reparented
+    const h = makeHarness(config, {
+      planner,
+      designReviewer: planner,
+      // No descendants — the spawning process exited before cleanup ran
+      getDescendantPids: () => new Set<number>(),
+      // Only reparentedPid has PPID=1; unrelatedPid has a living parent
+      getReparentedPids: (pids) => new Set(pids.filter(p => p === 33333)),
+      checkPidAlive: () => false,
+    });
+    h.memoryRunner.on(["lsof", "+D"], { code: 0, stdout: `${reparentedPid}\n${unrelatedPid}\n` });
+    h.source.queue = [issue("issue-A", "TY-1", { description: "## Acceptance Criteria\n- it works" })];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.5, summary: "implemented" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.verifyAgent.outcomes = [
+      { kind: "completed", costUsd: 0.4, summary: "## Build\nOK\n## Acceptance Check\nAll passed" },
+    ];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const killCalls = h.memoryRunner.calls.filter(
+      c => c.cmd === "kill" && c.args.includes("-TERM"),
+    );
+    expect(killCalls.length).toBeGreaterThanOrEqual(1);
+    // Reparented server must be killed
+    expect(killCalls[0].args).toContain(reparentedPid);
+    // Unrelated editor (not reparented, not descendant) must be spared
+    expect(killCalls[0].args).not.toContain(unrelatedPid);
   });
 
   it("verify: process cleanup escalates to SIGKILL when SIGTERM-ed process lingers (Finding 3)", async () => {
