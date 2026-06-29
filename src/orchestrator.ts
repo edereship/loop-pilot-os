@@ -42,6 +42,7 @@ import { buildGroomPrompt } from "./groom-prompt.js";
 import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
 import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
+import { retryTransient } from "./transient-retry.js";
 export interface IGroomBoardFetcher {
   getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
   getProjectIssueIds(): Promise<Set<string>>;
@@ -1311,13 +1312,15 @@ export class Orchestrator {
       now: this.clock(),
     });
     try {
-      await this.source.transition(issue.id, "in_progress");
+      await retryTransient(this.config.safety.transientRetryAttempts, () =>
+        this.source.transition(issue.id, "in_progress"),
+        { onRetry: (n, e) => this.log(`transient retry ${n}: transition(in_progress) for ${issue.identifier}: ${errMsg(e)}`) },
+      );
     } catch (err) {
       // ② transition 失敗：discardWorktree + stopped(claim_failed) + ticket→Todo（best-effort）→ HALT
       await bestEffort(() => this.git.discardWorktree(claimResult.branch, claimResult.worktreePath));
       await bestEffort(() => this.source.transition(issue.id, "todo"));
       return await this.stopSession(session, "claim_failed", `transition(in_progress) failed: ${errMsg(err)}`);
-
     }
     if (this.config.notify.progress) {
       await this.notifier.notify({
@@ -3428,15 +3431,24 @@ export class Orchestrator {
     const worktreePath = session.worktreePath as string;
     let prNumber: number;
     try {
-      const existing = await this.git.findOpenPrForBranch(session.branch);
+      const existing = await retryTransient(this.config.safety.transientRetryAttempts, () =>
+        this.git.findOpenPrForBranch(session.branch),
+        { onRetry: (n, e) => this.log(`transient retry ${n}: findOpenPrForBranch for ${issue.identifier}: ${errMsg(e)}`) },
+      );
       if (existing !== null) {
         prNumber = existing;
       } else {
-        prNumber = await this.git.pushAndOpenPr(session.branch, worktreePath, issue);
+        prNumber = await retryTransient(this.config.safety.transientRetryAttempts, () =>
+          this.git.pushAndOpenPr(session.branch, worktreePath, issue),
+          { onRetry: (n, e) => this.log(`transient retry ${n}: pushAndOpenPr for ${issue.identifier}: ${errMsg(e)}`) },
+        );
       }
       // PR 番号を即時永続化（仕様 §5.4 ③）
       this.store.updateSession(session.id, { prNumber });
-      await retry(3, () => this.git.addLabel(prNumber, this.config.looppilot.gateLabel));
+      await retryTransient(this.config.safety.transientRetryAttempts, () =>
+        this.git.addLabel(prNumber, this.config.looppilot.gateLabel),
+        { onRetry: (n, e) => this.log(`transient retry ${n}: addLabel for PR #${prNumber}: ${errMsg(e)}`) },
+      );
       await retry(3, () => this.source.transition(issue.id, "in_review"));
     } catch (err) {
       const prText = describePr(this.store.getSession(session.id).prNumber);

@@ -5,6 +5,12 @@ import type {
   GitPrManager as GitPrManagerInterface,
   PrDiffSummary,
 } from "./types.js";
+import { isTransientError } from "./transient-retry.js";
+
+// GitHub CLI error text emitted when a PR for the branch already exists.
+// Matches both "a pull request for branch 'x' already exists" and
+// "a pull request for branch \"x\" already exists".
+const DUPLICATE_PR_RE = /a pull request for branch/i;
 
 export interface GitPrManagerOptions {
   repoPath: string;
@@ -176,9 +182,8 @@ export class GitPrManager implements GitPrManagerInterface {
     // 非0終了は throw（他の gh ラッパと一貫）。stdout が空/HTML/部分でも
     // JSON.parse の偶発例外に頼らず明示的に失敗を上げる。
     if (res.code !== 0) {
-      throw new Error(
-        `gh pr list failed for ${branch}: ${res.stderr.trim() || `exit ${res.code}`}`,
-      );
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      throw new Error(`gh pr list failed for ${branch}: ${rawErr}`, { cause: rawErr });
     }
     const rows = JSON.parse(res.stdout) as Array<{ number: number }>;
     if (rows.length === 0) {
@@ -200,9 +205,8 @@ export class GitPrManager implements GitPrManagerInterface {
       { cwd: worktreePath, timeoutMs: 120_000 },
     );
     if (push.code !== 0) {
-      throw new Error(
-        `git push failed for ${branch}: ${push.stderr.trim() || `exit ${push.code}`}`,
-      );
+      const rawErr = push.stderr.trim() || `exit ${push.code}`;
+      throw new Error(`git push failed for ${branch}: ${rawErr}`, { cause: rawErr });
     }
 
     const body = renderPrBody(this.opts.prBodyTemplate, issue);
@@ -227,9 +231,23 @@ export class GitPrManager implements GitPrManagerInterface {
     );
 
     if (res.code !== 0) {
-      throw new Error(
-        `gh pr create failed for ${branch}: ${res.stderr.trim() || `exit ${res.code}`}`,
-      );
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      // Look up any server-side-created PR for two distinct cases:
+      // 1) Transient errors: the create may have succeeded but the response was lost.
+      // 2) Duplicate-PR errors: the previous retry created the PR successfully; the current
+      //    retry's `gh pr create` is deterministically rejected because the PR already
+      //    exists.  Adopting the existing PR is correct here (idempotent success path).
+      // All other deterministic errors (auth, validation) must not adopt stale PRs.
+      if (isTransientError(rawErr) || DUPLICATE_PR_RE.test(rawErr)) {
+        try {
+          const existing = await this.findOpenPrForBranch(branch);
+          if (existing !== null) return existing;
+        } catch (secondaryErr) {
+          try { this.opts.log?.(`pushAndOpenPr: idempotency check also failed: ${secondaryErr instanceof Error ? secondaryErr.message : String(secondaryErr)}`); } catch { /* log must not suppress original error */ }
+          if (isTransientError(secondaryErr)) throw secondaryErr;
+        }
+      }
+      throw new Error(`gh pr create failed for ${branch}: ${rawErr}`, { cause: rawErr });
     }
 
     const match = res.stdout.match(/\/pull\/(\d+)/);
@@ -251,9 +269,8 @@ export class GitPrManager implements GitPrManagerInterface {
       { cwd: repoPath, timeoutMs: 60_000 },
     );
     if (res.code !== 0) {
-      throw new Error(
-        `gh pr edit --add-label failed for PR #${prNumber}: ${res.stderr.trim() || `exit ${res.code}`}`,
-      );
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      throw new Error(`gh pr edit --add-label failed for PR #${prNumber}: ${rawErr}`, { cause: rawErr });
     }
   }
 

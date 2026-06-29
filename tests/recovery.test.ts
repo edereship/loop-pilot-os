@@ -49,6 +49,8 @@ function makeConfig(over: Partial<{
       maxVerifyAttempts: 2,
       maxCostUsdPerVerify: 2,
       verifyTimeoutMinutes: 15,
+      maxRecoveryAttempts: 2,
+      transientRetryAttempts: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
