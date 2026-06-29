@@ -294,6 +294,62 @@ describe("pushAndOpenPr — idempotency on retry", () => {
     expect(runner.calls).toHaveLength(2);
   });
 
+  it("duplicate-PR error → existing PR detected → returns existing PR number", async () => {
+    // Scenario: first retry created the PR but the response was lost; on the second attempt
+    // gh pr create is rejected because the PR already exists.
+    const runner = stubRunner([
+      { code: 0, stdout: "", stderr: "" },  // git push
+      // gh pr create: deterministic duplicate-PR rejection
+      { code: 1, stdout: "", stderr: 'a pull request for branch "feat-branch" already exists:' },
+      // findOpenPrForBranch: returns the already-created PR
+      { code: 0, stdout: JSON.stringify([{ number: 77 }]), stderr: "" },
+    ]);
+
+    const git = new GitPrManager(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    const prNumber = await git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue);
+    expect(prNumber).toBe(77);
+    // Three calls: push + pr create + pr list
+    expect(runner.calls).toHaveLength(3);
+  });
+
+  it("duplicate-PR error, no open PR found → throws original error", async () => {
+    // Unusual but possible: PR was closed between create and lookup.
+    const runner = stubRunner([
+      { code: 0, stdout: "", stderr: "" },  // git push
+      { code: 1, stdout: "", stderr: 'a pull request for branch "feat-branch" already exists:' },
+      { code: 0, stdout: "[]", stderr: "" },  // pr list returns empty
+    ]);
+
+    const git = new GitPrManager(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    await expect(git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue))
+      .rejects.toThrow(/gh pr create failed.*a pull request for branch/);
+    expect(runner.calls).toHaveLength(3);
+  });
+
+  it("duplicate-PR error, findOpenPrForBranch throws → throws original error", async () => {
+    const runner = stubRunner([
+      { code: 0, stdout: "", stderr: "" },              // git push
+      { code: 1, stdout: "", stderr: 'a pull request for branch "feat-branch" already exists:' },
+      { code: 1, stdout: "", stderr: "network error" }, // pr list also fails
+    ]);
+
+    const git = new GitPrManager(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    await expect(git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue))
+      .rejects.toThrow(/gh pr create failed.*a pull request for branch/);
+  });
+
   it("retryTransient + idempotent pushAndOpenPr → no duplicate PR", async () => {
     const runner = stubRunner([
       // Attempt 1: push OK, pr create network drop, pr list finds no existing PR

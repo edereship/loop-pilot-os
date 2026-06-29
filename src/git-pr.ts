@@ -7,6 +7,11 @@ import type {
 } from "./types.js";
 import { isTransientError } from "./transient-retry.js";
 
+// GitHub CLI error text emitted when a PR for the branch already exists.
+// Matches both "a pull request for branch 'x' already exists" and
+// "a pull request for branch \"x\" already exists".
+const DUPLICATE_PR_RE = /a pull request for branch/i;
+
 export interface GitPrManagerOptions {
   repoPath: string;
   remote: string;
@@ -228,9 +233,13 @@ export class GitPrManager implements GitPrManagerInterface {
 
     if (res.code !== 0) {
       const rawErr = res.stderr.trim() || `exit ${res.code}`;
-      // Only check for server-side-created PR on transient failures.
-      // Deterministic errors (auth, validation) must not adopt stale PRs.
-      if (isTransientError(rawErr)) {
+      // Look up any server-side-created PR for two distinct cases:
+      // 1) Transient errors: the create may have succeeded but the response was lost.
+      // 2) Duplicate-PR errors: the previous retry created the PR successfully; the current
+      //    retry's `gh pr create` is deterministically rejected because the PR already
+      //    exists.  Adopting the existing PR is correct here (idempotent success path).
+      // All other deterministic errors (auth, validation) must not adopt stale PRs.
+      if (isTransientError(rawErr) || DUPLICATE_PR_RE.test(rawErr)) {
         try {
           const existing = await this.findOpenPrForBranch(branch);
           if (existing !== null) return existing;
