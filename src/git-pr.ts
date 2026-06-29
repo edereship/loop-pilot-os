@@ -182,9 +182,8 @@ export class GitPrManager implements GitPrManagerInterface {
     // 非0終了は throw（他の gh ラッパと一貫）。stdout が空/HTML/部分でも
     // JSON.parse の偶発例外に頼らず明示的に失敗を上げる。
     if (res.code !== 0) {
-      throw new Error(
-        `gh pr list failed for ${branch}: ${res.stderr.trim() || `exit ${res.code}`}`,
-      );
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      throw new Error(`gh pr list failed for ${branch}: ${rawErr}`, { cause: rawErr });
     }
     const rows = JSON.parse(res.stdout) as Array<{ number: number }>;
     if (rows.length === 0) {
@@ -245,6 +244,7 @@ export class GitPrManager implements GitPrManagerInterface {
           if (existing !== null) return existing;
         } catch (secondaryErr) {
           try { this.opts.log?.(`pushAndOpenPr: idempotency check also failed: ${secondaryErr instanceof Error ? secondaryErr.message : String(secondaryErr)}`); } catch { /* log must not suppress original error */ }
+          if (isTransientError(secondaryErr)) throw secondaryErr;
         }
       }
       throw new Error(`gh pr create failed for ${branch}: ${rawErr}`, { cause: rawErr });

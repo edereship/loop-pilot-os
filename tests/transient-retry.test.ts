@@ -204,6 +204,83 @@ describe("retryTransient", () => {
   });
 });
 
+// ---- findOpenPrForBranch error classification (ES-488 Finding 2) ----
+
+describe("findOpenPrForBranch — error carries raw cause for correct transient classification", () => {
+  function stubRunner(response: { code: number; stdout: string; stderr: string }): {
+    run: (cmd: string, args: string[], opts: RunOptions) => Promise<CommandResult>;
+  } {
+    return {
+      run: async (_cmd: string, _args: string[], _opts: RunOptions) => response,
+    };
+  }
+
+  // ES-488 Finding 2: a branch name containing "500" or "timeout" must NOT cause a
+  // deterministic gh pr list failure (e.g. HTTP 401) to be misclassified as transient.
+  it("branch name with '500' does not cause HTTP 401 to be misclassified as transient", async () => {
+    const { isTransientError: isTrans } = await import("../src/transient-retry.js");
+    const runner = stubRunner({ code: 1, stdout: "", stderr: "HTTP 401 Unauthorized" });
+
+    const { GitPrManager: GPM } = await import("../src/git-pr.js");
+    const git = new GPM(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    let thrown: unknown;
+    try {
+      await git.findOpenPrForBranch("lp/es-500-fix-timeout-handling");
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    // The raw stderr (HTTP 401 Unauthorized) is deterministic, not transient.
+    // Without { cause: rawErr }, isTransientError would fall back to the message which
+    // contains "500" and "timeout", causing a false positive.
+    expect(isTrans(thrown)).toBe(false);
+  });
+
+  it("branch name with 'timed_out' does not cause HTTP 403 to be misclassified as transient", async () => {
+    const { isTransientError: isTrans } = await import("../src/transient-retry.js");
+    const runner = stubRunner({ code: 1, stdout: "", stderr: "HTTP 403 Forbidden" });
+
+    const { GitPrManager: GPM } = await import("../src/git-pr.js");
+    const git = new GPM(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    let thrown: unknown;
+    try {
+      await git.findOpenPrForBranch("lp/ty-99-fix-timed-out-handler");
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(isTrans(thrown)).toBe(false);
+  });
+
+  it("genuine ECONNRESET from gh pr list is still classified as transient", async () => {
+    const { isTransientError: isTrans } = await import("../src/transient-retry.js");
+    const runner = stubRunner({ code: 1, stdout: "", stderr: "ECONNRESET" });
+
+    const { GitPrManager: GPM } = await import("../src/git-pr.js");
+    const git = new GPM(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    let thrown: unknown;
+    try {
+      await git.findOpenPrForBranch("lp/es-999-some-fix");
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(isTrans(thrown)).toBe(true);
+  });
+});
+
 // ---- PR creation idempotency (ES-488) ----
 
 describe("pushAndOpenPr — idempotency on retry", () => {
@@ -348,6 +425,89 @@ describe("pushAndOpenPr — idempotency on retry", () => {
 
     await expect(git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue))
       .rejects.toThrow(/gh pr create failed.*a pull request for branch/);
+  });
+
+  // ES-488 Finding 1: when duplicate-PR error triggers idempotency lookup and that
+  // lookup itself fails transiently, the transient error must be rethrown so the outer
+  // retryTransient can retry the whole pushAndOpenPr (including the lookup again).
+  it("duplicate-PR error, findOpenPrForBranch fails transiently → rethrows transient error for outer retry", async () => {
+    const runner = stubRunner([
+      { code: 0, stdout: "", stderr: "" },              // git push
+      { code: 1, stdout: "", stderr: 'a pull request for branch "feat-branch" already exists:' },
+      { code: 1, stdout: "", stderr: "ECONNRESET" },    // pr list fails transiently
+    ]);
+
+    const git = new GitPrManager(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    // Must throw the transient secondary error, not the deterministic duplicate error,
+    // so that the outer retryTransient retries instead of failing fast.
+    await expect(git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue))
+      .rejects.toThrow(/ECONNRESET/);
+  });
+
+  // ES-488 Finding 1: when transient pr create triggers idempotency lookup and that
+  // lookup also fails transiently, the secondary transient error surfaces to allow retry.
+  it("transient gh pr create, findOpenPrForBranch also fails transiently → rethrows secondary transient", async () => {
+    const runner = stubRunner([
+      { code: 0, stdout: "", stderr: "" },              // git push
+      { code: 1, stdout: "", stderr: "ECONNRESET" },    // pr create transient
+      { code: 1, stdout: "", stderr: "ETIMEDOUT" },     // pr list also transient
+    ]);
+
+    const git = new GitPrManager(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    await expect(git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue))
+      .rejects.toThrow(/ETIMEDOUT/);
+  });
+
+  // ES-488 Finding 1: when duplicate-PR error triggers lookup and that lookup fails
+  // with a deterministic error, the original duplicate error is still rethrown.
+  it("duplicate-PR error, findOpenPrForBranch fails deterministically → throws original error", async () => {
+    const runner = stubRunner([
+      { code: 0, stdout: "", stderr: "" },
+      { code: 1, stdout: "", stderr: 'a pull request for branch "feat-branch" already exists:' },
+      { code: 1, stdout: "", stderr: "HTTP 401 Unauthorized" }, // deterministic
+    ]);
+
+    const git = new GitPrManager(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    await expect(git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue))
+      .rejects.toThrow(/gh pr create failed.*a pull request for branch/);
+  });
+
+  // ES-488 Finding 1+2 integration: outer retryTransient retries when the duplicate-branch
+  // path surfaces a transient lookup failure, and succeeds on the next attempt.
+  it("retryTransient retries after duplicate-PR error + transient lookup failure, succeeds on next attempt", async () => {
+    const runner = stubRunner([
+      // Attempt 1: push OK, pr create gets duplicate error, pr list fails transiently
+      { code: 0, stdout: "", stderr: "" },
+      { code: 1, stdout: "", stderr: 'a pull request for branch "feat-branch" already exists:' },
+      { code: 1, stdout: "", stderr: "ECONNRESET" },
+      // retryTransient sees ECONNRESET → retries pushAndOpenPr
+      // Attempt 2: push OK, pr create gets duplicate error again, pr list succeeds
+      { code: 0, stdout: "", stderr: "" },
+      { code: 1, stdout: "", stderr: 'a pull request for branch "feat-branch" already exists:' },
+      { code: 0, stdout: JSON.stringify([{ number: 88 }]), stderr: "" },
+    ]);
+
+    const git = new GitPrManager(runner, {
+      repoPath: "/repo", remote: "o/r", defaultBranch: "main",
+      branchPrefix: "lp", worktreeRoot: "/wt", prBodyTemplate: "", gateLabel: "lp",
+    });
+
+    const prNumber = await retryTransient(2, () =>
+      git.pushAndOpenPr("feat-branch", "/wt/feat", fakeIssue),
+    );
+    expect(prNumber).toBe(88);
   });
 
   it("retryTransient + idempotent pushAndOpenPr → no duplicate PR", async () => {
