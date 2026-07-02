@@ -1,6 +1,6 @@
 # v3.5 設計仕様: 自走堅牢化（受け入れ検証ゲート・自己回復）
 
-> ステータス: **ドラフト（スコープ・主要設計合意済み・実装詳細は各チケットで詰める）**
+> ステータス: **実装完了（全 9 チケット ES-487〜ES-495 クローズ済み・統合 E2E グリーン）**
 > 作成: 2026-06-27
 > マイルストーン: [v3.5 自走堅牢化（受け入れ検証ゲート・自己回復）](https://linear.app/edereship/project/looppilot-os-7a8262819c6f)
 > 関連: v3 設計仕様（`docs/superpowers/specs/2026-06-22-v3-pm-autonomy-design.md`）/ 要求仕様書（`docs/specs/requirements.md`）
@@ -133,16 +133,16 @@ Phase 5:           T8/ES-495 E2E + ドキュメント
 - **T8** E2E + ドキュメント — 統合検証 ＋ README ＋ example.toml ＋ マイルストーン更新 ＋ **Linear 自動ステータスとの綱引き注意書き**（オーケが唯一のステータス管理者）。
 - **T9** ネットワーク瞬断の 1 回リトライ（独立）— transient 限定リトライを CLAIM 遷移 / HANDOFF git・gh 操作の未リトライ箇所に。PR 作成は冪等化。
 
-## 7. オープン項目の解決（マイルストーン記載 6 項目）
+## 7. オープン項目の解決（マイルストーン記載 6 項目）— 全件解決済み
 
-| マイルストーンのオープン項目 | 解決（2026-06-27） |
-| -- | -- |
-| VERIFY 出力スキーマの具体フィールド | `{verdict,reasons[]}` 最小 ＋ 証拠は `verify_log`（D-08） |
-| acceptance 照合の合否判定基準 | 客観オラクル必須 ＋ Codex acceptance 判定、両方 OK で pass（D-04） |
-| max_verify_attempts / max_cost_usd_per_verify 既定 | 2 / $2（D-15） |
-| C2 policy テーブルの最終形 | §4 の表。ci/conflict は recover×2→abandon、CI ログ注入（D-10/11） |
-| C3 run_recipe の表現と縮退 | config キー `verify.run_recipe`、未設定で C1 縮退（D-13） |
-| needs-human ラベル・トリアージ設計（v4-A と共通化） | `needs-human` ラベル方式（新ステート不要）＋ SELECT 除外。v4-A トリアージと共通（D-02） |
+| マイルストーンのオープン項目 | 解決（2026-06-27） | 実装チケット |
+| -- | -- | -- |
+| VERIFY 出力スキーマの具体フィールド | `{verdict,reasons[]}` 最小 ＋ 証拠は `verify_log`（D-08） | ES-487, ES-489 |
+| acceptance 照合の合否判定基準 | 客観オラクル必須 ＋ Codex acceptance 判定、両方 OK で pass（D-04） | ES-489, ES-491 |
+| max_verify_attempts / max_cost_usd_per_verify 既定 | 2 / $2（D-15） | ES-487 |
+| C2 policy テーブルの最終形 | §4 の表。ci/conflict は recover×2→abandon、CI ログ注入（D-10/11） | ES-490, ES-493 |
+| C3 run_recipe の表現と縮退 | config キー `verify.run_recipe`、未設定で C1 縮退（D-13） | ES-494 |
+| needs-human ラベル・トリアージ設計（v4-A と共通化） | `needs-human` ラベル方式（新ステート不要）＋ SELECT 除外。v4-A トリアージと共通（D-02） | ES-492 |
 
 ## 8. 設計上のガード（チケット化時に厳守）
 - VERIFY は「実装した Claude 自身に合格判定させない」二重独立（実行=別 Claude / 判定=Codex）を必須とする。
