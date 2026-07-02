@@ -311,6 +311,91 @@ function isSandboxBypassed(extraArgs: string[]): boolean {
   return false;
 }
 
+// ES-498: preflight（runPreflight）から CodexPlanner のインスタンス化なしに呼べるよう
+// module-level 関数として公開する。CodexPlanner.checkAvailability() はここへ委譲する。
+// 各 probe に timeoutMs を付ける: RealCommandRunner は timeoutMs 未指定だと無期限待機のため、
+// ハングした codex がプリフライトを固めるのを防ぐ（preflight の他チェックの 30–60s と整合）。
+const AVAILABILITY_PROBE_TIMEOUT_MS = 30_000;
+
+export async function checkCodexAvailability(
+  runner: CommandRunner,
+  extraArgs?: string[],
+): Promise<string> {
+  // Create the private home early so the same sanitized env (including the
+  // PATH-stripped version) is used for both the --version probe and the auth
+  // check. This prevents a false-positive availability report when Codex is
+  // reachable only via a relative PATH entry (e.g. node_modules/.bin) that
+  // codexChildEnv strips before runtime.
+  const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
+  if (process.platform !== "win32") chmodSync(privateHome, 0o700);
+  try {
+    let result;
+    try {
+      result = await runner.run(CODEX_COMMAND, ["--version"], {
+        cwd: ".",
+        env: codexChildEnv(privateHome),
+        timeoutMs: AVAILABILITY_PROBE_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw new Error(
+        `codex CLI not found or not available: ${err instanceof Error ? err.message : String(err)}` +
+          "（Codex CLI をインストールし PATH を通してください）",
+      );
+    }
+    if (result.code !== 0) {
+      throw new Error(
+        "codex CLI not found or not available（Codex CLI をインストールし PATH を通してください）",
+      );
+    }
+    const version = result.stdout.trim();
+
+    // Run the auth check with the same filtered environment as run() so that
+    // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
+    // fail here at preflight rather than silently at exec time.
+    let authResult;
+    try {
+      authResult = await runner.run(CODEX_COMMAND, ["login", "status"], {
+        cwd: ".",
+        env: codexChildEnv(privateHome),
+        timeoutMs: AVAILABILITY_PROBE_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw new Error(
+        `codex: 認証状態を確認できません（${err instanceof Error ? err.message : String(err)}）`,
+      );
+    }
+    if (authResult.code !== 0) {
+      throw new Error("codex: 認証されていません（codex login を実行してください）");
+    }
+
+    // On Linux, Codex uses bwrap + seccomp for sandboxing. Probe bwrap so
+    // preflight can surface a missing helper early rather than at exec time.
+    // Skip the probe when extraArgs bypass sandboxing (e.g. --yolo), and
+    // treat a missing or failing bwrap as a non-fatal warning: Codex may
+    // fall back to its own sandbox helper on some configurations.
+    if (process.platform === "linux" && !isSandboxBypassed(extraArgs ?? [])) {
+      try {
+        // Use the same sanitized env as all other child invocations so that
+        // relative PATH entries (e.g. "." or "node_modules/.bin") cannot
+        // shadow the system bwrap binary when LoopPilot is started from a
+        // repository or config directory.
+        await runner.run("bwrap", ["--version"], {
+          cwd: ".",
+          env: codexChildEnv(privateHome),
+          timeoutMs: AVAILABILITY_PROBE_TIMEOUT_MS,
+        });
+      } catch {
+        // bwrap unavailable; Codex may use a fallback — proceed and let
+        // runtime surface the failure if sandboxing truly cannot start.
+      }
+    }
+
+    return version;
+  } finally {
+    rmSync(privateHome, { recursive: true, force: true });
+  }
+}
+
 export class CodexPlanner {
   constructor(
     private readonly runner: CommandRunner,
@@ -466,69 +551,6 @@ export class CodexPlanner {
   }
 
   async checkAvailability(): Promise<string> {
-    // Create the private home early so the same sanitized env (including the
-    // PATH-stripped version) is used for both the --version probe and the auth
-    // check. This prevents a false-positive availability report when Codex is
-    // reachable only via a relative PATH entry (e.g. node_modules/.bin) that
-    // codexChildEnv strips before runtime.
-    const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
-    if (process.platform !== "win32") chmodSync(privateHome, 0o700);
-    try {
-      let result;
-      try {
-        result = await this.runner.run(CODEX_COMMAND, ["--version"], {
-          cwd: ".",
-          env: codexChildEnv(privateHome),
-        });
-      } catch (err) {
-        throw new Error(
-          `codex CLI not found or not available: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      if (result.code !== 0) {
-        throw new Error("codex CLI not found or not available");
-      }
-      const version = result.stdout.trim();
-
-      // Run the auth check with the same filtered environment as run() so that
-      // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
-      // fail here at preflight rather than silently at exec time.
-      let authResult;
-      try {
-        authResult = await this.runner.run(CODEX_COMMAND, ["login", "status"], {
-          cwd: ".",
-          env: codexChildEnv(privateHome),
-        });
-      } catch (err) {
-        throw new Error(
-          `codex: 認証状態を確認できません（${err instanceof Error ? err.message : String(err)}）`,
-        );
-      }
-      if (authResult.code !== 0) {
-        throw new Error("codex: 認証されていません（codex login を実行してください）");
-      }
-
-      // On Linux, Codex uses bwrap + seccomp for sandboxing. Probe bwrap so
-      // preflight can surface a missing helper early rather than at exec time.
-      // Skip the probe when extraArgs bypass sandboxing (e.g. --yolo), and
-      // treat a missing or failing bwrap as a non-fatal warning: Codex may
-      // fall back to its own sandbox helper on some configurations.
-      if (process.platform === "linux" && !isSandboxBypassed(this.opts.extraArgs ?? [])) {
-        try {
-          // Use the same sanitized env as all other child invocations so that
-          // relative PATH entries (e.g. "." or "node_modules/.bin") cannot
-          // shadow the system bwrap binary when LoopPilot is started from a
-          // repository or config directory.
-          await this.runner.run("bwrap", ["--version"], { cwd: ".", env: codexChildEnv(privateHome) });
-        } catch {
-          // bwrap unavailable; Codex may use a fallback — proceed and let
-          // runtime surface the failure if sandboxing truly cannot start.
-        }
-      }
-
-      return version;
-    } finally {
-      rmSync(privateHome, { recursive: true, force: true });
-    }
+    return checkCodexAvailability(this.runner, this.opts.extraArgs);
   }
 }

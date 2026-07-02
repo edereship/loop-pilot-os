@@ -387,7 +387,10 @@ describe("CodexPlanner.checkAvailability", () => {
     expect(runner.calls[0]!.cmd).toBe(CODEX_CMD);
     expect(runner.calls[0]!.args).toEqual(["--version"]);
     expect(runner.calls[0]!.opts.cwd).toBe(".");
+    // ES-498: probe は 30s タイムアウト付き（RealCommandRunner は timeoutMs 未指定だと無期限待機）
+    expect(runner.calls[0]!.opts.timeoutMs).toBe(30_000);
     expect(runner.calls[1]!.args).toEqual(["login", "status"]);
+    expect(runner.calls[1]!.opts.timeoutMs).toBe(30_000);
   });
 
   it("checkAvailability の認証確認は run() と同じフィルタ済み env を使う（env-only 認証の早期検出）", async () => {
@@ -432,6 +435,8 @@ describe("CodexPlanner.checkAvailability", () => {
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
       /codex.*not found|not available/i,
     );
+    // ES-498: プリフライトで列挙されるため対処（インストール）を含むこと
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(/インストール/);
   });
 
   it("codex --version が spawn 失敗（ENOENT）→ 診断メッセージ付き throw", async () => {
