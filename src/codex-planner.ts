@@ -326,9 +326,19 @@ export async function checkCodexAvailability(
   // check. This prevents a false-positive availability report when Codex is
   // reachable only via a relative PATH entry (e.g. node_modules/.bin) that
   // codexChildEnv strips before runtime.
-  const privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
-  if (process.platform !== "win32") chmodSync(privateHome, 0o700);
+  let privateHome: string;
   try {
+    privateHome = mkdtempSync(path.join(os.tmpdir(), "codex-planner-"));
+  } catch (err) {
+    // fs エラーのメッセージは codex を名乗らない（"ENOENT: ..., mkdtemp ..."）ため、
+    // プリフライトの列挙でどのチェックか判別できるよう明示的に包む。
+    throw new Error(
+      `codex: 可用性チェック用の一時ディレクトリを作成できません（${err instanceof Error ? err.message : String(err)}）`,
+    );
+  }
+  try {
+    // chmod は try の内側で行う: 失敗しても finally の rmSync が privateHome を確実に片付ける。
+    if (process.platform !== "win32") chmodSync(privateHome, 0o700);
     let result;
     try {
       result = await runner.run(CODEX_COMMAND, ["--version"], {
@@ -337,20 +347,29 @@ export async function checkCodexAvailability(
         timeoutMs: AVAILABILITY_PROBE_TIMEOUT_MS,
       });
     } catch (err) {
-      throw new Error(
-        `codex CLI not found or not available: ${err instanceof Error ? err.message : String(err)}` +
-          "（Codex CLI をインストールし PATH を通してください）",
-      );
+      const msg = err instanceof Error ? err.message : String(err);
+      // ENOENT（spawn 失敗 = 本当に見つからない）のみ「未インストール」と断定する。
+      // timeout / EACCES 等は codex が存在しても起きるため、誤った対処（再インストール）を
+      // 提示せず原因をそのまま示す。
+      if (/ENOENT/.test(msg)) {
+        throw new Error(
+          `codex CLI not found or not available: ${msg}（Codex CLI をインストールし PATH を通してください）`,
+        );
+      }
+      throw new Error(`codex: 可用性確認に失敗しました（${msg}）`);
     }
     if (result.code !== 0) {
+      // stderr を併記する: 「存在するが起動できない」バイナリ（glibc 不整合・破損等）の
+      // 実診断を捨てない（checkClaude が stderr を表面化させるのと同じ基準）。
+      const detail = result.stderr.trim().slice(-STDERR_TAIL_MAX);
       throw new Error(
-        "codex CLI not found or not available（Codex CLI をインストールし PATH を通してください）",
+        `codex CLI not found or not available${detail ? `: ${detail}` : ""}（Codex CLI をインストールし PATH を通してください）`,
       );
     }
     const version = result.stdout.trim();
 
-    // Run the auth check with the same filtered environment as run() so that
-    // environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
+    // Run the auth check with the same filtered environment as CodexPlanner.run() so
+    // that environments relying on env-var-only auth (CODEX_API_KEY / CODEX_ACCESS_TOKEN)
     // fail here at preflight rather than silently at exec time.
     let authResult;
     try {
@@ -365,14 +384,20 @@ export async function checkCodexAvailability(
       );
     }
     if (authResult.code !== 0) {
-      throw new Error("codex: 認証されていません（codex login を実行してください）");
+      // stderr を併記する: 未認証以外の非0終了（サブコマンド非対応・設定破損等）で
+      // 「codex login せよ」だけを出すと誤誘導になるため、実診断を残す。
+      const detail = authResult.stderr.trim().slice(-STDERR_TAIL_MAX);
+      throw new Error(
+        `codex: 認証されていません（codex login を実行してください${detail ? `。詳細: ${detail}` : ""}）`,
+      );
     }
 
-    // On Linux, Codex uses bwrap + seccomp for sandboxing. Probe bwrap so
-    // preflight can surface a missing helper early rather than at exec time.
-    // Skip the probe when extraArgs bypass sandboxing (e.g. --yolo), and
-    // treat a missing or failing bwrap as a non-fatal warning: Codex may
-    // fall back to its own sandbox helper on some configurations.
+    // On Linux, Codex uses bwrap + seccomp for sandboxing. Probe bwrap for parity with
+    // the original checkAvailability, skipping it when extraArgs bypass sandboxing
+    // (e.g. --yolo). The probe result is intentionally unobserved: a missing or failing
+    // bwrap is non-fatal by design (Codex may fall back to its own sandbox helper), and
+    // runPreflight's only output channel is the errors list — there is no warning
+    // channel — so we silently proceed and let runtime surface a genuine sandbox failure.
     if (process.platform === "linux" && !isSandboxBypassed(extraArgs ?? [])) {
       try {
         // Use the same sanitized env as all other child invocations so that
@@ -385,14 +410,18 @@ export async function checkCodexAvailability(
           timeoutMs: AVAILABILITY_PROBE_TIMEOUT_MS,
         });
       } catch {
-        // bwrap unavailable; Codex may use a fallback — proceed and let
-        // runtime surface the failure if sandboxing truly cannot start.
+        // bwrap unavailable — intentionally silent (see probe comment above).
       }
     }
 
     return version;
   } finally {
-    rmSync(privateHome, { recursive: true, force: true });
+    try {
+      rmSync(privateHome, { recursive: true, force: true });
+    } catch {
+      // クリーンアップ失敗（EBUSY 等）が本来の診断を上書きしないよう握り潰す。
+      // 一時 dir のリークは許容（force:true が抑止するのは missing-path のみ）。
+    }
   }
 }
 

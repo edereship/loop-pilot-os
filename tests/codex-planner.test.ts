@@ -391,6 +391,11 @@ describe("CodexPlanner.checkAvailability", () => {
     expect(runner.calls[0]!.opts.timeoutMs).toBe(30_000);
     expect(runner.calls[1]!.args).toEqual(["login", "status"]);
     expect(runner.calls[1]!.opts.timeoutMs).toBe(30_000);
+    if (process.platform === "linux") {
+      // Linux では bwrap probe（calls[2]）も同じ 30s timeout を持つ
+      expect(runner.calls[2]!.cmd).toBe("bwrap");
+      expect(runner.calls[2]!.opts.timeoutMs).toBe(30_000);
+    }
   });
 
   it("checkAvailability の認証確認は run() と同じフィルタ済み env を使う（env-only 認証の早期検出）", async () => {
@@ -437,6 +442,8 @@ describe("CodexPlanner.checkAvailability", () => {
     );
     // ES-498: プリフライトで列挙されるため対処（インストール）を含むこと
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(/インストール/);
+    // ES-498 レビュー反映: 実診断（stderr）を捨てない
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(/command not found/);
   });
 
   it("codex --version が spawn 失敗（ENOENT）→ 診断メッセージ付き throw", async () => {
@@ -452,6 +459,26 @@ describe("CodexPlanner.checkAvailability", () => {
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
       /ENOENT/,
     );
+    // ES-498 レビュー反映: ENOENT（真の未インストール）はインストール対処を含む
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(/インストール/);
+  });
+
+  it("codex --version が timeout 等の非 ENOENT 失敗 → not found と誤分類せず原因を示す（ES-498 レビュー反映）", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on([CODEX_CMD, "--version"], () => {
+      throw new Error('command "codex" timed out after 30000ms');
+    });
+    const logs: string[] = [];
+
+    const err = await makePlanner(runner, logs)
+      .checkAvailability()
+      .then(() => null, (e) => e as Error);
+    expect(err).not.toBeNull();
+    expect(err!.message).toContain("可用性確認に失敗しました");
+    expect(err!.message).toContain("timed out after 30000ms");
+    // ハングした codex（= 発見済み・起動済み）に「インストールせよ」という誤対処を出さない
+    expect(err!.message).not.toContain("not found");
+    expect(err!.message).not.toContain("インストール");
   });
 
   it("codex login status が非0終了（未認証）→ 認証エラーで throw", async () => {
@@ -463,6 +490,8 @@ describe("CodexPlanner.checkAvailability", () => {
     await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(
       /認証されていません|codex login/,
     );
+    // ES-498 レビュー反映: 未認証以外の非0終了の誤誘導を避けるため stderr を併記する
+    await expect(makePlanner(runner, logs).checkAvailability()).rejects.toThrow(/詳細: not logged in/);
   });
 
   it("codex login status が spawn 失敗 → 認証確認エラーで throw", async () => {
@@ -489,15 +518,18 @@ describe("CodexPlanner.checkAvailability", () => {
     await expect(makePlanner(runner, logs).checkAvailability()).resolves.toBe("codex-cli 0.137.0");
   });
 
-  it("Linux で bwrap が非0終了でも checkAvailability は成功する（Codex sandbox probe を呼ばないため）", async () => {
+  it("Linux で bwrap が非0終了でも checkAvailability は成功する（probe 結果は設計上非致命）", async () => {
     if (process.platform !== "linux") return;
     const runner = new FakeCommandRunner();
     runner.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
     runner.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
-    // bwrap is intentionally not stubbed: if the code calls it, FakeCommandRunner throws.
+    // bwrap が「存在するが壊れている」（spawn 成功・非0終了）ケース。
+    // ES-498 レビュー反映: 従来この it は bwrap 未スタブ（= spawn 失敗）で上のテストと重複していた。
+    runner.on(["bwrap", "--version"], { code: 1, stdout: "", stderr: "bwrap: broken installation" });
     const logs: string[] = [];
 
     await expect(makePlanner(runner, logs).checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+    expect(runner.calls.some((c) => c.cmd === "bwrap")).toBe(true);
   });
 });
 
@@ -702,6 +734,9 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
     });
 
     await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+    // ES-498 レビュー反映: 「probe が走ったが握り潰された」と「スキップされた」を区別する
+    // （checkAvailability → checkCodexAvailability の extraArgs 転送をピン留めする）。
+    expect(runner.calls.some((c) => c.cmd === "bwrap")).toBe(false);
   });
 
   it("Linux で extraArgs に --sandbox=danger-full-access がある場合は bubblewrap チェックをスキップする", async () => {
@@ -715,6 +750,9 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
     });
 
     await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+    // ES-498 レビュー反映: 「probe が走ったが握り潰された」と「スキップされた」を区別する
+    // （checkAvailability → checkCodexAvailability の extraArgs 転送をピン留めする）。
+    expect(runner.calls.some((c) => c.cmd === "bwrap")).toBe(false);
   });
 
   it("Linux で extraArgs に --yolo がある場合は bubblewrap チェックをスキップする", async () => {
@@ -728,6 +766,9 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
     });
 
     await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+    // ES-498 レビュー反映: 「probe が走ったが握り潰された」と「スキップされた」を区別する
+    // （checkAvailability → checkCodexAvailability の extraArgs 転送をピン留めする）。
+    expect(runner.calls.some((c) => c.cmd === "bwrap")).toBe(false);
   });
 
   it("Linux で extraArgs に --dangerously-bypass-approvals-and-sandbox がある場合は bubblewrap チェックをスキップする", async () => {
@@ -741,6 +782,9 @@ describe("CodexPlanner bwrap sandbox bypass (Finding 3)", () => {
     });
 
     await expect(planner.checkAvailability()).resolves.toBe("codex-cli 0.137.0");
+    // ES-498 レビュー反映: 「probe が走ったが握り潰された」と「スキップされた」を区別する
+    // （checkAvailability → checkCodexAvailability の extraArgs 転送をピン留めする）。
+    expect(runner.calls.some((c) => c.cmd === "bwrap")).toBe(false);
   });
 });
 

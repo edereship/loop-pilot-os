@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **注（2026-07-03）**: 本プランは原案どおり実行済み。その後のマージ前内部レビュー（4 観点）で失敗メッセージの分岐（ENOENT のみ not-found 断定）・stderr 併記・fs 失敗経路の防御・テストのピン留め強化が追加された。最終仕様は spec の「内部レビュー反映」節と実装を参照。
+
 **Goal:** `CodexPlanner.checkAvailability()` 相当の検証を `runPreflight` に組み込み、Codex CLI 不在/未認証で `looppilot-os run` が起動時に fail-fast するようにする。
 
 **Architecture:** `checkAvailability()` の本体を module-level 関数 `checkCodexAvailability(runner, extraArgs?)` として `src/codex-planner.ts` から export し、メソッドは委譲に変える。`runPreflight` は `checkClaude` 直後に新チェック `checkCodex` を追加し、throw をエラー集約形式へ変換する（他チェックと同じ「途中 throw しない」契約）。チェックは無条件（main.ts が SELECT / DESIGN REVIEW に常時 codexPlanner を配線するため、Codex を使わない構成は存在しない）。
