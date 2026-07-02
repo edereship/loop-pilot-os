@@ -78,7 +78,7 @@
   5. `login status` spawn 失敗 → `認証状態を確認できません`
   6. (Linux ガード) bwrap probe が throw しても codex エラーなし（non-fatal 維持）
   7. 集約: codex 未認証 + claude 未認証 → 両エラーが同時に列挙される
-- `tests/codex-planner.test.ts` は無変更（委譲により全パスを維持することが受け入れ条件）。
+- `tests/codex-planner.test.ts`: 既存テストは無変更のまま全パス維持（委譲の検証）。加えて `checkCodexAvailability` の契約を単体側で固定するため、成功系テストに probe の `timeoutMs: 30_000` アサーション、`--version` 非 0 テストにインストール対処文言のアサーションを追加する。
 
 ### 4. README.md
 
