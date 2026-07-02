@@ -342,7 +342,7 @@ describe("v3.5 E2E: VERIFY fix loop", () => {
 // ────────────────────────────────────────────────────────────────────────────
 describe("v3.5 E2E: VERIFY exhaust → abandon → needs-human → next task", () => {
   it("verify_failed triggers abandon, needs-human triage, and loop continues to next task", async () => {
-    const config = makeConfig({ maxTasksPerRun: 3, maxVerifyAttempts: 2 });
+    const config = makeConfig({ maxTasksPerRun: 2, maxVerifyAttempts: 2 });
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designReviewer: planner });
 
@@ -484,6 +484,9 @@ describe("v3.5 E2E: CI recovery with log injection", () => {
     // CI logs were fetched
     expect(h.git.calls.some(c => c.method === "fetchCiLogs")).toBe(true);
 
+    // CI log text was injected into the recovery planner prompt
+    expect(planner.contexts[1].prompt).toContain("missing-dep");
+
     // Recovery notifications
     expect(h.notifier.events.some(e => e.kind === "recovery_started")).toBe(true);
     expect(h.notifier.events.some(e => e.kind === "recovery_succeeded")).toBe(true);
@@ -525,8 +528,9 @@ describe("v3.5 E2E: CI recovery exhaustion → abandon → next task", () => {
     // Recovery poll for TY-1: ci_failed → counter exhausted → abandon
     // TY-2: done → merged
     h.monitor.verdicts = [
-      { kind: "done" },     // TY-1: ci_failed → abandon
-      { kind: "done" },     // TY-2: merge
+      { kind: "done" },     // TY-1: recoverInReview() adopts PR, polls → done
+      { kind: "done" },     // TY-1: monitorSession → ci_failed → counter exhausted → abandon
+      { kind: "done" },     // TY-2: checkMergeReadiness → ready → mergePr
       { kind: "merged" },
     ];
     let readinessCallForPr = new Map<number, number>();
@@ -537,6 +541,9 @@ describe("v3.5 E2E: CI recovery exhaustion → abandon → next task", () => {
       if (pr === 100) return { ready: false, reason: "ci_failed" as const };
       return { ready: true, headSha: `sha-${pr}` };
     };
+    // Give TY-2 a distinct PR number (101) so checkMergeReadiness(101) returns
+    // ready and mergePr is called, exercising the full done-path for TY-2.
+    h.git.pushPrNumber.set("looppilot/ty-2-x", 101);
     h.agent.outcomes = [
       // TY-2: IMPLEMENT + SELF-REVIEW
       { kind: "completed", costUsd: 2.0, summary: "TY-2 done" },
@@ -559,12 +566,15 @@ describe("v3.5 E2E: CI recovery exhaustion → abandon → next task", () => {
     expect(ty1.failureReason).toBe("ci_failed");
     expect(ty1.recoveryAction).toBe("abandon");
 
-    // TY-2: merged with VERIFY pass
+    // TY-2: merged with VERIFY pass via the full done-path (checkMergeReadiness → mergePr)
     const runId = h.store.latestRun()!.id;
     const newSessions = h.store.sessionsForRun(runId).filter(s => s.linearIdentifier === "TY-2");
     expect(newSessions).toHaveLength(1);
     expect(newSessions[0].state).toBe("merged");
     expect(newSessions[0].verifyAttempts).toBe(1);
+    // Verify TY-2 exercised checkMergeReadiness and mergePr (done-path, not merged-verdict shortcut)
+    expect(h.monitor.readinessCalls).toContain(101);
+    expect(h.git.calls.some(c => c.method === "mergePr" && (c.args as number[])[0] === 101)).toBe(true);
 
     // needs-human label applied to TY-1
     expect(h.source.labelAdds.some(

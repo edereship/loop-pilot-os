@@ -353,7 +353,7 @@ looppilot-os status --config ./looppilot-os.toml
 - [ ] `status` で **2 件が `merged`** と表示され、各チケットが Linear で **Done**。
 - [ ] Run の状態が `idle`（キュー空）または `halted`（タスク上限）で、**`failure_reason` を持つセッションが無い**。
 - [ ] 通知（コンソール、Slack 設定時は Slack）に `run_started` と `idle`（または タスク上限の `halted`）が出ている。未配信通知が残っていない。
-- [ ] **失敗系の確認**（任意）: わざと壊れたチケット（差分を生まない指示など）を 1 件投入すると、対応する `failure_reason`（例 `agent_no_change`）で 1 セッションが `stopped`、Run が `halted`、`halted` 通知が出てループが停止する。`status` に停止箇所と理由が表示される。
+- [ ] **失敗系の確認**（任意）: わざと壊れたチケット（差分を生まない指示など）を 1 件投入すると、対応する `failure_reason`（例 `agent_no_change`）で 1 セッションが `stopped`（`recoveryAction=abandon`）、`needs-human` ラベルが付与されてループは継続（`task_skipped` 通知）、Run は `halted` にならず次タスクへ進む（キュー空なら `idle`）。`status` に停止箇所・理由・`recoveryAction` が表示される。
 - [ ] **再起動回復の確認**（任意）: `in_review`（オープン PR あり）のセッションがある状態で `run` を再起動すると、その PR の MONITOR が継続（`monitor_started_at` は維持）され、マージ済みなら DONE 後段から再開してカウンタが二重計上されない。
 
 これらが満たされれば、仕様 §12「一度起動したら人間の追加指示なしで、各チケットを 選定→ブランチ→Claude実装→PR→`loop-pilot` 受け渡し→LoopPilot がクリーン到達→**オーケがマージ**→ticket Done→次、と逐次処理し、キュー空 or タスク上限で**通知して綺麗に停止**する」を満たします。
