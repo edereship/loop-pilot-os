@@ -2883,6 +2883,100 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
   });
 });
 
+describe("Orchestrator DESIGN cost accounting (ES-499)", () => {
+  it("adds design cost to session cost_usd on completed outcome", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N", costUsd: 0.25 },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.costUsd).toBeCloseTo(1.25); // 0.25 design + 1.0 implement
+  });
+
+  it("accumulates design costs across a redesign loop", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nV1\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N", costUsd: 0.3 },
+      { kind: "completed", text: "## Goal\nV2\n\n## Change Targets\n- f\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N", costUsd: 0.5 },
+    ];
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: '```json\n{"verdict":"reject","reasons":["Missing error handling"]}\n```' },
+      { kind: "completed", text: '```json\n{"verdict":"approve","reasons":[]}\n```' },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer, designReviewer: reviewer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.costUsd).toBeCloseTo(1.8); // 0.3 + 0.5 design + 1.0 implement
+  });
+
+  it("keeps spent design cost when the design agent errors", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [{ kind: "error", message: "agent crashed", costUsd: 0.4 }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged"); // error はフォールバック（brief なしで IMPLEMENT へ）
+    expect(s.planBrief).toBeNull();
+    expect(s.costUsd).toBeCloseTo(1.4); // 0.4 design (error) + 1.0 implement
+  });
+
+  it("records design cost before halting on interrupted outcome", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [{ kind: "interrupted", costUsd: 0.2 }];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    const s = h.store.sessionsForRun(run.id)[0];
+    expect(s.costUsd).toBeCloseTo(0.2); // halt 前に計上済み
+  });
+
+  it("leaves cost_usd untouched when designer reports no cost (Codex-style undefined)", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N" },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(s.costUsd).toBeCloseTo(1.0); // implement のみ。undefined は加算スキップ
+  });
+});
+
 describe("Orchestrator DESIGN brief writeback (ES-406)", () => {
   it("writes back the brief as a Linear comment after successful generation", async () => {
     const briefText = "## Goal\nDo the thing.\n\n## Change Targets\n- file.ts\n\n## Implementation Steps\n1. Step one\n\n## Acceptance Criteria\n- Tests pass\n\n## Out of Scope\n- Nothing";
