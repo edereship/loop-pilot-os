@@ -39,11 +39,11 @@
 - `export async function checkCodexAvailability(runner: CommandRunner, extraArgs?: string[]): Promise<string>` を追加（本体は現 `checkAvailability` の移設。`this.runner` → `runner`、`this.opts.extraArgs` → `extraArgs`）。
 - `CodexPlanner.checkAvailability()` は `return checkCodexAvailability(this.runner, this.opts.extraArgs);` へ委譲（既存テスト・呼び出し API は無傷）。
 - 3 つの probe（`codex --version` / `codex login status` / `bwrap --version`）に `timeoutMs: 30_000` を付与する。`RealCommandRunner` は `timeoutMs` 未指定だと無期限待機のため、ハングした codex がプリフライトを固めるのを防ぐ（既存 preflight チェックの 30–60 秒タイムアウトと整合）。
-- 失敗メッセージ仕様（内部レビュー反映後の最終形。既存テストの正規表現 `/codex.*not found|not available/i`、`/ENOENT/` は維持）:
-  - `--version` spawn 失敗のうち **ENOENT のみ**: `codex CLI not found or not available: ${msg}（Codex CLI をインストールし PATH を通してください）`
-  - `--version` の **非 ENOENT 失敗**（timeout / EACCES 等）: `codex: 可用性確認に失敗しました（${msg}）` — codex は存在しても起きるため「未インストール」と誤分類せず、誤った対処（再インストール）を提示しない
-  - `--version` 非 0 終了: `codex CLI not found or not available: ${stderr末尾1000字}（Codex CLI をインストールし PATH を通してください）` — 「存在するが起動できない」バイナリの実診断を捨てない
-  - `login status` 非 0 終了: `codex: 認証されていません（codex login を実行してください。詳細: ${stderr末尾1000字}）` — 未認証以外の非 0 終了（サブコマンド非対応・設定破損等）での誤誘導対策
+- 失敗メッセージ仕様（内部レビュー第 1・2 回反映後の最終形。既存テストの正規表現 `/codex.*not found|not available/i`、`/ENOENT/` は維持）:
+  - `--version` spawn/解決失敗のうち **真の不在のみ**（POSIX: `ENOENT` ／ Windows: exec.ts の shim 解決が投げる `not found in any absolute PATH entry`）: `codex CLI not found or not available: ${msg}（Codex CLI をインストールし PATH を通してください）`
+  - `--version` の **上記以外の失敗**（timeout / EACCES 等）: `codex: 可用性確認に失敗しました（${msg}）` — codex は存在しても起きるため「未インストール」と誤分類せず、誤った対処（再インストール）を提示しない
+  - `--version` 非 0 終了: `codex CLI not found or not available: exit code ${code}${detail ? `: ${detail}` : ""}（Codex CLI をインストールし PATH を通してください）` — `detail` = stderr（空なら stdout）の末尾 1000 字。stderr 空の非 0 終了（シグナル死 = code -1 等）でも exit code が証跡として残る
+  - `login status` 非 0 終了: `codex: 認証されていません（codex login を実行してください。exit code ${code}${detail ? `。詳細: ${detail}` : ""}）` — `detail` は同上。未認証以外の非 0 終了（サブコマンド非対応・設定破損等）での誤誘導対策
   - `login status` spawn 失敗: `codex: 認証状態を確認できません（${msg}）`（変更なし）
   - `mkdtempSync` 失敗: `codex: 可用性チェック用の一時ディレクトリを作成できません（${msg}）` — fs エラーが無印でプリフライト一覧に並ぶのを防ぐ
 - 堅牢化: `chmodSync` は try 内へ移動（失敗時の一時 dir リーク防止）。`finally` の `rmSync` は自前の try/catch で包む（EBUSY 等のクリーンアップ失敗が本来の診断を上書きしないように）。
@@ -114,4 +114,16 @@
 4. **extraArgs 転送の未ピン留め**（tests Important）: 委譲メソッドから extraArgs を落とすミューテーションが全テストを生き残っていた → sandbox-bypass テスト 4 件に「bwrap が呼ばれない」アサーションを追加。
 5. その他: mkdtemp/chmod/rmSync の失敗経路の防御（codex 前置・リーク防止・診断保全）、`run()` 参照の曖昧さ解消（`CodexPlanner.run()` 表記）、ENOENT 経路のインストール文言ピン留め、bwrap 非 0 終了テストの実体化（従来は未スタブで重複だった）、Linux ガードテストの `it.skipIf` 化 + probe 実行アサーション、timeout 失敗 UX のテスト追加（unit + wiring）。
 
-見送った提案（理由付き）: bwrap probe の警告チャネル追加（runPreflight の出力契約変更 = スコープ外・フォローアップ候補）、mkdtemp 失敗の fs モックテスト（suite に fs モック前例なし・コスト対効果）、checkCodex 後続チェックとの明示的集約テスト(re-throw すれば既存 4 テストが落ちるため間接的にピン留め済み）。
+見送った提案（理由付き）: bwrap probe の警告チャネル追加（runPreflight の出力契約変更 = スコープ外・フォローアップ候補）、mkdtemp 失敗の fs モックテスト（→ 第 2 回で TMPDIR 差し替えにより fs モック不要と判明し追加済み）、checkCodex 後続チェックとの明示的集約テスト(re-throw すれば既存 4 テストが落ちるため間接的にピン留め済み）。
+
+## 内部レビュー反映・第 2 回（2026-07-03）
+
+第 1 回の修正コミットを対象に同 4 観点で再レビュー（修正の完全性検証 + 新規問題探索）。反映:
+
+1. **Critical: `node_modules` symlink の混入除去** — 第 1 回修正コミットが review worktree の `node_modules` symlink（絶対パス）を追跡してしまっていた（`.gitignore` の `node_modules/` は末尾スラッシュのため symlink = ファイルにマッチしない）。`git rm --cached` で除去し、`.gitignore` を `node_modules`（スラッシュなし）へ変更して再発防止。
+2. **Windows の真の不在が中立バケットに落ちる**（2 エージェントが独立指摘）— win32 では spawn 前に exec.ts の `resolveWindowsCmdShim` が `codex.cmd not found in any absolute PATH entry`（ENOENT なし）を投げるため、インストール対処が出なかった → 判定を `/ENOENT|not found in any absolute PATH entry/` に拡張。
+3. **stderr 空の非 0 終了で診断ゼロの再インストール誘導が残存** — シグナル死・サイレントクラッシュで第 1 回指摘が再現していた → 両非 0 分岐に exit code を常時併記し、stderr 空時は stdout へフォールバック。
+4. **二重前置契約の未ピン留め** — checkCodex を無条件 prefix 化する変異が全テストを生存 → wiring テストに `startsWith("codex CLI not found...")` を追加して封鎖。
+5. mkdtemp 失敗経路のテスト追加（TMPDIR 差し替え・fs モック不要）、空 stderr 形状の厳密ピン（`.toBe` ×2）、stdout フォールバックのピン、Windows shim メッセージ分類のピン、残る Linux ガードテスト 6 件の `it.skipIf` 化（非 Linux でスキップとして可視化）。
+
+第 2 回で確認された完全性: 第 1 回修正 5 件は Linux/POSIX 経路で全て完全（silent-failure 個別判定）、TypeScript 確定代入の制御フロー正当性、全 production エラー経路が codex 前置で列挙されること、テスト変異耐性（ENOENT 分岐・両層ピン済み）。見送り: bwrap probe の可観測化/短縮 timeout（フォローアップ候補のまま）、chmod の源流ラップ（checkCodex の防御接頭辞が安全網として機能・到達不能を確認済み）。

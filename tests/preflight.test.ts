@@ -2593,6 +2593,9 @@ describe("runPreflight: codex CLI 可用性（ES-498）", () => {
       e.includes("インストール") &&
       e.includes("command not found"), // ES-498 レビュー反映: stderr を捨てない
     )).toBe(true);
+    // ES-498 R2 反映: checkCodex は codex 発のメッセージを加工しない（"codex: " 二重前置なし）。
+    // startsWith で先頭を固定し、無条件 prefix 化の退行を検出する。
+    expect(errors.some((e) => e.startsWith("codex CLI not found or not available"))).toBe(true);
   });
 
   it("codex --version が spawn 失敗（ENOENT）なら診断付き not-found + インストール対処を列挙", async () => {

@@ -348,10 +348,12 @@ export async function checkCodexAvailability(
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // ENOENT（spawn 失敗 = 本当に見つからない）のみ「未インストール」と断定する。
+      // 「本当に見つからない」場合のみ「未インストール」と断定する: POSIX は spawn の ENOENT、
+      // Windows は spawn 前に resolveWindowsCmdShim（exec.ts）が投げる
+      // "codex.cmd not found in any absolute PATH entry"（ENOENT を含まない）。
       // timeout / EACCES 等は codex が存在しても起きるため、誤った対処（再インストール）を
       // 提示せず原因をそのまま示す。
-      if (/ENOENT/.test(msg)) {
+      if (/ENOENT|not found in any absolute PATH entry/.test(msg)) {
         throw new Error(
           `codex CLI not found or not available: ${msg}（Codex CLI をインストールし PATH を通してください）`,
         );
@@ -359,11 +361,12 @@ export async function checkCodexAvailability(
       throw new Error(`codex: 可用性確認に失敗しました（${msg}）`);
     }
     if (result.code !== 0) {
-      // stderr を併記する: 「存在するが起動できない」バイナリ（glibc 不整合・破損等）の
-      // 実診断を捨てない（checkClaude が stderr を表面化させるのと同じ基準）。
-      const detail = result.stderr.trim().slice(-STDERR_TAIL_MAX);
+      // exit code と実診断（stderr、なければ stdout）を併記する: stderr 空の非0終了
+      //（シグナル死 = code -1、サイレントクラッシュ等）で診断ゼロのまま再インストールへ
+      // 誘導しない（checkClaude が stderr を表面化させるのと同じ基準）。
+      const detail = (result.stderr.trim() || result.stdout.trim()).slice(-STDERR_TAIL_MAX);
       throw new Error(
-        `codex CLI not found or not available${detail ? `: ${detail}` : ""}（Codex CLI をインストールし PATH を通してください）`,
+        `codex CLI not found or not available: exit code ${result.code}${detail ? `: ${detail}` : ""}（Codex CLI をインストールし PATH を通してください）`,
       );
     }
     const version = result.stdout.trim();
@@ -384,11 +387,11 @@ export async function checkCodexAvailability(
       );
     }
     if (authResult.code !== 0) {
-      // stderr を併記する: 未認証以外の非0終了（サブコマンド非対応・設定破損等）で
-      // 「codex login せよ」だけを出すと誤誘導になるため、実診断を残す。
-      const detail = authResult.stderr.trim().slice(-STDERR_TAIL_MAX);
+      // exit code と実診断（stderr、なければ stdout）を併記する: 未認証以外の非0終了
+      //（サブコマンド非対応・設定破損等）で「codex login せよ」だけを出すと誤誘導になる。
+      const detail = (authResult.stderr.trim() || authResult.stdout.trim()).slice(-STDERR_TAIL_MAX);
       throw new Error(
-        `codex: 認証されていません（codex login を実行してください${detail ? `。詳細: ${detail}` : ""}）`,
+        `codex: 認証されていません（codex login を実行してください。exit code ${authResult.code}${detail ? `。詳細: ${detail}` : ""}）`,
       );
     }
 
