@@ -1412,6 +1412,7 @@ export class Orchestrator {
     // ES-499: DESIGN の Claude 消費をセッション総コストに合算する。
     // kind 分岐の前に一度だけ加算することで completed / error / interrupted（halt 前）の
     // 全経路と再設計ループの累積をカバーする。undefined はコスト計測不能（Codex 等）。
+    // designer.run() が throw した例外経路は outcome が存在せずコスト計上不能（現状維持）。
     if (outcome.costUsd !== undefined) {
       const priorCostUsd = this.store.getSession(session.id).costUsd ?? 0;
       this.store.updateSession(session.id, { costUsd: priorCostUsd + outcome.costUsd });

@@ -2975,6 +2975,23 @@ describe("Orchestrator DESIGN cost accounting (ES-499)", () => {
     expect(s.state).toBe("merged");
     expect(s.costUsd).toBeCloseTo(1.0); // implement のみ。undefined は加算スキップ
   });
+
+  it("design cost counts against the per-session IMPLEMENT budget", async () => {
+    const designer = new FakePlanRunner();
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nDo X\n\n## Change Targets\n- f.ts\n\n## Implementation Steps\n1. S\n\n## Acceptance Criteria\n- P\n\n## Out of Scope\n- N", costUsd: 0.25 },
+    ];
+    const config = makeConfig({ maxTasksPerRun: 1, maxCostUsdPerSession: 10 });
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1.0, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // IMPLEMENT's budget is the per-session cap minus what DESIGN already spent.
+    expect(h.agent.contexts[0]!.maxCostUsd).toBeCloseTo(9.75);
+  });
 });
 
 describe("Orchestrator DESIGN brief writeback (ES-406)", () => {
