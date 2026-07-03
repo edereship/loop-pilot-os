@@ -2,6 +2,7 @@ import type { CommandRunner, CommandResult, Notifier, TicketState } from "./type
 import type { Config } from "./config.js";
 import type { FetchFn, LinearSetupRequest } from "./task-source.js";
 import { resolveLinearSetup } from "./task-source.js";
+import { checkCodexAvailability } from "./codex-planner.js";
 
 export interface PreflightDeps {
   config: Config;
@@ -56,6 +57,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<string[]> {
   await checkStateCommentAuthors(runner, config, repoSlug, opts, errors); // §9.9（Step 13 で追加）
   await checkLinear(deps, errors);                                     // §9.7（Step 15 で追加）
   await checkClaude(runner, opts, errors);                             // §9.8（Step 17 で追加）
+  await checkCodex(runner, errors);                                    // ES-498: codex 可用性
   await checkSlack(deps, errors);                                      // §9.10（Step 17 で追加）
   checkNonRoot(deps, errors);                                          // ES-385: bypassPermissions + root 拒否
 
@@ -1503,6 +1505,23 @@ async function checkClaude(
     }
   } catch (e) {
     errors.push(`claude: 認証確認に失敗しました（${(e as Error).message}）`);
+  }
+}
+
+// ---- ES-498: codex 起動可 + 認証確認 ----
+// v2/v3 知能レイヤ（SELECT / DESIGN REVIEW / GROOM / VERIFY 判定）は main.ts で常時
+// codexPlanner を配線するため、Codex を使わない構成は現行 CLI に存在しない — 無条件で検証する。
+// extraArgs は渡さない（main.ts の CodexPlanner 構築も渡していない = 実行時と同一構成を検証）。
+// 検証ロジックは codex-planner.ts の checkCodexAvailability（CodexPlanner.checkAvailability と
+// 同一実体）を再利用し、throw をエラー集約形式へ変換する。設計上の throw メッセージは
+// "codex" で始まる自己記述形式なので加工しない（"codex: " の二重前置を避ける）が、
+// 想定外の throw（fs エラー・非 Error 値）に備え、codex を名乗らないものには接頭辞を付ける。
+async function checkCodex(runner: CommandRunner, errors: string[]): Promise<void> {
+  try {
+    await checkCodexAvailability(runner);
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e);
+    errors.push(raw.startsWith("codex") ? raw : `codex: 可用性確認に失敗しました（${raw}）`);
   }
 }
 

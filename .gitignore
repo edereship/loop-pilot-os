@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 
 # SQLite 状態ストア（実 DB はコミットしない。WAL 副生成物含む）

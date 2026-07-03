@@ -5,6 +5,9 @@ import type { Notifier, NotifyEvent, TicketState } from "../src/types.js";
 import type { Config } from "../src/config.js";
 import type { FetchFn } from "../src/task-source.js";
 
+// Windows では npm CLI が .cmd shim 経由になる（codex-planner.ts の CODEX_COMMAND と同一規則）
+const CODEX_CMD = process.platform === "win32" ? "codex.cmd" : "codex";
+
 // ---- テスト用の最小 Config（config.ts §の Config 形・camelCase は解決済みの形） ----
 function makeConfig(overrides: Partial<Config> = {}): Config {
   const base: Config = {
@@ -99,6 +102,10 @@ function passingRunner(): FakeCommandRunner {
   // §9.8: claude 起動可 + 認証済み
   r.on(["claude", "--version"], { code: 0, stdout: "2.1.165 (Claude Code)\n", stderr: "" });
   r.on(["claude", "auth", "status", "--json"], { code: 0, stdout: '{"loggedIn":true}\n', stderr: "" });
+  // ES-498: codex 起動可 + 認証済み（Linux の bwrap probe も portable にスタブ）
+  r.on([CODEX_CMD, "--version"], { code: 0, stdout: "codex-cli 0.137.0\n", stderr: "" });
+  r.on([CODEX_CMD, "login", "status"], { code: 0, stdout: "", stderr: "" });
+  r.on(["bwrap", "--version"], { code: 0, stdout: "bwrap 0.8.0\n", stderr: "" });
   return r;
 }
 
@@ -2562,5 +2569,102 @@ describe("runPreflight — runner.run に timeoutMs が設定される (ES-465)"
       expect(call.opts.timeoutMs, `${call.cmd} ${call.args.join(" ")}`).toBeTypeOf("number");
       expect(call.opts.timeoutMs).toBeGreaterThan(0);
     }
+  });
+});
+
+// ---- ES-498: codex CLI 可用性（checkCodexAvailability の runPreflight 配線） ----
+describe("runPreflight: codex CLI 可用性（ES-498）", () => {
+  it("codex が正常（--version 成功 + 認証済み）なら codex 系エラーなし・probe は cwd '.' / 30s timeout", async () => {
+    const r = passingRunner();
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.filter((e) => e.toLowerCase().includes("codex"))).toEqual([]);
+    const versionCall = r.calls.find((c) => c.cmd === CODEX_CMD && c.args[0] === "--version");
+    expect(versionCall).toBeDefined();
+    expect(versionCall!.opts.cwd).toBe(".");
+    expect(versionCall!.opts.timeoutMs).toBe(30_000);
+  });
+
+  it("codex --version が非0終了なら not-found + インストール対処 + stderr 実診断を列挙（修正方針 1）", async () => {
+    const r = passingRunner();
+    r.on([CODEX_CMD, "--version"], { code: 127, stdout: "", stderr: "command not found" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) =>
+      e.includes("codex CLI not found or not available") &&
+      e.includes("インストール") &&
+      e.includes("command not found"), // ES-498 レビュー反映: stderr を捨てない
+    )).toBe(true);
+    // ES-498 R2 反映: checkCodex は codex 発のメッセージを加工しない（"codex: " 二重前置なし）。
+    // startsWith で先頭を固定し、無条件 prefix 化の退行を検出する。
+    expect(errors.some((e) => e.startsWith("codex CLI not found or not available"))).toBe(true);
+  });
+
+  it("codex --version が spawn 失敗（ENOENT）なら診断付き not-found + インストール対処を列挙", async () => {
+    const r = passingRunner();
+    r.on([CODEX_CMD, "--version"], () => {
+      throw new Error("spawn codex ENOENT");
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) =>
+      e.includes("codex CLI not found or not available") &&
+      e.includes("ENOENT") &&
+      e.includes("インストール"), // ES-498 レビュー反映: ENOENT 経路の対処もピン留め
+    )).toBe(true);
+  });
+
+  it("codex --version が timeout なら not found と誤分類せず原因を列挙する（ES-498 レビュー反映）", async () => {
+    const r = passingRunner();
+    r.on([CODEX_CMD, "--version"], () => {
+      throw new Error('command "codex" timed out after 30000ms');
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("codex: 可用性確認に失敗しました") && e.includes("timed out after 30000ms"))).toBe(true);
+    // ハングした codex（= 発見済み）に「インストールせよ」という矛盾した対処を出さない
+    expect(errors.some((e) => e.includes("インストール"))).toBe(false);
+  });
+
+  it("codex login status が非0（未認証）なら codex login の対処 + stderr 実診断を列挙", async () => {
+    const r = passingRunner();
+    r.on([CODEX_CMD, "login", "status"], { code: 1, stdout: "", stderr: "not logged in" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) =>
+      e.includes("codex: 認証されていません") &&
+      e.includes("codex login") &&
+      e.includes("詳細: not logged in"), // ES-498 レビュー反映: 未認証以外の非0終了の誤誘導対策
+    )).toBe(true);
+  });
+
+  it("codex login status が spawn 失敗なら認証確認エラーを列挙", async () => {
+    const r = passingRunner();
+    r.on([CODEX_CMD, "login", "status"], () => {
+      throw new Error("spawn codex ENOENT");
+    });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("codex: 認証状態を確認できません"))).toBe(true);
+  });
+
+  // skipIf: 非 Linux では「パス」ではなく「スキップ」として報告させる（空振り合格の可視化）
+  it.skipIf(process.platform !== "linux")(
+    "Linux: bwrap probe が失敗しても codex チェックは合格のまま（non-fatal probe 維持）",
+    async () => {
+      const r = passingRunner();
+      // FakeCommandRunner は同一プレフィックスなら後登録が勝つ — bwrap probe を spawn 失敗に上書き。
+      r.on(["bwrap", "--version"], () => {
+        throw new Error("spawn bwrap ENOENT");
+      });
+      const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+      // probe が実際に呼ばれた（= スキップによる空振り合格ではない）ことを確認した上で、
+      // その失敗が preflight を汚さないことを検証する。
+      expect(r.calls.some((c) => c.cmd === "bwrap")).toBe(true);
+      expect(errors).toEqual([]);
+    },
+  );
+
+  it("codex 未認証 + claude 未認証は両方同時に列挙される（途中 throw せず集約; 仕様 §9）", async () => {
+    const r = passingRunner();
+    r.on([CODEX_CMD, "login", "status"], { code: 1, stdout: "", stderr: "not logged in" });
+    r.on(["claude", "auth", "status", "--json"], { code: 0, stdout: '{"loggedIn":false}\n', stderr: "" });
+    const errors = await runPreflight({ config: makeConfig(), runner: r, notifier: passingNotifier, fetchFn: passingFetch() });
+    expect(errors.some((e) => e.includes("codex: 認証されていません"))).toBe(true);
+    expect(errors.some((e) => e.includes("claude: 認証されていません"))).toBe(true);
   });
 });
