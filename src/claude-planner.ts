@@ -20,13 +20,13 @@ export class ClaudePlanRunner implements PlanRunner {
     const outcome = await this.agent.runSession(sessionCtx);
     switch (outcome.kind) {
       case "completed":
-        return { kind: "completed", text: outcome.fullResult ?? outcome.summary };
+        return { kind: "completed", text: outcome.fullResult ?? outcome.summary, costUsd: outcome.costUsd };
       case "interrupted":
-        return { kind: "interrupted" };
+        return { kind: "interrupted", costUsd: outcome.costUsd };
       case "cost_exceeded":
-        return { kind: "error", message: "design budget exceeded" };
+        return { kind: "error", message: "design budget exceeded", costUsd: outcome.costUsd };
       case "error":
-        return { kind: "error", message: outcome.message };
+        return { kind: "error", message: outcome.message, costUsd: outcome.costUsd };
     }
   }
 }

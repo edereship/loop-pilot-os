@@ -243,9 +243,11 @@ export interface PromptArgs {
 // ---- チケット濃化（A2: PLAN フェーズ） ----
 
 export type PlanOutcome =
-  | { kind: "completed"; text: string }
-  | { kind: "error"; message: string }
-  | { kind: "interrupted" };
+  // costUsd: 実測 Claude 課金（USD）。undefined = 計測不能（Codex CLI は非対応）。
+  // 0 は「実測して 0 だった」を意味する（ES-499）。
+  | { kind: "completed"; text: string; costUsd?: number }
+  | { kind: "error"; message: string; costUsd?: number }
+  | { kind: "interrupted"; costUsd?: number };
 
 export interface PlanRunner {
   run(ctx: { worktreePath: string; prompt: string; timeoutMs?: number; model?: string; effort?: string }): Promise<PlanOutcome>;
