@@ -10,7 +10,7 @@ describe("ClaudePlanRunner", () => {
 
     const result = await runner.run({ worktreePath: "/wt", prompt: "design it" });
 
-    expect(result).toEqual({ kind: "completed", text: "full design brief text" });
+    expect(result).toEqual({ kind: "completed", text: "full design brief text", costUsd: 0.5 });
     expect(agent.contexts[0]!.worktreePath).toBe("/wt");
     expect(agent.contexts[0]!.prompt).toBe("design it");
     expect(agent.contexts[0]!.maxCostUsd).toBe(2);
@@ -33,7 +33,7 @@ describe("ClaudePlanRunner", () => {
 
     const result = await runner.run({ worktreePath: "/wt", prompt: "p" });
 
-    expect(result).toEqual({ kind: "interrupted" });
+    expect(result).toEqual({ kind: "interrupted", costUsd: 0.1 });
   });
 
   it("maps cost_exceeded AgentOutcome to PlanOutcome error", async () => {
@@ -43,7 +43,7 @@ describe("ClaudePlanRunner", () => {
 
     const result = await runner.run({ worktreePath: "/wt", prompt: "p" });
 
-    expect(result).toEqual({ kind: "error", message: "design budget exceeded" });
+    expect(result).toEqual({ kind: "error", message: "design budget exceeded", costUsd: 2 });
   });
 
   it("maps error AgentOutcome to PlanOutcome error", async () => {
@@ -53,6 +53,16 @@ describe("ClaudePlanRunner", () => {
 
     const result = await runner.run({ worktreePath: "/wt", prompt: "p" });
 
-    expect(result).toEqual({ kind: "error", message: "agent crashed" });
+    expect(result).toEqual({ kind: "error", message: "agent crashed", costUsd: 0 });
+  });
+
+  it("propagates spent cost on error outcomes (ES-499)", async () => {
+    const agent = new FakeAgentRunner();
+    agent.outcomes = [{ kind: "error", costUsd: 0.75, message: "network blip mid-run" }];
+    const runner = new ClaudePlanRunner(agent, { maxCostUsd: 2 });
+
+    const result = await runner.run({ worktreePath: "/wt", prompt: "p" });
+
+    expect(result).toEqual({ kind: "error", message: "network blip mid-run", costUsd: 0.75 });
   });
 });
