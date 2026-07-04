@@ -1,4 +1,5 @@
 import type { BoardState, BoardTicket, InProgressTicket, DoneTicket, BlockedTicket, GroomPromptArgs } from "./types.js";
+import { buildMemoryBlock } from "./memory-inject.js";
 
 function priorityLabel(priority: number): string {
   switch (priority) {
@@ -203,23 +204,13 @@ export function buildGroomPrompt(args: GroomPromptArgs): string {
   }
 
   // 3. Cross-task memory (all 3 categories: D-23)
-  const memoryParts: string[] = [];
-  if (memory.pmDecisions) {
-    memoryParts.push(["## PM Decisions", "", memory.pmDecisions].join("\n"));
-  }
-  if (memory.implResults) {
-    memoryParts.push(["## Implementation Results", "", memory.implResults].join("\n"));
-  }
-  if (memory.productKnowledge) {
-    memoryParts.push(["## Product Knowledge", "", memory.productKnowledge].join("\n"));
-  }
-  if (memoryParts.length > 0) {
-    let memoryBlock = ["# 横断メモリ", "", ...memoryParts].join("\n\n");
-    if (memoryBlock.length > memoryBudgetChars) {
-      memoryBlock = memoryBlock.slice(0, memoryBudgetChars) + "\n[...省略...]";
-    }
-    blocks.push(memoryBlock);
-  }
+  const memoryEntries = [
+    ...(memory.pmDecisions ? [{ label: "PM Decisions", content: memory.pmDecisions }] : []),
+    ...(memory.implResults ? [{ label: "Implementation Results", content: memory.implResults }] : []),
+    ...(memory.productKnowledge ? [{ label: "Product Knowledge", content: memory.productKnowledge }] : []),
+  ];
+  const memoryBlock = buildMemoryBlock(memoryEntries, memoryBudgetChars);
+  if (memoryBlock.length > 0) blocks.push(memoryBlock);
 
   // 4. Ticket board
   const boardText = formatBoardWithBudget(board, boardBudgetChars);
