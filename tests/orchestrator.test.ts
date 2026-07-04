@@ -2491,7 +2491,7 @@ describe("Orchestrator bootstrap memory — rebase failure local commit (ES-503)
       (c) => c.cmd === "git" && c.args[0] === "commit",
     );
     expect(commitCalls.length).toBeGreaterThan(0);
-    expect(commitCalls[0].args).toContain("chore: bootstrap memory (rebase skipped)");
+    expect(commitCalls[0].args).toContain("chore: bootstrap memory (autostash conflict)");
   });
 
   it("degrades gracefully when bootstrap local commit fails (ES-503)", async () => {

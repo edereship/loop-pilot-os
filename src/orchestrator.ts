@@ -4970,13 +4970,20 @@ export class Orchestrator {
       if (beforeCommit !== undefined) {
         // Bootstrap path: seed memory, then commit locally (no push) so files survive
         // the GROOM worktree cleanup (ES-503). Push is skipped because the rebase failed
-        // — a push would be non-fast-forward. Both steps are best-effort; failure
-        // degrades to the pre-ES-503 behavior (files left dirty, may be cleaned by GROOM).
-        try { beforeCommit(); } catch { /* initializeMemory may partially write files */ }
+        // — a push would be non-fast-forward. Both steps are best-effort.
+        // Restore tracked memory files to HEAD first so autostash-restored stale content
+        // from a prior crashed run is not committed alongside fresh bootstrap data.
+        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        try { beforeCommit(); } catch (err: unknown) {
+          this.log(`warning: initializeMemory failed in rebase-skip path: ${err instanceof Error ? err.message : String(err)}`);
+        }
         try {
           await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
         } catch {
-          this.log("warning: bootstrap memory commit failed after rebase skip; files left uncommitted");
+          // commitIfChanged's internal cleanup already removed the files; re-seed so the
+          // current run still has memory available for reading (degrades to uncommitted).
+          try { beforeCommit(); } catch { /* best-effort re-seed */ }
+          this.log("warning: bootstrap memory commit failed after rebase skip; files re-seeded but uncommitted");
         }
       } else {
         // Halt-path: restore any dirty docs/memory files so the clean-worktree
@@ -4998,11 +5005,16 @@ export class Orchestrator {
       this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
       if (beforeCommit !== undefined) {
         // Bootstrap path: seed memory, then commit locally (ES-503).
-        try { beforeCommit(); } catch { /* initializeMemory may partially write files */ }
+        try { beforeCommit(); } catch (err: unknown) {
+          this.log(`warning: initializeMemory failed in autostash-conflict path: ${err instanceof Error ? err.message : String(err)}`);
+        }
         try {
-          await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
+          await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (autostash conflict)");
         } catch {
-          this.log("warning: bootstrap memory commit failed after unmerged skip; files left uncommitted");
+          // commitIfChanged's internal cleanup already removed the files; re-seed so the
+          // current run still has memory available for reading (degrades to uncommitted).
+          try { beforeCommit(); } catch { /* best-effort re-seed */ }
+          this.log("warning: bootstrap memory commit failed after autostash conflict; files re-seeded but uncommitted");
         }
       } else {
         // Halt-path: remove untracked files so the next startup's clean-worktree
