@@ -167,6 +167,7 @@ function makeConfig(): Config {
       maxCostUsdPerFix: 2, codexTimeoutMinutes: 30,
       selectDiffBudgetChars: 6000, selectCodebaseSummaryBudgetChars: 5000,
       groomTimeoutMinutes: 10, groomBoardBudgetChars: 10000,
+      transientRetryAttempts: 2,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
     looppilot: { gateLabel: "loop-pilot" },

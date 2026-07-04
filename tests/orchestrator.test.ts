@@ -9121,3 +9121,280 @@ describe("VERIFY (ES-491)", () => {
     expect(planner.contexts[0].prompt).toContain("acceptance check");
   });
 });
+
+describe("ES-504 abandon transient retry — executeAbandon", () => {
+  it("PR close transient → リトライ → abandon 完遂 → CONTINUE", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix bug",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 0,
+      recoveryTurnAttempts: 2,
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async () => ({ ready: false, reason: "ci_failed" as const });
+    planner.outcomes = [];
+    // PR close: 1st call → transient (ECONNRESET), 2nd call → success
+    let prCloseCalls = 0;
+    h.recoveryRunner.on(["gh", "pr", "close"], () => {
+      prCloseCalls++;
+      if (prCloseCalls === 1) return { code: 1, stderr: "ECONNRESET" };
+      return { code: 0 };
+    });
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAction).toBe("abandon");
+    // Run halts because maxTasksPerRun=1 is reached (the abandoned session still counts as
+    // a started task), not because abandon failed — same pattern as the existing
+    // "transition(done) failed" test (line ~2100): halted-by-cap is a normal outcome here.
+    const run = h.store.latestRun()!;
+    expect(run.haltReason).toContain("task cap reached");
+    // PR close was called twice (1st transient + 2nd success)
+    expect(prCloseCalls).toBe(2);
+    // Retry was logged
+    expect(h.logs.some((l) => l.includes("transient retry") && l.includes("PR close"))).toBe(true);
+  });
+
+  it("branch delete transient → リトライ → abandon 完遂", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix bug",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 0,
+      recoveryTurnAttempts: 2,
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async () => ({ ready: false, reason: "ci_failed" as const });
+    planner.outcomes = [];
+    // Branch delete: 1st call → transient, 2nd → success
+    let branchDeleteCalls = 0;
+    h.recoveryRunner.on(["git", "push", "origin", "--delete"], () => {
+      branchDeleteCalls++;
+      if (branchDeleteCalls === 1) return { code: 1, stderr: "Connection reset by peer" };
+      return { code: 0 };
+    });
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAction).toBe("abandon");
+    // Run halts because maxTasksPerRun=1 is reached, not because abandon failed.
+    const run = h.store.latestRun()!;
+    expect(run.haltReason).toContain("task cap reached");
+    expect(branchDeleteCalls).toBe(2);
+  });
+
+  it("ticket revert transient → リトライ → abandon 完遂", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix bug",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 0,
+      recoveryTurnAttempts: 2,
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async () => ({ ready: false, reason: "ci_failed" as const });
+    planner.outcomes = [];
+    // Ticket revert (transition to todo): 1st call → transient, 2nd → success
+    let todoTransitionCalls = 0;
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (id: string, state: string) => {
+      if (state === "todo" && id === "issue-A") {
+        todoTransitionCalls++;
+        if (todoTransitionCalls === 1) throw new Error("ECONNRESET");
+      }
+      return origTransition(id, state as any);
+    };
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    expect(s.recoveryAction).toBe("abandon");
+    // Run halts because maxTasksPerRun=1 is reached, not because abandon failed.
+    const run = h.store.latestRun()!;
+    expect(run.haltReason).toContain("task cap reached");
+    // transition(todo) called twice: 1st ECONNRESET + 2nd success
+    expect(todoTransitionCalls).toBe(2);
+  });
+
+  it("PR close deterministic エラー → リトライなし → HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "Fix bug",
+      branch: "looppilot/ty-1-fix",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:00.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "in_review",
+      prNumber: 100,
+      recoveryAttempted: 0,
+      recoveryTurnAttempts: 2,
+      monitorStartedAt: "2026-06-04T00:01:00.000Z",
+    });
+    h.source.queue = [];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.monitor.checkMergeReadiness = async () => ({ ready: false, reason: "ci_failed" as const });
+    planner.outcomes = [];
+    // PR close: deterministic error (not transient)
+    let prCloseCalls = 0;
+    h.recoveryRunner.on(["gh", "pr", "close"], () => {
+      prCloseCalls++;
+      return { code: 1, stderr: "HTTP 404 Not Found" };
+    });
+
+    await h.orch.run();
+
+    const s = h.store.getSession(seeded.id);
+    expect(s.state).toBe("stopped");
+    // Deterministic → no retry
+    expect(prCloseCalls).toBe(1);
+    // Run halted because abandon failed
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+  });
+});
+
+describe("ES-504 abandon transient retry — pre-PR abandon", () => {
+  it("todo revert transient → リトライ → 成功 → CONTINUE", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+    ];
+    h.monitor.verdicts = [{ kind: "merged" }];
+    // todo revert: 1st call → transient, 2nd → success
+    let todoRevertCalls = 0;
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (id: string, state: string) => {
+      if (state === "todo" && id === "issue-A") {
+        todoRevertCalls++;
+        if (todoRevertCalls === 1) throw new Error("ECONNRESET");
+      }
+      return origTransition(id, state as any);
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const sA = sessions.find((s) => s.linearIdentifier === "TY-1")!;
+    expect(sA.state).toBe("stopped");
+    expect(sA.failureReason).toBe("agent_no_change");
+    // Retry succeeded silently — no "todo revert failed" text leaked into stopDetail.
+    expect(sA.stopDetail).toBeNull();
+    // Run continued past TY-1's abandon to TY-2, which completed normally (not an
+    // immediate halt via the todoRevertErr branch).
+    const sB = sessions.find((s) => s.linearIdentifier === "TY-2");
+    expect(sB).toBeDefined();
+    expect(sB!.state).toBe("merged");
+    // With maxTasksPerRun=2, countTasksStarted (TY-1 abandoned + TY-2 merged = 2) reaches the
+    // cap once TY-2 finishes, so the run halts on the *next* loop iteration via the unrelated
+    // task_cap check — not because the abandon/retry failed. Same pattern as Task 2's
+    // "PR close transient" test above: halted-by-cap is a normal, orthogonal outcome here.
+    const run = h.store.latestRun()!;
+    expect(run.haltReason).toContain("task cap reached");
+    // transition(todo) retried
+    expect(todoRevertCalls).toBe(2);
+    expect(h.logs.some((l) => l.includes("transient retry") && l.includes("todo revert"))).toBe(true);
+  });
+
+  it("todo revert deterministic → リトライなし → HALT", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1.0, summary: "done" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+    ];
+    // todo revert: deterministic error
+    let todoRevertCalls = 0;
+    const origTransition = h.source.transition.bind(h.source);
+    h.source.transition = async (id: string, state: string) => {
+      if (state === "todo" && id === "issue-A") {
+        todoRevertCalls++;
+        throw new Error("HTTP 403 Forbidden");
+      }
+      return origTransition(id, state as any);
+    };
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const sA = sessions.find((s) => s.linearIdentifier === "TY-1")!;
+    expect(sA.state).toBe("stopped");
+    expect(sA.failureReason).toBe("agent_no_change");
+    // Deterministic → no retry
+    expect(todoRevertCalls).toBe(1);
+    // Run halted (ticket stuck In Progress)
+    const run = h.store.latestRun()!;
+    expect(run.state).toBe("halted");
+    // TY-2 was not started
+    expect(sessions.find((s) => s.linearIdentifier === "TY-2")).toBeUndefined();
+  });
+});

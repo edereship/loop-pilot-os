@@ -1175,7 +1175,6 @@ export class Orchestrator {
               session, "design_rejected",
               baseDetailA,
               {},
-              { haltIfRevertFailed: true },
             );
             if (ctrl.control === "halt") return;
             designRejected = true;
@@ -1203,7 +1202,7 @@ export class Orchestrator {
           if (designAttempt > maxRedesigns) {
             const lastReasons = review.reasons.length > 0 ? review.reasons.join("; ") : "(no reasons provided)";
             const detail = `design review rejected after ${maxRedesigns} redesign attempts: ${lastReasons}`;
-            const ctrl = await this.stopSession(session, "design_rejected", detail, {}, { haltIfRevertFailed: true });
+            const ctrl = await this.stopSession(session, "design_rejected", detail, {});
             if (ctrl.control === "halt") return;
             designRejected = true;
             break;
@@ -4276,7 +4275,6 @@ export class Orchestrator {
     reason: FailureReason,
     detail: string | null,
     extraPatch: Partial<Pick<TaskSessionRow, "costUsd" | "prNumber" | "workflowHandledErrorCount">> = {},
-    opts: { haltIfRevertFailed?: boolean } = {},
   ): Promise<RunControl> {
     let patch = extraPatch;
     // Effective stop detail — may be augmented with recovery failure message (Finding 3).
@@ -4793,7 +4791,10 @@ export class Orchestrator {
         }
         let todoRevertErr: string | null = null;
         try {
-          await this.source.transition(session.linearIssueId, "todo");
+          await retryTransient(this.config.safety.transientRetryAttempts, () =>
+            this.source.transition(session.linearIssueId, "todo"),
+            { onRetry: (n, e) => this.log(`transient retry ${n}: todo revert for ${session.linearIdentifier}: ${errMsg(e)}`) },
+          );
         } catch (err) {
           todoRevertErr = errMsg(err);
           this.log(`policy-abandon: todo revert failed (ticket may be stuck): ${todoRevertErr}`);
@@ -4903,7 +4904,10 @@ export class Orchestrator {
     const label = this.config.linear.needsHumanLabel;
     let labelApplied = false;
     try {
-      await this.source.addLabel(session.linearIssueId, label);
+      await retryTransient(this.config.safety.transientRetryAttempts, () =>
+        this.source.addLabel(session.linearIssueId, label),
+        { onRetry: (n, e) => this.log(`transient retry ${n}: addLabel for ${session.linearIdentifier}: ${errMsg(e)}`) },
+      );
       labelApplied = true;
       this.store.markNeedsHumanLabelAdded(session.id);
     } catch (err) {
@@ -4921,7 +4925,10 @@ export class Orchestrator {
       statusLine,
     ].join("\n");
     try {
-      await this.source.postComment(session.linearIssueId, commentBody);
+      await retryTransient(this.config.safety.transientRetryAttempts, () =>
+        this.source.postComment(session.linearIssueId, commentBody),
+        { onRetry: (n, e) => this.log(`transient retry ${n}: postComment for ${session.linearIdentifier}: ${errMsg(e)}`) },
+      );
     } catch (err) {
       this.log(`needs-human: postComment failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
     }
