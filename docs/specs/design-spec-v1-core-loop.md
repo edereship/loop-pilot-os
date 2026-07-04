@@ -9,7 +9,7 @@
 >
 > 以下の点は v1 以降のマイルストーンで変更されています:
 >
-> 1. **監視 timeout の既定値**: 本文（§3 確定事項・§10）では「既定オフ」だが、現行は**既定 60 分**（ES-449: `monitor_timeout_minutes` default 60）。
+> 1. **監視 timeout の既定値**: 本文（§3 確定事項・§8・§11）では「既定オフ」だが、現行は**既定 60 分**（ES-449: `monitor_timeout_minutes` default 60）。
 > 2. **失敗時のポリシー**: 本文（§5・§9）では「全失敗 → STOPPED → HALT（人間に上げる）」だが、現行は failure_reason ごとに **halt / recover / abandon の 3 ポリシー routing**（ES-490: `FAILURE_POLICY` テーブル）。詳細は README の failure_reason 一覧を参照。
 > 3. **MONITOR 中の書き込み制約**: 本文（§5）では「監視中は PR/ブランチへ書き込まない」だが、現行は /restart-review 自動投稿・workflow fix agent 等で正当に緩和（ES-397 / ES-409 / ES-450）。
 > 4. **status CLI のキュー表示**: 本文（§5・§10・§12）では status CLI でキューを表示する想定だが、実装では Linear 側の適格一覧は Store から導出不能のため省略。
