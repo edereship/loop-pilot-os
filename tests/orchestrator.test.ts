@@ -2347,22 +2347,24 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
     expect(h.store.latestRun()!.state).toBe("halted");
   });
 
-  it("skips memory commit and aborts rebase when rebase fails on halt (ES-452 Findings 3 & 4)", async () => {
+  it("skips memory push and aborts rebase when rebase fails on halt (ES-452 Findings 3 & 4)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     // Override: rebase fails, simulating conflicts between local memory edits and remote
     h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
     h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
-    // Memory has changes, but commit must NOT be called because rebase failed
+    // Memory has changes
     h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
 
     h.orch.requestStop();
     await h.orch.run();
 
-    const commitCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "commit",
+    // Bootstrap path may commit locally (ES-503), but push must NOT happen
+    const pushCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "push",
     );
-    expect(commitCall).toBeUndefined();
+    expect(pushCall).toBeUndefined();
     const abortCall = h.memoryRunner.calls.find(
       (c) => c.cmd === "git" && c.args[0] === "rebase" && c.args.includes("--abort"),
     );
@@ -2370,7 +2372,7 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
     expect(h.store.latestRun()!.state).toBe("halted");
   });
 
-  it("skips memory commit when autostash pop leaves conflicts after successful rebase (ES-452 Finding 2)", async () => {
+  it("skips memory push when autostash pop leaves conflicts after successful rebase (ES-452 Finding 2)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     // Rebase exits 0 (success), but autostash pop left unmerged files
@@ -2379,16 +2381,18 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
       stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
     });
     h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-    // Even though diff shows changes, commit must NOT be called
+    // Memory has changes
     h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
 
     h.orch.requestStop();
     await h.orch.run();
 
-    const commitCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "commit",
+    // Bootstrap path may commit locally (ES-503), but push must NOT happen
+    const pushCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "push",
     );
-    expect(commitCall).toBeUndefined();
+    expect(pushCall).toBeUndefined();
     const checkoutCall = h.memoryRunner.calls.find(
       (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD"),
     );
@@ -2437,6 +2441,75 @@ describe("Orchestrator bootstrap memory commit — ES-452 Finding 1", () => {
     expect(resetCalls.length).toBeGreaterThan(0);
     // Every reset to HEAD~1 must use --hard so the working tree is cleaned
     expect(resetCalls.every((c) => c.args.includes("--hard"))).toBe(true);
+  });
+});
+
+describe("Orchestrator bootstrap memory — rebase failure local commit (ES-503)", () => {
+  it("commits bootstrap memory locally when rebase fails so GROOM cleanup cannot remove it", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase fails during bootstrap
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+    // commitIfChanged: git add succeeds, diff shows staged changes, commit succeeds
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // A local commit must have been created with the bootstrap-specific message
+    const commitCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCalls.length).toBeGreaterThan(0);
+    expect(commitCalls[0].args).toContain("chore: bootstrap memory (rebase skipped)");
+    // Push must NOT be attempted (rebase failed → push would be non-fast-forward)
+    const pushCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "push",
+    );
+    expect(pushCalls.length).toBe(0);
+  });
+
+  it("commits bootstrap memory locally when autostash pop leaves conflicts (ES-503)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase succeeds but autostash pop leaves conflicts
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], {
+      code: 0,
+      stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
+    });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    // commitIfChanged: git add succeeds, diff shows staged changes, commit succeeds
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCalls.length).toBeGreaterThan(0);
+    expect(commitCalls[0].args).toContain("chore: bootstrap memory (rebase skipped)");
+  });
+
+  it("degrades gracefully when bootstrap local commit fails (ES-503)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase fails during bootstrap
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+    // commitIfChanged fails (git add returns error)
+    h.memoryRunner.on(["git", "add", "docs/memory/"], { code: 1, stderr: "fatal: index.lock" });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // Run must still complete (halted), not crash
+    expect(h.store.latestRun()!.state).toBe("halted");
+    // Warning must be logged
+    expect(h.logs.some((l) => l.includes("bootstrap memory commit failed"))).toBe(true);
   });
 });
 

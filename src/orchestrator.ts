@@ -4967,11 +4967,20 @@ export class Orchestrator {
     if (rebaseRes.code !== 0) {
       await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
       this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
-      beforeCommit?.();
-      // Halt-path only: restore any dirty docs/memory files so the clean-worktree
-      // preflight on the next startup does not fail (ES-452 Finding 1). The bootstrap
-      // path (beforeCommit defined) intentionally leaves files dirty for the current run.
-      if (beforeCommit === undefined) {
+      if (beforeCommit !== undefined) {
+        // Bootstrap path: seed memory, then commit locally (no push) so files survive
+        // the GROOM worktree cleanup (ES-503). Push is skipped because the rebase failed
+        // — a push would be non-fast-forward. Both steps are best-effort; failure
+        // degrades to the pre-ES-503 behavior (files left dirty, may be cleaned by GROOM).
+        try { beforeCommit(); } catch { /* initializeMemory may partially write files */ }
+        try {
+          await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
+        } catch {
+          this.log("warning: bootstrap memory commit failed after rebase skip; files left uncommitted");
+        }
+      } else {
+        // Halt-path: restore any dirty docs/memory files so the clean-worktree
+        // preflight on the next startup does not fail (ES-452 Finding 1).
         await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       }
@@ -4987,10 +4996,17 @@ export class Orchestrator {
     if (unmergedRes.stdout.trim().length > 0) {
       await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
-      beforeCommit?.();
-      // Halt-path only: also remove any untracked files created by the bootstrap path's
-      // initializeMemory so the next startup's clean-worktree preflight does not fail.
-      if (beforeCommit === undefined) {
+      if (beforeCommit !== undefined) {
+        // Bootstrap path: seed memory, then commit locally (ES-503).
+        try { beforeCommit(); } catch { /* initializeMemory may partially write files */ }
+        try {
+          await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
+        } catch {
+          this.log("warning: bootstrap memory commit failed after unmerged skip; files left uncommitted");
+        }
+      } else {
+        // Halt-path: remove untracked files so the next startup's clean-worktree
+        // preflight does not fail.
         await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       }
       return;

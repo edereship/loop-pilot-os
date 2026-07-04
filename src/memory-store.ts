@@ -113,6 +113,7 @@ export function initialize(
 export async function commitIfChanged(
   runner: CommandRunner,
   repoPath: string,
+  message = "chore: persist cross-task memory on halt",
 ): Promise<boolean> {
   const add = await runner.run("git", ["add", MEMORY_DIR + "/"], { cwd: repoPath });
   if (add.code !== 0) {
@@ -132,7 +133,7 @@ export async function commitIfChanged(
 
   const commit = await runner.run(
     "git",
-    ["commit", "-m", "chore: persist cross-task memory on halt", "--", MEMORY_DIR + "/"],
+    ["commit", "-m", message, "--", MEMORY_DIR + "/"],
     { cwd: repoPath },
   );
   if (commit.code !== 0) {
