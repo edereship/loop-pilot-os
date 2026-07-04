@@ -80,7 +80,8 @@ PM がタスクをまたいで知識を蓄積・参照する仕組み。
 
 - A3 アクション列と同じ設計: Codex が `update_memory` アクションを出力 → オーケストレーターが検証・書き込み
 - IPI 対策が A3 と同じ箇所に集約される
-- commit/PR フローに乗せることで人間レビューも可能
+- ~~commit/PR フローに乗せることで人間レビューも可能~~（廃止: D-25 実装改訂により現行は PR を経由せず直接 push。以下参照）
+- ⚠️ **D-25 実装改訂**: 当初設計「git コミットは HALT 時のみ」を、**一括 commit+push に変更**（理由: SELECT の reset --hard によるメモリファイル消失防止。ES-457 Finding 2）。現行は GROOM 全アクション実行後に `update_memory` が1件以上成功していれば一括 commit+push ＋ HALT 時 commit ＋ 起動時 bootstrap commit。メモリコミットは `origin/<defaultBranch>` へ直接 push（PR・CI なし）。プリフライトが `required_status_checks` を拒否するのはこの直接 push のため（ES-452 Finding 5）。
 
 #### 2.4 参照タイミング
 
