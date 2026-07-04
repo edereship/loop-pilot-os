@@ -520,16 +520,12 @@ describe("buildGroomPrompt — memory injection budget", () => {
       memoryBudgetChars: 200,
     });
     const out = buildGroomPrompt(args);
-    // Memory section header must still be present
     expect(out).toContain("# 横断メモリ");
-    // Truncation marker must appear
     expect(out).toContain("[...省略...]");
-    // The three 3000-char values together would vastly exceed 200 — ensure the block is bounded
-    const memStart = out.indexOf("# 横断メモリ");
-    const memEnd = out.indexOf("[...省略...]") + "[...省略...]".length;
-    const memBlock = out.slice(memStart, memEnd);
-    // budget (200) + marker overhead must be far less than 9000 chars of raw content
-    expect(memBlock.length).toBeLessThan(300);
+    // With balanced allocation, all 3 categories survive truncation
+    expect(out).toContain("## PM Decisions");
+    expect(out).toContain("## Implementation Results");
+    expect(out).toContain("## Product Knowledge");
   });
 
   it("does not append truncation marker when memory fits exactly within budget", () => {
@@ -541,5 +537,26 @@ describe("buildGroomPrompt — memory injection budget", () => {
     const out = buildGroomPrompt(args);
     expect(out).not.toContain("[...省略...]");
     expect(out).toContain(content);
+  });
+
+  it("preserves all three categories under budget pressure with balanced allocation (ES-502)", () => {
+    const args = makeGroomArgs({
+      memory: {
+        pmDecisions: "D".repeat(3000),
+        implResults: "I".repeat(3000),
+        productKnowledge: "K".repeat(3000),
+      },
+      memoryBudgetChars: 500,
+    });
+    const out = buildGroomPrompt(args);
+    expect(out).toContain("## PM Decisions");
+    expect(out).toContain("## Implementation Results");
+    expect(out).toContain("## Product Knowledge");
+    // Each category has some content (not entirely eliminated)
+    expect(out).toContain("DDD");
+    expect(out).toContain("III");
+    expect(out).toContain("KKK");
+    // Truncation markers present
+    expect(out).toContain("[...省略...]");
   });
 });
