@@ -8,6 +8,7 @@ import type {
   FailureReason,
 } from "./types.js";
 import type { Config } from "./config.js";
+import { retryTransient } from "./transient-retry.js";
 
 export type RecoveryActionKind =
   | "fix_code"
@@ -575,17 +576,24 @@ export async function executeAbandon(
   // Tolerate "already closed" errors so a retry after a prior partial abandon (PR closed but
   // ticket revert or branch delete failed) does not abort here (ES-450 Finding 1).
   if (session.prNumber !== null) {
-    const closeResult = await runner.run(
-      "gh", ["pr", "close", String(session.prNumber), "-R", config.repo.remote],
-      { cwd: config.repo.path },
-    );
-    if (closeResult.code !== 0) {
-      const msg = closeResult.stderr.trim() || `exit ${closeResult.code}`;
-      if (!/already\s*closed/i.test(msg)) {
-        log(`recovery: abandon PR close failed: ${msg}`);
-        return { kind: "failed", action: "abandon", message: `PR close failed: ${msg}` };
-      }
-      log(`recovery: abandon PR already closed, proceeding with cleanup`);
+    try {
+      await retryTransient(config.safety.transientRetryAttempts, async () => {
+        const closeResult = await runner.run(
+          "gh", ["pr", "close", String(session.prNumber), "-R", config.repo.remote],
+          { cwd: config.repo.path },
+        );
+        if (closeResult.code !== 0) {
+          const msg = closeResult.stderr.trim() || `exit ${closeResult.code}`;
+          if (!/already\s*closed/i.test(msg)) {
+            throw new Error(msg, { cause: msg });
+          }
+          log(`recovery: abandon PR already closed, proceeding with cleanup`);
+        }
+      }, { onRetry: (n, e) => log(`transient retry ${n}: abandon PR close: ${e instanceof Error ? e.message : e}`) });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`recovery: abandon PR close failed: ${msg}`);
+      return { kind: "failed", action: "abandon", message: `PR close failed: ${msg}` };
     }
   }
   // Discard worktree (best-effort)
@@ -601,28 +609,32 @@ export async function executeAbandon(
   // failures when a later run reuses the deterministic branch name (ES-450 Finding 6).
   // GitHub may have already deleted the branch on PR close — "does not exist" is benign.
   try {
-    const deleteResult = await runner.run(
-      "git", ["push", "origin", "--delete", session.branch],
-      { cwd: config.repo.path },
-    );
-    if (deleteResult.code !== 0) {
-      const stderr = deleteResult.stderr.trim();
-      if (!/remote ref does not exist/i.test(stderr)) {
-        log(`recovery: abandon remote branch delete failed (non-benign): ${stderr}`);
-        return { kind: "failed", action: "abandon", message: `remote branch delete failed: ${stderr}` };
+    await retryTransient(config.safety.transientRetryAttempts, async () => {
+      const deleteResult = await runner.run(
+        "git", ["push", "origin", "--delete", session.branch],
+        { cwd: config.repo.path },
+      );
+      if (deleteResult.code !== 0) {
+        const stderr = deleteResult.stderr.trim();
+        if (!/remote ref does not exist/i.test(stderr)) {
+          throw new Error(stderr, { cause: stderr });
+        }
+        log(`recovery: abandon remote branch already deleted`);
       }
-      log(`recovery: abandon remote branch already deleted`);
-    }
+    }, { onRetry: (n, e) => log(`transient retry ${n}: abandon branch delete: ${e instanceof Error ? e.message : e}`) });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log(`recovery: abandon remote branch delete threw: ${msg}`);
+    log(`recovery: abandon remote branch delete failed: ${msg}`);
     return { kind: "failed", action: "abandon", message: `remote branch delete failed: ${msg}` };
   }
   // Revert ticket to Todo after PR close and branch cleanup succeed. A failure here leaves
   // the ticket in In Progress with a closed PR — visible for human cleanup, but not eligible
   // for scheduling (Linear In Progress is not in the eligible set).
   try {
-    await source.transition(session.linearIssueId, "todo");
+    await retryTransient(config.safety.transientRetryAttempts, () =>
+      source.transition(session.linearIssueId, "todo"),
+      { onRetry: (n, e) => log(`transient retry ${n}: abandon ticket revert: ${e instanceof Error ? e.message : e}`) },
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log(`recovery: abandon ticket revert failed: ${msg}`);
