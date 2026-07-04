@@ -5,8 +5,7 @@ import type { ValidationContext } from "../src/groom-validator.js";
 
 function makeCtx(overrides?: Partial<ValidationContext>): ValidationContext {
   return {
-    projectIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
-    allIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5", "OTHER-1"]),
+    scopeIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     optInLabel: "looppilot",
     optInIssueIds: new Set(["ES-1", "ES-2", "ES-3", "ES-4", "ES-5"]),
     doneIssueIds: new Set(["ES-5"]),
@@ -42,9 +41,9 @@ function action(type: string, extra: Record<string, unknown> = {}): GroomAction 
 }
 
 describe("validateGroomActions", () => {
-  // ---- Rule 1: scope check ----
-  describe("Rule 1: out-of-scope issue", () => {
-    it("rejects action on issue not in project scope", () => {
+  // ---- Rule 1+2 (unified): scope check (ES-501) ----
+  describe("Rule 1+2: scope check (unified)", () => {
+    it("rejects action on issue not in scope", () => {
       const results = validateGroomActions(
         [action("reprioritize", { issueId: "OTHER-1" })],
         makeCtx(),
@@ -53,24 +52,22 @@ describe("validateGroomActions", () => {
       expect(results[0].reason).toContain("scope");
     });
 
+    it("rejects action on completely unknown issue ID", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { issueId: "FAKE-99" })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("not in project scope");
+      expect(results[0].reason).toContain("does not exist");
+    });
+
     it("accepts action on in-scope issue", () => {
       const results = validateGroomActions(
         [action("reprioritize", { issueId: "ES-1" })],
         makeCtx(),
       );
       expect(results[0].result).toBe("valid");
-    });
-  });
-
-  // ---- Rule 2: existence check ----
-  describe("Rule 2: non-existent issue", () => {
-    it("rejects action on unknown issue ID", () => {
-      const results = validateGroomActions(
-        [action("reprioritize", { issueId: "FAKE-99" })],
-        makeCtx(),
-      );
-      expect(results[0].result).toBe("rejected");
-      expect(results[0].reason).toContain("exist");
     });
   });
 
@@ -579,11 +576,59 @@ describe("validateGroomActions", () => {
     });
   });
 
+  // ---- Rule 11: rationale must be non-empty (D-02, ES-501) ----
+  describe("Rule 11: empty rationale", () => {
+    it("rejects action with empty rationale", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { rationale: "" })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty rationale");
+    });
+
+    it("rejects action with whitespace-only rationale", () => {
+      const results = validateGroomActions(
+        [action("create", { rationale: "   \t\n  " })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty rationale");
+    });
+
+    it("rejects update_memory with empty rationale (content is valid)", () => {
+      const results = validateGroomActions(
+        [action("update_memory", { rationale: "", content: "valid content" })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("rejected");
+      expect(results[0].reason).toContain("empty rationale");
+    });
+
+    it("accepts action with non-empty rationale", () => {
+      const results = validateGroomActions(
+        [action("reprioritize", { rationale: "valid reason" })],
+        makeCtx(),
+      );
+      expect(results[0].result).toBe("valid");
+    });
+
+    it("other actions in the batch continue when one has empty rationale", () => {
+      const actions: GroomAction[] = [
+        action("reprioritize", { rationale: "" }),
+        action("reprioritize", { issueId: "ES-2" }),
+      ];
+      const results = validateGroomActions(actions, makeCtx());
+      expect(results[0].result).toBe("rejected");
+      expect(results[1].result).toBe("valid");
+    });
+  });
+
   // ---- Cross-cutting: all actions validated, no early stop ----
   describe("cross-cutting behavior", () => {
     it("validates all actions even when some are rejected", () => {
       const actions: GroomAction[] = [
-        action("reprioritize", { issueId: "FAKE-99" }), // Rule 2: reject
+        action("reprioritize", { issueId: "FAKE-99" }), // Rule 1+2: reject (not in scope)
         action("reprioritize", { issueId: "ES-1" }),     // valid
         action("close", { issueId: "ES-5" }),             // valid (done but close is OK)
       ];

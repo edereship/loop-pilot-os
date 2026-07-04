@@ -1835,8 +1835,7 @@ export class Orchestrator {
         const activeIds = await this.groomDeps.boardFetcher.getActiveIssueIds();
         const needsHumanIds = await this.groomDeps.boardFetcher.getNeedsHumanIssueIds(this.config.linear.needsHumanLabel);
         validationCtx = {
-          projectIssueIds: projectIds,
-          allIssueIds: projectIds,
+          scopeIssueIds: projectIds,
           optInLabel: this.config.linear.optInLabel,
           optInIssueIds: optInIds,
           doneIssueIds: doneIds,

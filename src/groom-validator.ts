@@ -1,8 +1,7 @@
 import type { GroomAction } from "./types.js";
 
 export interface ValidationContext {
-  projectIssueIds: Set<string>;
-  allIssueIds: Set<string>;
+  scopeIssueIds: Set<string>;
   optInLabel: string;
   optInIssueIds: Set<string>;
   doneIssueIds: Set<string>;
@@ -110,6 +109,11 @@ export function validateGroomActions(
       }
     }
 
+    // Rule 11: rationale must be non-empty (D-02)
+    if (a.rationale.trim() === "") {
+      return { action: a, result: "rejected", reason: "empty rationale" };
+    }
+
     // Rule 8: memory content validity
     if (a.type === "update_memory") {
       if (a.content.trim() === "") {
@@ -124,14 +128,10 @@ export function validateGroomActions(
     if (hasIssueId(a)) {
       const { issueId } = a;
 
-      // Rule 2: existence (checked before scope, since non-existent implies out-of-scope)
-      if (!ctx.allIssueIds.has(issueId)) {
-        return { action: a, result: "rejected", reason: `Issue ${issueId} does not exist` };
-      }
-
-      // Rule 1: project scope
-      if (!ctx.projectIssueIds.has(issueId)) {
-        return { action: a, result: "rejected", reason: `Issue ${issueId} is out of project scope` };
+      // Rule 1+2 (unified): project scope — rejects both non-existent and out-of-scope
+      // issues in a single check (ES-501 案B: the caller only has project-scoped IDs).
+      if (!ctx.scopeIssueIds.has(issueId)) {
+        return { action: a, result: "rejected", reason: `Issue ${issueId} is not in project scope (or does not exist)` };
       }
 
       // Rule 1b: opt-in label required — GROOM may only act on opted-in issues
