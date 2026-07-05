@@ -131,6 +131,10 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `loop.idle_recheck_seconds` | IDLE 時のキュー再確認間隔 |
 | `loop.idle_timeout_minutes` | アイドルタイムアウト（既定 120 分。0 で無効化。適格チケットなしが継続し GROOM の空振りコストを防止） |
 | `groom.enabled` | GROOM フェーズの有効/無効（既定 `true`。`false` で GROOM フェーズのみ無効化。DESIGN・DESIGN REVIEW・SELF-REVIEW・VERIFY は引き続き実行される） |
+| `safety.merge_gate_timeout_minutes` | マージゲート Codex 判定のタイムアウト（既定 15 分） |
+| `safety.max_merge_gate_fix_attempts` | ゲート fail 時の自動修正上限（既定 2。尽きたら park） |
+| `safety.max_cost_usd_per_merge_gate_fix` | ゲート修正ターン（Claude）のコスト上限（既定 $2） |
+| `merge_gate.enabled` | マージ直前 破壊的変更ゲートの有効/無効（既定 `true`） |
 | `self_review.enabled` | セルフレビューステップの有効/無効（既定 `true`） |
 | `memory.max_chars_per_file` | 横断メモリ 1 ファイルあたりの最大文字数（既定 8000。超過は reject） |
 | `memory.inject_budget_chars` | プロンプト注入時のメモリバジェット（既定 6000。カテゴリ均等配分でトランケーション） |

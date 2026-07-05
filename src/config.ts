@@ -114,6 +114,9 @@ const rawSchema = z.object({
     verify_timeout_minutes: z.number().positive().default(15),
     max_recovery_attempts: z.number().int().positive().default(2),
     transient_retry_attempts: z.number().int().nonnegative().default(2),
+    merge_gate_timeout_minutes: z.number().positive().default(15),
+    max_merge_gate_fix_attempts: z.number().int().positive().default(2),
+    max_cost_usd_per_merge_gate_fix: z.number().positive().default(2),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -128,6 +131,9 @@ const rawSchema = z.object({
     progress: z.boolean().default(false),
   }).strict().optional(),
   groom: z.object({
+    enabled: z.boolean().default(true),
+  }).strict().optional(),
+  merge_gate: z.object({
     enabled: z.boolean().default(true),
   }).strict().optional(),
   self_review: z.object({
@@ -229,6 +235,9 @@ export interface Config {
     verifyTimeoutMinutes: number;
     maxRecoveryAttempts: number;
     transientRetryAttempts: number;
+    mergeGateTimeoutMinutes: number;
+    maxMergeGateFixAttempts: number;
+    maxCostUsdPerMergeGateFix: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -243,6 +252,9 @@ export interface Config {
     progress: boolean;
   };
   groom: {
+    enabled: boolean;
+  };
+  mergeGate: {
     enabled: boolean;
   };
   selfReview: {
@@ -898,6 +910,9 @@ export function loadConfig(
       verifyTimeoutMinutes: raw.safety.verify_timeout_minutes,
       maxRecoveryAttempts: raw.safety.max_recovery_attempts,
       transientRetryAttempts: raw.safety.transient_retry_attempts,
+      mergeGateTimeoutMinutes: raw.safety.merge_gate_timeout_minutes,
+      maxMergeGateFixAttempts: raw.safety.max_merge_gate_fix_attempts,
+      maxCostUsdPerMergeGateFix: raw.safety.max_cost_usd_per_merge_gate_fix,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
@@ -913,6 +928,9 @@ export function loadConfig(
     },
     groom: {
       enabled: raw.groom?.enabled ?? true,
+    },
+    mergeGate: {
+      enabled: raw.merge_gate?.enabled ?? true,
     },
     selfReview: {
       enabled: raw.self_review?.enabled ?? true,
