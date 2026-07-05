@@ -2729,7 +2729,7 @@ describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Fin
     expect(worktreeAddCalls).toHaveLength(0);
   });
 
-  it("uses --git-dir (not --git-common-dir) and reverts tracked memory files after CLAIM (ES-503 Finding 3)", async () => {
+  it("uses --git-common-dir (not --git-dir) and reverts tracked memory files after CLAIM (ES-503 Finding 1 fix)", async () => {
     const tmpWorktree = mkdtempSync(path.join(tmpdir(), "wt-es503-f12-"));
     tmpDirs.push(tmpWorktree);
 
@@ -2751,20 +2751,22 @@ describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Fin
     );
     expect(checkoutCalls.length).toBeGreaterThan(0);
 
-    // --git-dir must be used (not --git-common-dir): --git-common-dir resolves to
-    // the shared .git which would exclude docs/memory/ for all worktrees including
-    // the default checkout, breaking commitIfChanged (ES-503 Finding 3).
-    const gitDirCalls = h.memoryRunner.calls.filter(
-      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
-             c.args.includes("--git-dir") && !c.args.includes("--git-common-dir"),
-    );
-    expect(gitDirCalls.length).toBeGreaterThan(0);
-
+    // --git-common-dir must be used: Git reads info/exclude from the common git dir,
+    // not from the worktree-specific .git/worktrees/<name> path (ES-503 Finding 1 fix).
+    // gitignore rules only affect untracked files, so tracked memory files in the
+    // default checkout remain addable/committable by commitIfChanged.
     const commonDirCalls = h.memoryRunner.calls.filter(
       (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
              c.args.includes("--git-common-dir"),
     );
-    expect(commonDirCalls).toHaveLength(0);
+    expect(commonDirCalls.length).toBeGreaterThan(0);
+
+    const gitDirOnlyCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("rev-parse") && c.args.includes("--git-dir") &&
+             !c.args.includes("--git-common-dir"),
+    );
+    expect(gitDirOnlyCalls).toHaveLength(0);
   });
 });
 

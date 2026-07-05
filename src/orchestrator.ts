@@ -1338,25 +1338,32 @@ export class Orchestrator {
     // memory files, initializeMemory may rewrite them with session data (tracked modification).
     // Revert those tracked changes with git checkout so the worktree stays clean; the only
     // residual files are new untracked ones, which info/exclude then hides (ES-503 Finding 1).
-    // Use --git-dir for the exclude path: in a linked worktree this resolves to
-    // .git/worktrees/<name>, scoping the exclude to this worktree only. Using
-    // --git-common-dir would write to the shared .git/info/exclude and break
-    // commitIfChanged in the default checkout (ES-503 Finding 3).
+    // Git reads info/exclude from --git-common-dir (the shared .git/), not from --git-dir
+    // (.git/worktrees/<name>); writing to the worktree-specific path has no effect.
+    // gitignore rules only suppress UNTRACKED files, so memory files already tracked in
+    // the default checkout remain addable/committable by commitIfChanged even when this
+    // exclude is active (ES-503 Finding 1 fix).
+    // Idempotent: check before appending to avoid duplicate entries across multiple worktrees.
     try {
       initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
       await this.runner.run(
         "git", ["-C", claimResult.worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
         { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
       ).catch(() => {});
-      const gitDirRes = await this.runner.run(
-        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-dir"],
+      const gitCommonDirRes = await this.runner.run(
+        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-common-dir"],
         { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
       ).catch(() => ({ code: 1, stdout: "", stderr: "" }));
-      if (gitDirRes.code === 0 && gitDirRes.stdout.trim()) {
-        const worktreeGitDir = path.resolve(claimResult.worktreePath, gitDirRes.stdout.trim());
-        const infoDir = path.join(worktreeGitDir, "info");
+      if (gitCommonDirRes.code === 0 && gitCommonDirRes.stdout.trim()) {
+        const commonGitDir = path.resolve(claimResult.worktreePath, gitCommonDirRes.stdout.trim());
+        const infoDir = path.join(commonGitDir, "info");
         mkdirSync(infoDir, { recursive: true });
-        appendFileSync(path.join(infoDir, "exclude"), `\n${MEMORY_DIR}/\n`);
+        const excludeFile = path.join(infoDir, "exclude");
+        let existing = "";
+        try { existing = readFileSync(excludeFile, "utf-8"); } catch { /* file does not exist yet */ }
+        if (!existing.split("\n").some(line => line.trim() === `${MEMORY_DIR}/`)) {
+          appendFileSync(excludeFile, `\n${MEMORY_DIR}/\n`);
+        }
       }
     } catch (err) {
       this.log(`claim: memory re-seed in worktree failed (non-fatal): ${errMsg(err)}`);
@@ -5130,18 +5137,34 @@ export class Orchestrator {
       // (e.g., a local-only bootstrap commit from startup when the rebase failed).
       // Push those surviving commits so they are not lost by fetchDefaultBranch's
       // git reset --hard on the next run (ES-503 Finding 4).
+      // Guard: only push when every file in the ahead range lives under docs/memory/ to
+      // avoid accidentally publishing unrelated local commits (ES-503 Finding 2).
       const aheadRes = await this.runner.run(
         "git", ["rev-list", "--count", `origin/${defaultBranch}..HEAD`],
         { cwd: repoPath },
       ).catch((_e: unknown) => ({ code: 1, stdout: "0", stderr: "" }));
       if (aheadRes.code === 0 && parseInt(aheadRes.stdout.trim(), 10) > 0) {
-        const pushRes = await this.runner.run(
-          "git",
-          ["push", "origin", `HEAD:${defaultBranch}`],
+        const diffRes = await this.runner.run(
+          "git", ["diff", "--name-only", `origin/${defaultBranch}..HEAD`],
           { cwd: repoPath },
-        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
-        if (pushRes.code !== 0) {
-          this.log(`warning: failed to push local-only commits (non-fatal): ${pushRes.stderr.trim()}`);
+        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
+        if (diffRes.code !== 0) {
+          this.log("warning: could not inspect ahead commits; skipping push");
+        } else {
+          const aheadFiles = diffRes.stdout.trim().split("\n").filter(Boolean);
+          const hasNonMemory = aheadFiles.some(f => !f.startsWith(MEMORY_DIR + "/"));
+          if (hasNonMemory) {
+            this.log("warning: ahead commits contain non-memory changes; skipping push to avoid publishing unintended commits");
+          } else if (aheadFiles.length > 0) {
+            const pushRes = await this.runner.run(
+              "git",
+              ["push", "origin", `HEAD:${defaultBranch}`],
+              { cwd: repoPath },
+            ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+            if (pushRes.code !== 0) {
+              this.log(`warning: failed to push local-only commits (non-fatal): ${pushRes.stderr.trim()}`);
+            }
+          }
         }
       }
     }
