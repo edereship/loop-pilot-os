@@ -20,11 +20,25 @@ in_review = "In Review"
 done = "Done"
 
 [agent]
-model = "claude-opus-4-6[1m]"
-effort = "max"
+model = "claude-opus-4-8[1m]"
+effort = "xhigh"
 allowed_tools = "Edit,Write,Read,Glob,Grep,Bash"
 # ⚠ E2Eテスト専用: 隔離された ai-runner 上でのみ使用。本番は acceptEdits を使うこと。
 permission_mode = "bypassPermissions"
+
+# フェーズ別オーバーライド（example.toml の出荷既定と同一のコスパ配分）
+[agent.design]
+model = "claude-opus-4-8"
+effort = "high"
+[agent.self_review]
+model = "claude-sonnet-4-6"
+effort = "high"
+[agent.recovery]
+model = "claude-opus-4-8"
+effort = "high"
+[agent.verify]
+model = "claude-sonnet-4-6"
+effort = "medium"
 
 [handoff]
 branch_prefix = "looppilot"
