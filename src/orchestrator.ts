@@ -1738,7 +1738,7 @@ export class Orchestrator {
       // without this revert a crash before the next commitIfChanged leaves git status
       // dirty and the next startup's clean-worktree preflight rejects startup (ES-503).
       await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
 
       let specContent: SpecContent | null = null;
       const specDir = this.config.product.specDir;
@@ -2055,7 +2055,7 @@ export class Orchestrator {
           // are not untracked and git clean would skip them without this reset.
           await this.runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           // The commit (or git add) failed so the memory changes were not persisted.
           // Mark the corresponding update_memory results as failed so groom_log and
           // summaryForSelect reflect the actual outcome (Finding 2).
@@ -2207,7 +2207,7 @@ export class Orchestrator {
     }
     // Revert any tracked memory modifications so the main checkout stays clean (ES-503).
     await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
-    await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
+    await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
 
     const prompt = buildSelectPrompt({
       goal: this.config.product.goal ?? null,
@@ -5067,13 +5067,13 @@ export class Orchestrator {
         // Clean memory dir first: checkout restores tracked files to HEAD; clean removes
         // untracked stale files from a prior crashed run that initializeMemory would skip.
         await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in rebase-skip path: ${err instanceof Error ? err.message : String(err)}`);
           // Revert tracked modifications and remove untracked files so commitIfChanged
           // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
           await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         }
         try {
           await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
@@ -5088,7 +5088,7 @@ export class Orchestrator {
         // Halt-path: restore any dirty docs/memory files so the clean-worktree
         // preflight on the next startup does not fail (ES-452 Finding 1).
         await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       }
       return;
     }
@@ -5106,13 +5106,13 @@ export class Orchestrator {
         // Bootstrap path: seed memory, then commit locally (ES-503).
         // checkout HEAD already ran above to clear conflict markers; untracked
         // stale files are handled by git clean so initializeMemory starts fresh.
-        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in autostash-conflict path: ${err instanceof Error ? err.message : String(err)}`);
           // Revert tracked modifications and remove untracked files so commitIfChanged
           // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
           await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         }
         try {
           await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (autostash conflict)");
@@ -5126,7 +5126,7 @@ export class Orchestrator {
       } else {
         // Halt-path: remove untracked files so the next startup's clean-worktree
         // preflight does not fail.
-        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       }
       return;
     }
@@ -5175,7 +5175,7 @@ export class Orchestrator {
           let hasNonMemory = false;
           for (const sha of aheadShas) {
             const filesRes = await this.runner.run(
-              "git", ["diff-tree", "--no-commit-id", "-r", "--name-only", sha],
+              "git", ["diff-tree", "--no-commit-id", "-r", "-m", "--name-only", sha],
               { cwd: repoPath },
             ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
             if (filesRes.code !== 0) {

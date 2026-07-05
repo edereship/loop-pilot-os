@@ -149,11 +149,11 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
   memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-  memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   // GROOM always resets the memory directory before executing actions (ES-457 Finding 1).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-  memoryRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
   // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
   memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
@@ -719,7 +719,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
     const inlineMemoryRunner1 = new FakeCommandRunner();
     inlineMemoryRunner1.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner1.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
-    inlineMemoryRunner1.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config,
@@ -2503,7 +2503,7 @@ describe("Orchestrator bootstrap memory — rebase failure local commit (ES-503)
     h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
     h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
     // commitIfChanged fails (git add returns error)
-    h.memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 1, stderr: "fatal: index.lock" });
+    h.memoryRunner.on(["git", "add", "-f", "--"], { code: 1, stderr: "fatal: index.lock" });
 
     h.orch.requestStop();
     await h.orch.run();
@@ -2721,11 +2721,13 @@ describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Fin
 
     await h.orch.run();
 
-    // git add docs/memory/ (with or without -f) must NOT be called with the feature
+    // git add targeting docs/memory/ (any form) must NOT be called with the feature
     // worktree as cwd: that was the mechanism by which memory files were staged on the
     // feature branch.
     const worktreeAddCalls = h.memoryRunner.calls.filter(
-      (c) => c.cmd === "git" && c.args[0] === "add" && c.args.includes("docs/memory/") && c.opts.cwd === "/wt/ty-1",
+      (c) => c.cmd === "git" && c.args[0] === "add" &&
+        c.args.some(a => a === "docs/memory/" || a.startsWith("docs/memory/")) &&
+        c.opts.cwd === "/wt/ty-1",
     );
     expect(worktreeAddCalls).toHaveLength(0);
   });
@@ -2800,7 +2802,7 @@ describe("Orchestrator HALT memory commit — Codex Findings 1 & 2", () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     // Simulate a commitIfChanged failure (e.g. index lock) in the halt path.
-    h.memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 1, stderr: "fatal: Unable to create index.lock" });
+    h.memoryRunner.on(["git", "add", "-f", "--"], { code: 1, stderr: "fatal: Unable to create index.lock" });
 
     h.orch.requestStop();
     await h.orch.run();
@@ -2825,7 +2827,7 @@ describe("Orchestrator HALT memory commit — Codex Findings 1 & 2", () => {
     h.orch.requestStop();
     await h.orch.run();
 
-    // git clean -fd -- docs/memory/ must run in the halt path to remove untracked files.
+    // git clean -fdx -- docs/memory/ must run in the halt path to remove untracked files.
     const cleanCalls = h.memoryRunner.calls.filter(
       (c) => c.cmd === "git" && c.args[0] === "clean" && c.args[2] === "--" && c.args[3] === "docs/memory/",
     );
@@ -3067,7 +3069,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
     const inlineMemoryRunner2 = new FakeCommandRunner();
     inlineMemoryRunner2.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner2.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
-    inlineMemoryRunner2.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config: specConfig,
@@ -3715,7 +3717,7 @@ describe("Orchestrator.interruptablePause", () => {
     const inlineMemoryRunner3 = new FakeCommandRunner();
     inlineMemoryRunner3.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner3.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
-    inlineMemoryRunner3.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner3.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config, source, agent, selfReviewAgent: agent, verifyAgent: new FakeAgentRunner(), git, monitor, notifier, store,
@@ -6081,7 +6083,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
         text: '```json\n{"actions":[{"type":"update_memory","category":"pm_decisions","content":"Test decision","rationale":"update"}],"summary":"Updated memory"}\n```',
       });
       // Make git add fail so commitIfChanged throws; the catch block should mark the action as failed.
-      h.memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 1, stderr: "fatal: index.lock exists" });
+      h.memoryRunner.on(["git", "add", "-f", "--"], { code: 1, stderr: "fatal: index.lock exists" });
 
       // SELECT outcome (2 issues needed to trigger the planner)
       planner.outcomes.push({
@@ -6300,7 +6302,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
 
     // Clock: returns T=0, T+1s, T+2s, ... but after call #2
@@ -6447,7 +6449,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
 
     // Pre-create a run with idle_started_at already set 61 minutes ago
@@ -6511,7 +6513,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     // Self-review pre/post-review branch verification: rev-parse --abbrev-ref returns the
     // expected branch for the worktree so the guard passes without stopping the session.
@@ -6601,7 +6603,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
 
     // Previous run was idle with idle_started_at 61 minutes in the past.
@@ -9103,10 +9105,10 @@ describe("VERIFY (ES-491)", () => {
     lsofRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     lsofRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     lsofRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    lsofRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "add", "-f", "--"], { code: 0 });
     lsofRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     lsofRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-    lsofRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
     lsofRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
     lsofRunner.on(["git", "clean", "-fd"], { code: 0 });
     lsofRunner.on(["git", "checkout"], { code: 0 });

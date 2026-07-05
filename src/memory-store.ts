@@ -116,13 +116,14 @@ export async function commitIfChanged(
   repoPath: string,
   message = "chore: persist cross-task memory on halt",
 ): Promise<boolean> {
-  const add = await runner.run("git", ["add", "-f", MEMORY_DIR + "/"], { cwd: repoPath });
+  const knownMemoryFiles = Object.values(CATEGORY_FILES).map(f => `${MEMORY_DIR}/${f}`);
+  const add = await runner.run("git", ["add", "-f", "--", ...knownMemoryFiles], { cwd: repoPath });
   if (add.code !== 0) {
     // Restore tracked files to HEAD so the clean-worktree preflight on the next
     // startup does not fail due to dirty memory files (ES-452 Finding 1).
     await runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     // Remove any newly created untracked files (e.g. leftover bootstrap files).
-    await runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+    await runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     throw new Error(`git add failed (code ${add.code}): ${add.stderr}`);
   }
   const diff = await runner.run(
@@ -144,7 +145,7 @@ export async function commitIfChanged(
     // working tree stays clean and the next startup's clean-worktree preflight does
     // not fail (ES-452 Finding 4). Both steps are best-effort.
     await runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-    await runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+    await runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     throw new Error(`git commit failed (code ${commit.code}): ${commit.stderr}`);
   }
   return true;

@@ -307,7 +307,7 @@ describe("initialize", () => {
 describe("commitIfChanged", () => {
   it("commits when staged diff detects changes", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    runner.on(["git", "add", "-f", "--"], { code: 0 });
     // git diff --cached --quiet exits 1 when there are staged changes
     runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
     runner.on(["git", "commit", "-m"], { code: 0 });
@@ -325,22 +325,22 @@ describe("commitIfChanged", () => {
 
   it("throws when git add fails", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 128, stderr: "fatal: pathspec error" });
-    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    runner.on(["git", "add", "-f", "--"], { code: 128, stderr: "fatal: pathspec error" });
+    runner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
 
     await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
   });
 
   it("cleans up untracked memory files when git add fails (ES-452 Finding 1)", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 128, stderr: "fatal: unable to lock index" });
+    runner.on(["git", "add", "-f", "--"], { code: 128, stderr: "fatal: unable to lock index" });
     runner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    runner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
 
     await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
 
     const cleanCall = runner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd"),
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fdx"),
     );
     expect(cleanCall).toBeDefined();
     expect(cleanCall!.args).toContain("docs/memory/");
@@ -348,9 +348,9 @@ describe("commitIfChanged", () => {
 
   it("restores tracked memory files when git add fails (ES-452 Finding 1)", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 128, stderr: "fatal: unable to lock index" });
+    runner.on(["git", "add", "-f", "--"], { code: 128, stderr: "fatal: unable to lock index" });
     runner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    runner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
 
     await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git add failed/);
 
@@ -364,7 +364,7 @@ describe("commitIfChanged", () => {
 
   it("throws when git commit fails", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    runner.on(["git", "add", "-f", "--"], { code: 0 });
     runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
     runner.on(["git", "commit", "-m"], { code: 1, stderr: "error: author identity unknown" });
 
@@ -373,7 +373,7 @@ describe("commitIfChanged", () => {
 
   it("unstages staged changes when git commit fails", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    runner.on(["git", "add", "-f", "--"], { code: 0 });
     runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
     runner.on(["git", "commit", "-m"], { code: 1, stderr: "error: author identity unknown" });
     runner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
@@ -389,12 +389,12 @@ describe("commitIfChanged", () => {
 
   it("restores working tree after git commit fails (ES-452 Finding 4)", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    runner.on(["git", "add", "-f", "--"], { code: 0 });
     runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
     runner.on(["git", "commit", "-m"], { code: 1, stderr: "error: author identity unknown" });
     runner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
     runner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-    runner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    runner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
 
     await expect(commitIfChanged(runner, "/repo")).rejects.toThrow(/git commit failed/);
 
@@ -413,7 +413,7 @@ describe("commitIfChanged", () => {
 
   it("skips commit when no changes", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
+    runner.on(["git", "add", "-f", "--"], { code: 0 });
     // git diff --cached --quiet exits 0 when no staged changes
     runner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
 
