@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Orchestrator, isPidAlive } from "../src/orchestrator.js";
@@ -2510,6 +2510,152 @@ describe("Orchestrator bootstrap memory — rebase failure local commit (ES-503)
     expect(h.store.latestRun()!.state).toBe("halted");
     // Warning must be logged
     expect(h.logs.some((l) => l.includes("bootstrap memory commit failed"))).toBe(true);
+  });
+});
+
+describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Finding 1)", () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("groom reads store-seeded memory after fetchDefaultBranch discards local-only bootstrap commit", async () => {
+    const tmpRepo = mkdtempSync(path.join(tmpdir(), "groom-es503-cf1-"));
+    tmpDirs.push(tmpRepo);
+
+    const planner = new FakePlanRunner();
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[],"summary":"no changes"}\n```',
+    });
+    // SELECT outcome (2 issues → selectWithPm calls the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    const config = {
+      ...makeConfig({ maxTasksPerRun: 1, groomEnabled: true }),
+      repo: { ...makeConfig().repo, path: tmpRepo },
+    } as Config;
+    const h = makeHarness(config, { planner });
+
+    // Pre-create a completed session so initializeMemory writes meaningful impl-results content
+    const prevRun = h.store.createRun(5, "2024-01-01T00:00:00Z");
+    const prevSession = h.store.createSession({
+      runId: prevRun.id,
+      linearIssueId: "prev-x",
+      linearIdentifier: "TY-0",
+      issueTitle: "Previous task",
+      issueUrl: "https://linear.app/prev",
+      branch: "looppilot/ty-0",
+      worktreePath: "/wt/ty-0",
+      now: "2024-01-01T00:00:00Z",
+    });
+    h.store.updateSession(prevSession.id, { state: "merged", endedAt: "2024-01-01T01:00:00Z" });
+
+    // Simulate fetchDefaultBranch's git reset --hard discarding the local-only bootstrap commit
+    h.git.fetchDefaultBranchSideEffect = () => {
+      rmSync(path.join(tmpRepo, "docs", "memory"), { recursive: true, force: true });
+    };
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The groom prompt (planner call 0) must include TY-0 from the re-seeded impl-results
+    const groomPrompt = planner.calls[0]!.prompt;
+    expect(groomPrompt).toContain("TY-0");
+    expect(groomPrompt).toContain("Previous task");
+  });
+
+  it("select reads store-seeded memory after fetchDefaultBranch discards local-only bootstrap commit", async () => {
+    const tmpRepo = mkdtempSync(path.join(tmpdir(), "select-es503-cf1-"));
+    tmpDirs.push(tmpRepo);
+
+    const planner = new FakePlanRunner();
+    // SELECT outcome (2 issues → selectWithPm calls the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    const config = {
+      ...makeConfig({ maxTasksPerRun: 1 }),
+      repo: { ...makeConfig().repo, path: tmpRepo },
+    } as Config;
+    const h = makeHarness(config, { planner });
+
+    // Pre-create a completed session so initializeMemory writes meaningful impl-results content
+    const prevRun = h.store.createRun(5, "2024-01-01T00:00:00Z");
+    const prevSession = h.store.createSession({
+      runId: prevRun.id,
+      linearIssueId: "prev-x",
+      linearIdentifier: "TY-0",
+      issueTitle: "Previous task",
+      issueUrl: "https://linear.app/prev",
+      branch: "looppilot/ty-0",
+      worktreePath: "/wt/ty-0",
+      now: "2024-01-01T00:00:00Z",
+    });
+    h.store.updateSession(prevSession.id, { state: "merged", endedAt: "2024-01-01T01:00:00Z" });
+
+    // Simulate fetchDefaultBranch's git reset --hard discarding the local-only bootstrap commit
+    h.git.fetchDefaultBranchSideEffect = () => {
+      rmSync(path.join(tmpRepo, "docs", "memory"), { recursive: true, force: true });
+    };
+
+    // 2 issues are needed to trigger selectWithPm (single issue short-circuits)
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The select prompt (planner call 0) must include TY-0 from the re-seeded impl-results
+    const selectPrompt = planner.calls[0]!.prompt;
+    expect(selectPrompt).toContain("TY-0");
+    expect(selectPrompt).toContain("Previous task");
+  });
+
+  it("claim seeds memory files in new worktree from store so implement can read it", async () => {
+    const tmpWorktree = mkdtempSync(path.join(tmpdir(), "wt-es503-cf1-"));
+    tmpDirs.push(tmpWorktree);
+
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+
+    // Pre-create a completed session so initializeMemory writes meaningful impl-results content
+    const prevRun = h.store.createRun(5, "2024-01-01T00:00:00Z");
+    const prevSession = h.store.createSession({
+      runId: prevRun.id,
+      linearIssueId: "prev-x",
+      linearIdentifier: "TY-0",
+      issueTitle: "Previous task",
+      issueUrl: "https://linear.app/prev",
+      branch: "looppilot/ty-0",
+      worktreePath: "/wt/ty-0",
+      now: "2024-01-01T00:00:00Z",
+    });
+    h.store.updateSession(prevSession.id, { state: "merged", endedAt: "2024-01-01T01:00:00Z" });
+
+    // Point the worktree for TY-1 at the real tmpdir so initializeMemory can write there
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: tmpWorktree });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // impl-results.md must exist in the worktree and contain the pre-seeded session data
+    const implResultsPath = path.join(tmpWorktree, "docs", "memory", "impl-results.md");
+    expect(existsSync(implResultsPath)).toBe(true);
+    const content = readFileSync(implResultsPath, "utf-8");
+    expect(content).toContain("TY-0");
+    expect(content).toContain("Previous task");
   });
 });
 

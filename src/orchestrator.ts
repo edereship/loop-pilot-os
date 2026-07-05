@@ -1325,6 +1325,14 @@ export class Orchestrator {
       this.log(detail);
       return HALT;
     }
+    // Re-seed memory files into the new worktree: worktrees are created from
+    // origin/<defaultBranch> which lacks memory when the startup rebase failed and the
+    // bootstrap commit was local-only (ES-503 Codex Finding 1). Idempotent.
+    try {
+      initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
+    } catch (err) {
+      this.log(`claim: memory re-seed in worktree failed (non-fatal): ${errMsg(err)}`);
+    }
     const session = this.store.createSession({
       runId: this.runId,
       linearIssueId: issue.id,
@@ -1666,9 +1674,17 @@ export class Orchestrator {
       } catch (err) {
         this.log(`groom: fetch failed (non-fatal): ${errMsg(err)}`);
       }
+      // Re-seed memory from store: fetchDefaultBranch's git reset --hard discards the
+      // local-only bootstrap commit created when startup rebase fails, so memory would
+      // otherwise be absent for this GROOM cycle (ES-503 Codex Finding 1). Idempotent.
+      const repoPath = this.config.repo.path;
+      try {
+        initializeMemory(repoPath, this.store, this.config.digest.recentMergedCount);
+      } catch (err) {
+        this.log(`groom: memory re-seed after fetch failed (non-fatal): ${errMsg(err)}`);
+      }
 
       // 3. Assemble prompt
-      const repoPath = this.config.repo.path;
       const groomMem = readMemoryAll(repoPath);
       if (groomMem.readErrors) {
         this.log(`groom: memory read failed (non-fatal): ${groomMem.readErrors.join("; ")}`);
@@ -2085,6 +2101,12 @@ export class Orchestrator {
       await this.git.fetchDefaultBranch();
     } catch (err) {
       this.log(`select: fetch failed (non-fatal): ${errMsg(err)}`);
+    }
+    // Re-seed memory from store after fetchDefaultBranch (ES-503 Codex Finding 1). Idempotent.
+    try {
+      initializeMemory(this.config.repo.path, this.store, this.config.digest.recentMergedCount);
+    } catch (err) {
+      this.log(`select: memory re-seed after fetch failed (non-fatal): ${errMsg(err)}`);
     }
 
     // Build PM selection context

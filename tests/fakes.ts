@@ -308,9 +308,13 @@ export class FakeGitPr implements GitPrManager {
     this.takeFailure("discardWorktree");
   }
 
+  /** Optional side effect called after fetchDefaultBranch (e.g. delete files to simulate git reset --hard). */
+  fetchDefaultBranchSideEffect?: () => void;
+
   async fetchDefaultBranch(): Promise<void> {
     this.calls.push({ method: "fetchDefaultBranch", args: [] });
     this.takeFailure("fetchDefaultBranch");
+    this.fetchDefaultBranchSideEffect?.();
   }
 
   prDiffSummaries = new Map<number, import("../src/types.js").PrDiffSummary>();
