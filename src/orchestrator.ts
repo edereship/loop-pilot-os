@@ -37,7 +37,7 @@ import { executeRecoveryTurn, executeAbandon } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
-import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, MEMORY_DIR } from "./memory-store.js";
+import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, writeCategory, MEMORY_DIR } from "./memory-store.js";
 import { buildGroomPrompt } from "./groom-prompt.js";
 import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
@@ -1714,6 +1714,11 @@ export class Orchestrator {
 
       // 2. Fetch default branch so memory/spec/codebase reads see the current state of main
       // rather than a stale local checkout from a previous merge iteration (ES-457 Finding 3).
+      const repoPath = this.config.repo.path;
+      // Save non-header category content before the fetch resets HEAD: pm_decisions and
+      // product_knowledge cannot be rebuilt from the DB, so if the local bootstrap commit
+      // is discarded their content would be permanently lost (ES-503 Finding 3).
+      const preResetMem = readMemoryAll(repoPath);
       try {
         await this.git.fetchDefaultBranch();
       } catch (err) {
@@ -1722,11 +1727,24 @@ export class Orchestrator {
       // Re-seed memory from store: fetchDefaultBranch's git reset --hard discards the
       // local-only bootstrap commit created when startup rebase fails, so memory would
       // otherwise be absent for this GROOM cycle (ES-503 Codex Finding 1). Idempotent.
-      const repoPath = this.config.repo.path;
       try {
         initializeMemory(repoPath, this.store, this.config.digest.recentMergedCount);
       } catch (err) {
         this.log(`groom: memory re-seed after fetch failed (non-fatal): ${errMsg(err)}`);
+      }
+      // Restore categories that had real content pre-reset but are now header-only after
+      // initializeMemory (ES-503 Finding 3). impl_results is handled by initializeMemory
+      // itself; pm_decisions and product_knowledge have no DB fallback.
+      const postResetMem = readMemoryAll(repoPath);
+      if (preResetMem.pmDecisions !== null && postResetMem.pmDecisions === null) {
+        try {
+          writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, this.config.memory.maxCharsPerFile);
+        } catch { /* best-effort */ }
+      }
+      if (preResetMem.productKnowledge !== null && postResetMem.productKnowledge === null) {
+        try {
+          writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, this.config.memory.maxCharsPerFile);
+        } catch { /* best-effort */ }
       }
 
       // 3. Assemble prompt
@@ -1809,8 +1827,10 @@ export class Orchestrator {
           }
           // Reset the full checkout so any files Codex wrote are discarded before
           // haltForInterrupt() calls commitMemoryBeforeHalt() (Finding 3 + 4).
+          // -fd (not -fdx) avoids deleting repo-root ignored files (.env, node_modules, etc.).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
           if (startSha) {
             await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1831,7 +1851,8 @@ export class Orchestrator {
           }
           // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
           if (startSha) {
             await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1852,7 +1873,8 @@ export class Orchestrator {
         }
         // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1876,7 +1898,8 @@ export class Orchestrator {
         }
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1926,7 +1949,8 @@ export class Orchestrator {
         }
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1944,10 +1968,11 @@ export class Orchestrator {
       // discarded before validated update_memory actions write fresh content.
       // Using the full tree (not just docs/memory/) prevents tracked or untracked
       // files outside memory from persisting into the next SELECT preflight (Finding 3).
-      // -fdx (not -fd) removes ignored files too, so memory files hidden by the shared
-      // info/exclude (written in CLAIM) are also cleaned before actions run (ES-503 Finding 1).
+      // -fd (not -fdx) avoids deleting repo-root ignored files (.env, node_modules, etc.);
+      // the path-scoped -fdx -- docs/memory/ cleans ignored memory files specifically.
       await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       // If Codex created commits and advanced HEAD, reset back to the recorded starting
       // SHA so only the memory commit is pushed (ES-457 Finding 1).
       if (startSha) {
@@ -2150,6 +2175,8 @@ export class Orchestrator {
     }
 
     // Ensure the repo checkout is up-to-date before reading specs or running Codex.
+    // Save non-header category content before the fetch resets HEAD (ES-503 Finding 3).
+    const selectPreResetMem = readMemoryAll(this.config.repo.path);
     try {
       await this.git.fetchDefaultBranch();
     } catch (err) {
@@ -2160,6 +2187,18 @@ export class Orchestrator {
       initializeMemory(this.config.repo.path, this.store, this.config.digest.recentMergedCount);
     } catch (err) {
       this.log(`select: memory re-seed after fetch failed (non-fatal): ${errMsg(err)}`);
+    }
+    // Restore categories that had real content pre-reset but are now header-only (ES-503 Finding 3).
+    const selectPostResetMem = readMemoryAll(this.config.repo.path);
+    if (selectPreResetMem.pmDecisions !== null && selectPostResetMem.pmDecisions === null) {
+      try {
+        writeCategory(this.config.repo.path, "pm_decisions", selectPreResetMem.pmDecisions, this.config.memory.maxCharsPerFile);
+      } catch { /* best-effort */ }
+    }
+    if (selectPreResetMem.productKnowledge !== null && selectPostResetMem.productKnowledge === null) {
+      try {
+        writeCategory(this.config.repo.path, "product_knowledge", selectPreResetMem.productKnowledge, this.config.memory.maxCharsPerFile);
+      } catch { /* best-effort */ }
     }
 
     // Build PM selection context
@@ -2323,8 +2362,15 @@ export class Orchestrator {
     // real data while the worktree stays clean (ES-503 Findings 1 & 2).
     try { initializeMemory(worktreePath, this.store, this.config.digest.recentMergedCount); } catch { /* best-effort */ }
     const mem = readMemoryAll(worktreePath);
+    // Revert tracked memory files and remove untracked ones (e.g. newly seeded files
+    // in worktrees without the CLAIM exclude) so hasUncommittedChanges() stays false
+    // after reading (ES-503 Finding 4).
     await this.runner.run(
       "git", ["-C", worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
+    await this.runner.run(
+      "git", ["-C", worktreePath, "clean", "-fdx", "--", MEMORY_DIR + "/"],
       { cwd: worktreePath, timeoutMs: 10_000 },
     ).catch(() => {});
     if (mem.readErrors) {
