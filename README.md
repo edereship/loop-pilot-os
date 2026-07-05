@@ -99,11 +99,12 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `linear.project` | Project 名（プリフライトで ID 解決・検証） |
 | `linear.opt_in_label` | AI 着手を許可するオプトインラベル名 |
 | `linear.states.{todo,in_progress,in_review,done}` | 状態名 → プリフライトで stateId に解決 |
-| `agent.model` | `claude --model` に渡すモデル（出荷既定 `claude-opus-4-6[1m]`） |
-| `agent.effort` | `claude --effort` に渡す思考レベル（`low\|medium\|high\|xhigh\|max\|auto`・既定 `max`。`auto` はモデル既定にリセット＝effort 非対応モデル向け） |
+| `agent.model` | `claude --model` に渡すモデル（出荷既定 `claude-opus-4-8[1m]`） |
+| `agent.effort` | `claude --effort` に渡す思考レベル（`low\|medium\|high\|xhigh\|max\|auto`・既定 `xhigh`。`auto` はモデル既定にリセット＝effort 非対応モデル向け） |
 | `agent.allowed_tools` | `claude --allowedTools`（例 `Edit,Write,Read,Glob,Grep,Bash`） |
 | `agent.permission_mode` | `claude --permission-mode` に渡す権限モード（既定 `acceptEdits`）。隔離コンテナでは `bypassPermissions` を選択（下記セキュリティモデル参照） |
 | `agent.extra_args` | 任意の追加 claude フラグ（既定なし） |
+| `agent.{design,implement,self_review,recovery,verify}.{model,effort}` | フェーズ別オーバーライド（ES-486）。未設定フェーズは `[agent]` を継承。出荷既定（example.toml）: implement = Opus 4.8\[1m\]/xhigh、design・recovery = Opus 4.8/high、self_review = Sonnet 4.6/high、verify = Sonnet 4.6/medium |
 | `handoff.branch_prefix` | ブランチ接頭辞（例 `looppilot`） |
 | `handoff.pr_body_template` | PR 本文テンプレ。`{identifier}` `{title}` `{issue_url}` を置換 |
 | `looppilot.gate_label` | 対象リポの `LOOPPILOT_LABEL` に一致させる（既定 `loop-pilot`・大小無視） |
@@ -140,8 +141,8 @@ cp looppilot-os.example.toml looppilot-os.toml
 
 | model | 使える effort |
 | -- | -- |
-| Opus 4.8 / 4.7 | low / medium / high / xhigh / max |
-| **Opus 4.6**（出荷既定 `claude-opus-4-6[1m]`） | low / medium / high / **max**（xhigh 非対応） |
+| **Opus 4.8 / 4.7**（出荷既定 `claude-opus-4-8[1m]`） | low / medium / high / **xhigh** / max |
+| Opus 4.6 | low / medium / high / max（xhigh 非対応） |
 | Sonnet 4.6 | low / medium / high / max（xhigh 非対応） |
 | Haiku 4.5 / Sonnet 4.5 | **effort 非対応**（`auto` 以外はエラー。`auto` = `--effort` フラグ自体を省略してモデル既定にリセット） |
 
