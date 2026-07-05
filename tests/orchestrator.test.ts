@@ -2657,6 +2657,29 @@ describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Fin
     expect(content).toContain("TY-0");
     expect(content).toContain("Previous task");
   });
+
+  it("does not stage memory files in the feature worktree during claim (ES-503 Finding 1 fix)", async () => {
+    // Regression: the old code called commitIfChanged(runner, worktreePath) in claim(),
+    // which staged docs/memory/ files on the feature branch. This made hasCommitsWithDiff()
+    // return true even when the agent produced no real diff, and caused HANDOFF to open PRs
+    // containing only bootstrap memory files (ES-503 Codex Finding 1).
+    // The fix: seed files via initializeMemory + write to info/exclude instead of committing.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // git add docs/memory/ must NOT be called with the feature worktree as cwd: that
+    // was the mechanism by which memory files were staged on the feature branch.
+    const worktreeAddCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "add" && c.args[1] === "docs/memory/" && c.opts.cwd === "/wt/ty-1",
+    );
+    expect(worktreeAddCalls).toHaveLength(0);
+  });
 });
 
 describe("Orchestrator HALT memory commit — Codex Findings 1 & 2", () => {

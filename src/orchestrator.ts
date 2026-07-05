@@ -43,7 +43,8 @@ import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
 import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
 import { retryTransient } from "./transient-retry.js";
-import { readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync, mkdirSync, appendFileSync } from "node:fs";
+import path from "node:path";
 export interface IGroomBoardFetcher {
   getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
   getProjectIssueIds(): Promise<Set<string>>;
@@ -1325,15 +1326,28 @@ export class Orchestrator {
       this.log(detail);
       return HALT;
     }
-    // Re-seed memory files into the new worktree: worktrees are created from
-    // origin/<defaultBranch> which lacks memory when the startup rebase failed and the
-    // bootstrap commit was local-only (ES-503 Codex Finding 1). Idempotent.
-    // Commit immediately so the files are tracked; otherwise hasUncommittedChanges()
-    // sees them as untracked after the agent finishes and stops the session as leftovers,
-    // or the agent's git add . leaks them into the feature PR (ES-503 Codex Finding 1).
+    // Re-seed memory files into the new worktree when origin/<defaultBranch> does not yet
+    // carry them (ES-503: startup rebase failed, bootstrap commit is local-only). Idempotent.
+    // We must NOT commit the seeded files on the feature branch: a memory-only commit would
+    // make hasCommitsWithDiff() report "changed" even when the agent produced no real diff,
+    // and would cause HANDOFF to open a PR whose only content is bootstrap memory files.
+    // Instead, register docs/memory/ in the worktree-local info/exclude so that:
+    //   - git status --porcelain ignores them (hasUncommittedChanges stays clean)
+    //   - git add . does not stage them (agent cannot accidentally leak them into the PR)
+    // info/exclude only suppresses UNTRACKED files; tracked memory files (already on origin)
+    // are unaffected, so this is a no-op when the worktree already contains memory.
     try {
       initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
-      await commitIfChanged(this.runner, claimResult.worktreePath, "chore: bootstrap memory");
+      const gitDirRes = await this.runner.run(
+        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-dir"],
+        { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
+      ).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+      if (gitDirRes.code === 0 && gitDirRes.stdout.trim()) {
+        const worktreeGitDir = path.resolve(claimResult.worktreePath, gitDirRes.stdout.trim());
+        const infoDir = path.join(worktreeGitDir, "info");
+        mkdirSync(infoDir, { recursive: true });
+        appendFileSync(path.join(infoDir, "exclude"), `\n${MEMORY_DIR}/\n`);
+      }
     } catch (err) {
       this.log(`claim: memory re-seed in worktree failed (non-fatal): ${errMsg(err)}`);
     }
