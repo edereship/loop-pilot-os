@@ -25,7 +25,8 @@ export type FailureReason =
   | "handoff_failed"
   | "workflow_setup_failed"
   | "design_rejected"
-  | "verify_failed";
+  | "verify_failed"
+  | "merge_gate_failed";  // マージゲート fix 上限超過 → park（PR保留・ES-514）
 
 // ---- ドメイン ----
 export interface EligibleIssue {
@@ -84,6 +85,7 @@ export interface TaskSessionRow {
   selfReviewCostUsd: number | null; // cost of the self-review turn (ES-473)
   verifyAttempts: number;          // number of VERIFY attempts for this session (ES-487)
   recoveryTurnAttempts: number;    // durable counter for ci_failed/merge_conflict recovery turns (ES-487)
+  handoffHeadSha: string | null;   // HANDOFF 時の PR head SHA。マージゲートの累積差分基点（ES-514）
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----
@@ -179,7 +181,8 @@ export type NotifyEvent =
   | { kind: "resumed"; target: PauseTarget; detail: string }
   | { kind: "recovery_started"; identifier: string; reason: string }
   | { kind: "recovery_succeeded"; identifier: string; action: string }
-  | { kind: "task_skipped"; identifier: string; reason: string; detail: string };
+  | { kind: "task_skipped"; identifier: string; reason: string; detail: string }
+  | { kind: "merge_gate_parked"; identifier: string; prNumber: number; detail: string }; // ES-514: マージゲート上限超過でPR保留
 export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */
@@ -329,6 +332,24 @@ export interface GroomLogRow {
   actionsRejected: number;
   actionDetails: string | null;
   outcome: GroomOutcome | null;
+  errorDetail: string | null;
+}
+
+// ---- MERGE GATE (ES-514) ----
+export type MergeGateOutcome = "passed" | "fixed" | "parked" | "skipped" | "error";
+
+export interface MergeGateLogRow {
+  id: number;
+  runId: number;
+  sessionId: number;
+  attempt: number;             // 1始まり。fix 後の再ゲートで +1
+  startedAt: string;
+  endedAt: string | null;
+  verdict: "pass" | "fail" | null;
+  signals: string | null;      // breaking-signals 抽出結果の JSON（ES-515）
+  violations: string | null;   // fail 時の違反リスト JSON
+  outcome: MergeGateOutcome | null;
+  costUsd: number | null;      // fix ターン（Claude）の実測コスト。Codex 判定は計測不能（timeout ガードのみ）
   errorDetail: string | null;
 }
 

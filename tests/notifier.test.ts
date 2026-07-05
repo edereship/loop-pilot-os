@@ -345,3 +345,16 @@ describe("formatNotifyEvent", () => {
     expect(text).toBe("▶️ LoopPilot OS 再開 (codex): rate limit cleared");
   });
 });
+
+describe("formatNotifyEvent merge_gate_parked (ES-514)", () => {
+  it("formats merge_gate_parked with identifier, PR number and detail", () => {
+    expect(
+      formatNotifyEvent({
+        kind: "merge_gate_parked",
+        identifier: "ES-999",
+        prNumber: 42,
+        detail: "公開 export の削除を検出",
+      }),
+    ).toBe("🚧 マージ保留 (needs-human): ES-999 PR #42 — 公開 export の削除を検出");
+  });
+});

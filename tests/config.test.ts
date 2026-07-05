@@ -114,6 +114,14 @@ describe("loadConfig", () => {
     expect(config.safety.maxCostUsdPerFix).toBe(2);
   });
 
+  it("merge gate config applies defaults when keys are omitted (ES-514)", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.safety.mergeGateTimeoutMinutes).toBe(15);
+    expect(config.safety.maxMergeGateFixAttempts).toBe(2);
+    expect(config.safety.maxCostUsdPerMergeGateFix).toBe(2);
+    expect(config.mergeGate.enabled).toBe(true);
+  });
+
   // カーネル §3: SLACK_WEBHOOK_URL 未設定なら undefined（コンソールのみ）。
   it("leaves slackWebhookUrl undefined when env var is absent", () => {
     const config = loadConfig(fixture("config-minimal.toml"), {

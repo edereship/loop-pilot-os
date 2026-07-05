@@ -37,6 +37,8 @@ export function formatNotifyEvent(event: NotifyEvent): string {
       return `✅ リカバリー成功: ${event.identifier} (${event.action})`;
     case "task_skipped":
       return `⏭️ スキップ: ${event.identifier} (${event.reason}) — ${event.detail}`;
+    case "merge_gate_parked":
+      return `🚧 マージ保留 (needs-human): ${event.identifier} PR #${event.prNumber} — ${event.detail}`;
   }
 }
 

@@ -95,3 +95,9 @@ describe("FAILURE_POLICY", () => {
     }
   });
 });
+
+describe("FAILURE_POLICY (ES-514)", () => {
+  it("routes merge_gate_failed to park", () => {
+    expect(FAILURE_POLICY.merge_gate_failed).toBe("park");
+  });
+});

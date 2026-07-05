@@ -1,6 +1,6 @@
 import type { FailureReason } from "./types.js";
 
-export type FailurePolicy = "halt" | "recover" | "abandon";
+export type FailurePolicy = "halt" | "recover" | "abandon" | "park";
 
 export const FAILURE_POLICY = {
   claim_failed: "halt",
@@ -13,6 +13,7 @@ export const FAILURE_POLICY = {
   agent_no_change: "abandon",
   design_rejected: "abandon",
   verify_failed: "abandon",
+  merge_gate_failed: "park",
   ci_failed: "recover",
   merge_conflict: "recover",
   looppilot_stopped: "recover",
