@@ -1334,12 +1334,21 @@ export class Orchestrator {
     // Instead, register docs/memory/ in the worktree-local info/exclude so that:
     //   - git status --porcelain ignores them (hasUncommittedChanges stays clean)
     //   - git add . does not stage them (agent cannot accidentally leak them into the PR)
-    // info/exclude only suppresses UNTRACKED files; tracked memory files (already on origin)
-    // are unaffected, so this is a no-op when the worktree already contains memory.
+    // info/exclude only suppresses UNTRACKED files. If origin already carries header-only
+    // memory files, initializeMemory may rewrite them with session data (tracked modification).
+    // Revert those tracked changes with git checkout so the worktree stays clean; the only
+    // residual files are new untracked ones, which info/exclude then hides (ES-503 Finding 1).
+    // Use --git-common-dir for the exclude path: in a linked worktree --git-dir resolves to
+    // .git/worktrees/<name> which Git ignores for info/exclude; only the common gitdir
+    // (.git) is honoured by git-status (ES-503 Finding 2).
     try {
       initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
+      await this.runner.run(
+        "git", ["-C", claimResult.worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+        { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
+      ).catch(() => {});
       const gitDirRes = await this.runner.run(
-        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-dir"],
+        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-common-dir"],
         { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
       ).catch(() => ({ code: 1, stdout: "", stderr: "" }));
       if (gitDirRes.code === 0 && gitDirRes.stdout.trim()) {
@@ -5017,8 +5026,9 @@ export class Orchestrator {
         await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in rebase-skip path: ${err instanceof Error ? err.message : String(err)}`);
-          // Remove any partial files written before the error so commitIfChanged does
-          // not stage and commit incomplete memory (ES-503 Codex Finding 3).
+          // Revert tracked modifications and remove untracked files so commitIfChanged
+          // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
+          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         }
         try {
@@ -5055,8 +5065,9 @@ export class Orchestrator {
         await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in autostash-conflict path: ${err instanceof Error ? err.message : String(err)}`);
-          // Remove any partial files written before the error so commitIfChanged does
-          // not stage and commit incomplete memory (ES-503 Codex Finding 3).
+          // Revert tracked modifications and remove untracked files so commitIfChanged
+          // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
+          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         }
         try {

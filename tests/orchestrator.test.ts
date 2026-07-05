@@ -2511,6 +2511,52 @@ describe("Orchestrator bootstrap memory — rebase failure local commit (ES-503)
     // Warning must be logged
     expect(h.logs.some((l) => l.includes("bootstrap memory commit failed"))).toBe(true);
   });
+
+  it("reverts tracked memory files when initializeMemory fails in rebase-skip bootstrap path (ES-503 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // initializeMemory (beforeCommit) always throws in tests because /repo doesn't exist.
+    // The catch block must call git checkout HEAD -- docs/memory/ to revert any tracked
+    // modifications BEFORE git clean, so commitIfChanged cannot stage partial state
+    // (ES-503 Finding 3). Expected: >=3 checkout calls (pre-seed cleanup + catch + halt path).
+    // Without the fix only 2 calls would occur (pre-seed cleanup + halt path).
+    const checkoutCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" &&
+             c.args.includes("HEAD") && c.args.includes("docs/memory/"),
+    );
+    expect(checkoutCalls.length).toBeGreaterThanOrEqual(3);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("reverts tracked memory files when initializeMemory fails in autostash-conflict bootstrap path (ES-503 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], {
+      code: 0,
+      stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
+    });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // initializeMemory (beforeCommit) always throws in tests because /repo doesn't exist.
+    // The catch block must call git checkout HEAD to revert tracked modifications before
+    // git clean (ES-503 Finding 3). Expected: >=3 checkout calls (line-5049 bootstrap +
+    // catch + line-5049 halt). Without the fix only 2 calls occur.
+    const checkoutCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" &&
+             c.args.includes("HEAD") && c.args.includes("docs/memory/"),
+    );
+    expect(checkoutCalls.length).toBeGreaterThanOrEqual(3);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
 });
 
 describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Finding 1)", () => {
@@ -2679,6 +2725,43 @@ describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Fin
       (c) => c.cmd === "git" && c.args[0] === "add" && c.args[1] === "docs/memory/" && c.opts.cwd === "/wt/ty-1",
     );
     expect(worktreeAddCalls).toHaveLength(0);
+  });
+
+  it("uses --git-common-dir (not --git-dir) and reverts tracked memory files after CLAIM (ES-503 Findings 1 & 2)", async () => {
+    const tmpWorktree = mkdtempSync(path.join(tmpdir(), "wt-es503-f12-"));
+    tmpDirs.push(tmpWorktree);
+
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: tmpWorktree });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // After initializeMemory, git checkout HEAD -- docs/memory/ must be called to
+    // revert any tracked file modifications so the worktree stays clean (ES-503 Finding 1).
+    const checkoutCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("checkout") && c.args.includes("HEAD"),
+    );
+    expect(checkoutCalls.length).toBeGreaterThan(0);
+
+    // --git-common-dir must be used (not --git-dir): in a linked worktree --git-dir points
+    // to .git/worktrees/<name> which git-status ignores for info/exclude (ES-503 Finding 2).
+    const commonDirCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("--git-common-dir"),
+    );
+    expect(commonDirCalls.length).toBeGreaterThan(0);
+
+    const gitDirOnlyCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("--git-dir") && !c.args.includes("--git-common-dir"),
+    );
+    expect(gitDirOnlyCalls).toHaveLength(0);
   });
 });
 
