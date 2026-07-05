@@ -32,6 +32,7 @@ export function writeCategory(
     );
   }
   const filePath = path.join(repoPath, MEMORY_DIR, CATEGORY_FILES[category]);
+  mkdirSync(path.join(repoPath, MEMORY_DIR), { recursive: true });
   writeFileSync(filePath, content, "utf-8");
 }
 
@@ -113,14 +114,16 @@ export function initialize(
 export async function commitIfChanged(
   runner: CommandRunner,
   repoPath: string,
+  message = "chore: persist cross-task memory on halt",
 ): Promise<boolean> {
-  const add = await runner.run("git", ["add", MEMORY_DIR + "/"], { cwd: repoPath });
+  const filePaths = Object.values(CATEGORY_FILES).map(f => MEMORY_DIR + "/" + f);
+  const add = await runner.run("git", ["add", "-f", "--", ...filePaths], { cwd: repoPath });
   if (add.code !== 0) {
     // Restore tracked files to HEAD so the clean-worktree preflight on the next
     // startup does not fail due to dirty memory files (ES-452 Finding 1).
     await runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     // Remove any newly created untracked files (e.g. leftover bootstrap files).
-    await runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+    await runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     throw new Error(`git add failed (code ${add.code}): ${add.stderr}`);
   }
   const diff = await runner.run(
@@ -132,7 +135,7 @@ export async function commitIfChanged(
 
   const commit = await runner.run(
     "git",
-    ["commit", "-m", "chore: persist cross-task memory on halt", "--", MEMORY_DIR + "/"],
+    ["commit", "-m", message, "--", MEMORY_DIR + "/"],
     { cwd: repoPath },
   );
   if (commit.code !== 0) {
@@ -142,7 +145,7 @@ export async function commitIfChanged(
     // working tree stays clean and the next startup's clean-worktree preflight does
     // not fail (ES-452 Finding 4). Both steps are best-effort.
     await runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-    await runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+    await runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
     throw new Error(`git commit failed (code ${commit.code}): ${commit.stderr}`);
   }
   return true;

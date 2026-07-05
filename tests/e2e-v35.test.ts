@@ -143,16 +143,17 @@ function makeHarness(config: Config, opts?: {
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
   memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-  memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-  memoryRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
-  memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fdx"], { code: 0 });
   memoryRunner.on(["git", "checkout"], { code: 0 });
   memoryRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
   memoryRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "rev-list", "--count"], { code: 0, stdout: "0\n" });
   memoryRunner.on(["git", "-C"], (args, _opts) => {
     if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
       const cIdx = args.indexOf("-C");

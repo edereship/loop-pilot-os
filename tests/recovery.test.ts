@@ -115,7 +115,7 @@ function makeHarness(config: Config): Harness {
   };
   const recovery = new FakeWorkflowRecovery();
   const memoryRunner = new FakeCommandRunner();
-  memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   // Self-review pre/post-review branch verification: rev-parse --abbrev-ref returns the
   // expected branch for the worktree so the guard passes without stopping the session.

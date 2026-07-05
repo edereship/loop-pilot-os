@@ -37,13 +37,14 @@ import { executeRecoveryTurn, executeAbandon } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
-import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, MEMORY_DIR } from "./memory-store.js";
+import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, writeCategory, MEMORY_DIR } from "./memory-store.js";
 import { buildGroomPrompt } from "./groom-prompt.js";
 import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
 import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
 import { retryTransient } from "./transient-retry.js";
-import { readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync, mkdirSync, appendFileSync } from "node:fs";
+import path from "node:path";
 export interface IGroomBoardFetcher {
   getBoardState(prMap: Map<string, number | null>): Promise<BoardState>;
   getProjectIssueIds(): Promise<Set<string>>;
@@ -1325,6 +1326,49 @@ export class Orchestrator {
       this.log(detail);
       return HALT;
     }
+    // Re-seed memory files into the new worktree when origin/<defaultBranch> does not yet
+    // carry them (ES-503: startup rebase failed, bootstrap commit is local-only). Idempotent.
+    // We must NOT commit the seeded files on the feature branch: a memory-only commit would
+    // make hasCommitsWithDiff() report "changed" even when the agent produced no real diff,
+    // and would cause HANDOFF to open a PR whose only content is bootstrap memory files.
+    // Instead, register docs/memory/ in the worktree-local info/exclude so that:
+    //   - git status --porcelain ignores them (hasUncommittedChanges stays clean)
+    //   - git add . does not stage them (agent cannot accidentally leak them into the PR)
+    // info/exclude only suppresses UNTRACKED files. If origin already carries header-only
+    // memory files, initializeMemory may rewrite them with session data (tracked modification).
+    // Revert those tracked changes with git checkout so the worktree stays clean; the only
+    // residual files are new untracked ones, which info/exclude then hides (ES-503 Finding 1).
+    // Git reads info/exclude from --git-common-dir (the shared .git/), not from --git-dir
+    // (.git/worktrees/<name>); writing to the worktree-specific path has no effect.
+    // gitignore rules only suppress UNTRACKED files, so memory files already tracked in
+    // the default checkout remain addable/committable by commitIfChanged even when this
+    // exclude is active. GROOM cleanup uses -fdx so exclude-hidden planner files are
+    // still removed before validated actions run (ES-503 Finding 1).
+    // Idempotent: check before appending to avoid duplicate entries across multiple worktrees.
+    try {
+      initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
+      await this.runner.run(
+        "git", ["-C", claimResult.worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+        { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
+      ).catch(() => {});
+      const gitCommonDirRes = await this.runner.run(
+        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-common-dir"],
+        { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
+      ).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+      if (gitCommonDirRes.code === 0 && gitCommonDirRes.stdout.trim()) {
+        const commonGitDir = path.resolve(claimResult.worktreePath, gitCommonDirRes.stdout.trim());
+        const infoDir = path.join(commonGitDir, "info");
+        mkdirSync(infoDir, { recursive: true });
+        const excludeFile = path.join(infoDir, "exclude");
+        let existing = "";
+        try { existing = readFileSync(excludeFile, "utf-8"); } catch { /* file does not exist yet */ }
+        if (!existing.split("\n").some(line => line.trim() === `${MEMORY_DIR}/`)) {
+          appendFileSync(excludeFile, `\n${MEMORY_DIR}/\n`);
+        }
+      }
+    } catch (err) {
+      this.log(`claim: memory re-seed in worktree failed (non-fatal): ${errMsg(err)}`);
+    }
     const session = this.store.createSession({
       runId: this.runId,
       linearIssueId: issue.id,
@@ -1380,7 +1424,16 @@ export class Orchestrator {
       }
     }
 
+    // Re-seed memory from the store: claim-time checkout HEAD reverts tracked
+    // memory modifications, and design review cleanup deletes untracked files.
+    // Seed → read → revert so the prompt gets real data while the worktree stays
+    // clean (ES-503 Findings 1 & 2).
+    try { initializeMemory(worktreePath, this.store, this.config.digest.recentMergedCount); } catch { /* best-effort */ }
     const planMem = readMemoryAll(worktreePath);
+    await this.runner.run(
+      "git", ["-C", worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
     if (planMem.readErrors) {
       this.log(`design: memory read failed (non-fatal): ${planMem.readErrors.join("; ")}`);
     }
@@ -1661,18 +1714,50 @@ export class Orchestrator {
 
       // 2. Fetch default branch so memory/spec/codebase reads see the current state of main
       // rather than a stale local checkout from a previous merge iteration (ES-457 Finding 3).
+      const repoPath = this.config.repo.path;
+      // Save non-header category content before the fetch resets HEAD: pm_decisions and
+      // product_knowledge cannot be rebuilt from the DB, so if the local bootstrap commit
+      // is discarded their content would be permanently lost (ES-503 Finding 3).
+      const preResetMem = readMemoryAll(repoPath);
       try {
         await this.git.fetchDefaultBranch();
       } catch (err) {
         this.log(`groom: fetch failed (non-fatal): ${errMsg(err)}`);
       }
+      // Re-seed memory from store: fetchDefaultBranch's git reset --hard discards the
+      // local-only bootstrap commit created when startup rebase fails, so memory would
+      // otherwise be absent for this GROOM cycle (ES-503 Codex Finding 1). Idempotent.
+      try {
+        initializeMemory(repoPath, this.store, this.config.digest.recentMergedCount);
+      } catch (err) {
+        this.log(`groom: memory re-seed after fetch failed (non-fatal): ${errMsg(err)}`);
+      }
+      // Restore categories that had real content pre-reset but are now header-only after
+      // initializeMemory (ES-503 Finding 3). impl_results is handled by initializeMemory
+      // itself; pm_decisions and product_knowledge have no DB fallback.
+      const postResetMem = readMemoryAll(repoPath);
+      if (preResetMem.pmDecisions !== null && postResetMem.pmDecisions === null) {
+        try {
+          writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, this.config.memory.maxCharsPerFile);
+        } catch { /* best-effort */ }
+      }
+      if (preResetMem.productKnowledge !== null && postResetMem.productKnowledge === null) {
+        try {
+          writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, this.config.memory.maxCharsPerFile);
+        } catch { /* best-effort */ }
+      }
 
       // 3. Assemble prompt
-      const repoPath = this.config.repo.path;
       const groomMem = readMemoryAll(repoPath);
       if (groomMem.readErrors) {
         this.log(`groom: memory read failed (non-fatal): ${groomMem.readErrors.join("; ")}`);
       }
+      // Revert any tracked memory modifications so the main checkout stays clean.
+      // initializeMemory may have rewritten tracked header-only files with real data;
+      // without this revert a crash before the next commitIfChanged leaves git status
+      // dirty and the next startup's clean-worktree preflight rejects startup (ES-503).
+      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
 
       let specContent: SpecContent | null = null;
       const specDir = this.config.product.specDir;
@@ -1742,8 +1827,10 @@ export class Orchestrator {
           }
           // Reset the full checkout so any files Codex wrote are discarded before
           // haltForInterrupt() calls commitMemoryBeforeHalt() (Finding 3 + 4).
+          // -fd (not -fdx) avoids deleting repo-root ignored files (.env, node_modules, etc.).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
           if (startSha) {
             await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1765,6 +1852,7 @@ export class Orchestrator {
           // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
           if (startSha) {
             await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1786,6 +1874,7 @@ export class Orchestrator {
         // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
         await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1810,6 +1899,7 @@ export class Orchestrator {
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
         await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1860,6 +1950,7 @@ export class Orchestrator {
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
         await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1877,8 +1968,11 @@ export class Orchestrator {
       // discarded before validated update_memory actions write fresh content.
       // Using the full tree (not just docs/memory/) prevents tracked or untracked
       // files outside memory from persisting into the next SELECT preflight (Finding 3).
+      // -fd (not -fdx) avoids deleting repo-root ignored files (.env, node_modules, etc.);
+      // the path-scoped -fdx -- docs/memory/ cleans ignored memory files specifically.
       await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
       await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       // If Codex created commits and advanced HEAD, reset back to the recorded starting
       // SHA so only the memory commit is pushed (ES-457 Finding 1).
       if (startSha) {
@@ -1989,7 +2083,7 @@ export class Orchestrator {
           // are not untracked and git clean would skip them without this reset.
           await this.runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
           // The commit (or git add) failed so the memory changes were not persisted.
           // Mark the corresponding update_memory results as failed so groom_log and
           // summaryForSelect reflect the actual outcome (Finding 2).
@@ -2081,10 +2175,30 @@ export class Orchestrator {
     }
 
     // Ensure the repo checkout is up-to-date before reading specs or running Codex.
+    // Save non-header category content before the fetch resets HEAD (ES-503 Finding 3).
+    const selectPreResetMem = readMemoryAll(this.config.repo.path);
     try {
       await this.git.fetchDefaultBranch();
     } catch (err) {
       this.log(`select: fetch failed (non-fatal): ${errMsg(err)}`);
+    }
+    // Re-seed memory from store after fetchDefaultBranch (ES-503 Codex Finding 1). Idempotent.
+    try {
+      initializeMemory(this.config.repo.path, this.store, this.config.digest.recentMergedCount);
+    } catch (err) {
+      this.log(`select: memory re-seed after fetch failed (non-fatal): ${errMsg(err)}`);
+    }
+    // Restore categories that had real content pre-reset but are now header-only (ES-503 Finding 3).
+    const selectPostResetMem = readMemoryAll(this.config.repo.path);
+    if (selectPreResetMem.pmDecisions !== null && selectPostResetMem.pmDecisions === null) {
+      try {
+        writeCategory(this.config.repo.path, "pm_decisions", selectPreResetMem.pmDecisions, this.config.memory.maxCharsPerFile);
+      } catch { /* best-effort */ }
+    }
+    if (selectPreResetMem.productKnowledge !== null && selectPostResetMem.productKnowledge === null) {
+      try {
+        writeCategory(this.config.repo.path, "product_knowledge", selectPreResetMem.productKnowledge, this.config.memory.maxCharsPerFile);
+      } catch { /* best-effort */ }
     }
 
     // Build PM selection context
@@ -2133,6 +2247,9 @@ export class Orchestrator {
     if (selectMem.readErrors) {
       this.log(`select: memory read failed (non-fatal): ${selectMem.readErrors.join("; ")}`);
     }
+    // Revert any tracked memory modifications so the main checkout stays clean (ES-503).
+    await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
+    await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
 
     const prompt = buildSelectPrompt({
       goal: this.config.product.goal ?? null,
@@ -2239,7 +2356,23 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
       }
     }
+    // Re-seed memory from the store: design review cleanup runs
+    // discardUncommittedChanges + reset --hard, which deletes untracked memory
+    // files and reverts tracked ones. Seed → read → revert so the prompt gets
+    // real data while the worktree stays clean (ES-503 Findings 1 & 2).
+    try { initializeMemory(worktreePath, this.store, this.config.digest.recentMergedCount); } catch { /* best-effort */ }
     const mem = readMemoryAll(worktreePath);
+    // Revert tracked memory files and remove untracked ones (e.g. newly seeded files
+    // in worktrees without the CLAIM exclude) so hasUncommittedChanges() stays false
+    // after reading (ES-503 Finding 4).
+    await this.runner.run(
+      "git", ["-C", worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
+    await this.runner.run(
+      "git", ["-C", worktreePath, "clean", "-fdx", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
     if (mem.readErrors) {
       this.log(`implement: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
     }
@@ -2387,10 +2520,19 @@ export class Orchestrator {
       }
     }
 
+    // Re-seed memory: IMPLEMENT's seed→read→revert cycle leaves tracked memory files
+    // at HEAD (header-only). Without another seed here, SELF-REVIEW would see no memory
+    // context even when DB sessions exist (ES-503 Finding 3).
+    try { initializeMemory(worktreePath, this.store, this.config.digest.recentMergedCount); } catch { /* best-effort */ }
     const mem = readMemoryAll(worktreePath);
     if (mem.readErrors) {
       this.log(`selfReview: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
     }
+    // Revert tracked modifications so the worktree stays clean (ES-503).
+    await this.runner.run(
+      "git", ["-C", worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
 
     const prompt = buildSelfReviewPrompt({
       issue,
@@ -4967,13 +5109,35 @@ export class Orchestrator {
     if (rebaseRes.code !== 0) {
       await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
       this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
-      beforeCommit?.();
-      // Halt-path only: restore any dirty docs/memory files so the clean-worktree
-      // preflight on the next startup does not fail (ES-452 Finding 1). The bootstrap
-      // path (beforeCommit defined) intentionally leaves files dirty for the current run.
-      if (beforeCommit === undefined) {
+      if (beforeCommit !== undefined) {
+        // Bootstrap path: seed memory, then commit locally (no push) so files survive
+        // the GROOM worktree cleanup (ES-503). Push is skipped because the rebase failed
+        // — a push would be non-fast-forward. Both steps are best-effort.
+        // Clean memory dir first: checkout restores tracked files to HEAD; clean removes
+        // untracked stale files from a prior crashed run that initializeMemory would skip.
         await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        try { beforeCommit(); } catch (err: unknown) {
+          this.log(`warning: initializeMemory failed in rebase-skip path: ${err instanceof Error ? err.message : String(err)}`);
+          // Revert tracked modifications and remove untracked files so commitIfChanged
+          // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
+          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        }
+        try {
+          await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
+        } catch {
+          // commitIfChanged's internal cleanup already removed the files; re-seed so the
+          // current run still has memory available for reading (degrades to uncommitted).
+          let reseeded = false;
+          try { beforeCommit(); reseeded = true; } catch { /* best-effort */ }
+          this.log(`warning: bootstrap memory commit failed after rebase skip; ${reseeded ? "files re-seeded but uncommitted" : "re-seed also failed, memory unavailable"}`);
+        }
+      } else {
+        // Halt-path: restore any dirty docs/memory files so the clean-worktree
+        // preflight on the next startup does not fail (ES-452 Finding 1).
+        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       }
       return;
     }
@@ -4987,11 +5151,31 @@ export class Orchestrator {
     if (unmergedRes.stdout.trim().length > 0) {
       await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
-      beforeCommit?.();
-      // Halt-path only: also remove any untracked files created by the bootstrap path's
-      // initializeMemory so the next startup's clean-worktree preflight does not fail.
-      if (beforeCommit === undefined) {
-        await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      if (beforeCommit !== undefined) {
+        // Bootstrap path: seed memory, then commit locally (ES-503).
+        // checkout HEAD already ran above to clear conflict markers; untracked
+        // stale files are handled by git clean so initializeMemory starts fresh.
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        try { beforeCommit(); } catch (err: unknown) {
+          this.log(`warning: initializeMemory failed in autostash-conflict path: ${err instanceof Error ? err.message : String(err)}`);
+          // Revert tracked modifications and remove untracked files so commitIfChanged
+          // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
+          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        }
+        try {
+          await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (autostash conflict)");
+        } catch {
+          // commitIfChanged's internal cleanup already removed the files; re-seed so the
+          // current run still has memory available for reading (degrades to uncommitted).
+          let reseeded = false;
+          try { beforeCommit(); reseeded = true; } catch { /* best-effort */ }
+          this.log(`warning: bootstrap memory commit failed after autostash conflict; ${reseeded ? "files re-seeded but uncommitted" : "re-seed also failed, memory unavailable"}`);
+        }
+      } else {
+        // Halt-path: remove untracked files so the next startup's clean-worktree
+        // preflight does not fail.
+        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
       }
       return;
     }
@@ -5014,6 +5198,58 @@ export class Orchestrator {
         // memory files modified, causing the next startup's clean-worktree preflight to fail.
         await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
         this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
+      }
+    } else {
+      // No new memory changes, but HEAD may still be ahead of origin/<defaultBranch>
+      // (e.g., a local-only bootstrap commit from startup when the rebase failed).
+      // Push those surviving commits so they are not lost by fetchDefaultBranch's
+      // git reset --hard on the next run (ES-503 Finding 4).
+      // Guard: only push when EVERY file in EVERY ahead commit lives under docs/memory/.
+      // Inspect per-commit (not the net range diff) to catch the case where a non-memory
+      // commit is later reverted: the net diff would appear memory-only while the history
+      // still contains the unrelated commit (ES-503 Finding 2).
+      const aheadRes = await this.runner.run(
+        "git", ["rev-list", "--count", `origin/${defaultBranch}..HEAD`],
+        { cwd: repoPath },
+      ).catch((_e: unknown) => ({ code: 1, stdout: "0", stderr: "" }));
+      if (aheadRes.code === 0 && parseInt(aheadRes.stdout.trim(), 10) > 0) {
+        const logRes = await this.runner.run(
+          "git", ["log", "--format=%H", `origin/${defaultBranch}..HEAD`],
+          { cwd: repoPath },
+        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
+        if (logRes.code !== 0) {
+          this.log("warning: could not inspect ahead commits; skipping push");
+        } else {
+          const aheadShas = logRes.stdout.trim().split("\n").filter(Boolean);
+          let hasNonMemory = false;
+          for (const sha of aheadShas) {
+            const filesRes = await this.runner.run(
+              "git", ["diff-tree", "--no-commit-id", "-r", "-m", "--name-only", sha],
+              { cwd: repoPath },
+            ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
+            if (filesRes.code !== 0) {
+              hasNonMemory = true;
+              break;
+            }
+            const files = filesRes.stdout.trim().split("\n").filter(Boolean);
+            if (files.some(f => !f.startsWith(MEMORY_DIR + "/"))) {
+              hasNonMemory = true;
+              break;
+            }
+          }
+          if (hasNonMemory) {
+            this.log("warning: ahead commits contain non-memory changes; skipping push to avoid publishing unintended commits");
+          } else if (aheadShas.length > 0) {
+            const pushRes = await this.runner.run(
+              "git",
+              ["push", "origin", `HEAD:${defaultBranch}`],
+              { cwd: repoPath },
+            ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+            if (pushRes.code !== 0) {
+              this.log(`warning: failed to push local-only commits (non-fatal): ${pushRes.stderr.trim()}`);
+            }
+          }
+        }
       }
     }
   }

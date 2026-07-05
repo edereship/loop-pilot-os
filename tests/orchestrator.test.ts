@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Orchestrator, isPidAlive } from "../src/orchestrator.js";
@@ -149,14 +149,16 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
   memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-  memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   // GROOM always resets the memory directory before executing actions (ES-457 Finding 1).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-  memoryRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
   // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
+  // -fd (not -fdx) for the full tree; -fdx -- docs/memory/ separately (ES-503 Finding 1).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
   memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fdx"], { code: 0 });
   // Design reviewer branch restore — git checkout <session.branch> (ES-477 Finding 4).
   memoryRunner.on(["git", "checkout"], { code: 0 });
   // GROOM startSha recording and HEAD reset before memory commit (ES-457 Finding 1).
@@ -164,6 +166,8 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
   // ES-470 fallback: unstage staged memory files when commitIfChanged throws.
   memoryRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+  // Halt-path local-only commit check (ES-503 Finding 4): default to not ahead.
+  memoryRunner.on(["git", "rev-list", "--count"], { code: 0, stdout: "0\n" });
   // Self-review branch verification (Finding 4): git -C <worktreePath> rev-parse / checkout
   memoryRunner.on(["git", "-C"], (args, _opts) => {
     if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
@@ -717,7 +721,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
     const inlineMemoryRunner1 = new FakeCommandRunner();
     inlineMemoryRunner1.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner1.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
-    inlineMemoryRunner1.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config,
@@ -2347,22 +2351,24 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
     expect(h.store.latestRun()!.state).toBe("halted");
   });
 
-  it("skips memory commit and aborts rebase when rebase fails on halt (ES-452 Findings 3 & 4)", async () => {
+  it("skips memory push and aborts rebase when rebase fails on halt (ES-452 Findings 3 & 4)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     // Override: rebase fails, simulating conflicts between local memory edits and remote
     h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
     h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
-    // Memory has changes, but commit must NOT be called because rebase failed
+    // Memory has changes
     h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
 
     h.orch.requestStop();
     await h.orch.run();
 
-    const commitCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "commit",
+    // Bootstrap path may commit locally (ES-503), but push must NOT happen
+    const pushCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "push",
     );
-    expect(commitCall).toBeUndefined();
+    expect(pushCall).toBeUndefined();
     const abortCall = h.memoryRunner.calls.find(
       (c) => c.cmd === "git" && c.args[0] === "rebase" && c.args.includes("--abort"),
     );
@@ -2370,7 +2376,7 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
     expect(h.store.latestRun()!.state).toBe("halted");
   });
 
-  it("skips memory commit when autostash pop leaves conflicts after successful rebase (ES-452 Finding 2)", async () => {
+  it("skips memory push when autostash pop leaves conflicts after successful rebase (ES-452 Finding 2)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     // Rebase exits 0 (success), but autostash pop left unmerged files
@@ -2379,16 +2385,18 @@ describe("Orchestrator HALT memory commit — ES-452 Task 3", () => {
       stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
     });
     h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-    // Even though diff shows changes, commit must NOT be called
+    // Memory has changes
     h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
 
     h.orch.requestStop();
     await h.orch.run();
 
-    const commitCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "commit",
+    // Bootstrap path may commit locally (ES-503), but push must NOT happen
+    const pushCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "push",
     );
-    expect(commitCall).toBeUndefined();
+    expect(pushCall).toBeUndefined();
     const checkoutCall = h.memoryRunner.calls.find(
       (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD"),
     );
@@ -2440,6 +2448,333 @@ describe("Orchestrator bootstrap memory commit — ES-452 Finding 1", () => {
   });
 });
 
+describe("Orchestrator bootstrap memory — rebase failure local commit (ES-503)", () => {
+  it("commits bootstrap memory locally when rebase fails so GROOM cleanup cannot remove it", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase fails during bootstrap
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+    // commitIfChanged: git add succeeds, diff shows staged changes, commit succeeds
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // A local commit must have been created with the bootstrap-specific message
+    const commitCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCalls.length).toBeGreaterThan(0);
+    expect(commitCalls[0].args).toContain("chore: bootstrap memory (rebase skipped)");
+    // Push must NOT be attempted (rebase failed → push would be non-fast-forward)
+    const pushCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "push",
+    );
+    expect(pushCalls.length).toBe(0);
+  });
+
+  it("commits bootstrap memory locally when autostash pop leaves conflicts (ES-503)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase succeeds but autostash pop leaves conflicts
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], {
+      code: 0,
+      stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
+    });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+    // commitIfChanged: git add succeeds, diff shows staged changes, commit succeeds
+    h.memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 1 });
+    h.memoryRunner.on(["git", "commit", "-m"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    const commitCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "commit",
+    );
+    expect(commitCalls.length).toBeGreaterThan(0);
+    expect(commitCalls[0].args).toContain("chore: bootstrap memory (autostash conflict)");
+  });
+
+  it("degrades gracefully when bootstrap local commit fails (ES-503)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    // Rebase fails during bootstrap
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+    // commitIfChanged fails (git add returns error)
+    h.memoryRunner.on(["git", "add", "-f", "--"], { code: 1, stderr: "fatal: index.lock" });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // Run must still complete (halted), not crash
+    expect(h.store.latestRun()!.state).toBe("halted");
+    // Warning must be logged
+    expect(h.logs.some((l) => l.includes("bootstrap memory commit failed"))).toBe(true);
+  });
+
+  it("reverts tracked memory files when initializeMemory fails in rebase-skip bootstrap path (ES-503 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 1, stderr: "CONFLICT" });
+    h.memoryRunner.on(["git", "rebase", "--abort"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // initializeMemory (beforeCommit) always throws in tests because /repo doesn't exist.
+    // The catch block must call git checkout HEAD -- docs/memory/ to revert any tracked
+    // modifications BEFORE git clean, so commitIfChanged cannot stage partial state
+    // (ES-503 Finding 3). Expected: >=3 checkout calls (pre-seed cleanup + catch + halt path).
+    // Without the fix only 2 calls would occur (pre-seed cleanup + halt path).
+    const checkoutCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" &&
+             c.args.includes("HEAD") && c.args.includes("docs/memory/"),
+    );
+    expect(checkoutCalls.length).toBeGreaterThanOrEqual(3);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("reverts tracked memory files when initializeMemory fails in autostash-conflict bootstrap path (ES-503 Finding 3)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], {
+      code: 0,
+      stdout: "100644 abc123 1\tdocs/memory/pm-decisions.md\n",
+    });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // initializeMemory (beforeCommit) always throws in tests because /repo doesn't exist.
+    // The catch block must call git checkout HEAD to revert tracked modifications before
+    // git clean (ES-503 Finding 3). Expected: >=3 checkout calls (line-5049 bootstrap +
+    // catch + line-5049 halt). Without the fix only 2 calls occur.
+    const checkoutCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "checkout" &&
+             c.args.includes("HEAD") && c.args.includes("docs/memory/"),
+    );
+    expect(checkoutCalls.length).toBeGreaterThanOrEqual(3);
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+});
+
+describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Finding 1)", () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("groom reads store-seeded memory after fetchDefaultBranch discards local-only bootstrap commit", async () => {
+    const tmpRepo = mkdtempSync(path.join(tmpdir(), "groom-es503-cf1-"));
+    tmpDirs.push(tmpRepo);
+
+    const planner = new FakePlanRunner();
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[],"summary":"no changes"}\n```',
+    });
+    // SELECT outcome (2 issues → selectWithPm calls the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    const config = {
+      ...makeConfig({ maxTasksPerRun: 1, groomEnabled: true }),
+      repo: { ...makeConfig().repo, path: tmpRepo },
+    } as Config;
+    const h = makeHarness(config, { planner });
+
+    // Pre-create a completed session so initializeMemory writes meaningful impl-results content
+    const prevRun = h.store.createRun(5, "2024-01-01T00:00:00Z");
+    const prevSession = h.store.createSession({
+      runId: prevRun.id,
+      linearIssueId: "prev-x",
+      linearIdentifier: "TY-0",
+      issueTitle: "Previous task",
+      issueUrl: "https://linear.app/prev",
+      branch: "looppilot/ty-0",
+      worktreePath: "/wt/ty-0",
+      now: "2024-01-01T00:00:00Z",
+    });
+    h.store.updateSession(prevSession.id, { state: "merged", endedAt: "2024-01-01T01:00:00Z" });
+
+    // Simulate fetchDefaultBranch's git reset --hard discarding the local-only bootstrap commit
+    h.git.fetchDefaultBranchSideEffect = () => {
+      rmSync(path.join(tmpRepo, "docs", "memory"), { recursive: true, force: true });
+    };
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The groom prompt (planner call 0) must include TY-0 from the re-seeded impl-results
+    const groomPrompt = planner.calls[0]!.prompt;
+    expect(groomPrompt).toContain("TY-0");
+    expect(groomPrompt).toContain("Previous task");
+  });
+
+  it("select reads store-seeded memory after fetchDefaultBranch discards local-only bootstrap commit", async () => {
+    const tmpRepo = mkdtempSync(path.join(tmpdir(), "select-es503-cf1-"));
+    tmpDirs.push(tmpRepo);
+
+    const planner = new FakePlanRunner();
+    // SELECT outcome (2 issues → selectWithPm calls the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+
+    const config = {
+      ...makeConfig({ maxTasksPerRun: 1 }),
+      repo: { ...makeConfig().repo, path: tmpRepo },
+    } as Config;
+    const h = makeHarness(config, { planner });
+
+    // Pre-create a completed session so initializeMemory writes meaningful impl-results content
+    const prevRun = h.store.createRun(5, "2024-01-01T00:00:00Z");
+    const prevSession = h.store.createSession({
+      runId: prevRun.id,
+      linearIssueId: "prev-x",
+      linearIdentifier: "TY-0",
+      issueTitle: "Previous task",
+      issueUrl: "https://linear.app/prev",
+      branch: "looppilot/ty-0",
+      worktreePath: "/wt/ty-0",
+      now: "2024-01-01T00:00:00Z",
+    });
+    h.store.updateSession(prevSession.id, { state: "merged", endedAt: "2024-01-01T01:00:00Z" });
+
+    // Simulate fetchDefaultBranch's git reset --hard discarding the local-only bootstrap commit
+    h.git.fetchDefaultBranchSideEffect = () => {
+      rmSync(path.join(tmpRepo, "docs", "memory"), { recursive: true, force: true });
+    };
+
+    // 2 issues are needed to trigger selectWithPm (single issue short-circuits)
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // The select prompt (planner call 0) must include TY-0 from the re-seeded impl-results
+    const selectPrompt = planner.calls[0]!.prompt;
+    expect(selectPrompt).toContain("TY-0");
+    expect(selectPrompt).toContain("Previous task");
+  });
+
+  it("claim seeds memory files in new worktree from store so implement can read it", async () => {
+    const tmpWorktree = mkdtempSync(path.join(tmpdir(), "wt-es503-cf1-"));
+    tmpDirs.push(tmpWorktree);
+
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+
+    // Pre-create a completed session so initializeMemory writes meaningful impl-results content
+    const prevRun = h.store.createRun(5, "2024-01-01T00:00:00Z");
+    const prevSession = h.store.createSession({
+      runId: prevRun.id,
+      linearIssueId: "prev-x",
+      linearIdentifier: "TY-0",
+      issueTitle: "Previous task",
+      issueUrl: "https://linear.app/prev",
+      branch: "looppilot/ty-0",
+      worktreePath: "/wt/ty-0",
+      now: "2024-01-01T00:00:00Z",
+    });
+    h.store.updateSession(prevSession.id, { state: "merged", endedAt: "2024-01-01T01:00:00Z" });
+
+    // Point the worktree for TY-1 at the real tmpdir so initializeMemory can write there
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: tmpWorktree });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // impl-results.md must exist in the worktree and contain the pre-seeded session data
+    const implResultsPath = path.join(tmpWorktree, "docs", "memory", "impl-results.md");
+    expect(existsSync(implResultsPath)).toBe(true);
+    const content = readFileSync(implResultsPath, "utf-8");
+    expect(content).toContain("TY-0");
+    expect(content).toContain("Previous task");
+  });
+
+  it("does not stage memory files in the feature worktree during claim (ES-503 Finding 1 fix)", async () => {
+    // Regression: the old code called commitIfChanged(runner, worktreePath) in claim(),
+    // which staged docs/memory/ files on the feature branch. This made hasCommitsWithDiff()
+    // return true even when the agent produced no real diff, and caused HANDOFF to open PRs
+    // containing only bootstrap memory files (ES-503 Codex Finding 1).
+    // The fix: seed files via initializeMemory + write to info/exclude instead of committing.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // git add targeting docs/memory/ (any form) must NOT be called with the feature
+    // worktree as cwd: that was the mechanism by which memory files were staged on the
+    // feature branch.
+    const worktreeAddCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "add" &&
+        c.args.some(a => a === "docs/memory/" || a.startsWith("docs/memory/")) &&
+        c.opts.cwd === "/wt/ty-1",
+    );
+    expect(worktreeAddCalls).toHaveLength(0);
+  });
+
+  it("uses --git-common-dir (not --git-dir) and reverts tracked memory files after CLAIM (ES-503 Finding 1 fix)", async () => {
+    const tmpWorktree = mkdtempSync(path.join(tmpdir(), "wt-es503-f12-"));
+    tmpDirs.push(tmpWorktree);
+
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: tmpWorktree });
+
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // After initializeMemory, git checkout HEAD -- docs/memory/ must be called to
+    // revert any tracked file modifications so the worktree stays clean (ES-503 Finding 1).
+    const checkoutCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("checkout") && c.args.includes("HEAD"),
+    );
+    expect(checkoutCalls.length).toBeGreaterThan(0);
+
+    // --git-common-dir must be used: Git reads info/exclude from the common git dir,
+    // not from the worktree-specific .git/worktrees/<name> path (ES-503 Finding 1 fix).
+    // gitignore rules only affect untracked files, so tracked memory files in the
+    // default checkout remain addable/committable by commitIfChanged.
+    const commonDirCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("--git-common-dir"),
+    );
+    expect(commonDirCalls.length).toBeGreaterThan(0);
+
+    const gitDirOnlyCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("rev-parse") && c.args.includes("--git-dir") &&
+             !c.args.includes("--git-common-dir"),
+    );
+    expect(gitDirOnlyCalls).toHaveLength(0);
+  });
+});
+
 describe("Orchestrator HALT memory commit — Codex Findings 1 & 2", () => {
   it("cleans up dirty memory files when halt-path rebase fails (Codex Finding 1)", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
@@ -2469,7 +2804,7 @@ describe("Orchestrator HALT memory commit — Codex Findings 1 & 2", () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
     // Simulate a commitIfChanged failure (e.g. index lock) in the halt path.
-    h.memoryRunner.on(["git", "add", "docs/memory/"], { code: 1, stderr: "fatal: Unable to create index.lock" });
+    h.memoryRunner.on(["git", "add", "-f", "--"], { code: 1, stderr: "fatal: Unable to create index.lock" });
 
     h.orch.requestStop();
     await h.orch.run();
@@ -2494,7 +2829,7 @@ describe("Orchestrator HALT memory commit — Codex Findings 1 & 2", () => {
     h.orch.requestStop();
     await h.orch.run();
 
-    // git clean -fd -- docs/memory/ must run in the halt path to remove untracked files.
+    // git clean -fdx -- docs/memory/ must run in the halt path to remove untracked files.
     const cleanCalls = h.memoryRunner.calls.filter(
       (c) => c.cmd === "git" && c.args[0] === "clean" && c.args[2] === "--" && c.args[3] === "docs/memory/",
     );
@@ -2736,7 +3071,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
     const inlineMemoryRunner2 = new FakeCommandRunner();
     inlineMemoryRunner2.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner2.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
-    inlineMemoryRunner2.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config: specConfig,
@@ -3384,7 +3719,7 @@ describe("Orchestrator.interruptablePause", () => {
     const inlineMemoryRunner3 = new FakeCommandRunner();
     inlineMemoryRunner3.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner3.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
-    inlineMemoryRunner3.on(["git", "add", "docs/memory/"], { code: 0 });
+    inlineMemoryRunner3.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
       config, source, agent, selfReviewAgent: agent, verifyAgent: new FakeAgentRunner(), git, monitor, notifier, store,
@@ -5750,7 +6085,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
         text: '```json\n{"actions":[{"type":"update_memory","category":"pm_decisions","content":"Test decision","rationale":"update"}],"summary":"Updated memory"}\n```',
       });
       // Make git add fail so commitIfChanged throws; the catch block should mark the action as failed.
-      h.memoryRunner.on(["git", "add", "docs/memory/"], { code: 1, stderr: "fatal: index.lock exists" });
+      h.memoryRunner.on(["git", "add", "-f", "--"], { code: 1, stderr: "fatal: index.lock exists" });
 
       // SELECT outcome (2 issues needed to trigger the planner)
       planner.outcomes.push({
@@ -5833,10 +6168,16 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
       (c) => c.cmd === "git" && c.args[0] === "checkout" && c.args.includes("HEAD") && c.args.includes("."),
     );
     expect(checkoutCall).toBeDefined();
+    // ES-503 Finding 1: full-tree clean uses -fd (not -fdx) to preserve ignored files at the
+    // repo root; ignored memory files are cleaned separately with -fdx -- docs/memory/.
     const cleanCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd") && !c.args.includes("docs/memory/"),
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args[1] === "-fd" && !c.args.includes("docs/memory/"),
     );
     expect(cleanCall).toBeDefined();
+    const cleanMemCall = h.memoryRunner.calls.find(
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fdx") && c.args.includes("docs/memory/"),
+    );
+    expect(cleanMemCall).toBeDefined();
   });
 
   it("codex error cleanup resets to startSha to undo any Codex-created commits (ES-457 Finding 1)", async () => {
@@ -5969,7 +6310,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
 
     // Clock: returns T=0, T+1s, T+2s, ... but after call #2
@@ -6116,7 +6457,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
 
     // Pre-create a run with idle_started_at already set 61 minutes ago
@@ -6180,7 +6521,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     // Self-review pre/post-review branch verification: rev-parse --abbrev-ref returns the
     // expected branch for the worktree so the guard passes without stopping the session.
@@ -6270,7 +6611,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    memoryRunner.on(["git", "add", "-f", "--"], { code: 0 });
     memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
 
     // Previous run was idle with idle_started_at 61 minutes in the past.
@@ -8772,12 +9113,13 @@ describe("VERIFY (ES-491)", () => {
     lsofRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
     lsofRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
     lsofRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-    lsofRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "add", "-f", "--"], { code: 0 });
     lsofRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     lsofRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
-    lsofRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
     lsofRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
     lsofRunner.on(["git", "clean", "-fd"], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fdx"], { code: 0 });
     lsofRunner.on(["git", "checkout"], { code: 0 });
     lsofRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
     lsofRunner.on(["git", "reset", "--hard"], { code: 0 });
