@@ -1590,3 +1590,23 @@ describe("task_session.verifyAttempts/recoveryTurnAttempts migration (ES-487)", 
     expect(updated.recoveryTurnAttempts).toBe(1);
   });
 });
+
+describe("handoffHeadSha (ES-514)", () => {
+  it("defaults to null and persists via updateSession", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const run = store.createRun(3, clock());
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "ES-1",
+      issueTitle: "t",
+      branch: "b",
+      worktreePath: "/tmp/wt",
+      now: clock(),
+    });
+    expect(session.handoffHeadSha).toBeNull();
+    store.updateSession(session.id, { handoffHeadSha: "abc1234def" });
+    expect(store.getSession(session.id).handoffHeadSha).toBe("abc1234def");
+  });
+});

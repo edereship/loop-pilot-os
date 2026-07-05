@@ -85,6 +85,7 @@ export interface TaskSessionRow {
   selfReviewCostUsd: number | null; // cost of the self-review turn (ES-473)
   verifyAttempts: number;          // number of VERIFY attempts for this session (ES-487)
   recoveryTurnAttempts: number;    // durable counter for ci_failed/merge_conflict recovery turns (ES-487)
+  handoffHeadSha: string | null;   // HANDOFF 時の PR head SHA。マージゲートの累積差分基点（ES-514）
 }
 
 // ---- モジュールインターフェース（仕様 §4） ----

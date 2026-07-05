@@ -193,6 +193,7 @@ interface RawSessionRow {
   self_review_cost_usd: number | null;
   verify_attempts: number;
   recovery_turn_attempts: number;
+  handoff_head_sha: string | null;
 }
 function toSessionRow(r: RawSessionRow): TaskSessionRow {
   return {
@@ -229,6 +230,7 @@ function toSessionRow(r: RawSessionRow): TaskSessionRow {
     selfReviewCostUsd: r.self_review_cost_usd,
     verifyAttempts: r.verify_attempts,
     recoveryTurnAttempts: r.recovery_turn_attempts,
+    handoffHeadSha: r.handoff_head_sha,
   };
 }
 
@@ -389,6 +391,7 @@ const SESSION_PATCH_COLUMNS: Record<string, string> = {
   selfReviewCostUsd: "self_review_cost_usd",
   verifyAttempts: "verify_attempts",
   recoveryTurnAttempts: "recovery_turn_attempts",
+  handoffHeadSha: "handoff_head_sha",
 };
 const DESIGN_REVIEW_LOG_PATCH_COLUMNS: Record<string, string> = {
   endedAt: "ended_at",
@@ -538,6 +541,9 @@ export class SqliteStore {
       this.db.exec(
         `ALTER TABLE task_session ADD COLUMN issue_description TEXT NOT NULL DEFAULT ''`,
       );
+    }
+    if (!columns.has("handoff_head_sha")) {
+      this.db.exec(`ALTER TABLE task_session ADD COLUMN handoff_head_sha TEXT`);
     }
 
     const runColumns = new Set(
@@ -754,6 +760,7 @@ export class SqliteStore {
         | "selfReviewCostUsd"
         | "verifyAttempts"
         | "recoveryTurnAttempts"
+        | "handoffHeadSha"
       >
     >,
   ): void {
