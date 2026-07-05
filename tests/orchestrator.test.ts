@@ -164,6 +164,8 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
   // ES-470 fallback: unstage staged memory files when commitIfChanged throws.
   memoryRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+  // Halt-path local-only commit check (ES-503 Finding 4): default to not ahead.
+  memoryRunner.on(["git", "rev-list", "--count"], { code: 0, stdout: "0\n" });
   // Self-review branch verification (Finding 4): git -C <worktreePath> rev-parse / checkout
   memoryRunner.on(["git", "-C"], (args, _opts) => {
     if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
@@ -2727,7 +2729,7 @@ describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Fin
     expect(worktreeAddCalls).toHaveLength(0);
   });
 
-  it("uses --git-common-dir (not --git-dir) and reverts tracked memory files after CLAIM (ES-503 Findings 1 & 2)", async () => {
+  it("uses --git-dir (not --git-common-dir) and reverts tracked memory files after CLAIM (ES-503 Finding 3)", async () => {
     const tmpWorktree = mkdtempSync(path.join(tmpdir(), "wt-es503-f12-"));
     tmpDirs.push(tmpWorktree);
 
@@ -2749,19 +2751,20 @@ describe("Orchestrator memory re-seed after fetchDefaultBranch (ES-503 Codex Fin
     );
     expect(checkoutCalls.length).toBeGreaterThan(0);
 
-    // --git-common-dir must be used (not --git-dir): in a linked worktree --git-dir points
-    // to .git/worktrees/<name> which git-status ignores for info/exclude (ES-503 Finding 2).
+    // --git-dir must be used (not --git-common-dir): --git-common-dir resolves to
+    // the shared .git which would exclude docs/memory/ for all worktrees including
+    // the default checkout, breaking commitIfChanged (ES-503 Finding 3).
+    const gitDirCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
+             c.args.includes("--git-dir") && !c.args.includes("--git-common-dir"),
+    );
+    expect(gitDirCalls.length).toBeGreaterThan(0);
+
     const commonDirCalls = h.memoryRunner.calls.filter(
       (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
              c.args.includes("--git-common-dir"),
     );
-    expect(commonDirCalls.length).toBeGreaterThan(0);
-
-    const gitDirOnlyCalls = h.memoryRunner.calls.filter(
-      (c) => c.cmd === "git" && c.args[0] === "-C" && c.args[1] === tmpWorktree &&
-             c.args.includes("--git-dir") && !c.args.includes("--git-common-dir"),
-    );
-    expect(gitDirOnlyCalls).toHaveLength(0);
+    expect(commonDirCalls).toHaveLength(0);
   });
 });
 

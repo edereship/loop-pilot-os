@@ -153,6 +153,7 @@ function makeHarness(config: Config, opts?: {
   memoryRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
   memoryRunner.on(["git", "reset", "--hard"], { code: 0 });
   memoryRunner.on(["git", "reset", "HEAD", "--", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "rev-list", "--count"], { code: 0, stdout: "0\n" });
   memoryRunner.on(["git", "-C"], (args, _opts) => {
     if (args.includes("rev-parse") && args.includes("--abbrev-ref")) {
       const cIdx = args.indexOf("-C");

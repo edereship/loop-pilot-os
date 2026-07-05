@@ -1338,9 +1338,10 @@ export class Orchestrator {
     // memory files, initializeMemory may rewrite them with session data (tracked modification).
     // Revert those tracked changes with git checkout so the worktree stays clean; the only
     // residual files are new untracked ones, which info/exclude then hides (ES-503 Finding 1).
-    // Use --git-common-dir for the exclude path: in a linked worktree --git-dir resolves to
-    // .git/worktrees/<name> which Git ignores for info/exclude; only the common gitdir
-    // (.git) is honoured by git-status (ES-503 Finding 2).
+    // Use --git-dir for the exclude path: in a linked worktree this resolves to
+    // .git/worktrees/<name>, scoping the exclude to this worktree only. Using
+    // --git-common-dir would write to the shared .git/info/exclude and break
+    // commitIfChanged in the default checkout (ES-503 Finding 3).
     try {
       initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
       await this.runner.run(
@@ -1348,7 +1349,7 @@ export class Orchestrator {
         { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
       ).catch(() => {});
       const gitDirRes = await this.runner.run(
-        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-common-dir"],
+        "git", ["-C", claimResult.worktreePath, "rev-parse", "--git-dir"],
         { cwd: claimResult.worktreePath, timeoutMs: 10_000 },
       ).catch(() => ({ code: 1, stdout: "", stderr: "" }));
       if (gitDirRes.code === 0 && gitDirRes.stdout.trim()) {
@@ -1415,7 +1416,16 @@ export class Orchestrator {
       }
     }
 
+    // Re-seed memory from the store: claim-time checkout HEAD reverts tracked
+    // memory modifications, and design review cleanup deletes untracked files.
+    // Seed → read → revert so the prompt gets real data while the worktree stays
+    // clean (ES-503 Findings 1 & 2).
+    try { initializeMemory(worktreePath, this.store, this.config.digest.recentMergedCount); } catch { /* best-effort */ }
     const planMem = readMemoryAll(worktreePath);
+    await this.runner.run(
+      "git", ["-C", worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
     if (planMem.readErrors) {
       this.log(`design: memory read failed (non-fatal): ${planMem.readErrors.join("; ")}`);
     }
@@ -2288,7 +2298,16 @@ export class Orchestrator {
         return await this.stopSession(session, "exception", `spec loading failed: ${errMsg(err)}`);
       }
     }
+    // Re-seed memory from the store: design review cleanup runs
+    // discardUncommittedChanges + reset --hard, which deletes untracked memory
+    // files and reverts tracked ones. Seed → read → revert so the prompt gets
+    // real data while the worktree stays clean (ES-503 Findings 1 & 2).
+    try { initializeMemory(worktreePath, this.store, this.config.digest.recentMergedCount); } catch { /* best-effort */ }
     const mem = readMemoryAll(worktreePath);
+    await this.runner.run(
+      "git", ["-C", worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
     if (mem.readErrors) {
       this.log(`implement: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
     }
@@ -5105,6 +5124,25 @@ export class Orchestrator {
         // memory files modified, causing the next startup's clean-worktree preflight to fail.
         await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
         this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
+      }
+    } else {
+      // No new memory changes, but HEAD may still be ahead of origin/<defaultBranch>
+      // (e.g., a local-only bootstrap commit from startup when the rebase failed).
+      // Push those surviving commits so they are not lost by fetchDefaultBranch's
+      // git reset --hard on the next run (ES-503 Finding 4).
+      const aheadRes = await this.runner.run(
+        "git", ["rev-list", "--count", `origin/${defaultBranch}..HEAD`],
+        { cwd: repoPath },
+      ).catch((_e: unknown) => ({ code: 1, stdout: "0", stderr: "" }));
+      if (aheadRes.code === 0 && parseInt(aheadRes.stdout.trim(), 10) > 0) {
+        const pushRes = await this.runner.run(
+          "git",
+          ["push", "origin", `HEAD:${defaultBranch}`],
+          { cwd: repoPath },
+        ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
+        if (pushRes.code !== 0) {
+          this.log(`warning: failed to push local-only commits (non-fatal): ${pushRes.stderr.trim()}`);
+        }
       }
     }
   }
