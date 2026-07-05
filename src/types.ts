@@ -25,7 +25,8 @@ export type FailureReason =
   | "handoff_failed"
   | "workflow_setup_failed"
   | "design_rejected"
-  | "verify_failed";
+  | "verify_failed"
+  | "merge_gate_failed";  // マージゲート fix 上限超過 → park（PR保留・ES-514）
 
 // ---- ドメイン ----
 export interface EligibleIssue {
