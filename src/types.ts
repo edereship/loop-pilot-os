@@ -335,6 +335,24 @@ export interface GroomLogRow {
   errorDetail: string | null;
 }
 
+// ---- MERGE GATE (ES-514) ----
+export type MergeGateOutcome = "passed" | "fixed" | "parked" | "skipped" | "error";
+
+export interface MergeGateLogRow {
+  id: number;
+  runId: number;
+  sessionId: number;
+  attempt: number;             // 1始まり。fix 後の再ゲートで +1
+  startedAt: string;
+  endedAt: string | null;
+  verdict: "pass" | "fail" | null;
+  signals: string | null;      // breaking-signals 抽出結果の JSON（ES-515）
+  violations: string | null;   // fail 時の違反リスト JSON
+  outcome: MergeGateOutcome | null;
+  costUsd: number | null;      // fix ターン（Claude）の実測コスト。Codex 判定は計測不能（timeout ガードのみ）
+  errorDetail: string | null;
+}
+
 // ---- SELF-REVIEW (ES-473) ----
 export type SelfReviewOutcome = "passed" | "fixed" | "failed" | "error";
 

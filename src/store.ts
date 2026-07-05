@@ -8,6 +8,8 @@ import type {
   PauseMeta,
   GroomLogRow,
   GroomOutcome,
+  MergeGateLogRow,
+  MergeGateOutcome,
   DesignReviewLogRow,
   DesignReviewOutcome,
   SelfReviewLogRow,
@@ -121,6 +123,20 @@ CREATE TABLE IF NOT EXISTS verify_log (
   cost_usd REAL,
   error_detail TEXT,
   verified_head_sha TEXT
+);
+CREATE TABLE IF NOT EXISTS merge_gate_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES run(id),
+  session_id INTEGER NOT NULL REFERENCES task_session(id),
+  attempt INTEGER NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  verdict TEXT CHECK (verdict IN ('pass','fail')),
+  signals TEXT,
+  violations TEXT,
+  outcome TEXT CHECK (outcome IN ('passed','fixed','parked','skipped','error')),
+  cost_usd REAL,
+  error_detail TEXT
 );
 CREATE TABLE IF NOT EXISTS run_lock (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -261,6 +277,37 @@ function toGroomLogRow(r: RawGroomLogRow): GroomLogRow {
     actionsRejected: r.actions_rejected,
     actionDetails: r.action_details,
     outcome: r.outcome as GroomOutcome | null,
+    errorDetail: r.error_detail,
+  };
+}
+
+interface RawMergeGateLogRow {
+  id: number;
+  run_id: number;
+  session_id: number;
+  attempt: number;
+  started_at: string;
+  ended_at: string | null;
+  verdict: string | null;
+  signals: string | null;
+  violations: string | null;
+  outcome: string | null;
+  cost_usd: number | null;
+  error_detail: string | null;
+}
+function toMergeGateLogRow(r: RawMergeGateLogRow): MergeGateLogRow {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    sessionId: r.session_id,
+    attempt: r.attempt,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    verdict: r.verdict as "pass" | "fail" | null,
+    signals: r.signals,
+    violations: r.violations,
+    outcome: r.outcome as MergeGateOutcome | null,
+    costUsd: r.cost_usd,
     errorDetail: r.error_detail,
   };
 }
@@ -418,6 +465,16 @@ const VERIFY_LOG_PATCH_COLUMNS: Record<string, string> = {
   costUsd: "cost_usd",
   errorDetail: "error_detail",
   verifiedHeadSha: "verified_head_sha",
+};
+
+const MERGE_GATE_LOG_PATCH_COLUMNS: Record<string, string> = {
+  endedAt: "ended_at",
+  verdict: "verdict",
+  signals: "signals",
+  violations: "violations",
+  outcome: "outcome",
+  costUsd: "cost_usd",
+  errorDetail: "error_detail",
 };
 
 export class SqliteStore {
@@ -1173,6 +1230,66 @@ export class SqliteStore {
       .run(...values);
     if (info.changes !== 1) {
       throw new Error(`updateGroomLog affected ${info.changes} rows for id=${id}`);
+    }
+  }
+
+  // ---- merge_gate_log (ES-514) ----
+  insertMergeGateLog(s: {
+    runId: number;
+    sessionId: number;
+    attempt: number;
+    startedAt: string;
+  }): MergeGateLogRow {
+    const info = this.db
+      .prepare(
+        `INSERT INTO merge_gate_log (run_id, session_id, attempt, started_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(s.runId, s.sessionId, s.attempt, s.startedAt);
+    return this.getMergeGateLog(Number(info.lastInsertRowid));
+  }
+
+  getMergeGateLog(id: number): MergeGateLogRow {
+    const row = this.db
+      .prepare(`SELECT * FROM merge_gate_log WHERE id = ?`)
+      .get(id) as RawMergeGateLogRow | undefined;
+    if (row === undefined) {
+      throw new Error(`merge_gate_log not found: id=${id}`);
+    }
+    return toMergeGateLogRow(row);
+  }
+
+  updateMergeGateLog(
+    id: number,
+    patch: Partial<Pick<MergeGateLogRow,
+      | "endedAt"
+      | "verdict"
+      | "signals"
+      | "violations"
+      | "outcome"
+      | "costUsd"
+      | "errorDetail"
+    >>,
+  ): void {
+    const setClauses: string[] = [];
+    const values: Array<string | number | null> = [];
+    for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
+      const column = MERGE_GATE_LOG_PATCH_COLUMNS[key as string];
+      if (column === undefined) {
+        throw new Error(`updateMergeGateLog: unknown patch key "${String(key)}"`);
+      }
+      const raw = patch[key];
+      if (raw === undefined) continue;
+      setClauses.push(`${column} = ?`);
+      values.push(raw as string | number | null);
+    }
+    if (setClauses.length === 0) return;
+    values.push(id);
+    const info = this.db
+      .prepare(`UPDATE merge_gate_log SET ${setClauses.join(", ")} WHERE id = ?`)
+      .run(...values);
+    if (info.changes !== 1) {
+      throw new Error(`updateMergeGateLog affected ${info.changes} rows for id=${id}`);
     }
   }
 

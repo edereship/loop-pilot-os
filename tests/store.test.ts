@@ -1610,3 +1610,46 @@ describe("handoffHeadSha (ES-514)", () => {
     expect(store.getSession(session.id).handoffHeadSha).toBe("abc1234def");
   });
 });
+
+describe("merge_gate_log (ES-514)", () => {
+  it("insert → update → get roundtrip", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const run = store.createRun(3, clock());
+    const session = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "ES-1",
+      issueTitle: "t",
+      branch: "b",
+      worktreePath: "/tmp/wt",
+      now: clock(),
+    });
+    const log = store.insertMergeGateLog({
+      runId: run.id,
+      sessionId: session.id,
+      attempt: 1,
+      startedAt: clock(),
+    });
+    expect(log.verdict).toBeNull();
+    expect(log.outcome).toBeNull();
+    store.updateMergeGateLog(log.id, {
+      endedAt: clock(),
+      verdict: "fail",
+      signals: JSON.stringify({ deletedFiles: ["a.ts"] }),
+      violations: JSON.stringify(["public export removed"]),
+      outcome: "parked",
+      costUsd: 0.5,
+    });
+    const updated = store.getMergeGateLog(log.id);
+    expect(updated.verdict).toBe("fail");
+    expect(updated.outcome).toBe("parked");
+    expect(updated.costUsd).toBe(0.5);
+    expect(JSON.parse(updated.violations as string)).toEqual(["public export removed"]);
+  });
+
+  it("updateMergeGateLog rejects unknown patch keys at compile time and unknown ids at runtime", () => {
+    const store = newStore();
+    expect(() => store.getMergeGateLog(999)).toThrow("merge_gate_log not found");
+  });
+});
