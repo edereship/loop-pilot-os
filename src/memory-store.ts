@@ -116,7 +116,7 @@ export async function commitIfChanged(
   repoPath: string,
   message = "chore: persist cross-task memory on halt",
 ): Promise<boolean> {
-  const add = await runner.run("git", ["add", MEMORY_DIR + "/"], { cwd: repoPath });
+  const add = await runner.run("git", ["add", "-f", MEMORY_DIR + "/"], { cwd: repoPath });
   if (add.code !== 0) {
     // Restore tracked files to HEAD so the clean-worktree preflight on the next
     // startup does not fail due to dirty memory files (ES-452 Finding 1).

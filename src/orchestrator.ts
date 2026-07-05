@@ -1733,6 +1733,12 @@ export class Orchestrator {
       if (groomMem.readErrors) {
         this.log(`groom: memory read failed (non-fatal): ${groomMem.readErrors.join("; ")}`);
       }
+      // Revert any tracked memory modifications so the main checkout stays clean.
+      // initializeMemory may have rewritten tracked header-only files with real data;
+      // without this revert a crash before the next commitIfChanged leaves git status
+      // dirty and the next startup's clean-worktree preflight rejects startup (ES-503).
+      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
 
       let specContent: SpecContent | null = null;
       const specDir = this.config.product.specDir;
@@ -2199,6 +2205,9 @@ export class Orchestrator {
     if (selectMem.readErrors) {
       this.log(`select: memory read failed (non-fatal): ${selectMem.readErrors.join("; ")}`);
     }
+    // Revert any tracked memory modifications so the main checkout stays clean (ES-503).
+    await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
+    await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
 
     const prompt = buildSelectPrompt({
       goal: this.config.product.goal ?? null,
@@ -2462,10 +2471,19 @@ export class Orchestrator {
       }
     }
 
+    // Re-seed memory: IMPLEMENT's seed→read→revert cycle leaves tracked memory files
+    // at HEAD (header-only). Without another seed here, SELF-REVIEW would see no memory
+    // context even when DB sessions exist (ES-503 Finding 3).
+    try { initializeMemory(worktreePath, this.store, this.config.digest.recentMergedCount); } catch { /* best-effort */ }
     const mem = readMemoryAll(worktreePath);
     if (mem.readErrors) {
       this.log(`selfReview: memory read failed (non-fatal): ${mem.readErrors.join("; ")}`);
     }
+    // Revert tracked modifications so the worktree stays clean (ES-503).
+    await this.runner.run(
+      "git", ["-C", worktreePath, "checkout", "HEAD", "--", MEMORY_DIR + "/"],
+      { cwd: worktreePath, timeoutMs: 10_000 },
+    ).catch(() => {});
 
     const prompt = buildSelfReviewPrompt({
       issue,
@@ -5137,25 +5155,42 @@ export class Orchestrator {
       // (e.g., a local-only bootstrap commit from startup when the rebase failed).
       // Push those surviving commits so they are not lost by fetchDefaultBranch's
       // git reset --hard on the next run (ES-503 Finding 4).
-      // Guard: only push when every file in the ahead range lives under docs/memory/ to
-      // avoid accidentally publishing unrelated local commits (ES-503 Finding 2).
+      // Guard: only push when EVERY file in EVERY ahead commit lives under docs/memory/.
+      // Inspect per-commit (not the net range diff) to catch the case where a non-memory
+      // commit is later reverted: the net diff would appear memory-only while the history
+      // still contains the unrelated commit (ES-503 Finding 2).
       const aheadRes = await this.runner.run(
         "git", ["rev-list", "--count", `origin/${defaultBranch}..HEAD`],
         { cwd: repoPath },
       ).catch((_e: unknown) => ({ code: 1, stdout: "0", stderr: "" }));
       if (aheadRes.code === 0 && parseInt(aheadRes.stdout.trim(), 10) > 0) {
-        const diffRes = await this.runner.run(
-          "git", ["diff", "--name-only", `origin/${defaultBranch}..HEAD`],
+        const logRes = await this.runner.run(
+          "git", ["log", "--format=%H", `origin/${defaultBranch}..HEAD`],
           { cwd: repoPath },
         ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
-        if (diffRes.code !== 0) {
+        if (logRes.code !== 0) {
           this.log("warning: could not inspect ahead commits; skipping push");
         } else {
-          const aheadFiles = diffRes.stdout.trim().split("\n").filter(Boolean);
-          const hasNonMemory = aheadFiles.some(f => !f.startsWith(MEMORY_DIR + "/"));
+          const aheadShas = logRes.stdout.trim().split("\n").filter(Boolean);
+          let hasNonMemory = false;
+          for (const sha of aheadShas) {
+            const filesRes = await this.runner.run(
+              "git", ["diff-tree", "--no-commit-id", "-r", "--name-only", sha],
+              { cwd: repoPath },
+            ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
+            if (filesRes.code !== 0) {
+              hasNonMemory = true;
+              break;
+            }
+            const files = filesRes.stdout.trim().split("\n").filter(Boolean);
+            if (files.some(f => !f.startsWith(MEMORY_DIR + "/"))) {
+              hasNonMemory = true;
+              break;
+            }
+          }
           if (hasNonMemory) {
             this.log("warning: ahead commits contain non-memory changes; skipping push to avoid publishing unintended commits");
-          } else if (aheadFiles.length > 0) {
+          } else if (aheadShas.length > 0) {
             const pushRes = await this.runner.run(
               "git",
               ["push", "origin", `HEAD:${defaultBranch}`],

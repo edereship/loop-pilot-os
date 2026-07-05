@@ -143,7 +143,7 @@ function makeHarness(config: Config, opts?: {
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
   memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
-  memoryRunner.on(["git", "add", "docs/memory/"], { code: 0 });
+  memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "clean", "-fd", "--", "docs/memory/"], { code: 0 });
