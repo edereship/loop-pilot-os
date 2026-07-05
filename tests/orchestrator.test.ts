@@ -156,7 +156,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   memoryRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
   // GROOM full-checkout reset after Codex runs (ES-457 Findings 3 + 4).
   memoryRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
-  memoryRunner.on(["git", "clean", "-fd"], { code: 0 });
+  memoryRunner.on(["git", "clean", "-fdx"], { code: 0 });
   // Design reviewer branch restore — git checkout <session.branch> (ES-477 Finding 4).
   memoryRunner.on(["git", "checkout"], { code: 0 });
   // GROOM startSha recording and HEAD reset before memory commit (ES-457 Finding 1).
@@ -6167,7 +6167,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     );
     expect(checkoutCall).toBeDefined();
     const cleanCall = h.memoryRunner.calls.find(
-      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fd") && !c.args.includes("docs/memory/"),
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args.includes("-fdx") && !c.args.includes("docs/memory/"),
     );
     expect(cleanCall).toBeDefined();
   });
@@ -9110,7 +9110,7 @@ describe("VERIFY (ES-491)", () => {
     lsofRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
     lsofRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 0 });
     lsofRunner.on(["git", "checkout", "HEAD", "--", "."], { code: 0 });
-    lsofRunner.on(["git", "clean", "-fd"], { code: 0 });
+    lsofRunner.on(["git", "clean", "-fdx"], { code: 0 });
     lsofRunner.on(["git", "checkout"], { code: 0 });
     lsofRunner.on(["git", "rev-parse", "HEAD"], { code: 0, stdout: "abc1234\n" });
     lsofRunner.on(["git", "reset", "--hard"], { code: 0 });

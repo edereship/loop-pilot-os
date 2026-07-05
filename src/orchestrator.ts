@@ -1342,7 +1342,8 @@ export class Orchestrator {
     // (.git/worktrees/<name>); writing to the worktree-specific path has no effect.
     // gitignore rules only suppress UNTRACKED files, so memory files already tracked in
     // the default checkout remain addable/committable by commitIfChanged even when this
-    // exclude is active (ES-503 Finding 1 fix).
+    // exclude is active. GROOM cleanup uses -fdx so exclude-hidden planner files are
+    // still removed before validated actions run (ES-503 Finding 1).
     // Idempotent: check before appending to avoid duplicate entries across multiple worktrees.
     try {
       initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
@@ -1809,7 +1810,7 @@ export class Orchestrator {
           // Reset the full checkout so any files Codex wrote are discarded before
           // haltForInterrupt() calls commitMemoryBeforeHalt() (Finding 3 + 4).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
           if (startSha) {
             await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1830,7 +1831,7 @@ export class Orchestrator {
           }
           // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
           await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
           if (startSha) {
             await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1851,7 +1852,7 @@ export class Orchestrator {
         }
         // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1875,7 +1876,7 @@ export class Orchestrator {
         }
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1925,7 +1926,7 @@ export class Orchestrator {
         }
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
         await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
           await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
@@ -1943,8 +1944,10 @@ export class Orchestrator {
       // discarded before validated update_memory actions write fresh content.
       // Using the full tree (not just docs/memory/) prevents tracked or untracked
       // files outside memory from persisting into the next SELECT preflight (Finding 3).
+      // -fdx (not -fd) removes ignored files too, so memory files hidden by the shared
+      // info/exclude (written in CLAIM) are also cleaned before actions run (ES-503 Finding 1).
       await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fdx"], { cwd: repoPath }).catch(() => {});
       // If Codex created commits and advanced HEAD, reset back to the recorded starting
       // SHA so only the memory commit is pushed (ES-457 Finding 1).
       if (startSha) {
