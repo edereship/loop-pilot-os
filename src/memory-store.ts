@@ -32,6 +32,7 @@ export function writeCategory(
     );
   }
   const filePath = path.join(repoPath, MEMORY_DIR, CATEGORY_FILES[category]);
+  mkdirSync(path.join(repoPath, MEMORY_DIR), { recursive: true });
   writeFileSync(filePath, content, "utf-8");
 }
 

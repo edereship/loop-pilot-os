@@ -1328,8 +1328,12 @@ export class Orchestrator {
     // Re-seed memory files into the new worktree: worktrees are created from
     // origin/<defaultBranch> which lacks memory when the startup rebase failed and the
     // bootstrap commit was local-only (ES-503 Codex Finding 1). Idempotent.
+    // Commit immediately so the files are tracked; otherwise hasUncommittedChanges()
+    // sees them as untracked after the agent finishes and stops the session as leftovers,
+    // or the agent's git add . leaks them into the feature PR (ES-503 Codex Finding 1).
     try {
       initializeMemory(claimResult.worktreePath, this.store, this.config.digest.recentMergedCount);
+      await commitIfChanged(this.runner, claimResult.worktreePath, "chore: bootstrap memory");
     } catch (err) {
       this.log(`claim: memory re-seed in worktree failed (non-fatal): ${errMsg(err)}`);
     }
@@ -4999,6 +5003,9 @@ export class Orchestrator {
         await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in rebase-skip path: ${err instanceof Error ? err.message : String(err)}`);
+          // Remove any partial files written before the error so commitIfChanged does
+          // not stage and commit incomplete memory (ES-503 Codex Finding 3).
+          await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         }
         try {
           await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
@@ -5034,6 +5041,9 @@ export class Orchestrator {
         await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in autostash-conflict path: ${err instanceof Error ? err.message : String(err)}`);
+          // Remove any partial files written before the error so commitIfChanged does
+          // not stage and commit incomplete memory (ES-503 Codex Finding 3).
+          await this.runner.run("git", ["clean", "-fd", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
         }
         try {
           await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (autostash conflict)");
