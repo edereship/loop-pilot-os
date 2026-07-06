@@ -86,6 +86,32 @@ describe("parseMergeGateOutput", () => {
     expect(result.kind).toBe("parse_error");
   });
 
+  it("parses a compact single-line fenced block (Codex judge form)", () => {
+    // Codex sometimes emits the JSON on the same line as the ```json marker.
+    // The un-hardened design-review extraction would miss this → parse_error →
+    // caller fail-opens → a real fail silently merges. Must be recovered.
+    const input = `\`\`\`json {"verdict":"fail","violations":["Removed public export"]}\`\`\``;
+    const result = parseMergeGateOutput(input);
+    expect(result).toEqual({
+      kind: "ok",
+      value: { verdict: "fail", violations: ["Removed public export"] },
+    });
+  });
+
+  it("falls through to a valid bare object when the last fenced block is schema-invalid", () => {
+    // No early return: a fenced block that fails schema validation must not
+    // suppress a valid trailing bare object.
+    const input = [
+      "```json",
+      '{"verdict":"fail","violations":[]}',
+      "```",
+      "Correction:",
+      '{"verdict":"pass"}',
+    ].join("\n");
+    const result = parseMergeGateOutput(input);
+    expect(result).toEqual({ kind: "ok", value: { verdict: "pass" } });
+  });
+
   it("prefers the last fenced block when multiple exist", () => {
     const input = [
       "```json",
