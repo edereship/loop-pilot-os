@@ -83,6 +83,40 @@ async function showFile(
   }
 }
 
+/** export 宣言行を抽出して正規化（連続空白→1つ）した Set を返す。
+ *  軽量パーサ: 宣言の先頭行のみを見る（複数行シグネチャは先頭行で代表）。
+ *  網羅性より依存ゼロを優先 — 取りこぼしは Codex の diff 読解（ES-517）が補完する。 */
+export function extractExportLines(source: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of source.split("\n")) {
+    const trimmed = line.trim();
+    if (/^export\s/.test(trimmed)) {
+      out.add(trimmed.replace(/\s+/g, " "));
+    }
+  }
+  return out;
+}
+
+function isTsSourceFile(path: string): boolean {
+  return /\.[cm]?tsx?$/.test(path) && !path.endsWith(".d.ts") && !isTestFile(path);
+}
+
+/** head 時点の tsconfig.json 存在で TS リポかを判定（best-effort。失敗は非TS扱い） */
+async function isTsRepo(
+  repoPath: string,
+  cmd: CommandRunner,
+  headSha: string,
+): Promise<boolean> {
+  try {
+    const res = await cmd.run("git", ["cat-file", "-e", `${headSha}:tsconfig.json`], {
+      cwd: repoPath,
+    });
+    return res.code === 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function extractBreakingSignals(
   repoPath: string,
   cmd: CommandRunner,
@@ -143,6 +177,36 @@ export async function extractBreakingSignals(
     const reductionRatio = (linesBefore - linesAfter) / linesBefore;
     if (reductionRatio >= TEST_SHRINK_THRESHOLD) {
       signals.shrunkenTestFiles.push({ path, linesBefore, linesAfter, reductionRatio });
+    }
+  }
+
+  // ④ TS リポなら export 行 diff（軽量パーサ。最終判定は Codex）
+  if (await isTsRepo(repoPath, cmd, headSha)) {
+    signals.removedExports = [];
+    const tsTargets = entries.filter(
+      (e) => (e.status === "M" || e.status === "D") && isTsSourceFile(e.path),
+    );
+    for (const { status, path } of tsTargets) {
+      const before = await showFile(repoPath, cmd, baseSha, path);
+      if (before === null) {
+        signals.errors.push(`export diff failed for ${path} (base)`);
+        continue;
+      }
+      const baseExports = extractExportLines(before);
+      let headExports = new Set<string>();
+      if (status === "M") {
+        const after = await showFile(repoPath, cmd, headSha, path);
+        if (after === null) {
+          signals.errors.push(`export diff failed for ${path} (head)`);
+          continue;
+        }
+        headExports = extractExportLines(after);
+      }
+      for (const line of baseExports) {
+        if (!headExports.has(line)) {
+          signals.removedExports.push({ file: path, exportLine: line });
+        }
+      }
     }
   }
 

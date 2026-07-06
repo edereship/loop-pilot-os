@@ -5,6 +5,7 @@ import {
   isConfigFile,
   isWorkflowFile,
   extractBreakingSignals,
+  extractExportLines,
 } from "../src/breaking-signals.js";
 import { FakeCommandRunner } from "./fakes.js";
 
@@ -13,6 +14,9 @@ function stubNameStatus(runner: FakeCommandRunner, stdout: string): void {
 }
 function stubNotTsRepo(runner: FakeCommandRunner): void {
   runner.on(["git", "cat-file", "-e"], { code: 1 });
+}
+function stubTsRepo(runner: FakeCommandRunner): void {
+  runner.on(["git", "cat-file", "-e"], { code: 0 });
 }
 
 describe("parseNameStatusZ", () => {
@@ -173,5 +177,57 @@ describe("extractBreakingSignals: shrunken test files (ES-515 Task 3)", () => {
     expect(signals.shrunkenTestFiles).toEqual([]);
     expect(signals.deletedFiles).toEqual(["src/gone.ts"]); // 他セクションは生きている
     expect(signals.errors.length).toBe(1);
+  });
+});
+
+describe("extractExportLines", () => {
+  it("collects normalized export declaration lines", () => {
+    const src = [
+      "import x from './x.js';",
+      "export function foo(a: number): string {",
+      "  return String(a);",
+      "}",
+      "export   const  BAR = 1;",
+      "const internal = 2;",
+      "export type Baz = { a: number };",
+    ].join("\n");
+    expect([...extractExportLines(src)]).toEqual([
+      "export function foo(a: number): string {",
+      "export const BAR = 1;",
+      "export type Baz = { a: number };",
+    ]);
+  });
+});
+
+describe("extractBreakingSignals: removed exports (ES-515 Task 4)", () => {
+  it("reports exports removed from a modified .ts file and all exports of a deleted .ts file", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "M\0src/api.ts\0D\0src/gone.ts\0M\0src/style.css\0");
+    stubTsRepo(runner);
+    runner.on(["git", "show", "base123:src/api.ts"], {
+      code: 0,
+      stdout: "export function keep(): void {}\nexport function removed(): void {}\n",
+    });
+    runner.on(["git", "show", "head456:src/api.ts"], {
+      code: 0,
+      stdout: "export function keep(): void {}\n",
+    });
+    runner.on(["git", "show", "base123:src/gone.ts"], {
+      code: 0,
+      stdout: "export const GONE = 1;\n",
+    });
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.removedExports).toEqual([
+      { file: "src/api.ts", exportLine: "export function removed(): void {}" },
+      { file: "src/gone.ts", exportLine: "export const GONE = 1;" },
+    ]);
+  });
+
+  it("skips test files and returns null for non-TS repos", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "M\0src/api.test.ts\0");
+    stubNotTsRepo(runner);
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.removedExports).toBeNull();
   });
 });
