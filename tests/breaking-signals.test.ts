@@ -63,6 +63,13 @@ describe("isTestFile", () => {
     "src/foo.test.ts",
     "src/foo.spec.tsx",
     "src/foo.test.mjs",
+    // Go colocated test files (Finding 1)
+    "pkg/foo_test.go",
+    "foo_test.go",
+    // Python colocated test files (Finding 1)
+    "src/test_api.py",
+    "test_helpers.py",
+    "lib/utils_test.py",
   ])("detects '%s' as test file", (p) => {
     expect(isTestFile(p)).toBe(true);
   });
@@ -237,6 +244,36 @@ describe("extractExportLines", () => {
       "export type Baz = { a: number };",
     ]);
   });
+
+  it("extracts per-symbol entries from a multiline export block (Finding 2)", () => {
+    const src = [
+      "export {",
+      "  Foo,",
+      "  Bar,",
+      "  Baz as Qux,",
+      "}",
+    ].join("\n");
+    const lines = [...extractExportLines(src)];
+    expect(lines).toContain("export { Foo }");
+    expect(lines).toContain("export { Bar }");
+    // aliased export: exported name is "Qux"
+    expect(lines).toContain("export { Qux }");
+    expect(lines).not.toContain("export {");
+  });
+
+  it("extracts per-symbol entries from a single-line export block (Finding 2)", () => {
+    const src = "export { Alpha, Beta };\n";
+    const lines = [...extractExportLines(src)];
+    expect(lines).toContain("export { Alpha }");
+    expect(lines).toContain("export { Beta }");
+  });
+
+  it("handles export type { } blocks (Finding 2)", () => {
+    const src = ["export type {", "  MyType,", "  OtherType,", "}"].join("\n");
+    const lines = [...extractExportLines(src)];
+    expect(lines).toContain("export type { MyType }");
+    expect(lines).toContain("export type { OtherType }");
+  });
 });
 
 describe("extractBreakingSignals: removed exports (ES-515 Task 4)", () => {
@@ -269,6 +306,47 @@ describe("extractBreakingSignals: removed exports (ES-515 Task 4)", () => {
     stubNotTsRepo(runner);
     const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
     expect(signals.removedExports).toBeNull();
+  });
+
+  it("includes exports removed from .d.ts declaration files (Finding 3)", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "M\0types/api.d.ts\0");
+    stubTsRepo(runner);
+    runner.on(["git", "show", "base123:types/api.d.ts"], {
+      code: 0,
+      stdout: "export declare function keep(): void;\nexport declare function removed(): void;\n",
+    });
+    runner.on(["git", "show", "head456:types/api.d.ts"], {
+      code: 0,
+      stdout: "export declare function keep(): void;\n",
+    });
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.removedExports).toContainEqual({
+      file: "types/api.d.ts",
+      exportLine: "export declare function removed(): void;",
+    });
+  });
+
+  it("detects removed exports when tsconfig.json is deleted in the PR (Finding 4)", async () => {
+    const runner = new FakeCommandRunner();
+    // PR deletes tsconfig.json AND modifies a .ts file with export removal
+    stubNameStatus(runner, "D\0tsconfig.json\0M\0src/api.ts\0");
+    // head has no tsconfig.json (deleted), base has it
+    runner.on(["git", "cat-file", "-e", "head456:tsconfig.json"], { code: 1 });
+    runner.on(["git", "cat-file", "-e", "base123:tsconfig.json"], { code: 0 });
+    runner.on(["git", "show", "base123:src/api.ts"], {
+      code: 0,
+      stdout: "export function keep(): void {}\nexport function removed(): void {}\n",
+    });
+    runner.on(["git", "show", "head456:src/api.ts"], {
+      code: 0,
+      stdout: "export function keep(): void {}\n",
+    });
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.removedExports).toContainEqual({
+      file: "src/api.ts",
+      exportLine: "export function removed(): void {}",
+    });
   });
 });
 

@@ -52,7 +52,12 @@ export function parseNameStatusZ(stdout: string): Array<{ status: string; path: 
 
 export function isTestFile(path: string): boolean {
   if (/(^|\/)(tests?|__tests__)\//.test(path)) return true;
-  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(path);
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(path)) return true;
+  // Go: foo_test.go; Python: foo_test.py; other languages: foo_test.<ext>
+  if (/_test\.[^./]+$/.test(path)) return true;
+  // Python prefix convention: test_api.py; also other languages
+  if (/(^|\/)test_[^/]+\.[^./]+$/.test(path)) return true;
+  return false;
 }
 
 export function isConfigFile(path: string): boolean {
@@ -89,33 +94,52 @@ async function showFile(
 
 /** export 宣言行を抽出して正規化（連続空白→1つ）した Set を返す。
  *  軽量パーサ: 宣言の先頭行のみを見る（複数行シグネチャは先頭行で代表）。
+ *  export { } ブロックはシンボル単位に展開する（複数行 barrel ファイル対応）。
  *  網羅性より依存ゼロを優先 — 取りこぼしは Codex の diff 読解（ES-517）が補完する。 */
 export function extractExportLines(source: string): Set<string> {
   const out = new Set<string>();
   for (const line of source.split("\n")) {
     const trimmed = line.trim();
+    // export { } blocks (single-line opening or multiline opening) are handled below
+    if (/^export\s+(type\s+)?\{/.test(trimmed)) continue;
     if (/^export\s/.test(trimmed)) {
       out.add(trimmed.replace(/\s+/g, " "));
+    }
+  }
+  // Expand export { } blocks to per-symbol entries so removing one symbol
+  // from a multiline block is detected as a removal.
+  for (const match of source.matchAll(/export\s+(type\s+)?\{([^}]*)\}/gs)) {
+    const typeKw = match[1] ? "type " : "";
+    for (const rawSym of match[2].split(",")) {
+      const stripped = rawSym.replace(/\s*\/\/.*$/, "").trim();
+      if (!stripped) continue;
+      // "Foo as Bar" → exported name is "Bar"; "Foo" → "Foo"
+      const asMatch = /\s+as\s+(\S+)$/.exec(stripped);
+      const name = asMatch ? asMatch[1] : stripped.split(/\s+/)[0];
+      if (name) out.add(`export ${typeKw}{ ${name} }`);
     }
   }
   return out;
 }
 
 function isTsSourceFile(path: string): boolean {
-  return /\.[cm]?tsx?$/.test(path) && !path.endsWith(".d.ts") && !isTestFile(path);
+  return /\.[cm]?tsx?$/.test(path) && !isTestFile(path);
 }
 
-/** head 時点の tsconfig.json 存在で TS リポかを判定（best-effort。失敗は非TS扱い） */
+/** head または base の tsconfig.json 存在で TS リポかを判定（best-effort。失敗は非TS扱い）。
+ *  PR が tsconfig.json を削除する場合でも base 側から検知できるよう両方を確認する。 */
 async function isTsRepo(
   repoPath: string,
   cmd: CommandRunner,
+  baseSha: string,
   headSha: string,
 ): Promise<boolean> {
   try {
-    const res = await cmd.run("git", ["cat-file", "-e", `${headSha}:tsconfig.json`], {
-      cwd: repoPath,
-    });
-    return res.code === 0;
+    const [headRes, baseRes] = await Promise.all([
+      cmd.run("git", ["cat-file", "-e", `${headSha}:tsconfig.json`], { cwd: repoPath }),
+      cmd.run("git", ["cat-file", "-e", `${baseSha}:tsconfig.json`], { cwd: repoPath }),
+    ]);
+    return headRes.code === 0 || baseRes.code === 0;
   } catch {
     return false;
   }
@@ -185,7 +209,7 @@ export async function extractBreakingSignals(
   }
 
   // ④ TS リポなら export 行 diff（軽量パーサ。最終判定は Codex）
-  if (await isTsRepo(repoPath, cmd, headSha)) {
+  if (await isTsRepo(repoPath, cmd, baseSha, headSha)) {
     signals.removedExports = [];
     const tsTargets = entries.filter(
       (e) => (e.status === "M" || e.status === "D") && isTsSourceFile(e.path),
