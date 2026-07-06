@@ -127,3 +127,51 @@ describe("extractBreakingSignals: deleted/config/workflow (ES-515 Task 2)", () =
     expect(signals.errors[0]).toContain("name-status");
   });
 });
+
+describe("extractBreakingSignals: shrunken test files (ES-515 Task 3)", () => {
+  it("flags a modified test file that lost >=30% of its lines", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "M\0tests/store.test.ts\0M\0src/store.ts\0");
+    stubNotTsRepo(runner);
+    // git show <sha>:<path> で before/after の中身を返す
+    runner.on(["git", "show", "base123:tests/store.test.ts"], {
+      code: 0,
+      stdout: Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n"),
+    });
+    runner.on(["git", "show", "head456:tests/store.test.ts"], {
+      code: 0,
+      stdout: Array.from({ length: 60 }, (_, i) => `line${i}`).join("\n"),
+    });
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.shrunkenTestFiles).toEqual([
+      { path: "tests/store.test.ts", linesBefore: 100, linesAfter: 60, reductionRatio: 0.4 },
+    ]);
+  });
+
+  it("does not flag a test file below the 30% threshold", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "M\0tests/store.test.ts\0");
+    stubNotTsRepo(runner);
+    runner.on(["git", "show", "base123:tests/store.test.ts"], {
+      code: 0,
+      stdout: Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n"),
+    });
+    runner.on(["git", "show", "head456:tests/store.test.ts"], {
+      code: 0,
+      stdout: Array.from({ length: 80 }, (_, i) => `line${i}`).join("\n"),
+    });
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.shrunkenTestFiles).toEqual([]);
+  });
+
+  it("records an error but continues when git show fails for one file", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "M\0tests/a.test.ts\0D\0src/gone.ts\0");
+    stubNotTsRepo(runner);
+    runner.on(["git", "show", "base123:tests/a.test.ts"], { code: 128, stderr: "not found" });
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.shrunkenTestFiles).toEqual([]);
+    expect(signals.deletedFiles).toEqual(["src/gone.ts"]); // 他セクションは生きている
+    expect(signals.errors.length).toBe(1);
+  });
+});

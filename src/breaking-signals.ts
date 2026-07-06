@@ -63,6 +63,26 @@ export function isWorkflowFile(path: string): boolean {
   return path.startsWith(".github/workflows/");
 }
 
+function countLines(source: string): number {
+  if (source.length === 0) return 0;
+  return source.split("\n").length;
+}
+
+/** git show <sha>:<path> の中身を返す。失敗時は null（呼び出し側が errors に積む） */
+async function showFile(
+  repoPath: string,
+  cmd: CommandRunner,
+  sha: string,
+  path: string,
+): Promise<string | null> {
+  try {
+    const res = await cmd.run("git", ["show", `${sha}:${path}`], { cwd: repoPath });
+    return res.code === 0 ? res.stdout : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function extractBreakingSignals(
   repoPath: string,
   cmd: CommandRunner,
@@ -104,6 +124,26 @@ export async function extractBreakingSignals(
     }
     if (isConfigFile(path)) signals.changedConfigFiles.push(path);
     if (isWorkflowFile(path)) signals.changedWorkflowFiles.push(path);
+  }
+
+  // ② M ステータスのテストファイルの大幅縮小検知（閾値 TEST_SHRINK_THRESHOLD）
+  const modifiedTestFiles = entries
+    .filter((e) => e.status === "M" && isTestFile(e.path))
+    .map((e) => e.path);
+  for (const path of modifiedTestFiles) {
+    const before = await showFile(repoPath, cmd, baseSha, path);
+    const after = before === null ? null : await showFile(repoPath, cmd, headSha, path);
+    if (before === null || after === null) {
+      signals.errors.push(`shrink check failed for ${path}`);
+      continue;
+    }
+    const linesBefore = countLines(before);
+    const linesAfter = countLines(after);
+    if (linesBefore === 0) continue;
+    const reductionRatio = (linesBefore - linesAfter) / linesBefore;
+    if (reductionRatio >= TEST_SHRINK_THRESHOLD) {
+      signals.shrunkenTestFiles.push({ path, linesBefore, linesAfter, reductionRatio });
+    }
   }
 
   return signals;
