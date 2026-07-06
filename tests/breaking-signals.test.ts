@@ -4,7 +4,16 @@ import {
   isTestFile,
   isConfigFile,
   isWorkflowFile,
+  extractBreakingSignals,
 } from "../src/breaking-signals.js";
+import { FakeCommandRunner } from "./fakes.js";
+
+function stubNameStatus(runner: FakeCommandRunner, stdout: string): void {
+  runner.on(["git", "diff", "--name-status"], { code: 0, stdout });
+}
+function stubNotTsRepo(runner: FakeCommandRunner): void {
+  runner.on(["git", "cat-file", "-e"], { code: 1 });
+}
 
 describe("parseNameStatusZ", () => {
   it("parses NUL-delimited status/path pairs", () => {
@@ -75,5 +84,46 @@ describe("isWorkflowFile", () => {
     expect(isWorkflowFile(".github/workflows/ci.yml")).toBe(true);
     expect(isWorkflowFile(".github/dependabot.yml")).toBe(false);
     expect(isWorkflowFile("src/workflows/x.ts")).toBe(false);
+  });
+});
+
+describe("extractBreakingSignals: deleted/config/workflow (ES-515 Task 2)", () => {
+  it("classifies deleted files, config changes and workflow changes", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(
+      runner,
+      "D\0src/api.ts\0D\0tests/api.test.ts\0M\0vitest.config.ts\0M\0.github/workflows/ci.yml\0A\0src/new.ts\0",
+    );
+    stubNotTsRepo(runner);
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.deletedFiles).toEqual(["src/api.ts", "tests/api.test.ts"]);
+    expect(signals.deletedTestFiles).toEqual(["tests/api.test.ts"]);
+    expect(signals.changedConfigFiles).toEqual(["vitest.config.ts"]);
+    expect(signals.changedWorkflowFiles).toEqual([".github/workflows/ci.yml"]);
+    expect(signals.removedExports).toBeNull();
+    expect(signals.errors).toEqual([]);
+  });
+
+  it("passes base..head range and --no-renames to git diff", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "");
+    stubNotTsRepo(runner);
+    await extractBreakingSignals("/repo", runner, "base123", "head456");
+    const diffCall = runner.calls.find((c) => c.cmd === "git" && c.args[0] === "diff");
+    expect(diffCall).toBeDefined();
+    expect(diffCall!.args).toEqual([
+      "diff", "--name-status", "-z", "--no-renames", "base123", "head456",
+    ]);
+    expect(diffCall!.opts.cwd).toBe("/repo");
+  });
+
+  it("records an error and returns empty signals when git diff fails (fail-open)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "diff", "--name-status"], { code: 128, stderr: "bad revision" });
+    stubNotTsRepo(runner);
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.deletedFiles).toEqual([]);
+    expect(signals.errors.length).toBe(1);
+    expect(signals.errors[0]).toContain("name-status");
   });
 });

@@ -62,3 +62,49 @@ export function isConfigFile(path: string): boolean {
 export function isWorkflowFile(path: string): boolean {
   return path.startsWith(".github/workflows/");
 }
+
+export async function extractBreakingSignals(
+  repoPath: string,
+  cmd: CommandRunner,
+  baseSha: string,
+  headSha: string,
+): Promise<BreakingSignals> {
+  const signals: BreakingSignals = {
+    deletedFiles: [],
+    deletedTestFiles: [],
+    shrunkenTestFiles: [],
+    changedConfigFiles: [],
+    changedWorkflowFiles: [],
+    removedExports: null,
+    errors: [],
+  };
+
+  // ① 状態別ファイル一覧（--no-renames で rename を D+A に分解し削除検知を単純化）
+  let entries: Array<{ status: string; path: string }> = [];
+  try {
+    const res = await cmd.run(
+      "git",
+      ["diff", "--name-status", "-z", "--no-renames", baseSha, headSha],
+      { cwd: repoPath },
+    );
+    if (res.code !== 0) {
+      signals.errors.push(`name-status failed (code ${res.code}): ${res.stderr.slice(0, 200)}`);
+      return signals;
+    }
+    entries = parseNameStatusZ(res.stdout);
+  } catch (err) {
+    signals.errors.push(`name-status threw: ${err instanceof Error ? err.message : String(err)}`);
+    return signals;
+  }
+
+  for (const { status, path } of entries) {
+    if (status === "D") {
+      signals.deletedFiles.push(path);
+      if (isTestFile(path)) signals.deletedTestFiles.push(path);
+    }
+    if (isConfigFile(path)) signals.changedConfigFiles.push(path);
+    if (isWorkflowFile(path)) signals.changedWorkflowFiles.push(path);
+  }
+
+  return signals;
+}
