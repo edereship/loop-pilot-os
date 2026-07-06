@@ -224,11 +224,20 @@ export async function extractBreakingSignals(
  *  クォートしないため、改行入りファイル名がそのまま到達しうる。
  *  （ES-517 側でもブロック全体を untrusted としてフェンスする前提の多重防御。） */
 function sanitizeInline(value: string): string {
-  // 制御文字（C0 全域 U+0000..U+001F と DEL U+007F。改行/タブ/復帰含む）を空白へ。
+  // 行区切りとして解釈されうる文字を空白へ畳む:
+  //   - C0 制御 U+0000..U+001F（LF/CR/TAB/VT/FF 含む）
+  //   - DEL U+007F と C1 制御 U+0080..U+009F（NEL U+0085 を含む）
+  //   - Unicode 行区切り U+2028 / 段落区切り U+2029
+  // これらを残すと item が Markdown 行/見出しを偽装しうる（多くのパーサ・LLM は改行扱い）。
   let out = "";
   for (const ch of value) {
     const code = ch.codePointAt(0)!;
-    out += code < 0x20 || code === 0x7f ? " " : ch;
+    const isLineBreakish =
+      code < 0x20 ||
+      (code >= 0x7f && code <= 0x9f) ||
+      code === 0x2028 ||
+      code === 0x2029;
+    out += isLineBreakish ? " " : ch;
   }
   return out.replace(/ +/g, " ").trim();
 }
@@ -264,10 +273,12 @@ export function formatBreakingSignals(signals: BreakingSignals): string {
     lines.push(
       ...section(
         "削除・変更された公開 export（TS）",
-        // export 行はコードスパンに入れるため、バッククォートを ' に無害化
-        //（テンプレートリテラルを含む export がスパンを閉じてしまうのを防ぐ）。
+        // export 行はコードスパンに入れるため、バッククォートを ' に無害化する。
+        // ファイルパスもスパン直前に来る（git -z は未クォート）ので同様に無害化し、
+        // 不均衡なバッククォートでスパン境界が壊れるのを防ぐ。
         signals.removedExports.map(
-          (e) => `${e.file}: \`${e.exportLine.replace(/\`/g, "'")}\``,
+          (e) =>
+            `${e.file.replace(/\`/g, "'")}: \`${e.exportLine.replace(/\`/g, "'")}\``,
         ),
       ),
     );
