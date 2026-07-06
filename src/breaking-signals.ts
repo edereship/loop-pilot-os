@@ -10,7 +10,7 @@ const TEST_SHRINK_THRESHOLD = 0.3;
 
 const CONFIG_FILE_PATTERNS: RegExp[] = [
   /(^|\/)[^/]*\.config\.[^/]+$/, // vitest.config.ts / eslint.config.js など
-  /(^|\/)schema[^/]*\.(sql|prisma|graphql|gql|ya?ml|json)$/i, // schema.sql / schema.prisma など（.md 等のドキュメントは除外）
+  /(^|\/)schema[^/]*\.(?!(?:md|markdown|txt|rst)$)[^/]+$/i, // schema.sql / schema.prisma / schema.rb など（.md 等のドキュメントは除外）
   /(^|\/)\.env\.example$/,
   /(^|\/)package\.json$/,
   /(^|\/)tsconfig[^/]*\.json$/,
@@ -65,7 +65,11 @@ export function isWorkflowFile(path: string): boolean {
 
 function countLines(source: string): number {
   if (source.length === 0) return 0;
-  return source.split("\n").length;
+  // git show 出力は末尾改行で終わるため、そのまま split すると空要素で1行過大になる。
+  // 末尾の改行1つを落としてから数える（縮小率が閾値付近で保守側に歪むのを防ぐ）。
+  const body = source.endsWith("\n") ? source.slice(0, -1) : source;
+  if (body.length === 0) return 0;
+  return body.split("\n").length;
 }
 
 /** git show <sha>:<path> の中身を返す。失敗時は null（呼び出し側が errors に積む） */
@@ -211,4 +215,45 @@ export async function extractBreakingSignals(
   }
 
   return signals;
+}
+
+function section(title: string, items: string[]): string[] {
+  const lines = [`### ${title}`];
+  if (items.length === 0) {
+    lines.push("（該当なし）");
+  } else {
+    for (const item of items) lines.push(`- ${item}`);
+  }
+  lines.push("");
+  return lines;
+}
+
+/** Codex プロンプト注入用の Markdown 整形（ES-517 が消費）。 */
+export function formatBreakingSignals(signals: BreakingSignals): string {
+  const lines: string[] = ["## 機械抽出シグナル（breaking-signals）", ""];
+  lines.push(...section("削除されたファイル", signals.deletedFiles));
+  lines.push(...section("削除されたテストファイル", signals.deletedTestFiles));
+  lines.push(
+    ...section(
+      `大幅縮小したテストファイル（${Math.round(TEST_SHRINK_THRESHOLD * 100)}%以上）`,
+      signals.shrunkenTestFiles.map(
+        (s) =>
+          `${s.path} (${s.linesBefore}L → ${s.linesAfter}L, -${Math.round(s.reductionRatio * 100)}%)`,
+      ),
+    ),
+  );
+  lines.push(...section("変更された設定ファイル", signals.changedConfigFiles));
+  lines.push(...section("変更された CI ワークフロー", signals.changedWorkflowFiles));
+  if (signals.removedExports !== null) {
+    lines.push(
+      ...section(
+        "削除・変更された公開 export（TS）",
+        signals.removedExports.map((e) => `${e.file}: \`${e.exportLine}\``),
+      ),
+    );
+  }
+  if (signals.errors.length > 0) {
+    lines.push(...section("抽出エラー", signals.errors));
+  }
+  return lines.join("\n");
 }

@@ -6,8 +6,22 @@ import {
   isWorkflowFile,
   extractBreakingSignals,
   extractExportLines,
+  formatBreakingSignals,
 } from "../src/breaking-signals.js";
+import type { BreakingSignals } from "../src/breaking-signals.js";
 import { FakeCommandRunner } from "./fakes.js";
+
+function emptySignals(): BreakingSignals {
+  return {
+    deletedFiles: [],
+    deletedTestFiles: [],
+    shrunkenTestFiles: [],
+    changedConfigFiles: [],
+    changedWorkflowFiles: [],
+    removedExports: null,
+    errors: [],
+  };
+}
 
 function stubNameStatus(runner: FakeCommandRunner, stdout: string): void {
   runner.on(["git", "diff", "--name-status"], { code: 0, stdout });
@@ -67,6 +81,8 @@ describe("isConfigFile", () => {
     "packages/app/eslint.config.js",
     "schema.sql",
     "prisma/schema.prisma",
+    "db/schema.rb",
+    "src/schema.ts",
     ".env.example",
     "package.json",
     "tsconfig.json",
@@ -152,6 +168,25 @@ describe("extractBreakingSignals: shrunken test files (ES-515 Task 3)", () => {
     ]);
   });
 
+  it("counts lines correctly for newline-terminated files at the boundary", async () => {
+    const runner = new FakeCommandRunner();
+    stubNameStatus(runner, "M\0tests/edge.test.ts\0");
+    stubNotTsRepo(runner);
+    // git show 出力は末尾改行付き。10行→7行（真の削減率0.30）は末尾改行を落として数えれば閾値ちょうどで検知される。
+    runner.on(["git", "show", "base123:tests/edge.test.ts"], {
+      code: 0,
+      stdout: Array.from({ length: 10 }, (_, i) => `line${i}`).join("\n") + "\n",
+    });
+    runner.on(["git", "show", "head456:tests/edge.test.ts"], {
+      code: 0,
+      stdout: Array.from({ length: 7 }, (_, i) => `line${i}`).join("\n") + "\n",
+    });
+    const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
+    expect(signals.shrunkenTestFiles).toEqual([
+      { path: "tests/edge.test.ts", linesBefore: 10, linesAfter: 7, reductionRatio: 0.3 },
+    ]);
+  });
+
   it("does not flag a test file below the 30% threshold", async () => {
     const runner = new FakeCommandRunner();
     stubNameStatus(runner, "M\0tests/store.test.ts\0");
@@ -229,5 +264,33 @@ describe("extractBreakingSignals: removed exports (ES-515 Task 4)", () => {
     stubNotTsRepo(runner);
     const signals = await extractBreakingSignals("/repo", runner, "base123", "head456");
     expect(signals.removedExports).toBeNull();
+  });
+});
+
+describe("formatBreakingSignals", () => {
+  it("renders each section with items", () => {
+    const text = formatBreakingSignals({
+      deletedFiles: ["src/gone.ts"],
+      deletedTestFiles: ["tests/gone.test.ts"],
+      shrunkenTestFiles: [
+        { path: "tests/big.test.ts", linesBefore: 100, linesAfter: 40, reductionRatio: 0.6 },
+      ],
+      changedConfigFiles: ["package.json"],
+      changedWorkflowFiles: [".github/workflows/ci.yml"],
+      removedExports: [{ file: "src/api.ts", exportLine: "export const X = 1;" }],
+      errors: ["export diff failed for src/x.ts (base)"],
+    });
+    expect(text).toContain("## 機械抽出シグナル（breaking-signals）");
+    expect(text).toContain("- src/gone.ts");
+    expect(text).toContain("- tests/big.test.ts (100L → 40L, -60%)");
+    expect(text).toContain("- src/api.ts: `export const X = 1;`");
+    expect(text).toContain("### 抽出エラー");
+  });
+
+  it("marks empty sections and omits TS section for non-TS repos", () => {
+    const text = formatBreakingSignals(emptySignals());
+    expect(text).toContain("（該当なし）");
+    expect(text).not.toContain("公開 export");
+    expect(text).not.toContain("### 抽出エラー"); // errors 空ならセクション自体を出さない
   });
 });
