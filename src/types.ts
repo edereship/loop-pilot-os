@@ -338,6 +338,12 @@ export interface GroomLogRow {
 // ---- MERGE GATE (ES-514) ----
 export type MergeGateOutcome = "passed" | "fixed" | "parked" | "skipped" | "error";
 
+// Codex 最終判定の結果（ES-517）。fail のときのみ violations を伴う。
+// 判定基準は「原仕様への累積適合」のみ（G-B5）。
+export type MergeGateVerdict =
+  | { verdict: "pass" }
+  | { verdict: "fail"; violations: string[] };
+
 export interface MergeGateLogRow {
   id: number;
   runId: number;
