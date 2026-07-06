@@ -10,7 +10,7 @@ const TEST_SHRINK_THRESHOLD = 0.3;
 
 const CONFIG_FILE_PATTERNS: RegExp[] = [
   /(^|\/)[^/]*\.config\.[^/]+$/, // vitest.config.ts / eslint.config.js など
-  /(^|\/)schema[^/]*\.(?!(?:md|markdown|txt|rst)$)[^/]+$/i, // schema.sql / schema.prisma / schema.rb など（.md 等のドキュメントは除外）
+  /(^|\/)schema[^/]*\.(?!(?:md|markdown|txt|rst)$)[^./]+$/i, // schema.sql / schema.prisma / schema.rb など（末尾拡張子が .md 等のドキュメントは除外。[^./] で最終拡張子を判定）
   /(^|\/)\.env\.example$/,
   /(^|\/)package\.json$/,
   /(^|\/)tsconfig[^/]*\.json$/,
@@ -217,12 +217,28 @@ export async function extractBreakingSignals(
   return signals;
 }
 
+/** diff 由来の未信頼値（パス・git stderr・export 行）を1行の表示値に畳む。
+ *  formatBreakingSignals の出力は Codex マージゲート判定プロンプトに注入されるため、
+ *  制御文字（特に改行）を除去して、1件の項目が別の Markdown 行や `##` 見出しを
+ *  偽装（プロンプトインジェクション）できないようにする。git diff -z はパスを
+ *  クォートしないため、改行入りファイル名がそのまま到達しうる。
+ *  （ES-517 側でもブロック全体を untrusted としてフェンスする前提の多重防御。） */
+function sanitizeInline(value: string): string {
+  // 制御文字（C0 全域 U+0000..U+001F と DEL U+007F。改行/タブ/復帰含む）を空白へ。
+  let out = "";
+  for (const ch of value) {
+    const code = ch.codePointAt(0)!;
+    out += code < 0x20 || code === 0x7f ? " " : ch;
+  }
+  return out.replace(/ +/g, " ").trim();
+}
+
 function section(title: string, items: string[]): string[] {
   const lines = [`### ${title}`];
   if (items.length === 0) {
     lines.push("（該当なし）");
   } else {
-    for (const item of items) lines.push(`- ${item}`);
+    for (const item of items) lines.push(`- ${sanitizeInline(item)}`);
   }
   lines.push("");
   return lines;
@@ -248,7 +264,11 @@ export function formatBreakingSignals(signals: BreakingSignals): string {
     lines.push(
       ...section(
         "削除・変更された公開 export（TS）",
-        signals.removedExports.map((e) => `${e.file}: \`${e.exportLine}\``),
+        // export 行はコードスパンに入れるため、バッククォートを ' に無害化
+        //（テンプレートリテラルを含む export がスパンを閉じてしまうのを防ぐ）。
+        signals.removedExports.map(
+          (e) => `${e.file}: \`${e.exportLine.replace(/\`/g, "'")}\``,
+        ),
       ),
     );
   }
