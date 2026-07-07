@@ -164,8 +164,8 @@ describe("loadSpecContentAtRef（ES-521: handoff 基点の trusted spec 読み�
     expect(spec).toEqual({
       requirements: "REQ",
       domainSpecs: [
-        { name: "alpha.md", content: "A" },
-        { name: "zebra.md", content: "Z" },
+        { name: "alpha", content: "A" },
+        { name: "zebra", content: "Z" },
       ],
     });
   });

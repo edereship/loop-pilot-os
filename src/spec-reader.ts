@@ -141,7 +141,7 @@ export async function loadSpecContentAtRef(
   for (const p of domainPaths) {
     const content = await show(p);
     if (content === null) return null;
-    domainSpecs.push({ name: path.basename(p), content });
+    domainSpecs.push({ name: path.basename(p, ".md"), content });
   }
   return { requirements, domainSpecs };
 }
