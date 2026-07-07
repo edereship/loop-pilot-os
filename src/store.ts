@@ -477,6 +477,14 @@ const MERGE_GATE_LOG_PATCH_COLUMNS: Record<string, string> = {
   errorDetail: "error_detail",
 };
 
+// needs-human 終端（人間のトリアージ待ちで SELECT から除外すべきセッション）の共有述語。
+// abandon 完了(recovery_action='abandon')に加え、abandon を経ない終端 reason を列挙する。
+// 3 クエリ（excludedIssueIds / legacyExcludedIssueIds / markNeedsHumanLabelAddedByIssueId）は
+// この述語を必ず共有すること — 片方だけ更新すると legacy 検出と bit 更新が非同期になり、
+// ラベルを外してもチケットが恒久除外される（ES-521 レビュー所見）。
+const NEEDS_HUMAN_TERMINAL_PREDICATE =
+  `(recovery_action = 'abandon' OR failure_reason IN ('design_rejected', 'merge_gate_failed'))`;
+
 export class SqliteStore {
   private readonly db: Database.Database;
 
@@ -928,15 +936,13 @@ export class SqliteStore {
     // NOT successfully applied (needs_human_label_added=0). When the label WAS applied
     // (needs_human_label_added=1), the Linear label is the authority: if an operator removes
     // the label during the current run, the ticket becomes eligible again immediately.
-    // failure_reason = 'merge_gate_failed' も同様に対象: park 終端（ES-521）は recovery_action
-    // が null のままなので abandon 条件では拾えず、needs-human ラベル付与が retryTransient 上限
-    // まで失敗した場合に備えて DB 側フォールバック除外に加える（design_rejected と同じ前例）。
+    // needs-human 終端述語は NEEDS_HUMAN_TERMINAL_PREDICATE を共有（同期必須）。
     const rows = this.db
       .prepare(
         `SELECT DISTINCT linear_issue_id AS id FROM task_session
          WHERE run_id = ?
            AND state = 'stopped'
-           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected' OR failure_reason = 'merge_gate_failed')
+           AND ${NEEDS_HUMAN_TERMINAL_PREDICATE}
            AND needs_human_label_added = 0`,
       )
       .all(runId) as Array<{ id: string }>;
@@ -953,15 +959,13 @@ export class SqliteStore {
     //   b) the session is superseded by a newer one.
     // Kept separate from excludedIssueIds so that getAllEligible can check the Linear label FIRST
     // for legacy-excluded issues and detect manual label additions (ES-492 Finding 3).
-    // failure_reason = 'merge_gate_failed' も同様に対象: park 終端（ES-521）は recovery_action
-    // が null のままなので abandon 条件では拾えず、needs-human ラベル付与が retryTransient 上限
-    // まで失敗した場合に備えて DB 側フォールバック除外に加える（design_rejected と同じ前例）。
+    // needs-human 終端述語は NEEDS_HUMAN_TERMINAL_PREDICATE を共有（同期必須）。
     const rows = this.db
       .prepare(
         `SELECT ts.linear_issue_id AS id
          FROM task_session ts
          WHERE ts.state = 'stopped'
-           AND (ts.recovery_action = 'abandon' OR ts.failure_reason = 'design_rejected' OR ts.failure_reason = 'merge_gate_failed')
+           AND ${NEEDS_HUMAN_TERMINAL_PREDICATE}
            AND ts.needs_human_label_added = 0
            AND ts.id = (
              SELECT MAX(id) FROM task_session WHERE linear_issue_id = ts.linear_issue_id
@@ -982,15 +986,13 @@ export class SqliteStore {
     // Called by getAllEligible's onLegacyLabelDetected callback when the operator manually adds
     // the needs-human label to a legacy-excluded issue, so that a subsequent label removal
     // re-enables the ticket (ES-492 Finding 3).
-    // failure_reason = 'merge_gate_failed' も同様に対象: legacyExcludedIssueIds が park
-    // セッション（ES-521）も返すようになったため、この WHERE を同期させないと
-    // onLegacyLabelDetected コールバックが park 行を更新できず bit が 0 のまま残る。
+    // needs-human 終端述語は NEEDS_HUMAN_TERMINAL_PREDICATE を共有（同期必須）。
     this.db
       .prepare(
         `UPDATE task_session SET needs_human_label_added = 1
          WHERE linear_issue_id = ?
            AND state = 'stopped'
-           AND (recovery_action = 'abandon' OR failure_reason = 'design_rejected' OR failure_reason = 'merge_gate_failed')
+           AND ${NEEDS_HUMAN_TERMINAL_PREDICATE}
            AND id = (SELECT MAX(id) FROM task_session WHERE linear_issue_id = ?)`,
       )
       .run(issueId, issueId);
