@@ -111,8 +111,10 @@ export async function loadSpecContentAtRef(
     // 非再帰: ls-tree --name-only（-r なし）はトップレベルのエントリのみ返す。サブディレクトリは
     // 拡張子なしの名前で現れるため .md フィルタで自然に落ちる（working tree 版 readdirSync と同様、
     // ネストした spec ファイルは注入対象に含めない）。
+    // pathspec は末尾スラッシュ必須: `<dir>` だと非再帰 ls-tree はディレクトリ自身の1エントリしか
+    // 返さず、直下一覧を得るには `<dir>/` にする必要がある（末尾スラッシュなしは常時 null の regression）。
     const res = await runner.run(
-      "git", ["-C", worktreePath, "ls-tree", "--name-only", sha, "--", dir],
+      "git", ["-C", worktreePath, "ls-tree", "--name-only", sha, "--", `${dir}/`],
       { cwd: worktreePath, timeoutMs: 30_000 },
     );
     if (res.code !== 0) return null;

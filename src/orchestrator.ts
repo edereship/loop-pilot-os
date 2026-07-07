@@ -4500,11 +4500,19 @@ export class Orchestrator {
     }
     if (diff.length > MERGE_GATE_DIFF_MAX_CHARS) {
       const originalLength = diff.length;
-      const tailChars = MERGE_GATE_DIFF_MAX_CHARS - MERGE_GATE_DIFF_HEAD_CHARS;
-      const omittedChars = originalLength - MERGE_GATE_DIFF_HEAD_CHARS - tailChars;
       const head = diff.slice(0, MERGE_GATE_DIFF_HEAD_CHARS);
+      // マーカー自体の文字数も予算に含めないと head+marker+tail の合計が
+      // MERGE_GATE_DIFF_MAX_CHARS を超えうる。omittedChars は tailChars 確定後でないと
+      // 求まらないため、まず originalLength を両方の数値枠に使った上限見積りでマーカー長を
+      // 求めて tailChars を確定し、そのあと実際の omittedChars でマーカーを組み立てる
+      // （omittedChars <= originalLength なので桁数は見積り以下 = 予算を超過しない）。
+      const marker = (omitted: number): string =>
+        `\n\n[... merge gate: diff truncated (${omitted} of ${originalLength} chars omitted) ...]\n\n`;
+      const markerBudget = marker(originalLength).length;
+      const tailChars = Math.max(0, MERGE_GATE_DIFF_MAX_CHARS - MERGE_GATE_DIFF_HEAD_CHARS - markerBudget);
+      const omittedChars = originalLength - head.length - tailChars;
       const tail = diff.slice(diff.length - tailChars);
-      diff = `${head}\n\n[... merge gate: diff truncated (${omittedChars} of ${originalLength} chars omitted) ...]\n\n${tail}`;
+      diff = `${head}${marker(omittedChars)}${tail}`;
       this.log(`merge gate: diff truncated for ${session.linearIdentifier} (${originalLength} -> ${diff.length} chars)`);
     }
 
