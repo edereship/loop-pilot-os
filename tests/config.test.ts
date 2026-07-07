@@ -800,6 +800,16 @@ describe("loadConfig", () => {
       .toThrow(/pm\.effort\.verify.*max/);
   });
 
+  it("pm.effort.merge_gate に不正値を渡すと値入りのエラーメッセージで落ちる", () => {
+    expect(() => loadConfig(fixture("config-per-phase-codex-merge-gate-max.toml"), fullEnv))
+      .toThrow(/pm\.effort\.merge_gate: "ultra" is not a valid Codex effort level/);
+  });
+
+  it("pm.effort.merge_gate の既定は high", () => {
+    const config = loadConfig(fixture("config-per-phase-merge-gate.toml"), fullEnv);
+    expect(config.pm?.effort.mergeGate).toBe("high");
+  });
+
   it("reads explicit verify/safety/linear values from config-per-phase-verify fixture", () => {
     const config = loadConfig(fixture("config-per-phase-verify.toml"), fullEnv);
     expect(config.verify.enabled).toBe(false);

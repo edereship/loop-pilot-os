@@ -78,6 +78,7 @@ const rawSchema = z.object({
       design_review: z.string().default("high"),
       recovery: z.string().default("high"),
       verify: z.string().default("high"),
+      merge_gate: z.string().default("high"),
     }).strict().optional(),
   }).strict().optional(),
   handoff: z.object({
@@ -201,6 +202,7 @@ export interface Config {
       designReview: string | undefined;
       recovery: string | undefined;
       verify: string | undefined;
+      mergeGate: string | undefined;
     };
   } | undefined;
   handoff: {
@@ -754,6 +756,7 @@ export function loadConfig(
         ["design_review", pmEffort.design_review],
         ["recovery", pmEffort.recovery],
         ["verify", pmEffort.verify],
+        ["merge_gate", pmEffort.merge_gate],
       ] as [string, string][]) {
         if (!VALID_CODEX_EFFORT.includes(value)) {
           errors.push(
@@ -875,6 +878,7 @@ export function loadConfig(
             designReview: raw.pm.effort?.design_review,
             recovery: raw.pm.effort?.recovery,
             verify: raw.pm.effort?.verify,
+            mergeGate: raw.pm.effort?.merge_gate,
           },
         }
       : undefined,
