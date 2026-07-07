@@ -257,6 +257,46 @@ describe("Orchestrator 正常系 — 1チケット完走（仕様 §5 SELECT→C
     // merge が呼ばれた
     expect(h.git.calls.some((c) => c.method === "mergePr")).toBe(true);
   });
+
+  it("HANDOFF 完了時に worktree HEAD が handoffHeadSha として記録される（ES-521）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    // memoryRunner の rev-parse HEAD スタブは "abc1234" を返す（L165/L179-181）
+    expect(s.handoffHeadSha).toBe("abc1234");
+  });
+
+  it("rev-parse HEAD が失敗しても HANDOFF は成功し handoffHeadSha は NULL のまま（フェイルオープン）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // 汎用 ["git","-C"] ハンドラより長いプレフィックスで rev-parse を失敗させる。
+    // worktree パスは FakeGitPr.prepareWorktree の既定生成（identifier.toLowerCase()）に合わせる。
+    // 汎用 ["git","-C"] ハンドラより長いこのプレフィックスは、SELF-REVIEW の pre-review
+    // SHA 取得・VERIFY の pre-verify SHA 取得（いずれもフェイルクローズ/フェイルオープンの
+    // ガードで先行実行される、プレーンな `rev-parse HEAD`）にも一致する。この2回は
+    // 成功させ、3回目（HANDOFF 本体）だけ失敗させて対象を狙い撃つ。
+    let revParseHeadCalls = 0;
+    h.memoryRunner.on(["git", "-C", "/wt/ty-1", "rev-parse", "HEAD"], () => {
+      revParseHeadCalls++;
+      if (revParseHeadCalls <= 2) return { code: 0, stdout: "abc1234\n" };
+      return { code: 128, stderr: "boom" };
+    });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged"); // HANDOFF は失敗していない
+    expect(s.handoffHeadSha).toBeNull();
+  });
 });
 
 describe("Orchestrator 正常系 — 2チケット逐次（仕様 §3 逐次・§5 ループ）", () => {

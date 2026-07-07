@@ -3751,8 +3751,29 @@ export class Orchestrator {
       const ctrl = await this.stopSession(session, "handoff_failed", `handoff failed (${prText}): ${errMsg(err)}`);
       return ctrl;
     }
+    // v4-B（ES-521）: HANDOFF 完了直後の PR head SHA を記録 — マージゲートの累積差分基点。
+    // 取得失敗は NULL のまま = ゲートはフェイルオープンでスキップ（spec §1）。HANDOFF は失敗させない。
+    let handoffHeadSha: string | null = null;
+    try {
+      const shaRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      const sha = shaRes.stdout.trim();
+      if (shaRes.code === 0 && sha !== "") {
+        handoffHeadSha = sha;
+      } else {
+        this.log(`handoff: rev-parse HEAD failed (exit ${shaRes.code}) — merge gate will be skipped for ${issue.identifier}`);
+      }
+    } catch (err) {
+      this.log(`handoff: rev-parse HEAD threw — merge gate will be skipped for ${issue.identifier}: ${errMsg(err)}`);
+    }
     // in_review 入りと監視起点を同一 patch で原子的に設定（仕様 §5.4 ⑤）
-    this.store.updateSession(session.id, { state: "in_review", monitorStartedAt: this.clock() });
+    this.store.updateSession(session.id, {
+      state: "in_review",
+      monitorStartedAt: this.clock(),
+      ...(handoffHeadSha !== null ? { handoffHeadSha } : {}),
+    });
     return { control: "continue", prNumber };
   }
 
