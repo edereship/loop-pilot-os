@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { loadSpecContent } from "../src/spec-reader.js";
+import { loadSpecContent, loadSpecContentAtRef } from "../src/spec-reader.js";
+import { FakeCommandRunner } from "./fakes.js";
 
 function makeTmpSpecDir(files: Record<string, string>): { repoPath: string; specDir: string } {
   const repoPath = mkdtempSync(path.join(os.tmpdir(), "spec-reader-"));
@@ -144,5 +145,48 @@ describe("loadSpecContent", () => {
     writeFileSync(path.join(specDirAbs, "requirements.md"), "要求", "utf-8");
     symlinkSync(path.join(outsideDir, "secret.md"), path.join(specDirAbs, "external.md"));
     expect(() => loadSpecContent(repoPath, "docs/specs")).toThrow(/outside|symlink/);
+  });
+});
+
+describe("loadSpecContentAtRef（ES-521: handoff 基点の trusted spec 読み）", () => {
+  it("ls-tree のファイル一覧から requirements.md と domain specs をアルファベット順で読む", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt", "ls-tree", "-r", "--name-only", "abc123", "--", "docs/specs"], {
+      code: 0,
+      stdout: "docs/specs/zebra.md\ndocs/specs/requirements.md\ndocs/specs/alpha.md\ndocs/specs/note.txt\n",
+    });
+    runner.on(["git", "-C", "/wt", "show", "abc123:docs/specs/requirements.md"], { code: 0, stdout: "REQ" });
+    runner.on(["git", "-C", "/wt", "show", "abc123:docs/specs/alpha.md"], { code: 0, stdout: "A" });
+    runner.on(["git", "-C", "/wt", "show", "abc123:docs/specs/zebra.md"], { code: 0, stdout: "Z" });
+
+    const spec = await loadSpecContentAtRef("/wt", "docs/specs", "abc123", runner);
+
+    expect(spec).toEqual({
+      requirements: "REQ",
+      domainSpecs: [
+        { name: "alpha.md", content: "A" },
+        { name: "zebra.md", content: "Z" },
+      ],
+    });
+  });
+
+  it("requirements.md が存在しない ref では null を返す", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt", "ls-tree"], { code: 0, stdout: "docs/specs/alpha.md\n" });
+    expect(await loadSpecContentAtRef("/wt", "docs/specs", "abc123", runner)).toBeNull();
+  });
+
+  it("git 失敗（ls-tree 非0 / show 非0 / throw）では null を返す", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "-C", "/wt", "ls-tree"], { code: 128, stderr: "bad ref" });
+    expect(await loadSpecContentAtRef("/wt", "docs/specs", "bad", runner)).toBeNull();
+
+    const runner2 = new FakeCommandRunner();
+    runner2.on(["git", "-C", "/wt", "ls-tree"], { code: 0, stdout: "docs/specs/requirements.md\n" });
+    runner2.on(["git", "-C", "/wt", "show"], { code: 128, stderr: "missing object" });
+    expect(await loadSpecContentAtRef("/wt", "docs/specs", "abc123", runner2)).toBeNull();
+
+    const runner3 = new FakeCommandRunner(); // 未登録 → reject
+    expect(await loadSpecContentAtRef("/wt", "docs/specs", "abc123", runner3)).toBeNull();
   });
 });

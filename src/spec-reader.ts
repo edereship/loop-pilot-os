@@ -1,6 +1,6 @@
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
-import type { SpecContent } from "./types.js";
+import type { SpecContent, CommandRunner, SpecFile } from "./types.js";
 
 function assertInsideRepo(realPath: string, repoReal: string, label: string): void {
   if (realPath !== repoReal && !realPath.startsWith(repoReal + path.sep)) {
@@ -89,5 +89,59 @@ export function loadSpecContent(repoPath: string, specDir: string): SpecContent 
     }
   });
 
+  return { requirements, domainSpecs };
+}
+
+/**
+ * ES-521: SpecContent を working tree ではなく指定 SHA（handoff_head_sha）の git object から読む。
+ * マージゲートの原仕様グラウンディング用 — LoopPilot のドリフトコミットが docs/specs を
+ * 書き換えていても、handoff 時点の trusted な仕様で判定できる。
+ * best-effort: git 失敗・requirements.md 不在は null（呼び出し側が spec なしで判定続行）。
+ * specDir は loadSpecContent と同じく repo 相対パス前提（ref 読みなので symlink escape は生じない）。
+ */
+export async function loadSpecContentAtRef(
+  worktreePath: string,
+  specDir: string,
+  sha: string,
+  runner: CommandRunner,
+): Promise<SpecContent | null> {
+  const dir = specDir.replace(/\/+$/, "");
+  let fileList: string[];
+  try {
+    const res = await runner.run(
+      "git", ["-C", worktreePath, "ls-tree", "-r", "--name-only", sha, "--", dir],
+      { cwd: worktreePath, timeoutMs: 30_000 },
+    );
+    if (res.code !== 0) return null;
+    fileList = res.stdout.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  } catch {
+    return null;
+  }
+  const mdFiles = fileList.filter((p) => p.endsWith(".md"));
+  const requirementsPath = `${dir}/requirements.md`;
+  if (!mdFiles.includes(requirementsPath)) return null;
+
+  const show = async (p: string): Promise<string | null> => {
+    try {
+      const res = await runner.run(
+        "git", ["-C", worktreePath, "show", `${sha}:${p}`],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      return res.code === 0 ? res.stdout : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const requirements = await show(requirementsPath);
+  if (requirements === null) return null;
+
+  const domainSpecs: SpecFile[] = [];
+  const domainPaths = mdFiles.filter((p) => p !== requirementsPath).sort();
+  for (const p of domainPaths) {
+    const content = await show(p);
+    if (content === null) return null;
+    domainSpecs.push({ name: path.basename(p), content });
+  }
   return { requirements, domainSpecs };
 }
