@@ -4483,6 +4483,53 @@ export class Orchestrator {
         policy = "recover";
       }
     }
+    // ---- park（ES-521 / v4-B spec §5）----
+    // マージゲート fix 上限超過。レビュー済み成果物を捨てない: PR はオープンのまま・
+    // ブランチも削除しない（executeAbandon 流用禁止 — R6）。needs-human で人間へ引き継ぎ、
+    // ループは次タスクへ継続する（HALT しない）。
+    if (policy === "park") {
+      this.store.updateSession(session.id, {
+        state: "stopped",
+        failureReason: reason,
+        stopDetail: effectiveDetail,
+        endedAt: this.clock(),
+        // 終端マーカー: stoppedSessionsWithFailedRecovery（recovery_attempted=0 条件）に
+        // 拾わせない。stoppedSessionsWithPr は failure_reason='looppilot_stopped' 限定、
+        // active 系クエリは state='stopped' で除外されるため、これで再採用経路は閉じる。
+        recoveryAttempted: 1,
+        ...patch,
+      });
+      // Linear: needs-human ラベル + 理由コメント（ES-492 配管の再利用。SELECT は
+      // needs-human チケットを除外済みなので掴み直し事故なし）
+      await this.applyNeedsHumanTriage(session, reason, userFacingDetail(effectiveDetail), "park");
+      // PR: 理由コメントのみ（PR 側ラベルは付けない — 対象リポに同名ラベルの存在保証がない）
+      const prNumber = session.prNumber ?? this.store.getSession(session.id).prNumber;
+      if (prNumber !== null) {
+        const prBody = [
+          "## 🚧 LoopPilot OS — merge gate parked",
+          "",
+          "マージ直前ゲートが原仕様への違反を検出し、自動修正の上限に達したため、この PR を保留します。",
+          "PR とブランチはそのまま残しています。内容を確認し、手動でマージするか修正してください。",
+          ...(effectiveDetail !== null ? ["", `**Detail:** ${userFacingDetail(effectiveDetail)}`] : []),
+        ].join("\n");
+        try {
+          await retryTransient(this.config.safety.transientRetryAttempts, () =>
+            this.git.postComment(prNumber, prBody),
+            { onRetry: (n, e) => this.log(`transient retry ${n}: park PR comment for #${prNumber}: ${errMsg(e)}`) },
+          );
+        } catch (err) {
+          this.log(`merge gate park: PR comment failed for #${prNumber} (non-fatal): ${errMsg(err)}`);
+        }
+      }
+      await this.notifier.notify({
+        kind: "merge_gate_parked",
+        identifier: session.linearIdentifier,
+        prNumber: prNumber ?? -1,
+        detail: userFacingDetail(effectiveDetail) ?? reason,
+      });
+      return CONTINUE;
+    }
+
     const isCounterBasedRecovery = reason === "ci_failed" || reason === "merge_conflict";
     // --- workflow_setup_failed cost exhaustion marker (pre-existing) ---
     const isWorkflowCostExhaustion =
@@ -5063,6 +5110,7 @@ export class Orchestrator {
     session: TaskSessionRow,
     reason: FailureReason,
     detail: string | null,
+    mode: "abandon" | "park" = "abandon",
   ): Promise<void> {
     const label = this.config.linear.needsHumanLabel;
     let labelApplied = false;
@@ -5079,11 +5127,17 @@ export class Orchestrator {
     const statusLine = labelApplied
       ? `\`${label}\` ラベルが付与されました。ラベルを外すと再投入されます。`
       : `⚠️ \`${label}\` ラベルの付与に失敗しました。手動でラベルを付与してください。`;
+    const heading = mode === "park"
+      ? `## 🚧 LoopPilot OS — merge-gate park (needs-human)`
+      : `## 🛑 LoopPilot OS — abandon (needs-human)`;
     const commentBody = [
-      `## 🛑 LoopPilot OS — abandon (needs-human)`,
+      heading,
       "",
       `**Reason:** \`${reason}\``,
       ...(detail ? [`**Detail:** ${detail}`] : []),
+      ...(mode === "park"
+        ? ["", "PR はオープンのまま保留されています（ブランチも保持）。違反内容を確認し、手動でマージするか修正を指示してください。"]
+        : []),
       "",
       statusLine,
     ].join("\n");
