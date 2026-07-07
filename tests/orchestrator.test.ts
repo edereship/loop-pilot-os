@@ -770,6 +770,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
     inlineMemoryRunner1.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config,
       source,
       agent,
@@ -3120,6 +3121,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
     inlineMemoryRunner2.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config: specConfig,
       source,
       agent,
@@ -3768,6 +3770,7 @@ describe("Orchestrator.interruptablePause", () => {
     inlineMemoryRunner3.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner3.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config, source, agent, selfReviewAgent: agent, verifyAgent: new FakeAgentRunner(), git, monitor, notifier, store,
       buildPrompt: () => "prompt", specLoader: null, clock, sleep,
       log: () => {}, recovery: new FakeWorkflowRecovery(), planner: null, designer: null,
@@ -6379,6 +6382,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     source.getAllEligible = async () => [];
 
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config,
       source,
       agent: new FakeAgentRunner(),
@@ -6517,6 +6521,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     source.getAllEligible = async () => [];
 
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config,
       source,
       agent: new FakeAgentRunner(),
@@ -6608,6 +6613,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
 
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config,
       source,
       agent,
@@ -6674,6 +6680,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     const groomLinearClient = new FakeGroomLinearClient();
 
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config,
       source,
       agent: new FakeAgentRunner(),
@@ -9195,6 +9202,7 @@ describe("VERIFY (ES-491)", () => {
     monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
 
     const orch = new Orchestrator({
+      mergeGateJudge: null,
       config,
       source,
       agent,
