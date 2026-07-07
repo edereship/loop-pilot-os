@@ -129,6 +129,14 @@ type RunControl =
 const CONTINUE: { control: "continue" } = { control: "continue" };
 const HALT: { control: "halt" } = { control: "halt" };
 
+/**
+ * v4-B マージゲート（ES-521）の poll 間で共有する in-memory ガード状態。
+ * - lastFixedHeadSha: 修正 push 直後、gh が旧 head を ready と返す stale readiness の再判定抑止。
+ * - lastPassedHeadSha: 一度 pass 判定した head の再判定（Codex 二重判定）抑止。
+ * どちらも揮発してよい（クラッシュ後の再判定は冪等・安全側に倒れるだけ）。
+ */
+type GateCtx = { lastFixedHeadSha: string | null; lastPassedHeadSha: string | null };
+
 export class Orchestrator {
   private readonly config: Config;
   private readonly source: TaskSource;
@@ -3830,8 +3838,9 @@ export class Orchestrator {
     let quotaRetryCount = session.quotaRetryAttempts;
     let quotaResumedNotified = false;
     let firstPoll = true;
-    // v4-B（ES-521）: 修正 push 直後の stale readiness ガード用（runMergeGate が読み書き）
-    const gateCtx: { lastFixedHeadSha: string | null } = { lastFixedHeadSha: null };
+    // v4-B（ES-521）: 修正 push 直後の stale readiness ガード / pass 済み head のメモ化用
+    // （runMergeGate が読み書き）
+    const gateCtx: GateCtx = { lastFixedHeadSha: null, lastPassedHeadSha: null };
     while (true) {
       // ES-450 Finding 2: if recovery abandoned the session, exit the monitor loop so the
       // outer loop can proceed to SELECT the next task instead of continuing to poll a
@@ -4397,7 +4406,7 @@ export class Orchestrator {
   private async runMergeGate(
     session: TaskSessionRow,
     headSha: string,
-    gateCtx: { lastFixedHeadSha: string | null },
+    gateCtx: GateCtx,
   ): Promise<"pass" | "continue" | "parked" | "halt"> {
     if (!this.config.mergeGate.enabled || this.mergeGateJudge === null) return "pass";
     const mergeGateJudge = this.mergeGateJudge;
@@ -4409,6 +4418,13 @@ export class Orchestrator {
     // 揮発しても再判定は冪等・安全側に倒れるだけ）。
     if (gateCtx.lastFixedHeadSha !== null && headSha === gateCtx.lastFixedHeadSha) {
       return "continue";
+    }
+
+    // 同一 head を一度 pass 判定したら Codex を再起動しない（二重判定防止）。mergePr が失敗して
+    // 次ポーリングに同一 head が再入した場合など。ログ行も作らず即 pass を返す。in-memory ガード
+    // （揮発してもゲートは冪等・安全側 = 再判定するだけ）。
+    if (gateCtx.lastPassedHeadSha !== null && headSha === gateCtx.lastPassedHeadSha) {
+      return "pass";
     }
 
     const priorLogs = this.store.getMergeGateLogsForSession(session.id);
@@ -4438,17 +4454,21 @@ export class Orchestrator {
       return await failOpen("worktree path missing");
     }
 
-    // ① fetch — LoopPilot のドリフトコミットは remote にのみ存在する。diff / シグナル抽出に必要
-    let fetchOk = false;
+    // ① fetch — LoopPilot のドリフトコミットは remote にのみ存在する。diff / シグナル抽出に必要。
+    // 一時的なネットワーク障害は handoff() と同流儀で retryTransient する（非 0 exit は stderr を
+    // cause に載せて throw → 一時エラーのみ再試行。決定的失敗は即時 throw）。最終失敗はフェイルオープン。
     try {
-      const fetchRes = await this.runner.run(
-        "git", ["-C", worktreePath, "fetch", "origin", session.branch],
-        { cwd: worktreePath, timeoutMs: 120_000 },
-      );
-      fetchOk = fetchRes.code === 0;
-    } catch { /* fall through */ }
-    if (!fetchOk) {
-      return await failOpen("fetch origin failed");
+      await retryTransient(this.config.safety.transientRetryAttempts, async () => {
+        const fetchRes = await this.runner.run(
+          "git", ["-C", worktreePath, "fetch", "origin", session.branch],
+          { cwd: worktreePath, timeoutMs: 120_000 },
+        );
+        if (fetchRes.code !== 0) {
+          throw new Error(`git fetch origin ${session.branch} failed (exit ${fetchRes.code})`, { cause: fetchRes.stderr });
+        }
+      }, { onRetry: (n, e) => this.log(`transient retry ${n}: merge gate fetch for ${session.linearIdentifier}: ${errMsg(e)}`) });
+    } catch (err) {
+      return await failOpen(`fetch origin failed: ${errMsg(err)}`);
     }
 
     // ② 客観シグナル抽出（ES-515。内部 best-effort — 失敗は errors に載るだけ）
@@ -4498,6 +4518,20 @@ export class Orchestrator {
       );
       if (preRes.code === 0 && preRes.stdout.trim()) preSha = preRes.stdout.trim();
     } catch { /* best-effort */ }
+    // 判定前に worktree を評価対象 headSha へ同期する（偽陰性 pass 防止）。fetch 済みなので
+    // object は存在する。worktree HEAD が古い/ドリフトしたままだと judge が「クリーンな状態」を
+    // 見て誤って pass しうる。失敗はフェイルオープン（警告のみ・判定は続行しゲートは止めない）。
+    try {
+      const syncRes = await this.runner.run(
+        "git", ["-C", worktreePath, "checkout", "--detach", headSha],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      if (syncRes.code !== 0) {
+        this.log(`merge gate: checkout --detach ${headSha.slice(0, 7)} failed (exit ${syncRes.code}) — judging on possibly-drifted worktree (${session.linearIdentifier})`);
+      }
+    } catch (err) {
+      this.log(`merge gate: checkout --detach threw — judging on possibly-drifted worktree (${session.linearIdentifier}): ${errMsg(err)}`);
+    }
     let judgeOutcome: PlanOutcome;
     try {
       judgeOutcome = await mergeGateJudge.run({
@@ -4509,12 +4543,22 @@ export class Orchestrator {
     } catch (err) {
       return await failOpen(`judge threw: ${errMsg(err)}`);
     } finally {
-      // 判定器が worktree を汚しても後段（fix の reset --hard / リモート基準の merge）には
-      // 影響しないが、best-effort で戻しておく（designReview のような halt ガードは不要）
-      if (preSha !== null) {
-        await this.runner.run("git", ["-C", worktreePath, "reset", "--hard", preSha], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => {});
-        await this.runner.run("git", ["-C", worktreePath, "clean", "-fd"], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => {});
-      }
+      // 復元: ①ブランチ復帰（detach 状態を解消）→ ②preSha へ reset → ③clean。
+      // 後段 fix ターンが自身で reset --hard するので復元失敗の実害は限定的だが、黙殺せず
+      // 警告ログを残す（無症状のドリフト蓄積を検知可能にする）。
+      const restore = async (args: string[]): Promise<void> => {
+        try {
+          const r = await this.runner.run("git", ["-C", worktreePath, ...args], { cwd: worktreePath, timeoutMs: 30_000 });
+          if (r.code !== 0) {
+            this.log(`merge gate: worktree restore \`git ${args.join(" ")}\` failed (exit ${r.code}) (${session.linearIdentifier})`);
+          }
+        } catch (err) {
+          this.log(`merge gate: worktree restore \`git ${args.join(" ")}\` threw (${session.linearIdentifier}): ${errMsg(err)}`);
+        }
+      };
+      await restore(["checkout", session.branch]);
+      if (preSha !== null) await restore(["reset", "--hard", preSha]);
+      await restore(["clean", "-fd"]);
     }
     if (judgeOutcome.kind === "interrupted") {
       this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "error", errorDetail: "judge interrupted" });
@@ -4536,6 +4580,7 @@ export class Orchestrator {
     });
     if (verdict.verdict === "pass") {
       this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "passed" });
+      gateCtx.lastPassedHeadSha = headSha;
       return "pass";
     }
 
@@ -4597,7 +4642,7 @@ export class Orchestrator {
   private async tryMerge(
     session: TaskSessionRow,
     prNumber: number,
-    gateCtx: { lastFixedHeadSha: string | null } = { lastFixedHeadSha: null },
+    gateCtx: GateCtx,
   ): Promise<
     | { kind: "merged" }
     | { kind: "continue" }
@@ -4644,10 +4689,17 @@ export class Orchestrator {
     // ---- v4-B マージ直前ゲート（ES-521）: ready 確定後・mergePr 直前。
     // done / stopped(review_done) の 2 経路を tryMerge 1 箇所でカバーする（spec 採用案①）。
     const gate = await this.runMergeGate(session, readiness.headSha, gateCtx);
-    if (gate === "halt") return { kind: "halt" };
-    if (gate === "parked") return { kind: "parked" };
-    if (gate === "continue") return { kind: "continue" };
-    // gate === "pass" → fall through to mergePr
+    switch (gate) {
+      case "halt": return { kind: "halt" };
+      case "parked": return { kind: "parked" };
+      case "continue": return { kind: "continue" };
+      case "pass": break; // fall through to mergePr
+      default: {
+        // 将来 runMergeGate の戻り値が増えたらコンパイル時に検知する（網羅性チェック）
+        const _exhaustive: never = gate;
+        return _exhaustive;
+      }
+    }
     try {
       await this.git.mergePr(prNumber, readiness.headSha);
       return { kind: "merged" };
