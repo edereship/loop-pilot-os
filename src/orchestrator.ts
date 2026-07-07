@@ -33,8 +33,12 @@ import { parseSelfReviewOutput } from "./self-review-parser.js";
 import { buildVerifyEvidencePrompt, buildVerifyJudgmentPrompt } from "./verify-prompt.js";
 import { parseVerifyOutput } from "./verify-parser.js";
 import { buildSelectPrompt, parseSelection } from "./select-prompt.js";
-import { executeRecoveryTurn, executeAbandon } from "./recovery-turn.js";
+import { executeRecoveryTurn, executeAbandon, executeFixCode } from "./recovery-turn.js";
 import type { RecoveryTurnDeps } from "./recovery-turn.js";
+import { extractBreakingSignals, formatBreakingSignals } from "./breaking-signals.js";
+import { buildMergeGatePrompt } from "./merge-gate-prompt.js";
+import { parseMergeGateOutput } from "./merge-gate-parser.js";
+import { loadSpecContentAtRef } from "./spec-reader.js";
 import type { SqliteStore } from "./store.js";
 import type { Config } from "./config.js";
 import { commitIfChanged, initialize as initializeMemory, readAll as readMemoryAll, writeCategory, MEMORY_DIR } from "./memory-store.js";
@@ -90,6 +94,8 @@ export interface OrchestratorDeps {
   planner: PlanRunner | null;
   designer: PlanRunner | null;
   designReviewer: PlanRunner | null;
+  /** v4-B マージゲートの Codex 最終判定器（ES-521）。null ならゲートは全スキップ。 */
+  mergeGateJudge: PlanRunner | null;
   codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
@@ -142,6 +148,7 @@ export class Orchestrator {
   private readonly planner: PlanRunner | null;
   private readonly designer: PlanRunner | null;
   private readonly designReviewer: PlanRunner | null;
+  private readonly mergeGateJudge: PlanRunner | null;
   private readonly codebaseSummaryGenerator: (repoPath: string) => Promise<string>;
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
@@ -173,6 +180,7 @@ export class Orchestrator {
     this.planner = deps.planner;
     this.designer = deps.designer;
     this.designReviewer = deps.designReviewer;
+    this.mergeGateJudge = deps.mergeGateJudge;
     this.codebaseSummaryGenerator = deps.codebaseSummaryGenerator;
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
@@ -3799,6 +3807,8 @@ export class Orchestrator {
     let quotaRetryCount = session.quotaRetryAttempts;
     let quotaResumedNotified = false;
     let firstPoll = true;
+    // v4-B（ES-521）: 修正 push 直後の stale readiness ガード用（runMergeGate が読み書き）
+    const gateCtx: { lastFixedHeadSha: string | null } = { lastFixedHeadSha: null };
     while (true) {
       // ES-450 Finding 2: if recovery abandoned the session, exit the monitor loop so the
       // outer loop can proceed to SELECT the next task instead of continuing to poll a
@@ -3866,9 +3876,12 @@ export class Orchestrator {
             this.store.updateSession(session.id, { pendingRestartReason: null });
             continue;
           }
-          const outcome = await this.tryMerge(session, prNumber);
+          const outcome = await this.tryMerge(session, prNumber, gateCtx);
           if (outcome.kind === "merged") return CONTINUE;
           if (outcome.kind === "halt") return HALT;
+          // v4-B: park 終端（セッションは stopped 済み）。呼び出し元の DONE は
+          // state==='stopped' ガードでスキップされ、ループは次タスクへ継続する。
+          if (outcome.kind === "parked") return CONTINUE;
           if (outcome.kind === "readiness_failed") {
             // checkMergeReadiness が throw → poll throw と同じ一時障害扱い（仕様 §5.5）。
             // バックオフ再試行、5 連続で stopped(exception)。カウンタは readiness 評価成功でリセット。
@@ -3934,9 +3947,12 @@ export class Orchestrator {
                 continue;
               }
             }
-            const outcome = await this.tryMerge(session, prNumber);
+            const outcome = await this.tryMerge(session, prNumber, gateCtx);
             if (outcome.kind === "merged") return CONTINUE;
             if (outcome.kind === "halt") return HALT;
+            // v4-B: park 終端（セッションは stopped 済み）。呼び出し元の DONE は
+            // state==='stopped' ガードでスキップされ、ループは次タスクへ継続する。
+            if (outcome.kind === "parked") return CONTINUE;
             if (outcome.kind === "readiness_failed") {
               readinessFailures += 1;
               mergeFailures = 0;
@@ -4347,6 +4363,209 @@ export class Orchestrator {
   }
 
   /**
+   * v4-B マージ直前ゲート（ES-521 / spec §1〜§5）。tryMerge 内・readiness ready 後・mergePr 直前。
+   * 返り値:
+   *   "pass"    … マージ続行（スキップ / 判定 pass / フェイルセーフ pass）
+   *   "continue" … このポーリングではマージしない（fix push 済み CI 再待機 / stale readiness / fix 失敗の再試行待ち）
+   *   "parked"  … park 終端済み（セッションは stopped）
+   *   "halt"    … 操作者割り込み（haltForInterrupt 済み）
+   * 検証器の不調（fetch / Codex 例外 / パース失敗）は pass + 警告ログ + outcome=error（フェイルオープン）。
+   */
+  private async runMergeGate(
+    session: TaskSessionRow,
+    headSha: string,
+    gateCtx: { lastFixedHeadSha: string | null },
+  ): Promise<"pass" | "continue" | "parked" | "halt"> {
+    if (!this.config.mergeGate.enabled || this.mergeGateJudge === null) return "pass";
+    const mergeGateJudge = this.mergeGateJudge;
+    const fresh = this.store.getSession(session.id);
+    const baseSha = fresh.handoffHeadSha;
+
+    // 修正 push 直後、gh が旧 head の green を ready と返す stale readiness の窓で
+    // 同一 diff を再判定して attempt を二重消費しない（in-memory ガード。クラッシュで
+    // 揮発しても再判定は冪等・安全側に倒れるだけ）。
+    if (gateCtx.lastFixedHeadSha !== null && headSha === gateCtx.lastFixedHeadSha) {
+      return "continue";
+    }
+
+    const priorLogs = this.store.getMergeGateLogsForSession(session.id);
+    const attempt = priorLogs.length + 1;
+    const startedAt = this.clock();
+
+    // スキップ①: 旧セッション（カラム追加前）は NULL → フェイルオープン（spec §1）
+    // スキップ②: LoopPilot 中コミットなし → 検査対象ドリフトなし（クリーン PR の所要時間不変）
+    if (baseSha === null || baseSha === headSha) {
+      const row = this.store.insertMergeGateLog({ runId: this.runId, sessionId: session.id, attempt, startedAt });
+      this.store.updateMergeGateLog(row.id, {
+        endedAt: this.clock(),
+        outcome: "skipped",
+        errorDetail: baseSha === null ? "handoff_head_sha is NULL (pre-migration session)" : null,
+      });
+      return "pass";
+    }
+
+    const worktreePath = fresh.worktreePath;
+    const row = this.store.insertMergeGateLog({ runId: this.runId, sessionId: session.id, attempt, startedAt });
+    const failOpen = async (detail: string): Promise<"pass"> => {
+      this.log(`merge gate: ${detail} — fail-open pass (${session.linearIdentifier})`);
+      this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "error", errorDetail: detail });
+      return "pass";
+    };
+    if (worktreePath === null) {
+      return await failOpen("worktree path missing");
+    }
+
+    // ① fetch — LoopPilot のドリフトコミットは remote にのみ存在する。diff / シグナル抽出に必要
+    let fetchOk = false;
+    try {
+      const fetchRes = await this.runner.run(
+        "git", ["-C", worktreePath, "fetch", "origin", session.branch],
+        { cwd: worktreePath, timeoutMs: 120_000 },
+      );
+      fetchOk = fetchRes.code === 0;
+    } catch { /* fall through */ }
+    if (!fetchOk) {
+      return await failOpen("fetch origin failed");
+    }
+
+    // ② 客観シグナル抽出（ES-515。内部 best-effort — 失敗は errors に載るだけ）
+    const signals = await extractBreakingSignals(worktreePath, this.runner, baseSha, headSha);
+    const signalsMarkdown = formatBreakingSignals(signals);
+
+    // ③ 累積 diff（handoff 基点〜マージ候補 head。LoopPilot 稼働中コミットのみ）
+    let diff: string;
+    try {
+      const diffRes = await this.runner.run(
+        "git", ["-C", worktreePath, "diff", `${baseSha}..${headSha}`],
+        { cwd: worktreePath, timeoutMs: 120_000 },
+      );
+      if (diffRes.code !== 0) return await failOpen(`diff failed (exit ${diffRes.code})`);
+      diff = diffRes.stdout;
+    } catch (err) {
+      return await failOpen(`diff threw: ${errMsg(err)}`);
+    }
+
+    // ④ 原仕様は handoff 基点の trusted ref から読む — working tree はドリフト後でありうる
+    //   （merge-gate-prompt.ts の注記どおり。読めなければ spec なしで判定続行）
+    let specContent: SpecContent | null = null;
+    if (this.config.product.specDir !== undefined) {
+      specContent = await loadSpecContentAtRef(worktreePath, this.config.product.specDir, baseSha, this.runner);
+      if (specContent === null) {
+        this.log(`merge gate: spec load at ${baseSha.slice(0, 7)} failed — judging without spec (${session.linearIdentifier})`);
+      }
+    }
+    const brief = fresh.planBrief ? parseBrief(fresh.planBrief) : null;
+    const issueForPrompt: EligibleIssue = {
+      id: fresh.linearIssueId,
+      identifier: fresh.linearIdentifier,
+      title: fresh.issueTitle,
+      description: fresh.issueDescription,
+      priority: 0,
+      sortOrder: 0,
+      url: fresh.issueUrl,
+    };
+    const prompt = buildMergeGatePrompt({ issue: issueForPrompt, brief, specContent, signalsMarkdown, diff });
+
+    // ⑤ Codex 最終判定（コスト報告なし — timeout のみでガード。spec §4）
+    let preSha: string | null = null;
+    try {
+      const preRes = await this.runner.run(
+        "git", ["-C", worktreePath, "rev-parse", "HEAD"],
+        { cwd: worktreePath, timeoutMs: 30_000 },
+      );
+      if (preRes.code === 0 && preRes.stdout.trim()) preSha = preRes.stdout.trim();
+    } catch { /* best-effort */ }
+    let judgeOutcome: PlanOutcome;
+    try {
+      judgeOutcome = await mergeGateJudge.run({
+        worktreePath,
+        prompt,
+        timeoutMs: this.config.safety.mergeGateTimeoutMinutes * 60_000,
+        effort: this.config.pm?.effort.mergeGate,
+      });
+    } catch (err) {
+      return await failOpen(`judge threw: ${errMsg(err)}`);
+    } finally {
+      // 判定器が worktree を汚しても後段（fix の reset --hard / リモート基準の merge）には
+      // 影響しないが、best-effort で戻しておく（designReview のような halt ガードは不要）
+      if (preSha !== null) {
+        await this.runner.run("git", ["-C", worktreePath, "reset", "--hard", preSha], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => {});
+        await this.runner.run("git", ["-C", worktreePath, "clean", "-fd"], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => {});
+      }
+    }
+    if (judgeOutcome.kind === "interrupted") {
+      this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "error", errorDetail: "judge interrupted" });
+      await this.haltForInterrupt();
+      return "halt";
+    }
+    if (judgeOutcome.kind === "error") {
+      return await failOpen(`judge error: ${judgeOutcome.message}`);
+    }
+    const parsed = parseMergeGateOutput(judgeOutcome.text);
+    if (parsed.kind === "parse_error") {
+      return await failOpen("judge output parse error");
+    }
+    const verdict = parsed.value;
+    this.store.updateMergeGateLog(row.id, {
+      verdict: verdict.verdict,
+      signals: JSON.stringify(signals),
+      violations: verdict.verdict === "fail" ? JSON.stringify(verdict.violations) : null,
+    });
+    if (verdict.verdict === "pass") {
+      this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "passed" });
+      return "pass";
+    }
+
+    // ---- fail ----
+    this.log(`merge gate: FAIL (attempt ${attempt}) for ${session.linearIdentifier}: ${verdict.violations.join("; ")}`);
+    // 耐久 attempt カウント: 過去の fail 判定行数（fix 成否を問わず消費 — fix が失敗し続けても
+    // fail 行の蓄積で park に有界収束する）。in-memory カウンタは使わない（spec オープン項目の確定）。
+    const priorFailCount = priorLogs.filter((l) => l.verdict === "fail").length;
+    const recoveryTurn = this.recoveryTurn;
+    if (priorFailCount >= this.config.safety.maxMergeGateFixAttempts || recoveryTurn === null) {
+      this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "parked" });
+      const detail = `merge_gate: ${verdict.violations.join("; ")}`.slice(0, 2000);
+      const ctrl = await this.stopSession(session, "merge_gate_failed", detail);
+      return ctrl.control === "halt" ? "halt" : "parked";
+    }
+
+    // ---- fix ターン（executeFixCode 同型・fix_code 固定。Codex の action 選択はスキップ）----
+    const instruction = [
+      "The pre-merge specification gate rejected the current state of this PR branch.",
+      "Fix ONLY the following violations so the cumulative changes conform to the original specification again.",
+      "Do not refactor unrelated code. Commit your fix (do not push).",
+      "",
+      "Violations:",
+      ...verdict.violations.map((v, i) => `${i + 1}. ${v}`),
+    ].join("\n");
+    const fixResult = await executeFixCode(recoveryTurn, this.store.getSession(session.id), instruction, {
+      maxCostUsd: this.config.safety.maxCostUsdPerMergeGateFix,
+      postRestartComment: false, // R3: LoopPilot フルレビューは再実行しない（CI 再通過 + 再ゲートのみ）
+    });
+    const fixCostUsd = "costUsd" in fixResult ? fixResult.costUsd : undefined;
+    if (fixCostUsd !== undefined && fixCostUsd > 0) {
+      const f = this.store.getSession(session.id);
+      this.store.updateSession(session.id, { costUsd: (f.costUsd ?? 0) + fixCostUsd });
+    }
+    if (fixResult.kind === "interrupted") {
+      this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "error", errorDetail: "fix interrupted", costUsd: fixCostUsd ?? null });
+      await this.haltForInterrupt();
+      return "halt";
+    }
+    if (fixResult.kind === "recovered") {
+      this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "fixed", costUsd: fixCostUsd ?? null });
+      // 修正 push → CI 再通過待ち（done 再待機は monitorSession のポーリングに乗る。spec §4）
+      gateCtx.lastFixedHeadSha = headSha;
+      return "continue";
+    }
+    // failed: fix 自体の不調。次ポーリングで再ゲート（fail 行の蓄積により park で有界）
+    const msg = fixResult.kind === "failed" ? fixResult.message : fixResult.kind;
+    this.log(`merge gate: fix turn failed for ${session.linearIdentifier} (non-fatal, will re-gate): ${msg}`);
+    this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "error", errorDetail: `fix failed: ${msg}`, costUsd: fixCostUsd ?? null });
+    return "continue";
+  }
+
+  /**
    * done verdict 時のマージ試行（カーネル §7.6）。
    * - checkMergeReadiness が throw → readiness_failed（一時障害。バックオフ/5連続停止は monitorSession 側）。
    * - readiness が ready でなければ reason ごとに分類（ci_pending/unknown→continue、その他は stopSession→halt）。
@@ -4355,10 +4574,12 @@ export class Orchestrator {
   private async tryMerge(
     session: TaskSessionRow,
     prNumber: number,
+    gateCtx: { lastFixedHeadSha: string | null } = { lastFixedHeadSha: null },
   ): Promise<
     | { kind: "merged" }
     | { kind: "continue" }
     | { kind: "halt" }
+    | { kind: "parked" }   // v4-B: マージゲート park 終端（ES-521）
     | { kind: "merge_failed"; error: string }
     | { kind: "readiness_failed"; error: string }
   > {
@@ -4397,6 +4618,13 @@ export class Orchestrator {
         }
       }
     }
+    // ---- v4-B マージ直前ゲート（ES-521）: ready 確定後・mergePr 直前。
+    // done / stopped(review_done) の 2 経路を tryMerge 1 箇所でカバーする（spec 採用案①）。
+    const gate = await this.runMergeGate(session, readiness.headSha, gateCtx);
+    if (gate === "halt") return { kind: "halt" };
+    if (gate === "parked") return { kind: "parked" };
+    if (gate === "continue") return { kind: "continue" };
+    // gate === "pass" → fall through to mergePr
     try {
       await this.git.mergePr(prNumber, readiness.headSha);
       return { kind: "merged" };

@@ -64,6 +64,9 @@ function makeConfig(over: Partial<{
       verifyTimeoutMinutes: 15,
       maxRecoveryAttempts: 2,
       transientRetryAttempts: 2,
+      mergeGateTimeoutMinutes: 15,
+      maxMergeGateFixAttempts: 2,
+      maxCostUsdPerMergeGateFix: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -73,6 +76,7 @@ function makeConfig(over: Partial<{
     looppilot: { gateLabel: over.gateLabel ?? "loop-pilot" },
     notify: { progress: over.notifyProgress ?? false },
     groom: { enabled: over.groomEnabled ?? false },
+    mergeGate: { enabled: true },
     selfReview: { enabled: true },
     verify: { enabled: true, runRecipe: "" },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
@@ -111,8 +115,8 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean }): Harness {
-  const store = new SqliteStore(":memory:");
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; mergeGateJudge?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean; store?: SqliteStore }): Harness {
+  const store = opts?.store ?? new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
   const git = new FakeGitPr();
@@ -145,6 +149,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   const planner = opts?.planner ?? null;
   const designer = opts?.designer ?? null;
   const designReviewer = opts?.designReviewer ?? null;
+  const mergeGateJudge = opts?.mergeGateJudge ?? null;
   const memoryRunner = new FakeCommandRunner();
   memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
   memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
@@ -208,6 +213,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
     planner,
     designer,
     designReviewer,
+    mergeGateJudge,
     codebaseSummaryGenerator,
     recoveryTurn: planner !== null ? {
       planner,
@@ -9778,5 +9784,195 @@ describe("ES-504 abandon transient retry — pre-PR abandon", () => {
     expect(run.state).toBe("halted");
     // TY-2 was not started
     expect(sessions.find((s) => s.linearIdentifier === "TY-2")).toBeUndefined();
+  });
+});
+
+// ---- v4-B マージゲート（ES-521） ----
+function passJson(): string {
+  return '```json\n{ "verdict": "pass" }\n```';
+}
+function failJson(violations: string[]): string {
+  return "```json\n" + JSON.stringify({ verdict: "fail", violations }) + "\n```";
+}
+
+describe("v4-B マージゲート（ES-521 / spec §1・§3・§5）— 評価・スキップ・フェイルセーフ・park", () => {
+  function gateHarness(over: Parameters<typeof makeConfig>[0] = {}) {
+    const config = makeConfig({ maxTasksPerRun: 1, ...over });
+    const judge = new FakePlanRunner();
+    const h = makeHarness(config, { mergeGateJudge: judge });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+    // breaking-signals は cmd.run("git",["diff",...],{cwd}) を -C なしで呼ぶ（best-effort、
+    // 未スタブだと errors に落ちるだけだが、判定を安定させるため空 diff を返しておく）
+    h.memoryRunner.on(["git", "diff"], { code: 0, stdout: "" });
+    h.memoryRunner.on(["git", "cat-file"], { code: 1 });
+    return { h, judge, config };
+  }
+
+  it("handoffHeadSha == readiness.headSha ならゲートをスキップしてマージ（クリーン PR・judge 不呼び出し・outcome=skipped）", async () => {
+    const { h, judge } = gateHarness();
+    // handoff 記録は abc1234（memoryRunner）。readiness も abc1234 に合わせる
+    h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "abc1234" });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(judge.calls).toHaveLength(0);
+    const logs = h.store.getMergeGateLogsForSession(s.id);
+    expect(logs).toHaveLength(1);
+    expect(logs[0].outcome).toBe("skipped");
+  });
+
+  it("handoffHeadSha が NULL（移行期の旧セッション）ならフェイルオープンでスキップしてマージ", async () => {
+    const { h, judge } = gateHarness();
+    // rev-parse を失敗させて handoffHeadSha を NULL にする（Task 2 と同じ長プレフィックス上書き。
+    // FakeGitPr.prepareWorktree は worktreePath を issue.identifier.toLowerCase() で生成する）。
+    // 汎用 ["git","-C"] ハンドラより長いこのプレフィックスは SELF-REVIEW / VERIFY の pre-check
+    // rev-parse HEAD にも一致するため、その2回は成功させ、3回目（HANDOFF 本体）だけ失敗させる。
+    let revParseHeadCalls = 0;
+    h.memoryRunner.on(["git", "-C", "/wt/ty-1", "rev-parse", "HEAD"], () => {
+      revParseHeadCalls++;
+      if (revParseHeadCalls <= 2) return { code: 0, stdout: "abc1234\n" };
+      return { code: 128, stderr: "boom" };
+    });
+    h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "drift1" });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(judge.calls).toHaveLength(0);
+    expect(h.store.getMergeGateLogsForSession(s.id)[0].outcome).toBe("skipped");
+  });
+
+  it("merge_gate.enabled=false ならログ行も残さず素通し", async () => {
+    const { h, judge, config } = gateHarness();
+    config.mergeGate.enabled = false;
+    h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "drift1" });
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(judge.calls).toHaveLength(0);
+    expect(h.store.getMergeGateLogsForSession(s.id)).toHaveLength(0);
+  });
+
+  it("LoopPilot 中コミットあり + judge pass → verdict/signals を記録してマージ", async () => {
+    const { h, judge } = gateHarness();
+    h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "drift1" });
+    judge.outcomes = [{ kind: "completed", text: passJson() }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("merged");
+    expect(judge.calls).toHaveLength(1);
+    // ゲートは timeout/effort を config から渡す
+    expect(judge.calls[0].timeoutMs).toBe(15 * 60_000);
+    const log = h.store.getMergeGateLogsForSession(s.id)[0];
+    expect(log.verdict).toBe("pass");
+    expect(log.outcome).toBe("passed");
+    expect(log.signals).not.toBeNull();
+  });
+
+  it("judge 例外 / error / パース不能 → pass 扱い + outcome=error（フェイルセーフ・マージは通る）", async () => {
+    for (const outcome of [
+      { kind: "error" as const, message: "codex down" },
+      { kind: "completed" as const, text: "こわれた出力" },
+    ]) {
+      const { h, judge } = gateHarness();
+      h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "drift1" });
+      judge.outcomes = [outcome];
+
+      await h.orch.run();
+
+      const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+      expect(s.state).toBe("merged"); // ゲート不調でループを止めない
+      expect(h.store.getMergeGateLogsForSession(s.id)[0].outcome).toBe("error");
+    }
+  });
+
+  it("judge fail + fix 手段なし（recoveryTurn 未配線）→ park: PR保持・needs-human・PRコメント・通知・次タスク継続", async () => {
+    const config = makeConfig({ maxTasksPerRun: 2 });
+    const judge = new FakePlanRunner();
+    const h = makeHarness(config, { mergeGateJudge: judge }); // planner 未指定 → recoveryTurn null
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1, summary: "A" },
+      // SELF-REVIEW for A (non-fatal error → proceeds to HANDOFF; shared FakeAgentRunner
+      // with IMPLEMENT so B's implement outcome is not accidentally consumed here)
+      { kind: "error", costUsd: 0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 1, summary: "B" },
+      { kind: "error", costUsd: 0, message: "self-review skipped" },
+    ];
+    // FakeMonitor.poll shifts while >1 queued, then keeps returning the last entry once
+    // length===1 — so A (parked after 1 poll) and B (must also see "done" to reach
+    // runMergeGate) each need a "done" in the shared queue; the trailing "merged" is
+    // consumed if B's tryMerge needs another poll (it won't here, but keeps the fake safe).
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "done" }, { kind: "merged" }];
+    h.memoryRunner.on(["git", "diff"], { code: 0, stdout: "" });
+    h.memoryRunner.on(["git", "cat-file"], { code: 1 });
+    h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "drift1" });
+    judge.outcomes = [
+      { kind: "completed", text: failJson(["public export removed", "test gutted"]) },
+      { kind: "completed", text: passJson() }, // 2 タスク目はクリーンに通す
+    ];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    const a = sessions.find((s) => s.linearIdentifier === "TY-1")!;
+    const b = sessions.find((s) => s.linearIdentifier === "TY-2")!;
+    // park 終端
+    expect(a.state).toBe("stopped");
+    expect(a.failureReason).toBe("merge_gate_failed");
+    expect(a.stopDetail).toContain("public export removed");
+    expect(a.recoveryAttempted).toBe(1);
+    // PR は閉じない・ブランチも消さない（GitPrManager に closePr は存在せず discardWorktree も呼ばれない）
+    expect(h.git.calls.filter((c) => c.method === "closePr")).toHaveLength(0);
+    expect(h.git.calls.filter((c) => c.method === "discardWorktree")).toHaveLength(0);
+    // Linear needs-human ラベル + コメント（park 見出し）
+    expect(h.source.labelAdds.some((l) => l.issueId === "issue-A" && l.labelName === config.linear.needsHumanLabel)).toBe(true);
+    expect(h.source.comments.some((c) => c.issueId === "issue-A" && c.body.includes("merge-gate park"))).toBe(true);
+    // PR 理由コメント
+    expect(h.git.calls.some((c) => c.method === "postComment" && String(c.args[1]).includes("merge gate parked"))).toBe(true);
+    // 通知
+    expect(h.notifier.events.some((e) => e.kind === "merge_gate_parked")).toBe(true);
+    // ログ行 outcome=parked
+    expect(h.store.getMergeGateLogsForSession(a.id).at(-1)!.outcome).toBe("parked");
+    // ループは HALT せず次タスクを完走
+    expect(b.state).toBe("merged");
+  });
+
+  it("park 済みセッションは再起動時に再採用されない（recoverInReview / stoppedSessions* 経路）", async () => {
+    // 上の park テストと同じ手順で TY-1 を park させたあと、同じ store で 2 回目の run を実行。
+    // 2 回目: queue は空。park セッションが adopt されないこと =
+    // monitor.poll が一度も呼ばれず、セッション state が stopped のまま変わらないことを確認する。
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const judge = new FakePlanRunner();
+    const h = makeHarness(config, { mergeGateJudge: judge });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "A" }];
+    h.monitor.verdicts = [{ kind: "done" }];
+    h.memoryRunner.on(["git", "diff"], { code: 0, stdout: "" });
+    h.memoryRunner.on(["git", "cat-file"], { code: 1 });
+    h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "drift1" });
+    judge.outcomes = [{ kind: "completed", text: failJson(["v1"]) }];
+    await h.orch.run();
+    const parked = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(parked.failureReason).toBe("merge_gate_failed");
+
+    // 2 回目の run: 同一 store を注入した新規 Orchestrator で「daemon 再起動」を模す。
+    const h2 = makeHarness(config, { mergeGateJudge: judge, store: h.store });
+    h2.source.queue = [];
+    await h2.orch.run();
+
+    const after = h.store.getSession(parked.id);
+    expect(after.state).toBe("stopped");
+    expect(after.failureReason).toBe("merge_gate_failed");
+    expect(h2.monitor.pollCalls).toHaveLength(0);
   });
 });
