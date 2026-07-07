@@ -548,11 +548,34 @@ export class Orchestrator {
       }
       // 既存のオープン PR を採用。monitorStartedAt は既存値 ?? clock()。
       const monitorStartedAt = session.monitorStartedAt ?? this.clock();
+      // v4-B（ES-521）: HANDOFF 途中クラッシュ（rev-parse HEAD の記録前）で handoffHeadSha が
+      // NULL のまま採用される場合、worktree HEAD をバックフィルしてマージゲートの累積差分基点を
+      // 復元する。recoverByOpenPr に来るセッション（claimed/implementing/handing_off）は fix ターン
+      // （in_review/stopped 専用）を一度も経ていないため、worktree HEAD は push した head と一致する。
+      // 取得失敗は handoff() と同じフェイルオープン（NULL のまま = ゲートはスキップ）。
+      let handoffHeadShaPatch: { handoffHeadSha?: string } = {};
+      if (session.handoffHeadSha === null && session.worktreePath !== null) {
+        try {
+          const shaRes = await this.runner.run(
+            "git", ["-C", session.worktreePath, "rev-parse", "HEAD"],
+            { cwd: session.worktreePath, timeoutMs: 30_000 },
+          );
+          const sha = shaRes.stdout.trim();
+          if (shaRes.code === 0 && sha !== "") {
+            handoffHeadShaPatch = { handoffHeadSha: sha };
+          } else {
+            this.log(`recovery: rev-parse HEAD failed (exit ${shaRes.code}) — handoffHeadSha stays NULL, merge gate will skip (${session.linearIdentifier})`);
+          }
+        } catch (err) {
+          this.log(`recovery: rev-parse HEAD threw — handoffHeadSha stays NULL, merge gate will skip (${session.linearIdentifier}): ${errMsg(err)}`);
+        }
+      }
       this.store.updateSession(session.id, {
         runId: this.runId,
         prNumber,
         state: "in_review",
         monitorStartedAt,
+        ...handoffHeadShaPatch,
       });
       return await this.adoptAndMonitor(session, prNumber, monitorStartedAt);
     }
