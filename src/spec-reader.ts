@@ -108,8 +108,11 @@ export async function loadSpecContentAtRef(
   const dir = specDir.replace(/\/+$/, "");
   let fileList: string[];
   try {
+    // 非再帰: ls-tree --name-only（-r なし）はトップレベルのエントリのみ返す。サブディレクトリは
+    // 拡張子なしの名前で現れるため .md フィルタで自然に落ちる（working tree 版 readdirSync と同様、
+    // ネストした spec ファイルは注入対象に含めない）。
     const res = await runner.run(
-      "git", ["-C", worktreePath, "ls-tree", "-r", "--name-only", sha, "--", dir],
+      "git", ["-C", worktreePath, "ls-tree", "--name-only", sha, "--", dir],
       { cwd: worktreePath, timeoutMs: 30_000 },
     );
     if (res.code !== 0) return null;
@@ -117,9 +120,14 @@ export async function loadSpecContentAtRef(
   } catch {
     return null;
   }
-  const mdFiles = fileList.filter((p) => p.endsWith(".md"));
+  // working tree 版 loadSpecContent L66 と同一のドメイン仕様フィルタ規則（basename 比較。
+  // フルパスなので README.md / requirements.md は末尾一致で判定する）。
+  const mdFiles = fileList.filter((p) => {
+    const base = path.basename(p);
+    return p.endsWith(".md") && base !== "requirements.md" && base !== "README.md";
+  });
   const requirementsPath = `${dir}/requirements.md`;
-  if (!mdFiles.includes(requirementsPath)) return null;
+  if (!fileList.includes(requirementsPath)) return null;
 
   const show = async (p: string): Promise<string | null> => {
     try {
@@ -134,10 +142,12 @@ export async function loadSpecContentAtRef(
   };
 
   const requirements = await show(requirementsPath);
-  if (requirements === null) return null;
+  // 空仕様でグラウンディングしたことにしない — working tree 版 loadSpecContent の
+  // 空チェック（throw）に対応するフェイルオープン版（null → 呼び出し側が spec なしで判定続行）。
+  if (requirements === null || requirements.trim() === "") return null;
 
   const domainSpecs: SpecFile[] = [];
-  const domainPaths = mdFiles.filter((p) => p !== requirementsPath).sort();
+  const domainPaths = mdFiles.sort();
   for (const p of domainPaths) {
     const content = await show(p);
     if (content === null) return null;
