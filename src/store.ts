@@ -1293,6 +1293,14 @@ export class SqliteStore {
     }
   }
 
+  /** ES-521: セッションのゲート判定履歴（id 昇順）。fix attempt 上限の耐久カウントに使う。 */
+  getMergeGateLogsForSession(sessionId: number): MergeGateLogRow[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM merge_gate_log WHERE session_id = ? ORDER BY id ASC`)
+      .all(sessionId) as RawMergeGateLogRow[];
+    return rows.map(toMergeGateLogRow);
+  }
+
   // ---- design_review_log (ES-477) ----
   insertDesignReviewLog(s: {
     runId: number;

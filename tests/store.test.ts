@@ -1652,4 +1652,55 @@ describe("merge_gate_log (ES-514)", () => {
     const store = newStore();
     expect(() => store.getMergeGateLog(999)).toThrow("merge_gate_log not found");
   });
+
+  it("getMergeGateLogsForSession はセッションの行のみを id 昇順で返す", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const run = store.createRun(3, clock());
+    const s1 = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "ES-1",
+      issueTitle: "t",
+      branch: "b",
+      worktreePath: "/tmp/wt",
+      now: clock(),
+    });
+    const s2 = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-2",
+      linearIdentifier: "ES-2",
+      issueTitle: "t2",
+      branch: "b2",
+      worktreePath: "/tmp/wt2",
+      now: clock(),
+    });
+    const a = store.insertMergeGateLog({
+      runId: run.id,
+      sessionId: s1.id,
+      attempt: 1,
+      startedAt: clock(),
+    });
+    store.insertMergeGateLog({
+      runId: run.id,
+      sessionId: s2.id,
+      attempt: 1,
+      startedAt: clock(),
+    });
+    const b = store.insertMergeGateLog({
+      runId: run.id,
+      sessionId: s1.id,
+      attempt: 2,
+      startedAt: clock(),
+    });
+    store.updateMergeGateLog(a.id, {
+      verdict: "fail",
+      outcome: "fixed",
+    });
+
+    const logs = store.getMergeGateLogsForSession(s1.id);
+    expect(logs.map((l) => l.id)).toEqual([a.id, b.id]);
+    expect(logs[0].verdict).toBe("fail");
+    expect(logs[0].outcome).toBe("fixed");
+  });
 });
