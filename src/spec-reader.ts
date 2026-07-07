@@ -106,6 +106,11 @@ export async function loadSpecContentAtRef(
   runner: CommandRunner,
 ): Promise<SpecContent | null> {
   const dir = specDir.replace(/\/+$/, "");
+  // git ls-tree output strips the leading "./" from path arguments (e.g., the pathspec
+  // "./docs/specs/" returns "docs/specs/file.md", not "./docs/specs/file.md"). Normalize dir
+  // for path matching so requirementsPath matches what ls-tree actually returns. The original
+  // dir is still used for the pathspec to avoid changing git invocation behaviour.
+  const gitDir = dir === "." ? "" : dir.replace(/^\.\//, "");
   let fileList: string[];
   try {
     // 非再帰: ls-tree --name-only（-r なし）はトップレベルのエントリのみ返す。サブディレクトリは
@@ -128,7 +133,7 @@ export async function loadSpecContentAtRef(
     const base = path.basename(p);
     return p.endsWith(".md") && base !== "requirements.md" && base !== "README.md";
   });
-  const requirementsPath = `${dir}/requirements.md`;
+  const requirementsPath = gitDir ? `${gitDir}/requirements.md` : "requirements.md";
   if (!fileList.includes(requirementsPath)) return null;
 
   const show = async (p: string): Promise<string | null> => {
