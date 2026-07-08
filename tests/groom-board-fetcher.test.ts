@@ -386,4 +386,83 @@ describe("GroomBoardFetcher", () => {
     const ids = await fetcher.getNeedsHumanIssueIds("needs-human");
     expect(ids.size).toBe(0);
   });
+
+  // ---- getIssuesByLabel (ES-518) ----
+  // getBoardState は opt-in 必須フィルタのため scout-triage（非 opt-in）チケットが
+  // 盤面から欠落する。SCOUT の重複起票防止リストはこのメソッドで引く。
+  it("getIssuesByLabel returns issues carrying the label even without the opt-in label", async () => {
+    const scoutTriage = makeNode("id-1", "ES-10", stateIds.todo, { title: "Triage me", labels: ["scout", "scout-triage"] });
+    const optInScout = makeNode("id-2", "ES-11", stateIds.todo, { labels: [OPT_IN_LABEL, "scout"] });
+    const unrelated = makeNode("id-3", "ES-12", stateIds.todo, { labels: [OPT_IN_LABEL] });
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [scoutTriage, optInScout, unrelated], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    const result = await fetcher.getIssuesByLabel("scout");
+    expect(result).toEqual([
+      { identifier: "ES-10", title: "Triage me", labels: ["scout", "scout-triage"] },
+      { identifier: "ES-11", title: "Title ES-11", labels: [OPT_IN_LABEL, "scout"] },
+    ]);
+  });
+
+  it("getIssuesByLabel excludes done-state issues (fixed findings may be re-filed on regression)", async () => {
+    const doneScout = makeNode("id-1", "ES-20", stateIds.done, { labels: ["scout"] });
+    const openScout = makeNode("id-2", "ES-21", stateIds.todo, { labels: ["scout"] });
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [doneScout, openScout], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    const result = await fetcher.getIssuesByLabel("scout");
+    expect(result.map((r) => r.identifier)).toEqual(["ES-21"]);
+  });
+
+  it("getIssuesByLabel includes issues in unknown states (e.g. canceled) so human-rejected findings stay listed", async () => {
+    const canceled = makeNode("id-1", "ES-30", "s-canceled", { labels: ["scout"] });
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [canceled], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    const result = await fetcher.getIssuesByLabel("scout");
+    expect(result.map((r) => r.identifier)).toEqual(["ES-30"]);
+  });
+
+  it("getIssuesByLabel returns [] when no issue carries the label", async () => {
+    const node = makeNode("id-1", "ES-40", stateIds.todo, { labels: [OPT_IN_LABEL] });
+    const fetcher = new GroomBoardFetcher({
+      ...BASE_OPTS,
+      fetchFn: makeFetch({
+        issues: { nodes: [node], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    expect(await fetcher.getIssuesByLabel("scout")).toEqual([]);
+  });
+
+  it("getIssuesByLabel reuses the cached board fetch (no extra API call)", async () => {
+    let fetchCount = 0;
+    const countingFetch: FetchFn = async () => {
+      fetchCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: {
+            issues: {
+              nodes: [makeNode("id-1", "ES-50", stateIds.todo, { labels: ["scout"] })],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+      };
+    };
+    const fetcher = new GroomBoardFetcher({ ...BASE_OPTS, fetchFn: countingFetch });
+    await fetcher.getIssuesByLabel("scout");
+    await fetcher.getIssuesByLabel("scout-triage");
+    expect(fetchCount).toBe(1);
+  });
 });

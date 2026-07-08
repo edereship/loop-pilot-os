@@ -160,6 +160,68 @@ describe("GroomLinearClient.createIssue", () => {
   });
 });
 
+describe("GroomLinearClient.createIssue includeOptIn (ES-518)", () => {
+  // SCOUT の spec_mismatch 起票（opt-in なし = 即適格にしない）用。
+  it("omits the opt-in label when includeOptIn is false", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueCreate: { success: true, issue: { id: "i-90", identifier: "ES-90" } } } } },
+    ]);
+    const result = await makeClient(fetchFn).createIssue({
+      title: "T",
+      description: "D",
+      priority: 3,
+      extraLabelIds: ["label-scout", "label-scout-triage"],
+      includeOptIn: false,
+    });
+    expect(result).toBe("ES-90");
+    expect(calls[0].variables.labelIds).toEqual(["label-scout", "label-scout-triage"]);
+  });
+
+  // 呼び出し側の混乱で extras に opt-in が紛れても、includeOptIn: false なら必ず除去される
+  // （spec_mismatch を誤って即適格にしない構造的ガード）。
+  it("filters the opt-in label out of extraLabelIds even when includeOptIn is false", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueCreate: { success: true, issue: { id: "i-91", identifier: "ES-91" } } } } },
+    ]);
+    await makeClient(fetchFn).createIssue({
+      title: "T",
+      description: "D",
+      priority: 3,
+      extraLabelIds: ["label-optin", "label-scout"],
+      includeOptIn: false,
+    });
+    expect(calls[0].variables.labelIds).toEqual(["label-scout"]);
+  });
+
+  it("sends empty labelIds when includeOptIn is false and there are no extras", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueCreate: { success: true, issue: { id: "i-92", identifier: "ES-92" } } } } },
+    ]);
+    await makeClient(fetchFn).createIssue({
+      title: "T",
+      description: "D",
+      priority: 3,
+      includeOptIn: false,
+    });
+    expect(calls[0].variables.labelIds).toEqual([]);
+  });
+
+  // includeOptIn: true 明示は省略時（既存挙動）と同一であることを固定する。
+  it("behaves identically to the default when includeOptIn is true explicitly", async () => {
+    const { fetchFn, calls } = makeFetch([
+      { body: { data: { issueCreate: { success: true, issue: { id: "i-93", identifier: "ES-93" } } } } },
+    ]);
+    await makeClient(fetchFn).createIssue({
+      title: "T",
+      description: "D",
+      priority: 2,
+      extraLabelIds: ["label-extra"],
+      includeOptIn: true,
+    });
+    expect(calls[0].variables.labelIds).toEqual(["label-optin", "label-extra"]);
+  });
+});
+
 describe("GroomLinearClient.addLabels", () => {
   it("resolves label names to IDs from cache and sends issueAddLabel", async () => {
     const labels = new Map([["bug", "label-bug"], ["urgent", "label-urgent"]]);

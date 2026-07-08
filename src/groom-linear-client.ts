@@ -118,10 +118,20 @@ export class GroomLinearClient {
     return id;
   }
 
-  async createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string> {
-    const { extraLabelIds, ...rest } = fields;
+  async createIssue(fields: {
+    title: string;
+    description: string;
+    priority: number;
+    extraLabelIds?: string[];
+    // SCOUT の spec_mismatch 起票用（ES-518）。false で opt-in ラベルを付与しない
+    // （= 即適格にしない）。既定 true = GROOM の既存挙動不変。
+    includeOptIn?: boolean;
+  }): Promise<string> {
+    const { extraLabelIds, includeOptIn = true, ...rest } = fields;
+    // includeOptIn: false でも extras から opt-in ID を除去する（呼び出し側の混乱で
+    // spec_mismatch が誤って即適格になる事故を構造的に防ぐ）。
     const dedupedExtras = (extraLabelIds ?? []).filter((id) => id !== this.optInLabelId);
-    const labelIds = [this.optInLabelId, ...dedupedExtras];
+    const labelIds = includeOptIn ? [this.optInLabelId, ...dedupedExtras] : dedupedExtras;
     const data = await graphql<{ issueCreate: { success: boolean; issue: { id: string; identifier: string } | null } }>(
       this.fetchFn, this.apiKey, ISSUE_CREATE_MUTATION, {
         ...rest,

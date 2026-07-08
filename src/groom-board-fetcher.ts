@@ -253,4 +253,23 @@ export class GroomBoardFetcher {
         .map((n) => n.identifier),
     );
   }
+
+  /**
+   * 指定ラベル名が付いた issue の一覧（identifier / title / labels 名配列）を返す（ES-518）。
+   * getBoardState は opt-in ラベル必須フィルタのため scout-triage（非 opt-in）チケットが
+   * 盤面から欠落する — SCOUT の重複起票防止プロンプト注入はこちらで引く。
+   * done 状態のみ除外する（done = 修正済みは再発時の再起票が正当。canceled 等の
+   * 未知 state は人間が却下した所見の再起票を防ぐため一覧に残す）。
+   */
+  async getIssuesByLabel(label: string): Promise<Array<{ identifier: string; title: string; labels: string[] }>> {
+    const nodes = await this.ensureFetched();
+    return nodes
+      .filter((n) => n.state.id !== this.stateIds.done)
+      .filter((n) => n.labels.nodes.some((l) => l.name === label))
+      .map((n) => ({
+        identifier: n.identifier,
+        title: n.title,
+        labels: n.labels.nodes.map((l) => l.name),
+      }));
+  }
 }
