@@ -5,7 +5,6 @@ import path from "node:path";
 import process from "node:process";
 import { config as dotenvConfig } from "dotenv";
 
-import type { TicketState } from "./types.js";
 import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar } from "./config.js";
 import { SqliteStore } from "./store.js";
 import { RealCommandRunner } from "./exec.js";
@@ -13,7 +12,7 @@ import { ConsoleSlackNotifier } from "./notifier.js";
 import {
   LinearTaskSource,
   resolveLinearSetup,
-  type LinearSetupRequest,
+  buildLinearSetupRequest,
 } from "./task-source.js";
 import { GitPrManager } from "./git-pr.js";
 import { ClaudeAgentRunner, type RateLimitOpts } from "./agent-runner.js";
@@ -117,21 +116,8 @@ async function runLoop(configPath: string): Promise<number> {
       return EXIT_PREFLIGHT;
     }
 
-    // Linear の team/project/4状態/オプトインラベルを ID へ解決。
-    // config の camelCase 状態名 → TicketState キーへ写像して渡す。
-    const stateNames: Record<TicketState, string> = {
-      todo: config.linear.states.todo,
-      in_progress: config.linear.states.inProgress,
-      in_review: config.linear.states.inReview,
-      done: config.linear.states.done,
-    };
-    const setupRequest: LinearSetupRequest = {
-      teamKey: config.linear.team,
-      projectName: config.linear.project,
-      stateNames,
-      optInLabel: config.linear.optInLabel,
-      needsHumanLabel: config.linear.needsHumanLabel,
-    };
+    // Linear の team/project/4状態/ラベル（opt-in / needs-human / scout）を ID へ解決（ES-516）。
+    const setupRequest = buildLinearSetupRequest(config);
     const linearSetup = await resolveLinearSetup(
       config.linearApiKey,
       setupRequest,

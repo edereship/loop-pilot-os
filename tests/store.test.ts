@@ -1333,6 +1333,58 @@ describe("SqliteStore: idle timeout", () => {
     store.clearIdleStartedAt(run.id);
     expect(store.getRun(run.id).idleStartedAt).toBeNull();
   });
+
+  // ES-516: SCOUT 実行時間の idle 不算入用プリミティブ。
+  // clear→再set はゼロリセットになる（setIdleStartedAt は NULL ガード付き上書き不可）ため、
+  // タイムスタンプの前方シフトで「経過に数えない」を実現する。
+  it("advanceIdleStartedAt shifts the timestamp forward by deltaMs (ES-516)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 5 * 60_000);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:05:00.000Z");
+  });
+
+  it("advanceIdleStartedAt accumulates across calls", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 60_000);
+    store.advanceIdleStartedAt(run.id, 30_000);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:01:30.000Z");
+  });
+
+  it("advanceIdleStartedAt is a no-op when idle_started_at is null", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 60_000);
+    expect(store.getRun(run.id).idleStartedAt).toBeNull();
+  });
+
+  it("advanceIdleStartedAt throws for an unknown run id", () => {
+    const store = newStore();
+    expect(() => store.advanceIdleStartedAt(999, 60_000)).toThrow(
+      /run not found/,
+    );
+  });
+
+  it("advanceIdleStartedAt is a no-op for deltaMs = 0 or negative (ES-516)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 0);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, -60_000);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:00:00.000Z");
+  });
+
+  it("advanceIdleStartedAt is a no-op for a corrupt stored timestamp (ES-516)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "not-a-timestamp");
+    expect(() => store.advanceIdleStartedAt(run.id, 60_000)).not.toThrow();
+    expect(store.getRun(run.id).idleStartedAt).toBe("not-a-timestamp");
+  });
 });
 
 describe("design_review_log CRUD (ES-477)", () => {
@@ -1739,5 +1791,82 @@ describe("merge_gate_log (ES-514)", () => {
     expect(logs.map((l) => l.id)).toEqual([a.id, b.id]);
     expect(logs[0].verdict).toBe("fail");
     expect(logs[0].outcome).toBe("fixed");
+  });
+});
+
+describe("scout_log CRUD (ES-516)", () => {
+  it("inserts a scout log row with fired_at and null defaults", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const row = store.insertScoutLog({
+      runId: run.id,
+      firedAt: "2026-07-08T01:00:00.000Z",
+    });
+    expect(row.runId).toBe(run.id);
+    expect(row.firedAt).toBe("2026-07-08T01:00:00.000Z");
+    expect(row.endedAt).toBeNull();
+    expect(row.candidates).toBeNull();
+    expect(row.verdicts).toBeNull();
+    expect(row.createdIssueIdentifiers).toBeNull();
+    expect(row.outcome).toBeNull();
+    expect(row.costUsd).toBeNull();
+    expect(row.errorDetail).toBeNull();
+  });
+
+  it("updates scout log fields via partial patch", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const row = store.insertScoutLog({
+      runId: run.id,
+      firedAt: "2026-07-08T01:00:00.000Z",
+    });
+    store.updateScoutLog(row.id, {
+      endedAt: "2026-07-08T01:20:00.000Z",
+      candidates: JSON.stringify([{ title: "flaky test", evidence_type: "objective" }]),
+      verdicts: JSON.stringify([{ verdict: "accept" }]),
+      createdIssueIdentifiers: JSON.stringify(["ES-999"]),
+      outcome: "completed",
+      costUsd: 1.23,
+    });
+    const updated = store.getScoutLog(row.id);
+    expect(updated.endedAt).toBe("2026-07-08T01:20:00.000Z");
+    expect(updated.candidates).toContain("flaky test");
+    expect(updated.verdicts).toContain("accept");
+    expect(updated.createdIssueIdentifiers).toBe(JSON.stringify(["ES-999"]));
+    expect(updated.outcome).toBe("completed");
+    expect(updated.costUsd).toBe(1.23);
+    expect(updated.errorDetail).toBeNull();
+  });
+
+  it("updateScoutLog rejects unknown patch keys", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const row = store.insertScoutLog({
+      runId: run.id,
+      firedAt: "2026-07-08T01:00:00.000Z",
+    });
+    expect(() =>
+      store.updateScoutLog(row.id, { bogus: 1 } as never),
+    ).toThrow(/unknown patch key/);
+  });
+
+  it("getScoutLog throws for a missing id", () => {
+    const store = newStore();
+    expect(() => store.getScoutLog(999)).toThrow(/scout_log not found/);
+  });
+
+  it("latestScoutFiredAt returns null when scout has never run", () => {
+    const store = newStore();
+    expect(store.latestScoutFiredAt()).toBeNull();
+  });
+
+  it("latestScoutFiredAt returns the max fired_at across runs", () => {
+    const store = newStore();
+    const run1 = store.createRun(3, "2026-07-07T00:00:00.000Z");
+    const run2 = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.insertScoutLog({ runId: run1.id, firedAt: "2026-07-07T05:00:00.000Z" });
+    store.insertScoutLog({ runId: run2.id, firedAt: "2026-07-08T09:00:00.000Z" });
+    store.insertScoutLog({ runId: run2.id, firedAt: "2026-07-08T03:00:00.000Z" });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T09:00:00.000Z");
   });
 });

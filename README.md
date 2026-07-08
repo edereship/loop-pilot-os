@@ -144,6 +144,13 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `memory.inject_budget_chars` | プロンプト注入時のメモリバジェット（既定 6000。カテゴリ均等配分でトランケーション） |
 | `digest.recent_merged_count` | プロンプトに含める直近マージ済みセッション要約の件数 |
 | `notify.progress` | `true` で各チケットの着手/完了を Slack にも通知（既定 `false`・コンソールログは常時出力） |
+| `scout.enabled` | idle 時の自律バグ発見・自動起票（SCOUT・v4-A）の有効/無効（既定 `false`。有効化には Linear に scout / scout-triage ラベルの作成が必要） |
+| `scout.idle_minutes` | SCOUT 発火に必要な連続 idle 時間（既定 30 分） |
+| `scout.min_interval_hours` | 前回 SCOUT 実行からの最小間隔（既定 24 時間） |
+| `scout.max_issues_per_scout` | 1 回の SCOUT で起票できる上限（既定 3 件） |
+| `linear.scout_label` | SCOUT 起票チケットに付与する出所ラベル名（既定 `scout`） |
+| `linear.scout_triage_label` | spec_mismatch 候補の人間トリアージ用ラベル名（既定 `scout-triage`・SELECT 対象外） |
+| `safety.max_cost_usd_per_scout` | SCOUT 探索（Claude）のコスト上限（既定 $2） |
 
 #### model × effort 対応表
 

@@ -27,6 +27,8 @@ const rawSchema = z.object({
     project: z.string(),
     opt_in_label: z.string(),
     needs_human_label: z.string().default("needs-human"),
+    scout_label: z.string().default("scout"),
+    scout_triage_label: z.string().default("scout-triage"),
     states: z.object({
       todo: z.string(),
       in_progress: z.string(),
@@ -118,6 +120,7 @@ const rawSchema = z.object({
     merge_gate_timeout_minutes: z.number().positive().default(15),
     max_merge_gate_fix_attempts: z.number().int().positive().default(2),
     max_cost_usd_per_merge_gate_fix: z.number().positive().default(2),
+    max_cost_usd_per_scout: z.number().positive().default(2),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -148,6 +151,14 @@ const rawSchema = z.object({
     enabled: z.boolean().default(true),
     run_recipe: z.string().default(""),
   }).strict().optional(),
+  // SCOUT（v4-A 自律バグ発見・ES-516）。enabled 既定 false = 明示オプトイン
+  // （true にはリポの Linear に scout / scout-triage ラベルの作成が必要なため）。
+  scout: z.object({
+    enabled: z.boolean().default(false),
+    idle_minutes: z.number().int().positive().default(30),
+    min_interval_hours: z.number().positive().default(24),
+    max_issues_per_scout: z.number().int().positive().default(3),
+  }).strict().optional(),
   rate_limit: z.object({
     reprobe_minutes: z.number().positive().default(15),
     cap_hours: z.number().positive().default(6),
@@ -175,6 +186,8 @@ export interface Config {
     project: string;
     optInLabel: string;
     needsHumanLabel: string;
+    scoutLabel: string;
+    scoutTriageLabel: string;
     states: {
       todo: string;
       inProgress: string;
@@ -240,6 +253,7 @@ export interface Config {
     mergeGateTimeoutMinutes: number;
     maxMergeGateFixAttempts: number;
     maxCostUsdPerMergeGateFix: number;
+    maxCostUsdPerScout: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -269,6 +283,12 @@ export interface Config {
   verify: {
     enabled: boolean;
     runRecipe: string;
+  };
+  scout: {
+    enabled: boolean;
+    idleMinutes: number;
+    minIntervalHours: number;
+    maxIssuesPerScout: number;
   };
   rateLimit: {
     reprobeMinutes: number;
@@ -840,6 +860,8 @@ export function loadConfig(
       project: raw.linear.project,
       optInLabel: raw.linear.opt_in_label,
       needsHumanLabel: raw.linear.needs_human_label,
+      scoutLabel: raw.linear.scout_label,
+      scoutTriageLabel: raw.linear.scout_triage_label,
       states: {
         todo: raw.linear.states.todo,
         inProgress: raw.linear.states.in_progress,
@@ -917,6 +939,7 @@ export function loadConfig(
       mergeGateTimeoutMinutes: raw.safety.merge_gate_timeout_minutes,
       maxMergeGateFixAttempts: raw.safety.max_merge_gate_fix_attempts,
       maxCostUsdPerMergeGateFix: raw.safety.max_cost_usd_per_merge_gate_fix,
+      maxCostUsdPerScout: raw.safety.max_cost_usd_per_scout,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,
@@ -946,6 +969,12 @@ export function loadConfig(
     verify: {
       enabled: raw.verify?.enabled ?? true,
       runRecipe: raw.verify?.run_recipe ?? "",
+    },
+    scout: {
+      enabled: raw.scout?.enabled ?? false,
+      idleMinutes: raw.scout?.idle_minutes ?? 30,
+      minIntervalHours: raw.scout?.min_interval_hours ?? 24,
+      maxIssuesPerScout: raw.scout?.max_issues_per_scout ?? 3,
     },
     rateLimit: {
       reprobeMinutes: raw.rate_limit?.reprobe_minutes ?? 15,

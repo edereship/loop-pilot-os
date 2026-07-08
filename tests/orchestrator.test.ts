@@ -67,6 +67,7 @@ function makeConfig(over: Partial<{
       mergeGateTimeoutMinutes: 15,
       maxMergeGateFixAttempts: 2,
       maxCostUsdPerMergeGateFix: 2,
+      maxCostUsdPerScout: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -79,8 +80,9 @@ function makeConfig(over: Partial<{
     mergeGate: { enabled: true },
     selfReview: { enabled: true },
     verify: { enabled: true, runRecipe: "" },
+    scout: { enabled: false, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
-    linear: { optInLabel: "looppilot-os", needsHumanLabel: "needs-human", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
+    linear: { optInLabel: "looppilot-os", needsHumanLabel: "needs-human", scoutLabel: "scout", scoutTriageLabel: "scout-triage", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
     pm: undefined,
   } as unknown as Config;
 }

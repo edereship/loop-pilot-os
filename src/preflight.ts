@@ -1,7 +1,7 @@
-import type { CommandRunner, CommandResult, Notifier, TicketState } from "./types.js";
+import type { CommandRunner, CommandResult, Notifier } from "./types.js";
 import type { Config } from "./config.js";
-import type { FetchFn, LinearSetupRequest } from "./task-source.js";
-import { resolveLinearSetup } from "./task-source.js";
+import type { FetchFn } from "./task-source.js";
+import { resolveLinearSetup, buildLinearSetupRequest } from "./task-source.js";
 import { checkCodexAvailability } from "./codex-planner.js";
 
 export interface PreflightDeps {
@@ -1449,20 +1449,8 @@ async function checkStateCommentAuthors(
 // ---- §9.7 Linear 解決 ----
 async function checkLinear(deps: PreflightDeps, errors: string[]): Promise<void> {
   const { config, fetchFn } = deps;
-  // config.linear.states は camelCase。resolveLinearSetup の stateNames は TicketState キー。明示写像する。
-  const stateNames: Record<TicketState, string> = {
-    todo: config.linear.states.todo,
-    in_progress: config.linear.states.inProgress,
-    in_review: config.linear.states.inReview,
-    done: config.linear.states.done,
-  };
-  const req: LinearSetupRequest = {
-    teamKey: config.linear.team,
-    projectName: config.linear.project,
-    stateNames,
-    optInLabel: config.linear.optInLabel,
-    needsHumanLabel: config.linear.needsHumanLabel,
-  };
+  // ラベル解決対象は buildLinearSetupRequest が決める（scout.enabled 時は scout ラベルも必須・ES-516）。
+  const req = buildLinearSetupRequest(config);
   try {
     // resolveLinearSetup: viewer 取得（APIキー検証）/ team・project・4状態・opt_in_label の解決。
     // いずれか解決不能なら欠落を 1 回でまとめて throw する契約（task-source.ts）。

@@ -51,6 +51,7 @@ function makeConfig(over: Partial<{
       verifyTimeoutMinutes: 15,
       maxRecoveryAttempts: 2,
       transientRetryAttempts: 2,
+      maxCostUsdPerScout: 2,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -62,6 +63,7 @@ function makeConfig(over: Partial<{
     mergeGate: { enabled: true },
     selfReview: { enabled: true },
     verify: { enabled: true, runRecipe: "" },
+    scout: { enabled: false, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
   } as unknown as Config;
 }
