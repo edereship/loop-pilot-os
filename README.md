@@ -29,6 +29,9 @@ per-task ライフサイクル（状態機械、仕様 §5）:
 ```
 GROOM ─→ SELECT ─→ CLAIM ─→ DESIGN ─→ DESIGN REVIEW ─→ IMPLEMENT ─→ SELF-REVIEW ─→ VERIFY ─→ HANDOFF ─→ MONITOR ─→ DONE
   │         │         │         │            │               │              │             │          │          │
+  │         │         │         │            │               │              │             │          │          ├─ merge gate（マージ直前・v4-B）: 累積ドリフトを Codex 判定
+  │         │         │         │            │               │              │             │          │          │    skip（ドリフトなし）／ fail → fix ループ（上限 max_merge_gate_fix_attempts）
+  │         │         │         │            │               │              │             │          │          │      └─ 超過 → STOPPED(merge_gate_failed) → park（PR保持・needs-human・ループ継続）
   │         │         │         │            │               │              │             │          │          └─ stopped/closed → ポリシー振り分け
   │         │         │         │            │               │              │             │          │               halt / recover / abandon
   │         │         │         │            │               │              │             │          └─ push/ラベル/遷移 失敗 → STOPPED → HALT
@@ -53,6 +56,7 @@ GROOM ─→ SELECT ─→ CLAIM ─→ DESIGN ─→ DESIGN REVIEW ─→ IMPLE
 - **VERIFY**（v3.5）: SELF-REVIEW 後・HANDOFF 前の受け入れ検証ゲート。**2 アクター構造**で自己採点を避ける: **証拠収集 = Claude（IMPLEMENT とは別セッション）**が build/test/型/lint を実行し結果を収集、**合否判定 = Codex（ブロッキング裁定）**が客観オラクル ＋ acceptance 基準への適合を判定。両方 OK で pass。fail 時は reasons を添えて IMPLEMENT へ差し戻し（fix ループ、最大 `max_verify_attempts` 回、既定 2）。尽きたら `verify_failed` → abandon。fail-open: 検証器の例外・コスト超・パース失敗は pass 扱い（検証器の不調でループを止めない）。`verify.enabled = false` で無効化可能。`verify.run_recipe` を設定するとアプリ実起動まで拡張（未設定時は軽量モードに縮退）。
 - **HANDOFF**: push → PR 作成（ready-for-review・**draft 不可**）→ PR 番号を即永続化 → `loop-pilot` ラベル付与 → Linear を In Review に。一時的ネットワークエラーは操作ごとに `transient_retry_attempts` 回リトライ（既定 2 回＝計 3 試行）。
 - **MONITOR**: `looppilot-state` 隠しコメント + PR の merged を一定間隔でポーリング。監視中は PR/ブランチに書き込まない（マージを除く）。
+- **MERGE GATE**（v4-B）: マージ直前（readiness ready 後・mergePr 直前）に、HANDOFF 時点〜マージ候補 head の累積 diff を Codex が原仕様（handoff 時点の trusted ref から読む）と照合。LoopPilot 中コミットが無ければスキップ（クリーン PR の所要時間は不変）。fail 時は violations を注入した fix_code 固定の自動修正 → CI 再通過 → 再ゲート（上限 `max_merge_gate_fix_attempts`、既定 2。attempt は merge_gate_log の fail 行数で耐久カウント）。超過で park。検証器の不調（fetch/Codex/パース失敗）は pass 扱い + 警告ログ（フェイルオープン）。`merge_gate.enabled = false` で無効化可能。
 - **DONE**: `merged` を先に永続化 → Linear を Done に（best-effort・既 Done 許容）→ 次の SELECT へ。
 
 ## 必要環境
@@ -242,7 +246,7 @@ docs/memory/
 
 ## 失敗時の見方（`failure_reason` 一覧）
 
-セッションが STOPPED すると、**失敗ポリシー**に応じて halt / recover / abandon に振り分けられます。`status` の `failure_reason` で原因が分かります。13 種すべて（カーネル §2 / 仕様 §7）:
+セッションが STOPPED すると、**失敗ポリシー**に応じて halt / recover / abandon / park に振り分けられます。`status` の `failure_reason` で原因が分かります。14 種すべて（カーネル §2 / 仕様 §7）:
 
 | failure_reason | 意味（どのフェーズで・何が起きたか） | ポリシー | 主な人間の対処 |
 | -- | -- | -- | -- |
@@ -259,18 +263,20 @@ docs/memory/
 | `workflow_setup_failed` | MONITOR 中のワークフロー回復が例外・上限到達・回復不能で失敗 | **halt** | ワークフロー回復ログ・fix-agent の出力を確認 |
 | `design_rejected` | DESIGN REVIEW で `max_design_review_attempts` 回の再設計後も Codex が approve しなかった | **abandon** | `needs-human` ラベルを外すと再投入。チケットの曖昧さ・スコープを見直す |
 | `verify_failed` | VERIFY ゲートで `max_verify_attempts` 回の再実装後も合格しなかった。`stop_detail` に最後の fail reasons | **abandon** | `needs-human` ラベルを外すと再投入。実装方針・acceptance 基準を見直す |
+| `merge_gate_failed` | MONITOR のマージ直前ゲートで違反検出が `max_merge_gate_fix_attempts` 回の自動修正後も解消しなかった。`stop_detail` に violations（`merge_gate:` プレフィックス） | **park** | PR はオープンのまま保持。PR/Linear の理由コメントを確認し、手動マージするか修正を指示。再投入（needs-human 除去 + Todo 戻し）は新規ブランチ・新規 PR で走る点に注意 |
 
 ※ `ci_failed` かつ `stop_detail` が `"merge blocked by branch protection"` で始まる場合は **halt**（CI コードに修正対象がなく、ブランチ保護ルールの変更が必要）。
 
 `stop_detail` 列に追加文脈（LoopPilot の stopReason、例外メッセージ、ブロック理由、回復時の手動掃除対象など）が入ります。
 
-### 失敗ポリシー表（v3.5）
+### 失敗ポリシー表（v4）
 
 | ポリシー | 動き |
 | -- | -- |
 | **halt** | ループを停止し人間に通知。インフラ異常や復旧不能な問題に対応 |
 | **recover** | CI ログを取得し Codex 分析 → Claude 自動修正を `max_recovery_attempts`（既定 2）回まで試行。尽きたら abandon |
 | **abandon** | worktree 破棄・チケットを Todo に復帰（PR 前）、または PR クローズ・ブランチ削除（PR 後）。`needs-human` ラベル＋理由コメントを付与し SELECT から除外。ラベルを外すと再投入される。ループは次タスクへ継続 |
+| **park** | PR・ブランチを**保持したまま**セッションを終端し `needs-human` ラベル＋理由コメント（Linear/PR 両方）を付与、`merge_gate_parked` を通知。ループは次タスクへ継続。レビュー済み成果物を捨てない（abandon との違い） |
 
 ## 回復の挙動（再起動時）
 

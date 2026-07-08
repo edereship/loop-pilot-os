@@ -2,7 +2,7 @@
 
 **Date**: 2026-07-05
 **Milestone**: [v4 自律品質レイヤ](https://linear.app/edereship/project/looppilot-os-7a8262819c6f)（B側）
-**Status**: Draft (awaiting user review)
+**Status**: Implemented & E2E-verified (2026-07-08)
 
 ## 背景 / 問題
 
@@ -104,12 +104,12 @@ fail → Claude 修正ターン（violations 注入・worktree で修正 → pus
 
 v4 内では **B（本 spec）→ A（SCOUT）** の順（マイルストーン推奨どおり。単一チョークポイントで表面積が小さく確度が高い）。
 
-## オープン項目（実装計画時に確定）
+## オープン項目の解決状況（2026-07-08 E2E 完了時点）
 
-- **修正 push と外部 LoopPilot の相互作用**: B ゲートの修正コミット push が LoopPilot ワークフローを再トリガーし `looppilot-state` が done から巻き戻る場合の扱い。オーケ側に state リセット機構はない（monitor.ts は read-only 観測のみ）ため、再トリガーされる場合は done 再待機に乗せる方向（§4 参照）。実装計画時に LoopPilot 側のトリガー条件を確認して確定する
-- **再ゲート待ち中間状態の耐久マーカー**: 「修正 push 済み・CI/再ゲート待ち」の途中でクラッシュした場合、マーカーなしでは再起動時にゲート判定からやり直しになる（判定は冪等なので安全側だが、fix attempt カウントが揮発すると上限 2 回を超えて修正しうる）。attempt カウントの永続化要否を確定する
-- テストファイル「大幅縮小」の閾値（行数削減率）と、テスト認識パターンの具体形
-- 設定ファイル既知パターンの一覧と config での上書き可否
-- TS export diff の実装方式（tsc API / 軽量パーサ）
-- `safety.max_cost_usd_per_merge_gate_fix` の既定値
-- status CLI での表示形式
+- **修正 push と外部 LoopPilot の相互作用**: **確定**。LoopPilot workflow のトリガーは `issue_comment` / `pull_request_review` イベントのみで、**ブランチへの push では再発火しない**（ドリフト push・fix push とも再トリガーなし。`gh run list` で確認）。したがって `looppilot-state` は done のまま**巻き戻らない** — 再ゲートは `monitorSession` の既存 done 据え置きポーリングで自然に成立し、done 再待機の特別処理は不要だった。stale readiness ガード（`lastFixedHeadSha`）の発動は観測されなかった（gh は fix push 後の新 head を最初の readiness 照会から返した。ガードは無害に待機）（2026-07-08 E2E・PR racoma-dev/loop-pilot-os-e2e#28/#29 で実測）
+- **再ゲート待ち中間状態の耐久マーカー**: **解決済み（ES-521）**。attempt は `merge_gate_log` の fail 判定行数から導出する設計のため専用マーカーは不要。fix 失敗も fail 行の蓄積で park に有界収束する（E2E park シナリオ ES-529/PR #29 で実測: fail→fix(cost_exceeded)→outcome=error→再ゲート fail(attempt2)→park）
+- テストファイル「大幅縮小」の閾値（行数削減率）と、テスト認識パターンの具体形 → **ES-515 実装値で確定**（`src/breaking-signals.ts` 参照）
+- 設定ファイル既知パターンの一覧と config での上書き可否 → **ES-515 実装値で確定**（`src/breaking-signals.ts` 参照）
+- TS export diff の実装方式（tsc API / 軽量パーサ）→ **軽量パーサで確定（ES-515）**
+- `safety.max_cost_usd_per_merge_gate_fix` の既定値 → **$2 で確定（ES-514）**
+- status CLI での表示形式 → **未対応のまま（フォローアップ）**
