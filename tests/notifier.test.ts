@@ -358,3 +358,15 @@ describe("formatNotifyEvent merge_gate_parked (ES-514)", () => {
     ).toBe("🚧 マージ保留 (needs-human): ES-999 PR #42 — 公開 export の削除を検出");
   });
 });
+
+describe("formatNotifyEvent scout_completed (ES-516)", () => {
+  it("formats scout_completed with created/objective/triage counts", () => {
+    const text = formatNotifyEvent({
+      kind: "scout_completed",
+      createdCount: 3,
+      objectiveCount: 2,
+      triageCount: 1,
+    });
+    expect(text).toBe("🔍 SCOUT: 3 件起票（objective 2 / triage 1）");
+  });
+});

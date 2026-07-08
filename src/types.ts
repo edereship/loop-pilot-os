@@ -182,7 +182,8 @@ export type NotifyEvent =
   | { kind: "recovery_started"; identifier: string; reason: string }
   | { kind: "recovery_succeeded"; identifier: string; action: string }
   | { kind: "task_skipped"; identifier: string; reason: string; detail: string }
-  | { kind: "merge_gate_parked"; identifier: string; prNumber: number; detail: string }; // ES-514: マージゲート上限超過でPR保留
+  | { kind: "merge_gate_parked"; identifier: string; prNumber: number; detail: string } // ES-514: マージゲート上限超過でPR保留
+  | { kind: "scout_completed"; createdCount: number; objectiveCount: number; triageCount: number }; // ES-516: SCOUT 起票あり（0件時は呼び出し側が emit しない = ノイズ抑制）
 export interface Notifier {
   notify(event: NotifyEvent): Promise<void>;  // コンソールは必ず成功。Slack失敗でも throw しない
   /** プリフライト専用: Slack設定時は Webhook へ直接POSTし非2xxで throw。未設定なら即resolve */
