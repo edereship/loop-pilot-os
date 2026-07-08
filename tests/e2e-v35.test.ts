@@ -61,6 +61,7 @@ function makeConfig(over: Partial<{
       verifyTimeoutMinutes: 15,
       maxRecoveryAttempts: over.maxRecoveryAttempts ?? 2,
       transientRetryAttempts: over.transientRetryAttempts ?? 2,
+      maxCostUsdPerScout: 2,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300, idleTimeoutMinutes: 120 },
     looppilot: { gateLabel: "loop-pilot" },
@@ -69,8 +70,9 @@ function makeConfig(over: Partial<{
     mergeGate: { enabled: true },
     selfReview: { enabled: true },
     verify: { enabled: true, runRecipe: "" },
+    scout: { enabled: false, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
-    linear: { optInLabel: "looppilot-os", needsHumanLabel: "needs-human", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
+    linear: { optInLabel: "looppilot-os", needsHumanLabel: "needs-human", scoutLabel: "scout", scoutTriageLabel: "scout-triage", team: "ENG", project: "LoopPilot", states: { todo: "Todo", inProgress: "In Progress", inReview: "In Review", done: "Done" } },
     pm: undefined,
   } as unknown as Config;
 }

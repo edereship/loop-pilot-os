@@ -679,6 +679,37 @@ describe("resolveLinearSetup", () => {
       /opt_in_label and scout_triage_label must be different/,
     );
   });
+
+  // ES-516 レビュー反映: 衝突は最初の1件で止めず、全ペアを収集して一括報告する。
+  it("reports all label collisions when multiple pairs clash simultaneously", async () => {
+    const { fetchFn, calls } = makeFetch([]);
+    const err = await resolveLinearSetup(
+      "lin_api_test",
+      {
+        teamKey: "TY",
+        projectName: "LoopPilot OS",
+        stateNames: {
+          todo: "Todo",
+          in_progress: "In Progress",
+          in_review: "In Review",
+          done: "Done",
+        },
+        optInLabel: "same1",
+        needsHumanLabel: "same1",
+        scoutLabel: "same2",
+        scoutTriageLabel: "same2",
+      },
+      fetchFn,
+    ).then(
+      () => {
+        throw new Error("resolveLinearSetup unexpectedly succeeded");
+      },
+      (e: Error) => e,
+    );
+    expect(err.message).toContain("opt_in_label and needs_human_label");
+    expect(err.message).toContain("scout_label and scout_triage_label");
+    expect(calls).toHaveLength(0);
+  });
 });
 
 const configFixtureEnv: NodeJS.ProcessEnv = {

@@ -301,7 +301,7 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
     expect(reasons).toHaveLength(5);
   });
 
-  it("NotifyEvent は kind で 9 バリアント（halted/idle/run_started/task_started/task_merged/quota_waiting/quota_resumed/paused/resumed）を判別できる（仕様 §10）", () => {
+  it("NotifyEvent は kind で 14 バリアント（halted/idle/run_started/task_started/task_merged/quota_waiting/quota_resumed/paused/resumed/recovery_started/recovery_succeeded/task_skipped/merge_gate_parked/scout_completed）を判別できる（仕様 §10・ES-516）", () => {
     const events = [
       { kind: "halted", reason: "task_cap", detail: "limit reached" },
       { kind: "idle", detail: "queue empty" },
@@ -312,10 +312,20 @@ describe("判別可能ユニオン（カーネル §2 / 仕様 §5-§6）", () =
       { kind: "quota_resumed", detail: "d" },
       { kind: "paused", target: "claude", detail: "d" },
       { kind: "resumed", target: "codex", detail: "d" },
+      { kind: "recovery_started", identifier: "TY-1", reason: "ci_failed" },
+      { kind: "recovery_succeeded", identifier: "TY-1", action: "fix_code" },
+      { kind: "task_skipped", identifier: "TY-1", reason: "abandon", detail: "PR closed" },
+      { kind: "merge_gate_parked", identifier: "TY-1", prNumber: 42, detail: "fix budget exceeded" },
+      { kind: "scout_completed", createdCount: 2, objectiveCount: 1, triageCount: 1 },
     ] as const satisfies readonly NotifyEvent[];
     const kinds = events.map((e) => e.kind);
-    expect(kinds).toEqual(["halted", "idle", "run_started", "task_started", "task_merged", "quota_waiting", "quota_resumed", "paused", "resumed"]);
-    expect(kinds).toHaveLength(9);
+    expect(kinds).toEqual([
+      "halted", "idle", "run_started", "task_started", "task_merged",
+      "quota_waiting", "quota_resumed", "paused", "resumed",
+      "recovery_started", "recovery_succeeded", "task_skipped",
+      "merge_gate_parked", "scout_completed",
+    ]);
+    expect(kinds).toHaveLength(14);
   });
 });
 

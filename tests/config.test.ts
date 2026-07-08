@@ -850,5 +850,13 @@ describe("loadConfig", () => {
         loadConfig(fixture("config-scout-unknown-key.toml"), fullEnv),
       ).toThrow(/scout/);
     });
+
+    it("fills zod defaults for keys omitted from a partial [scout] section", () => {
+      const config = loadConfig(fixture("config-scout-partial.toml"), fullEnv);
+      expect(config.scout.enabled).toBe(true);
+      expect(config.scout.idleMinutes).toBe(30);
+      expect(config.scout.minIntervalHours).toBe(24);
+      expect(config.scout.maxIssuesPerScout).toBe(3);
+    });
   });
 });

@@ -346,7 +346,7 @@ export interface ScoutLogRow {
   endedAt: string | null;
   candidates: string | null;       // Stage 1（Claude 探索）候補の JSON
   verdicts: string | null;         // Stage 2（Codex 検証）裁定の JSON
-  createdIssueIds: string | null;  // 起票した issue identifier の JSON 配列
+  createdIssueIdentifiers: string | null;  // 起票した issue の Linear identifier（"ES-123" 形式。UUID の issueId ではない）の JSON 配列
   outcome: ScoutOutcome | null;
   costUsd: number | null;          // Stage 1（Claude）の実測コスト
   errorDetail: string | null;

@@ -1367,6 +1367,24 @@ describe("SqliteStore: idle timeout", () => {
       /run not found/,
     );
   });
+
+  it("advanceIdleStartedAt is a no-op for deltaMs = 0 or negative (ES-516)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 0);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, -60_000);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:00:00.000Z");
+  });
+
+  it("advanceIdleStartedAt is a no-op for a corrupt stored timestamp (ES-516)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "not-a-timestamp");
+    expect(() => store.advanceIdleStartedAt(run.id, 60_000)).not.toThrow();
+    expect(store.getRun(run.id).idleStartedAt).toBe("not-a-timestamp");
+  });
 });
 
 describe("design_review_log CRUD (ES-477)", () => {
@@ -1789,7 +1807,7 @@ describe("scout_log CRUD (ES-516)", () => {
     expect(row.endedAt).toBeNull();
     expect(row.candidates).toBeNull();
     expect(row.verdicts).toBeNull();
-    expect(row.createdIssueIds).toBeNull();
+    expect(row.createdIssueIdentifiers).toBeNull();
     expect(row.outcome).toBeNull();
     expect(row.costUsd).toBeNull();
     expect(row.errorDetail).toBeNull();
@@ -1806,7 +1824,7 @@ describe("scout_log CRUD (ES-516)", () => {
       endedAt: "2026-07-08T01:20:00.000Z",
       candidates: JSON.stringify([{ title: "flaky test", evidence_type: "objective" }]),
       verdicts: JSON.stringify([{ verdict: "accept" }]),
-      createdIssueIds: JSON.stringify(["ES-999"]),
+      createdIssueIdentifiers: JSON.stringify(["ES-999"]),
       outcome: "completed",
       costUsd: 1.23,
     });
@@ -1814,7 +1832,7 @@ describe("scout_log CRUD (ES-516)", () => {
     expect(updated.endedAt).toBe("2026-07-08T01:20:00.000Z");
     expect(updated.candidates).toContain("flaky test");
     expect(updated.verdicts).toContain("accept");
-    expect(updated.createdIssueIds).toBe(JSON.stringify(["ES-999"]));
+    expect(updated.createdIssueIdentifiers).toBe(JSON.stringify(["ES-999"]));
     expect(updated.outcome).toBe("completed");
     expect(updated.costUsd).toBe(1.23);
     expect(updated.errorDetail).toBeNull();

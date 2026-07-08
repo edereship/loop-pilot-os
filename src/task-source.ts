@@ -448,14 +448,18 @@ export async function resolveLinearSetup(
   if (req.scoutTriageLabel !== undefined) {
     labelEntries.push(["scout_triage_label", req.scoutTriageLabel]);
   }
+  const conflicts: string[] = [];
   for (let i = 0; i < labelEntries.length; i++) {
     for (let j = i + 1; j < labelEntries.length; j++) {
       if (labelEntries[i][1] === labelEntries[j][1]) {
-        throw new Error(
-          `Linear setup: ${labelEntries[i][0]} and ${labelEntries[j][0]} must be different (both are "${labelEntries[i][1]}")`,
+        conflicts.push(
+          `${labelEntries[i][0]} and ${labelEntries[j][0]} must be different (both are "${labelEntries[i][1]}")`,
         );
       }
     }
+  }
+  if (conflicts.length > 0) {
+    throw new Error(`Linear setup: ${conflicts.join("; ")}`);
   }
 
   // Phase 1: viewer + team keys のみ（軽量クエリ）
@@ -496,16 +500,16 @@ export async function resolveLinearSetup(
     fetchAllWorkspaceLabels(fetchFn, apiKey, data.issueLabels),
   ]);
 
-  const label =
-    teamLabels.find((l) => l.name === req.optInLabel) ??
-    wsLabels.find((l) => l.name === req.optInLabel);
+  // ラベル名 → エントリ解決（team スコープ優先、次に workspace スコープ）。4 ラベル共通。
+  const findLabel = (name: string) =>
+    teamLabels.find((l) => l.name === name) ?? wsLabels.find((l) => l.name === name);
+
+  const label = findLabel(req.optInLabel);
   if (!label) {
     missing.push(`label "${req.optInLabel}"`);
   }
 
-  const needsHumanLabelEntry =
-    teamLabels.find((l) => l.name === req.needsHumanLabel) ??
-    wsLabels.find((l) => l.name === req.needsHumanLabel);
+  const needsHumanLabelEntry = findLabel(req.needsHumanLabel);
   if (!needsHumanLabelEntry) {
     missing.push(`label "${req.needsHumanLabel}"`);
   }
@@ -513,9 +517,7 @@ export async function resolveLinearSetup(
   // SCOUT ラベル解決（ES-516・needs-human と同型）。未指定 = SCOUT 無効で null。
   let scoutLabelId: string | null = null;
   if (req.scoutLabel !== undefined) {
-    const entry =
-      teamLabels.find((l) => l.name === req.scoutLabel) ??
-      wsLabels.find((l) => l.name === req.scoutLabel);
+    const entry = findLabel(req.scoutLabel);
     if (entry) {
       scoutLabelId = entry.id;
     } else {
@@ -524,9 +526,7 @@ export async function resolveLinearSetup(
   }
   let scoutTriageLabelId: string | null = null;
   if (req.scoutTriageLabel !== undefined) {
-    const entry =
-      teamLabels.find((l) => l.name === req.scoutTriageLabel) ??
-      wsLabels.find((l) => l.name === req.scoutTriageLabel);
+    const entry = findLabel(req.scoutTriageLabel);
     if (entry) {
       scoutTriageLabelId = entry.id;
     } else {

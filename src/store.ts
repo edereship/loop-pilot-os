@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS scout_log (
   ended_at TEXT,
   candidates TEXT,
   verdicts TEXT,
-  created_issue_ids TEXT,
+  created_issue_identifiers TEXT,
   outcome TEXT CHECK (outcome IN ('completed','skipped','error')),
   cost_usd REAL,
   error_detail TEXT
@@ -333,7 +333,7 @@ interface RawScoutLogRow {
   ended_at: string | null;
   candidates: string | null;
   verdicts: string | null;
-  created_issue_ids: string | null;
+  created_issue_identifiers: string | null;
   outcome: string | null;
   cost_usd: number | null;
   error_detail: string | null;
@@ -346,7 +346,7 @@ function toScoutLogRow(r: RawScoutLogRow): ScoutLogRow {
     endedAt: r.ended_at,
     candidates: r.candidates,
     verdicts: r.verdicts,
-    createdIssueIds: r.created_issue_ids,
+    createdIssueIdentifiers: r.created_issue_identifiers,
     outcome: r.outcome as ScoutOutcome | null,
     costUsd: r.cost_usd,
     errorDetail: r.error_detail,
@@ -522,7 +522,7 @@ const SCOUT_LOG_PATCH_COLUMNS: Record<string, string> = {
   endedAt: "ended_at",
   candidates: "candidates",
   verdicts: "verdicts",
-  createdIssueIds: "created_issue_ids",
+  createdIssueIdentifiers: "created_issue_identifiers",
   outcome: "outcome",
   costUsd: "cost_usd",
   errorDetail: "error_detail",
@@ -793,18 +793,17 @@ export class SqliteStore {
    * clear→再 set はゼロリセットになるため使えない（setIdleStartedAt は NULL ガード付き）。
    * 非 idle（NULL）の場合は no-op。better-sqlite3 は同期・単一接続のため
    * read-modify-write でも競合しない。
+   * 前方（未来方向）シフト専用: deltaMs <= 0 は no-op（負値は idle 経過の水増しになるため拒否）。
+   * 破損タイムスタンプ（Date.parse が NaN）も no-op（parsePauseMeta と同じ防御方針:
+   * クラッシュでループを止めない）。
    */
   advanceIdleStartedAt(id: number, deltaMs: number): void {
-    const row = this.db
-      .prepare(`SELECT idle_started_at FROM run WHERE id = ?`)
-      .get(id) as { idle_started_at: string | null } | undefined;
-    if (row === undefined) {
-      throw new Error(`run not found: id=${id}`);
-    }
-    if (row.idle_started_at === null) return;
-    const advanced = new Date(
-      Date.parse(row.idle_started_at) + deltaMs,
-    ).toISOString();
+    if (deltaMs <= 0) return;
+    const run = this.getRun(id);
+    if (run.idleStartedAt === null) return;
+    const parsed = Date.parse(run.idleStartedAt);
+    if (Number.isNaN(parsed)) return;
+    const advanced = new Date(parsed + deltaMs).toISOString();
     this.db
       .prepare(`UPDATE run SET idle_started_at = ? WHERE id = ?`)
       .run(advanced, id);
@@ -1413,7 +1412,7 @@ export class SqliteStore {
       | "endedAt"
       | "candidates"
       | "verdicts"
-      | "createdIssueIds"
+      | "createdIssueIdentifiers"
       | "outcome"
       | "costUsd"
       | "errorDetail"
