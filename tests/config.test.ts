@@ -821,4 +821,34 @@ describe("loadConfig", () => {
     expect(config.safety.transientRetryAttempts).toBe(1);
     expect(config.linear.needsHumanLabel).toBe("needs-human-custom");
   });
+
+  describe("scout config (ES-516)", () => {
+    it("applies scout defaults when [scout] and label keys are omitted", () => {
+      const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+      expect(config.scout.enabled).toBe(false);
+      expect(config.scout.idleMinutes).toBe(30);
+      expect(config.scout.minIntervalHours).toBe(24);
+      expect(config.scout.maxIssuesPerScout).toBe(3);
+      expect(config.linear.scoutLabel).toBe("scout");
+      expect(config.linear.scoutTriageLabel).toBe("scout-triage");
+      expect(config.safety.maxCostUsdPerScout).toBe(2);
+    });
+
+    it("loads explicit scout keys and maps snake_case to camelCase", () => {
+      const config = loadConfig(fixture("config-scout.toml"), fullEnv);
+      expect(config.scout.enabled).toBe(true);
+      expect(config.scout.idleMinutes).toBe(15);
+      expect(config.scout.minIntervalHours).toBe(12);
+      expect(config.scout.maxIssuesPerScout).toBe(1);
+      expect(config.linear.scoutLabel).toBe("bug-scout");
+      expect(config.linear.scoutTriageLabel).toBe("bug-scout-triage");
+      expect(config.safety.maxCostUsdPerScout).toBe(1.5);
+    });
+
+    it("rejects unknown keys in [scout] (strict schema)", () => {
+      expect(() =>
+        loadConfig(fixture("config-scout-unknown-key.toml"), fullEnv),
+      ).toThrow(/scout/);
+    });
+  });
 });
