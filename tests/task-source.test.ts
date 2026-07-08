@@ -5,9 +5,11 @@ import { dirname, join } from "node:path";
 import {
   LinearTaskSource,
   resolveLinearSetup,
+  buildLinearSetupRequest,
   type FetchFn,
 } from "../src/task-source.js";
 import type { TicketState } from "../src/types.js";
+import { loadConfig } from "../src/config.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 function fixture(name: string): unknown {
@@ -271,6 +273,8 @@ describe("resolveLinearSetup", () => {
       },
       optInLabelId: "label-aiok",
       needsHumanLabelId: "label-nh",
+      scoutLabelId: null,
+      scoutTriageLabelId: null,
       labelMap: new Map([["bug", "label-bug"], ["ai-ok", "label-aiok"], ["needs-human", "label-nh"]]),
       knownLabels: ["ai-ok", "bug", "needs-human"],
     });
@@ -584,6 +588,126 @@ describe("resolveLinearSetup", () => {
       }, fetchFn),
     ).rejects.toThrow(/opt_in_label.*needs_human_label|needs_human_label.*opt_in_label|must be different/i);
     expect(calls).toHaveLength(0);
+  });
+
+  // ES-516: scout / scout-triage ラベルの解決（needsHumanLabelId と同型・opt-in 型）。
+  it("resolves scout labels when requested (ES-516)", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-setup-viewer.json") },
+      { body: fixture("linear-resolve-setup-scout.json") },
+    ]);
+    const resolved = await resolveLinearSetup(
+      "lin_api_test",
+      {
+        teamKey: "TY",
+        projectName: "LoopPilot OS",
+        stateNames: {
+          todo: "Todo",
+          in_progress: "In Progress",
+          in_review: "In Review",
+          done: "Done",
+        },
+        optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
+        scoutLabel: "scout",
+        scoutTriageLabel: "scout-triage",
+      },
+      fetchFn,
+    );
+    expect(resolved.scoutLabelId).toBe("label-scout");
+    expect(resolved.scoutTriageLabelId).toBe("label-scout-triage");
+  });
+
+  it("throws listing missing scout labels when requested but absent", async () => {
+    // linear-resolve-setup.json には scout ラベルが存在しない
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-setup-viewer.json") },
+      { body: fixture("linear-resolve-setup.json") },
+    ]);
+    const err = await resolveLinearSetup(
+      "lin_api_test",
+      {
+        teamKey: "TY",
+        projectName: "LoopPilot OS",
+        stateNames: {
+          todo: "Todo",
+          in_progress: "In Progress",
+          in_review: "In Review",
+          done: "Done",
+        },
+        optInLabel: "ai-ok",
+        needsHumanLabel: "needs-human",
+        scoutLabel: "scout",
+        scoutTriageLabel: "scout-triage",
+      },
+      fetchFn,
+    ).then(
+      () => {
+        throw new Error("resolveLinearSetup unexpectedly succeeded");
+      },
+      (e: Error) => e,
+    );
+    expect(err.message).toContain(`label "scout"`);
+    expect(err.message).toContain(`label "scout-triage"`);
+  });
+
+  // scout-triage が opt-in と同名だと triage チケットが即適格になり人間ゲートが消える。
+  it("throws when scout_triage_label equals opt_in_label", async () => {
+    const { fetchFn } = makeFetch([
+      { body: fixture("linear-setup-viewer.json") },
+    ]);
+    await expect(
+      resolveLinearSetup(
+        "lin_api_test",
+        {
+          teamKey: "TY",
+          projectName: "LoopPilot OS",
+          stateNames: {
+            todo: "Todo",
+            in_progress: "In Progress",
+            in_review: "In Review",
+            done: "Done",
+          },
+          optInLabel: "ai-ok",
+          needsHumanLabel: "needs-human",
+          scoutLabel: "scout",
+          scoutTriageLabel: "ai-ok",
+        },
+        fetchFn,
+      ),
+    ).rejects.toThrow(
+      /opt_in_label and scout_triage_label must be different/,
+    );
+  });
+});
+
+const configFixtureEnv: NodeJS.ProcessEnv = {
+  LINEAR_API_KEY: "lin_api_test_key",
+};
+
+describe("buildLinearSetupRequest (ES-516)", () => {
+  it("omits scout labels when scout is disabled", () => {
+    const config = loadConfig(join(here, "fixtures", "config-minimal.toml"), configFixtureEnv);
+    const req = buildLinearSetupRequest(config);
+    expect(req.teamKey).toBe("TY");
+    expect(req.projectName).toBe("LoopPilot OS");
+    expect(req.stateNames).toEqual({
+      todo: "Todo",
+      in_progress: "In Progress",
+      in_review: "In Review",
+      done: "Done",
+    });
+    expect(req.optInLabel).toBe("ai-ok");
+    expect(req.needsHumanLabel).toBe("needs-human");
+    expect(req.scoutLabel).toBeUndefined();
+    expect(req.scoutTriageLabel).toBeUndefined();
+  });
+
+  it("includes scout labels when scout.enabled = true", () => {
+    const config = loadConfig(join(here, "fixtures", "config-scout.toml"), configFixtureEnv);
+    const req = buildLinearSetupRequest(config);
+    expect(req.scoutLabel).toBe("bug-scout");
+    expect(req.scoutTriageLabel).toBe("bug-scout-triage");
   });
 });
 

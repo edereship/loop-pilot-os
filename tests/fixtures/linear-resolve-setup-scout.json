@@ -1,0 +1,26 @@
+{
+  "data": {
+    "team": {
+      "id": "team-uuid-1",
+      "key": "TY",
+      "states": { "nodes": [
+        { "id": "state-todo", "name": "Todo" },
+        { "id": "state-wip", "name": "In Progress" },
+        { "id": "state-review", "name": "In Review" },
+        { "id": "state-done", "name": "Done" }
+      ] },
+      "labels": { "nodes": [
+        { "id": "label-aiok", "name": "ai-ok" },
+        { "id": "label-nh", "name": "needs-human" },
+        { "id": "label-scout", "name": "scout" },
+        { "id": "label-scout-triage", "name": "scout-triage" }
+      ], "pageInfo": { "hasNextPage": false, "endCursor": null } },
+      "projects": { "nodes": [
+        { "id": "project-uuid-1", "name": "LoopPilot OS" }
+      ] }
+    },
+    "issueLabels": { "nodes": [
+      { "id": "label-bug", "name": "bug" }
+    ], "pageInfo": { "hasNextPage": false, "endCursor": null } }
+  }
+}

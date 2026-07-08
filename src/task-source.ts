@@ -1,4 +1,5 @@
 import type { EligibleIssue, TaskSource, TicketState } from "./types.js";
+import type { Config } from "./config.js";
 
 /** Web 標準 fetch のサブセット。本番は globalThis.fetch、テストはフェイクを注入する。 */
 export type FetchFn = (
@@ -400,6 +401,9 @@ export interface LinearSetupRequest {
   stateNames: Record<TicketState, string>;
   optInLabel: string;
   needsHumanLabel: string;
+  // SCOUT ラベル（ES-516）。undefined = SCOUT 無効・解決をスキップする。
+  scoutLabel?: string;
+  scoutTriageLabel?: string;
 }
 
 export interface ResolvedLinearSetup {
@@ -409,6 +413,8 @@ export interface ResolvedLinearSetup {
   stateIds: Record<TicketState, string>;
   optInLabelId: string;
   needsHumanLabelId: string;
+  scoutLabelId: string | null;        // req.scoutLabel 未指定時は null
+  scoutTriageLabelId: string | null;  // req.scoutTriageLabel 未指定時は null
   labelMap: Map<string, string>;   // label name → id (team + workspace)
   knownLabels: string[];           // known label names for GROOM prompt
 }
@@ -429,12 +435,27 @@ export async function resolveLinearSetup(
   req: LinearSetupRequest,
   fetchFn: FetchFn,
 ): Promise<ResolvedLinearSetup> {
-  // Reject identical label names up front (ES-492 Finding 3): every opt-in issue would
-  // carry the needs-human label, causing SELECT to return nothing indefinitely.
-  if (req.optInLabel === req.needsHumanLabel) {
-    throw new Error(
-      `Linear setup: opt_in_label and needs_human_label must be different (both are "${req.optInLabel}")`,
-    );
+  // 同名ラベルは fail-fast で拒否する（ES-492 Finding 3 / ES-516）。
+  // 例: opt_in == needs_human は SELECT が永遠に空になる。
+  //     scout_triage == opt_in は triage チケットが即適格になり人間ゲートが消える。
+  const labelEntries: Array<[string, string]> = [
+    ["opt_in_label", req.optInLabel],
+    ["needs_human_label", req.needsHumanLabel],
+  ];
+  if (req.scoutLabel !== undefined) {
+    labelEntries.push(["scout_label", req.scoutLabel]);
+  }
+  if (req.scoutTriageLabel !== undefined) {
+    labelEntries.push(["scout_triage_label", req.scoutTriageLabel]);
+  }
+  for (let i = 0; i < labelEntries.length; i++) {
+    for (let j = i + 1; j < labelEntries.length; j++) {
+      if (labelEntries[i][1] === labelEntries[j][1]) {
+        throw new Error(
+          `Linear setup: ${labelEntries[i][0]} and ${labelEntries[j][0]} must be different (both are "${labelEntries[i][1]}")`,
+        );
+      }
+    }
   }
 
   // Phase 1: viewer + team keys のみ（軽量クエリ）
@@ -489,6 +510,30 @@ export async function resolveLinearSetup(
     missing.push(`label "${req.needsHumanLabel}"`);
   }
 
+  // SCOUT ラベル解決（ES-516・needs-human と同型）。未指定 = SCOUT 無効で null。
+  let scoutLabelId: string | null = null;
+  if (req.scoutLabel !== undefined) {
+    const entry =
+      teamLabels.find((l) => l.name === req.scoutLabel) ??
+      wsLabels.find((l) => l.name === req.scoutLabel);
+    if (entry) {
+      scoutLabelId = entry.id;
+    } else {
+      missing.push(`label "${req.scoutLabel}"`);
+    }
+  }
+  let scoutTriageLabelId: string | null = null;
+  if (req.scoutTriageLabel !== undefined) {
+    const entry =
+      teamLabels.find((l) => l.name === req.scoutTriageLabel) ??
+      wsLabels.find((l) => l.name === req.scoutTriageLabel);
+    if (entry) {
+      scoutTriageLabelId = entry.id;
+    } else {
+      missing.push(`label "${req.scoutTriageLabel}"`);
+    }
+  }
+
   if (missing.length > 0) {
     throw new Error(
       `Linear setup resolution failed; not found: ${missing.join(", ")}`,
@@ -515,7 +560,37 @@ export async function resolveLinearSetup(
     stateIds,
     optInLabelId: label!.id,
     needsHumanLabelId: needsHumanLabelEntry!.id,
+    scoutLabelId,
+    scoutTriageLabelId,
     labelMap,
     knownLabels,
+  };
+}
+
+/**
+ * Config から LinearSetupRequest を組み立てる（main / preflight で共有・ES-516）。
+ * config.linear.states は camelCase、stateNames は TicketState キーのため明示写像する。
+ * SCOUT ラベルは scout.enabled のときのみ解決対象に含める
+ * （無効ユーザーに Linear ラベル作成を強制しない）。
+ */
+export function buildLinearSetupRequest(config: Config): LinearSetupRequest {
+  const stateNames: Record<TicketState, string> = {
+    todo: config.linear.states.todo,
+    in_progress: config.linear.states.inProgress,
+    in_review: config.linear.states.inReview,
+    done: config.linear.states.done,
+  };
+  return {
+    teamKey: config.linear.team,
+    projectName: config.linear.project,
+    stateNames,
+    optInLabel: config.linear.optInLabel,
+    needsHumanLabel: config.linear.needsHumanLabel,
+    ...(config.scout.enabled
+      ? {
+          scoutLabel: config.linear.scoutLabel,
+          scoutTriageLabel: config.linear.scoutTriageLabel,
+        }
+      : {}),
   };
 }
