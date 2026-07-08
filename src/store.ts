@@ -8,6 +8,8 @@ import type {
   PauseMeta,
   GroomLogRow,
   GroomOutcome,
+  ScoutLogRow,
+  ScoutOutcome,
   MergeGateLogRow,
   MergeGateOutcome,
   DesignReviewLogRow,
@@ -135,6 +137,18 @@ CREATE TABLE IF NOT EXISTS merge_gate_log (
   signals TEXT,
   violations TEXT,
   outcome TEXT CHECK (outcome IN ('passed','fixed','parked','skipped','error')),
+  cost_usd REAL,
+  error_detail TEXT
+);
+CREATE TABLE IF NOT EXISTS scout_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES run(id),
+  fired_at TEXT NOT NULL,
+  ended_at TEXT,
+  candidates TEXT,
+  verdicts TEXT,
+  created_issue_ids TEXT,
+  outcome TEXT CHECK (outcome IN ('completed','skipped','error')),
   cost_usd REAL,
   error_detail TEXT
 );
@@ -312,6 +326,33 @@ function toMergeGateLogRow(r: RawMergeGateLogRow): MergeGateLogRow {
   };
 }
 
+interface RawScoutLogRow {
+  id: number;
+  run_id: number;
+  fired_at: string;
+  ended_at: string | null;
+  candidates: string | null;
+  verdicts: string | null;
+  created_issue_ids: string | null;
+  outcome: string | null;
+  cost_usd: number | null;
+  error_detail: string | null;
+}
+function toScoutLogRow(r: RawScoutLogRow): ScoutLogRow {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    firedAt: r.fired_at,
+    endedAt: r.ended_at,
+    candidates: r.candidates,
+    verdicts: r.verdicts,
+    createdIssueIds: r.created_issue_ids,
+    outcome: r.outcome as ScoutOutcome | null,
+    costUsd: r.cost_usd,
+    errorDetail: r.error_detail,
+  };
+}
+
 interface RawDesignReviewLogRow {
   id: number;
   run_id: number;
@@ -472,6 +513,16 @@ const MERGE_GATE_LOG_PATCH_COLUMNS: Record<string, string> = {
   verdict: "verdict",
   signals: "signals",
   violations: "violations",
+  outcome: "outcome",
+  costUsd: "cost_usd",
+  errorDetail: "error_detail",
+};
+
+const SCOUT_LOG_PATCH_COLUMNS: Record<string, string> = {
+  endedAt: "ended_at",
+  candidates: "candidates",
+  verdicts: "verdicts",
+  createdIssueIds: "created_issue_ids",
   outcome: "outcome",
   costUsd: "cost_usd",
   errorDetail: "error_detail",
@@ -1310,6 +1361,73 @@ export class SqliteStore {
       .prepare(`SELECT * FROM merge_gate_log WHERE session_id = ? ORDER BY id ASC`)
       .all(sessionId) as RawMergeGateLogRow[];
     return rows.map(toMergeGateLogRow);
+  }
+
+  // ---- scout_log (ES-516) ----
+  insertScoutLog(s: { runId: number; firedAt: string }): ScoutLogRow {
+    const info = this.db
+      .prepare(
+        `INSERT INTO scout_log (run_id, fired_at)
+         VALUES (?, ?)`,
+      )
+      .run(s.runId, s.firedAt);
+    return this.getScoutLog(Number(info.lastInsertRowid));
+  }
+
+  getScoutLog(id: number): ScoutLogRow {
+    const row = this.db
+      .prepare(`SELECT * FROM scout_log WHERE id = ?`)
+      .get(id) as RawScoutLogRow | undefined;
+    if (row === undefined) {
+      throw new Error(`scout_log not found: id=${id}`);
+    }
+    return toScoutLogRow(row);
+  }
+
+  updateScoutLog(
+    id: number,
+    patch: Partial<Pick<ScoutLogRow,
+      | "endedAt"
+      | "candidates"
+      | "verdicts"
+      | "createdIssueIds"
+      | "outcome"
+      | "costUsd"
+      | "errorDetail"
+    >>,
+  ): void {
+    const setClauses: string[] = [];
+    const values: Array<string | number | null> = [];
+    for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
+      const column = SCOUT_LOG_PATCH_COLUMNS[key as string];
+      if (column === undefined) {
+        throw new Error(`updateScoutLog: unknown patch key "${String(key)}"`);
+      }
+      const raw = patch[key];
+      if (raw === undefined) continue;
+      setClauses.push(`${column} = ?`);
+      values.push(raw as string | number | null);
+    }
+    if (setClauses.length === 0) return;
+    values.push(id);
+    const info = this.db
+      .prepare(`UPDATE scout_log SET ${setClauses.join(", ")} WHERE id = ?`)
+      .run(...values);
+    if (info.changes !== 1) {
+      throw new Error(`updateScoutLog affected ${info.changes} rows for id=${id}`);
+    }
+  }
+
+  /**
+   * 前回 SCOUT 発火時刻（run 横断のグローバル MAX・ES-516）。
+   * min_interval_hours 判定用。ISO-8601 文字列は辞書順 = 時系列順のため MAX で正しい。
+   * 一度も発火していなければ null。
+   */
+  latestScoutFiredAt(): string | null {
+    const row = this.db
+      .prepare(`SELECT MAX(fired_at) AS latest FROM scout_log`)
+      .get() as { latest: string | null };
+    return row.latest;
   }
 
   // ---- design_review_log (ES-477) ----

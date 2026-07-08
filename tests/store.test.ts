@@ -1741,3 +1741,80 @@ describe("merge_gate_log (ES-514)", () => {
     expect(logs[0].outcome).toBe("fixed");
   });
 });
+
+describe("scout_log CRUD (ES-516)", () => {
+  it("inserts a scout log row with fired_at and null defaults", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const row = store.insertScoutLog({
+      runId: run.id,
+      firedAt: "2026-07-08T01:00:00.000Z",
+    });
+    expect(row.runId).toBe(run.id);
+    expect(row.firedAt).toBe("2026-07-08T01:00:00.000Z");
+    expect(row.endedAt).toBeNull();
+    expect(row.candidates).toBeNull();
+    expect(row.verdicts).toBeNull();
+    expect(row.createdIssueIds).toBeNull();
+    expect(row.outcome).toBeNull();
+    expect(row.costUsd).toBeNull();
+    expect(row.errorDetail).toBeNull();
+  });
+
+  it("updates scout log fields via partial patch", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const row = store.insertScoutLog({
+      runId: run.id,
+      firedAt: "2026-07-08T01:00:00.000Z",
+    });
+    store.updateScoutLog(row.id, {
+      endedAt: "2026-07-08T01:20:00.000Z",
+      candidates: JSON.stringify([{ title: "flaky test", evidence_type: "objective" }]),
+      verdicts: JSON.stringify([{ verdict: "accept" }]),
+      createdIssueIds: JSON.stringify(["ES-999"]),
+      outcome: "completed",
+      costUsd: 1.23,
+    });
+    const updated = store.getScoutLog(row.id);
+    expect(updated.endedAt).toBe("2026-07-08T01:20:00.000Z");
+    expect(updated.candidates).toContain("flaky test");
+    expect(updated.verdicts).toContain("accept");
+    expect(updated.createdIssueIds).toBe(JSON.stringify(["ES-999"]));
+    expect(updated.outcome).toBe("completed");
+    expect(updated.costUsd).toBe(1.23);
+    expect(updated.errorDetail).toBeNull();
+  });
+
+  it("updateScoutLog rejects unknown patch keys", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const row = store.insertScoutLog({
+      runId: run.id,
+      firedAt: "2026-07-08T01:00:00.000Z",
+    });
+    expect(() =>
+      store.updateScoutLog(row.id, { bogus: 1 } as never),
+    ).toThrow(/unknown patch key/);
+  });
+
+  it("getScoutLog throws for a missing id", () => {
+    const store = newStore();
+    expect(() => store.getScoutLog(999)).toThrow(/scout_log not found/);
+  });
+
+  it("latestScoutFiredAt returns null when scout has never run", () => {
+    const store = newStore();
+    expect(store.latestScoutFiredAt()).toBeNull();
+  });
+
+  it("latestScoutFiredAt returns the max fired_at across runs", () => {
+    const store = newStore();
+    const run1 = store.createRun(3, "2026-07-07T00:00:00.000Z");
+    const run2 = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.insertScoutLog({ runId: run1.id, firedAt: "2026-07-07T05:00:00.000Z" });
+    store.insertScoutLog({ runId: run2.id, firedAt: "2026-07-08T09:00:00.000Z" });
+    store.insertScoutLog({ runId: run2.id, firedAt: "2026-07-08T03:00:00.000Z" });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T09:00:00.000Z");
+  });
+});
