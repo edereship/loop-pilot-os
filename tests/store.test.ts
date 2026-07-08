@@ -1333,6 +1333,40 @@ describe("SqliteStore: idle timeout", () => {
     store.clearIdleStartedAt(run.id);
     expect(store.getRun(run.id).idleStartedAt).toBeNull();
   });
+
+  // ES-516: SCOUT 実行時間の idle 不算入用プリミティブ。
+  // clear→再set はゼロリセットになる（setIdleStartedAt は NULL ガード付き上書き不可）ため、
+  // タイムスタンプの前方シフトで「経過に数えない」を実現する。
+  it("advanceIdleStartedAt shifts the timestamp forward by deltaMs (ES-516)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 5 * 60_000);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:05:00.000Z");
+  });
+
+  it("advanceIdleStartedAt accumulates across calls", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.setIdleStartedAt(run.id, "2026-07-08T01:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 60_000);
+    store.advanceIdleStartedAt(run.id, 30_000);
+    expect(store.getRun(run.id).idleStartedAt).toBe("2026-07-08T01:01:30.000Z");
+  });
+
+  it("advanceIdleStartedAt is a no-op when idle_started_at is null", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    store.advanceIdleStartedAt(run.id, 60_000);
+    expect(store.getRun(run.id).idleStartedAt).toBeNull();
+  });
+
+  it("advanceIdleStartedAt throws for an unknown run id", () => {
+    const store = newStore();
+    expect(() => store.advanceIdleStartedAt(999, 60_000)).toThrow(
+      /run not found/,
+    );
+  });
 });
 
 describe("design_review_log CRUD (ES-477)", () => {

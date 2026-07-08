@@ -787,6 +787,29 @@ export class SqliteStore {
     ).run(id);
   }
 
+  /**
+   * idle_started_at を deltaMs だけ未来方向へシフトする（ES-516）。
+   * SCOUT 実行時間を idle 経過に不算入にするための一時停止プリミティブ。
+   * clear→再 set はゼロリセットになるため使えない（setIdleStartedAt は NULL ガード付き）。
+   * 非 idle（NULL）の場合は no-op。better-sqlite3 は同期・単一接続のため
+   * read-modify-write でも競合しない。
+   */
+  advanceIdleStartedAt(id: number, deltaMs: number): void {
+    const row = this.db
+      .prepare(`SELECT idle_started_at FROM run WHERE id = ?`)
+      .get(id) as { idle_started_at: string | null } | undefined;
+    if (row === undefined) {
+      throw new Error(`run not found: id=${id}`);
+    }
+    if (row.idle_started_at === null) return;
+    const advanced = new Date(
+      Date.parse(row.idle_started_at) + deltaMs,
+    ).toISOString();
+    this.db
+      .prepare(`UPDATE run SET idle_started_at = ? WHERE id = ?`)
+      .run(advanced, id);
+  }
+
   countTasksStarted(runId: number): number {
     const row = this.db
       .prepare(`SELECT COUNT(*) AS c FROM task_session WHERE run_id = ?`)
