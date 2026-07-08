@@ -66,6 +66,7 @@ function makeConfig(over: Partial<{
     looppilot: { gateLabel: "loop-pilot" },
     notify: { progress: false },
     groom: { enabled: over.groomEnabled ?? false },
+    mergeGate: { enabled: true },
     selfReview: { enabled: true },
     verify: { enabled: true, runRecipe: "" },
     memory: { maxCharsPerFile: 8000, injectBudgetChars: 6000 },
@@ -198,6 +199,7 @@ function makeHarness(config: Config, opts?: {
     planner,
     designer,
     designReviewer,
+    mergeGateJudge: null,
     codebaseSummaryGenerator,
     recoveryTurn: planner !== null ? {
       planner,

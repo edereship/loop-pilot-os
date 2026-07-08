@@ -286,10 +286,15 @@ export async function executeRecoveryTurn(
   }
 }
 
-async function executeFixCode(
+export async function executeFixCode(
   deps: RecoveryTurnDeps,
   session: TaskSessionRow,
   instruction: string,
+  // ES-521: マージゲート fix ループから直接呼ぶためのオプション。
+  // maxCostUsd はゲート専用予算（safety.max_cost_usd_per_merge_gate_fix）を上書き注入する。
+  // postRestartComment:false は LoopPilot フルレビューを再実行しない（R3）— CI 再通過と
+  // 再ゲートのみで検証するため /restart-review を投稿しない。
+  opts: { maxCostUsd?: number; postRestartComment?: boolean } = {},
 ): Promise<RecoveryTurnResult> {
   const { agent, runner, git, config, log } = deps;
   const worktreePath = session.worktreePath ?? config.repo.path;
@@ -309,7 +314,7 @@ async function executeFixCode(
   const outcome = await agent.runSession({
     worktreePath,
     prompt: instruction,
-    maxCostUsd: config.safety.maxCostUsdPerFix,
+    maxCostUsd: opts.maxCostUsd ?? config.safety.maxCostUsdPerFix,
     hardTimeoutMs: config.safety.sessionHardTimeoutMinutes * 60_000,
   });
 
@@ -462,7 +467,7 @@ async function executeFixCode(
   }
 
   // Post /restart-review if PR exists
-  if (session.prNumber !== null) {
+  if (opts.postRestartComment !== false && session.prNumber !== null) {
     try {
       await git.postComment(session.prNumber, "/restart-review");
     } catch (err) {

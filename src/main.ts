@@ -268,6 +268,7 @@ async function runLoop(configPath: string): Promise<number> {
       planner: codexPlanner,
       designer,
       designReviewer: codexPlanner,
+      mergeGateJudge: codexPlanner,
       codebaseSummaryGenerator,
       runner,
       recoveryTurn: {

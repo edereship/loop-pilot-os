@@ -846,3 +846,53 @@ describe("executeRecoveryTurn", () => {
     });
   });
 });
+
+import { executeFixCode } from "../src/recovery-turn.js";
+
+describe("executeFixCode 直接呼び出し（ES-521 マージゲート用オプション）", () => {
+  function makeFixDeps() {
+    const { deps, agent, git, runner } = makeDeps();
+    agent.outcomes = [{ kind: "completed", costUsd: 0.5, summary: "fixed" }];
+    runner.on(["git", "-C"], (args) => {
+      if (args.includes("status")) return { code: 0, stdout: "" };
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      if (args.includes("fetch")) return { code: 0 };
+      if (args.includes("reset")) return { code: 0 };
+      return { code: 0 };
+    });
+    runner.on(["git", "push"], { code: 0 });
+    return { deps, agent, git, runner };
+  }
+
+  it("postRestartComment:false のとき push 成功後も /restart-review を投稿しない", async () => {
+    const { deps, git } = makeFixDeps();
+    const session = fakeSession({ prNumber: 100 });
+
+    const result = await executeFixCode(deps, session, "fix the violations", {
+      postRestartComment: false,
+    });
+
+    expect(result).toEqual<RecoveryTurnResult>({ kind: "recovered", action: "fix_code", costUsd: 0.5 });
+    expect(git.calls.filter((c) => c.method === "postComment")).toHaveLength(0);
+  });
+
+  it("opts.maxCostUsd が agent.runSession の maxCostUsd に渡る", async () => {
+    const { deps, agent } = makeFixDeps();
+    const session = fakeSession({ prNumber: 100 });
+
+    await executeFixCode(deps, session, "fix", { maxCostUsd: 7 });
+
+    expect(agent.contexts[0].maxCostUsd).toBe(7);
+  });
+
+  it("opts 省略時は従来挙動（maxCostUsdPerFix + /restart-review 投稿）", async () => {
+    const { deps, agent, git } = makeFixDeps();
+    const session = fakeSession({ prNumber: 100 });
+    const config = makeConfig();
+
+    await executeFixCode(deps, session, "fix");
+
+    expect(agent.contexts[0].maxCostUsd).toBe(config.safety.maxCostUsdPerFix);
+    expect(git.calls.some((c) => c.method === "postComment")).toBe(true);
+  });
+});

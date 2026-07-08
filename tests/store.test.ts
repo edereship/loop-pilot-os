@@ -919,6 +919,22 @@ describe("excludedIssueIds (ES-492)", () => {
     // Different run_id: no current-run match. needs_human_label_added=1: no legacy match.
     expect(store.excludedIssueIds(run2.id)).toEqual([]);
   });
+
+  it("returns merge_gate_failed (park) issue IDs for the current run (ES-521)", () => {
+    // Park terminal (ES-521): recovery_action stays null (PR is kept, not abandoned), so the
+    // exclusion can only key off failure_reason. Guards against re-selection while the
+    // needs-human label add is still retrying (needs_human_label_added=0).
+    const store = newStore();
+    const run = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s = store.createSession({
+      runId: run.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s.id, { state: "stopped", failureReason: "merge_gate_failed", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    expect(store.excludedIssueIds(run.id)).toEqual(["issue-A"]);
+  });
 });
 
 describe("legacyExcludedIssueIds (ES-492 Finding 3)", () => {
@@ -989,6 +1005,27 @@ describe("legacyExcludedIssueIds (ES-492 Finding 3)", () => {
       now: "2026-01-01T00:00:01.000Z",
     });
     store.updateSession(s.id, { state: "stopped", recoveryAction: "abandon", endedAt: "2026-01-01T01:00:00.000Z" });
+
+    expect(store.legacyExcludedIssueIds()).toContain("issue-A");
+
+    store.markNeedsHumanLabelAddedByIssueId("issue-A");
+
+    expect(store.legacyExcludedIssueIds()).not.toContain("issue-A");
+  });
+
+  it("excludes and promotes park (merge_gate_failed) sessions cross-run (ES-521)", () => {
+    // Same cross-run fallback as legacy abandon sessions, but for park terminals where
+    // recovery_action stays null (PR is kept). Also verifies markNeedsHumanLabelAddedByIssueId
+    // is kept in sync with the legacy guard's WHERE clause, since getAllEligible's
+    // onLegacyLabelDetected callback relies on it to promote park rows too.
+    const store = newStore();
+    const run1 = store.createRun(3, "2026-01-01T00:00:00.000Z");
+    const s = store.createSession({
+      runId: run1.id, linearIssueId: "issue-A", linearIdentifier: "TY-1",
+      issueTitle: "A", branch: "b1", worktreePath: "/wt1",
+      now: "2026-01-01T00:00:01.000Z",
+    });
+    store.updateSession(s.id, { state: "stopped", failureReason: "merge_gate_failed", endedAt: "2026-01-01T01:00:00.000Z" });
 
     expect(store.legacyExcludedIssueIds()).toContain("issue-A");
 
@@ -1651,5 +1688,56 @@ describe("merge_gate_log (ES-514)", () => {
   it("updateMergeGateLog rejects unknown patch keys at compile time and unknown ids at runtime", () => {
     const store = newStore();
     expect(() => store.getMergeGateLog(999)).toThrow("merge_gate_log not found");
+  });
+
+  it("getMergeGateLogsForSession はセッションの行のみを id 昇順で返す", () => {
+    const store = newStore();
+    const clock = makeClock();
+    const run = store.createRun(3, clock());
+    const s1 = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-1",
+      linearIdentifier: "ES-1",
+      issueTitle: "t",
+      branch: "b",
+      worktreePath: "/tmp/wt",
+      now: clock(),
+    });
+    const s2 = store.createSession({
+      runId: run.id,
+      linearIssueId: "uuid-2",
+      linearIdentifier: "ES-2",
+      issueTitle: "t2",
+      branch: "b2",
+      worktreePath: "/tmp/wt2",
+      now: clock(),
+    });
+    const a = store.insertMergeGateLog({
+      runId: run.id,
+      sessionId: s1.id,
+      attempt: 1,
+      startedAt: clock(),
+    });
+    store.insertMergeGateLog({
+      runId: run.id,
+      sessionId: s2.id,
+      attempt: 1,
+      startedAt: clock(),
+    });
+    const b = store.insertMergeGateLog({
+      runId: run.id,
+      sessionId: s1.id,
+      attempt: 2,
+      startedAt: clock(),
+    });
+    store.updateMergeGateLog(a.id, {
+      verdict: "fail",
+      outcome: "fixed",
+    });
+
+    const logs = store.getMergeGateLogsForSession(s1.id);
+    expect(logs.map((l) => l.id)).toEqual([a.id, b.id]);
+    expect(logs[0].verdict).toBe("fail");
+    expect(logs[0].outcome).toBe("fixed");
   });
 });
