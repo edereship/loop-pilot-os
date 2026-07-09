@@ -46,6 +46,8 @@ import { buildGroomPrompt } from "./groom-prompt.js";
 import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
 import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
+import { runScoutExploration } from "./scout-explorer.js";
+import { buildScoutPrompt } from "./scout-prompt.js";
 import { retryTransient } from "./transient-retry.js";
 import { readdirSync, readFileSync, readlinkSync, mkdirSync, appendFileSync } from "node:fs";
 import path from "node:path";
@@ -1181,6 +1183,20 @@ export class Orchestrator {
           }
         }
 
+        // v4-A SCOUT（ES-519）: fire when idle long enough and min-interval has passed.
+        if (this.config.scout.enabled && this.scoutDeps !== null) {
+          const scoutRun = this.store.getRun(this.runId);
+          const idleElapsedMs = scoutRun.idleStartedAt !== null
+            ? Date.parse(this.clock()) - Date.parse(scoutRun.idleStartedAt)
+            : 0;
+          const scoutCtrl = await this.scout(idleElapsedMs);
+          if (scoutCtrl.control === "halt") return;
+          if (this.interrupted) {
+            await this.haltForInterrupt();
+            return;
+          }
+        }
+
         // IDLE（キュー空 → 通知は初回のみ → 定期再確認）
         if (!idleNotified) {
           await this.notifier.notify({ kind: "idle", detail: "no eligible tickets" });
@@ -2226,6 +2242,184 @@ export class Orchestrator {
         this.log(`groom: failed to update groom_log in error handler: ${errMsg(logErr)}`);
       }
       return { control: "continue", summary: null, blockedIds: new Set<string>() };
+    }
+  }
+
+  // ---- SCOUT（v4-A 自律バグ発見・ES-519） ----
+  private async scout(idleElapsedMs: number): Promise<RunControl> {
+    if (!this.config.scout.enabled || this.scoutDeps === null) return CONTINUE;
+
+    // Check idle threshold
+    if (idleElapsedMs < this.config.scout.idleMinutes * 60_000) return CONTINUE;
+
+    // Check min interval between SCOUT runs
+    const lastFiredAt = this.store.latestScoutFiredAt();
+    if (lastFiredAt !== null) {
+      const sinceLastMs = Date.parse(this.clock()) - Date.parse(lastFiredAt);
+      if (sinceLastMs < this.config.scout.minIntervalHours * 60 * 60_000) return CONTINUE;
+    }
+
+    let scoutLogRow: { id: number };
+    try {
+      scoutLogRow = this.store.insertScoutLog({ runId: this.runId, firedAt: this.clock() });
+    } catch (err) {
+      this.log(`scout: failed to insert scout_log, skipping: ${errMsg(err)}`);
+      return CONTINUE;
+    }
+
+    const scoutStartMs = Date.parse(this.clock());
+
+    try {
+      // Fetch known scout/triage issues for duplicate prevention
+      let existingScoutIssues: Array<{ identifier: string; title: string }> = [];
+      let pendingTriageIssues: Array<{ identifier: string; title: string }> = [];
+      try {
+        const [scoutIssues, triageIssues] = await Promise.all([
+          this.scoutDeps.boardFetcher.getIssuesByLabel(this.config.linear.scoutLabel),
+          this.scoutDeps.boardFetcher.getIssuesByLabel(this.config.linear.scoutTriageLabel),
+        ]);
+        existingScoutIssues = scoutIssues.map((i) => ({ identifier: i.identifier, title: i.title }));
+        pendingTriageIssues = triageIssues.map((i) => ({ identifier: i.identifier, title: i.title }));
+      } catch (err) {
+        this.log(`scout: board fetch failed (non-fatal): ${errMsg(err)}`);
+      }
+
+      // Load spec content for the prompt
+      const repoPath = this.config.repo.path;
+      let specContent: SpecContent | null = null;
+      const specDir = this.config.product.specDir;
+      if (specDir !== undefined && this.specLoader !== null) {
+        try {
+          specContent = this.specLoader(repoPath, specDir);
+        } catch (err) {
+          this.log(`scout: spec loading failed (non-fatal): ${errMsg(err)}`);
+        }
+      }
+
+      const objectiveOnly = specContent === null;
+      const prompt = buildScoutPrompt({
+        specContent,
+        specDir,
+        existingScoutIssues,
+        pendingTriageIssues,
+        maxCandidates: this.config.scout.maxIssuesPerScout,
+      });
+
+      this.log("scout: starting exploration");
+      const explorationResult = await runScoutExploration({
+        agent: this.scoutDeps.agent,
+        runner: this.runner,
+        repoPath,
+        prompt,
+        maxCostUsd: this.config.safety.maxCostUsdPerScout,
+        timeoutMs: this.config.safety.scoutTimeoutMinutes * 60_000,
+        log: this.log,
+        objectiveOnly,
+      });
+
+      // Advance idleStartedAt so SCOUT duration does not count toward idle timeout
+      const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
+      this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);
+
+      if (explorationResult.kind === "interrupted") {
+        try {
+          this.store.updateScoutLog(scoutLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "skipped",
+            errorDetail: "interrupted",
+            costUsd: explorationResult.costUsd,
+          });
+        } catch (logErr) {
+          this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+        }
+        await this.haltForInterrupt();
+        return HALT;
+      }
+
+      if (explorationResult.kind === "error") {
+        this.log(`scout: exploration failed: ${explorationResult.message}`);
+        try {
+          this.store.updateScoutLog(scoutLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: explorationResult.message,
+            costUsd: explorationResult.costUsd,
+          });
+        } catch (logErr) {
+          this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+        }
+        return CONTINUE;
+      }
+
+      // Create Linear issues for each candidate
+      const candidates = explorationResult.candidates.slice(0, this.config.scout.maxIssuesPerScout);
+      const createdIdentifiers: string[] = [];
+      let objectiveCount = 0;
+      let triageCount = 0;
+
+      for (const candidate of candidates) {
+        if (this.interrupted) break;
+        try {
+          const extraLabelIds: string[] = [];
+          if (this.scoutDeps.scoutLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutLabelId);
+          if (this.scoutDeps.scoutTriageLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
+          const identifier = await this.scoutDeps.linearClient.createIssue({
+            title: candidate.title,
+            description: `${candidate.description}\n\n**Evidence (${candidate.evidence_type}):**\n\n${candidate.evidence}`,
+            priority: candidate.priority,
+            extraLabelIds,
+          });
+          createdIdentifiers.push(identifier);
+          if (candidate.evidence_type === "objective") objectiveCount++;
+          else triageCount++;
+        } catch (err) {
+          this.log(`scout: failed to create issue for "${candidate.title}": ${errMsg(err)}`);
+        }
+      }
+
+      try {
+        this.store.updateScoutLog(scoutLogRow.id, {
+          endedAt: this.clock(),
+          candidates: JSON.stringify(candidates),
+          createdIssueIdentifiers: JSON.stringify(createdIdentifiers),
+          outcome: "completed",
+          costUsd: explorationResult.costUsd,
+        });
+      } catch (logErr) {
+        this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+      }
+
+      this.log(`scout: completed (candidates=${candidates.length}, created=${createdIdentifiers.length})`);
+
+      if (createdIdentifiers.length > 0) {
+        await this.notifier.notify({
+          kind: "scout_completed",
+          createdCount: createdIdentifiers.length,
+          objectiveCount,
+          triageCount,
+        });
+      }
+
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return HALT;
+      }
+
+      return CONTINUE;
+    } catch (err) {
+      const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
+      this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);
+      this.log(`scout: unexpected error, skipping: ${errMsg(err)}`);
+      try {
+        this.store.updateScoutLog(scoutLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `unexpected: ${errMsg(err)}`,
+        });
+      } catch (logErr) {
+        this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+      }
+      return CONTINUE;
     }
   }
 

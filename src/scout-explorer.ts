@@ -67,7 +67,8 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     const raw = outcome.fullResult ?? outcome.summary;
     const parsed = parseScoutOutput(raw);
     if (parsed.kind === "ok") {
-      return { kind: "ok", candidates: parsed.candidates, dropped: parsed.dropped, costUsd };
+      const filtered = applyObjectiveOnlyFilter(parsed, deps.objectiveOnly ?? false);
+      return { kind: "ok", candidates: filtered.candidates, dropped: filtered.dropped, costUsd };
     }
 
     log(`scout: parse failed, raw preview: ${parsed.raw.slice(0, RAW_PREVIEW_CHARS)}`);
@@ -97,7 +98,8 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     }
     const retryParsed = parseScoutOutput(retry.fullResult ?? retry.summary);
     if (retryParsed.kind === "ok") {
-      return { kind: "ok", candidates: retryParsed.candidates, dropped: retryParsed.dropped, costUsd };
+      const filtered = applyObjectiveOnlyFilter(retryParsed, deps.objectiveOnly ?? false);
+      return { kind: "ok", candidates: filtered.candidates, dropped: filtered.dropped, costUsd };
     }
     return {
       kind: "error",
@@ -115,18 +117,43 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     // -fdx removes ignored files (build caches, coverage, etc.) that -fd would leave behind
     // and that could affect later loop iterations while git status remains clean.
     await cleanupStep(["clean", "-fdx"]);
-    // Restore the original branch before resetting to avoid rewinding a different branch
-    // if SCOUT ran git checkout during its session.
-    if (startBranch) await cleanupStep(["checkout", startBranch]);
-    if (startSha) await cleanupStep(["reset", "--hard", startSha]);
-  }
-
-  async function cleanupStep(args: string[]): Promise<void> {
-    try {
-      const res = await runner.run("git", args, { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS });
-      if (res.code !== 0) log(`scout: cleanup "git ${args.join(" ")}" exited ${res.code}`);
-    } catch (err) {
-      log(`scout: cleanup "git ${args.join(" ")}" failed: ${err instanceof Error ? err.message : String(err)}`);
+    // Restore the original branch before resetting; only reset if the restore succeeds so we
+    // don't rewind a different branch when the original was removed during exploration.
+    if (startBranch) {
+      const restored = await cleanupStep(["checkout", startBranch]);
+      if (restored && startSha) await cleanupStep(["reset", "--hard", startSha]);
+    } else if (startSha) {
+      await cleanupStep(["reset", "--hard", startSha]);
     }
   }
+
+  async function cleanupStep(args: string[]): Promise<boolean> {
+    try {
+      const res = await runner.run("git", args, { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS });
+      if (res.code !== 0) {
+        log(`scout: cleanup "git ${args.join(" ")}" exited ${res.code}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      log(`scout: cleanup "git ${args.join(" ")}" failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+}
+
+function applyObjectiveOnlyFilter(
+  result: { candidates: ScoutCandidate[]; dropped: string[] },
+  objectiveOnly: boolean,
+): { candidates: ScoutCandidate[]; dropped: string[] } {
+  if (!objectiveOnly) return result;
+  const dropped = [...result.dropped];
+  const candidates = result.candidates.filter((c) => {
+    if (c.evidence_type === "spec_mismatch") {
+      dropped.push(`candidate dropped (objectiveOnly): "${c.title}"`);
+      return false;
+    }
+    return true;
+  });
+  return { candidates, dropped };
 }

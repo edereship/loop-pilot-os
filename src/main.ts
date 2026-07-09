@@ -153,6 +153,7 @@ async function runLoop(configPath: string): Promise<number> {
       phaseConfig: { model: string; effort: string } | undefined,
       permissionMode: string,
       allowedTools?: string,
+      extraArgs?: string[],
     ): ClaudeAgentRunner {
       const model = phaseConfig?.model ?? config.agent.model;
       const rawEffort = phaseConfig?.effort ?? config.agent.effort;
@@ -165,7 +166,7 @@ async function runLoop(configPath: string): Promise<number> {
         effortEnvOverride: supported || rawEffort === "auto" ? rawEffort : undefined,
         permissionMode,
         allowedTools: allowedTools ?? config.agent.allowedTools,
-        extraArgs: config.agent.extraArgs,
+        extraArgs: extraArgs ?? config.agent.extraArgs,
         log: logLine,
         rateLimit: rateLimitOpts,
       });
@@ -179,10 +180,15 @@ async function runLoop(configPath: string): Promise<number> {
     // allowedTools auto-execute.  Inheriting "acceptEdits" or "bypassPermissions" would
     // let the agent edit files despite the read-only-ish tool list (those modes
     // auto-approve edits regardless of allowedTools).
+    // Strip --dangerously-skip-permissions from global extra_args: that flag is equivalent
+    // to bypassPermissions and would nullify the "default" permission boundary.
+    const SCOUT_BYPASS_ARGS = new Set(["--dangerously-skip-permissions"]);
+    const scoutExtraArgs = config.agent.extraArgs.filter((a) => !SCOUT_BYPASS_ARGS.has(a));
     const scoutAgent = buildPhaseAgent(
       config.agent.scout,
       "default",
       config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS,
+      scoutExtraArgs,
     );
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {
