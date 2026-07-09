@@ -1913,4 +1913,50 @@ describe("scout_log CRUD (ES-516)", () => {
     // MAX(fired_at) over included rows → the interrupted row, not the board-fetch failure
     expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
   });
+
+  it("latestScoutFiredAt excludes creation-failure errors so SCOUT can retry sooner (Finding 4 — Codex review)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Creation-failure error: candidates found but all Linear calls failed — must NOT consume the interval
+    const creationFailRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(creationFailRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T12:05:00.000Z",
+      costUsd: 0.8,
+      errorDetail: "all issue creation failed",
+    });
+    // No other rows — must return null so the interval is not blocked
+    expect(store.latestScoutFiredAt()).toBeNull();
+  });
+
+  it("latestScoutFiredAt includes non-creation-failure error rows toward the interval", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // A different error (e.g. agent error) — should still count toward the interval
+    const errorRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T10:00:00.000Z" });
+    store.updateScoutLog(errorRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T10:30:00.000Z",
+      costUsd: 0.5,
+      errorDetail: "scout agent cost exceeded",
+    });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt excludes creation-failure but includes an earlier completed row", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Creation-failure at a later time — excluded
+    const creationFailRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(creationFailRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T14:05:00.000Z",
+      costUsd: 0.8,
+      errorDetail: "all issue creation failed",
+    });
+    // Earlier completed row — must be returned
+    const completedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T06:00:00.000Z" });
+    store.updateScoutLog(completedRow.id, { outcome: "completed", endedAt: "2026-07-08T06:30:00.000Z", costUsd: 1.5 });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T06:00:00.000Z");
+  });
 });

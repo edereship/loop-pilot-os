@@ -1452,12 +1452,20 @@ export class SqliteStore {
     // (Finding 7 — ES-519).
     // NULL outcome (in-progress) is always included via the explicit IS NULL check;
     // using NOT (...) alone would silently exclude NULL rows due to SQL NULL semantics.
+    // Creation-failure errors (all ticket creation calls failed, e.g. Linear outage) are
+    // excluded so SCOUT can retry sooner without waiting the full interval (Finding 4 — Codex review).
+    // Written as a positive predicate (not NOT) to preserve correct NULL semantics: NULL outcome
+    // rows (in-progress) must not be filtered out by the creation-failure exclusion.
     const row = this.db
       .prepare(
         `SELECT MAX(fired_at) AS latest FROM scout_log
-         WHERE outcome IS NULL
-            OR outcome != 'skipped'
-            OR (cost_usd IS NOT NULL AND cost_usd > 0)`,
+         WHERE (outcome IS NULL
+             OR outcome != 'skipped'
+             OR (cost_usd IS NOT NULL AND cost_usd > 0))
+           AND (outcome IS NULL
+             OR outcome != 'error'
+             OR error_detail IS NULL
+             OR error_detail != 'all issue creation failed')`,
       )
       .get() as { latest: string | null };
     return row.latest;

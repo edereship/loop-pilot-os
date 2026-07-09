@@ -24,6 +24,22 @@ function readProcCwdPids(dir: string): number[] {
   }
 }
 
+function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: unknown) {
+    if (err && typeof err === "object" && "code" in err && (err as { code: string }).code === "EPERM") {
+      return true;
+    }
+    return false;
+  }
+}
+
+function msDelay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export const REFORMAT_TIMEOUT_MS = 5 * 60_000;
 export const REFORMAT_MIN_BUDGET_USD = 0.1;
 export const REFORMAT_RAW_TAIL_CHARS = 20_000;
@@ -69,6 +85,16 @@ export interface ScoutExplorerDeps {
    * max_issues_per_scout so the cap in the parser matches the configured value.
    */
   maxCandidates?: number;
+  /**
+   * Check if a process with the given PID is still alive. Defaults to process.kill(pid, 0).
+   * Injectable for testing to prevent non-deterministic interaction with the real process table.
+   */
+  checkPidAlive?: (pid: number) => boolean;
+  /**
+   * Sleep for the given number of milliseconds. Defaults to a setTimeout-based delay.
+   * Injectable for testing.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export type ScoutExplorationResult =
@@ -104,16 +130,19 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       if (resetRes === null || resetRes.code !== 0) {
         log(`scout: warning: git reset --hard origin/${deps.defaultBranch} failed; running on current HEAD`);
       } else {
-        // Reset succeeded: restore memory categories that had local content so SCOUT
-        // can read them and so the bootstrap commit is not permanently discarded.
+        // Reset succeeded: restore categories that had local content but are now absent
+        // (e.g. local-only bootstrap commit removed by the reset). Only fill gaps — do
+        // NOT overwrite categories that upstream already provides, which would revert
+        // newer content that arrived via the fetch+reset (Finding 1 — Codex review).
+        const postResetMem = readMemoryAll(repoPath);
         const NO_LIMIT = Number.MAX_SAFE_INTEGER;
-        if (preResetMem.pmDecisions !== null) {
+        if (preResetMem.pmDecisions !== null && postResetMem.pmDecisions === null) {
           try { writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, NO_LIMIT); } catch { /* best-effort */ }
         }
-        if (preResetMem.implResults !== null) {
+        if (preResetMem.implResults !== null && postResetMem.implResults === null) {
           try { writeCategory(repoPath, "impl_results", preResetMem.implResults, NO_LIMIT); } catch { /* best-effort */ }
         }
-        if (preResetMem.productKnowledge !== null) {
+        if (preResetMem.productKnowledge !== null && postResetMem.productKnowledge === null) {
           try { writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, NO_LIMIT); } catch { /* best-effort */ }
         }
       }
@@ -230,16 +259,19 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     // Re-apply memory content after git clean -fd so a local-only bootstrap commit in
     // docs/memory is not permanently lost (Finding 2 — ES-519): git clean deletes the
     // untracked files we wrote back after git reset --hard.
+    // Only restore categories that are absent after cleanup; preserve upstream content
+    // that the post-cleanup git state already provides (Finding 1 — Codex review).
     if (preResetMem !== undefined) {
       const NO_LIMIT = Number.MAX_SAFE_INTEGER;
       let wroteMemory = false;
-      if (preResetMem.pmDecisions !== null) {
+      const postCleanupMem = readMemoryAll(repoPath);
+      if (preResetMem.pmDecisions !== null && postCleanupMem.pmDecisions === null) {
         try { writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, NO_LIMIT); wroteMemory = true; } catch { /* best-effort */ }
       }
-      if (preResetMem.implResults !== null) {
+      if (preResetMem.implResults !== null && postCleanupMem.implResults === null) {
         try { writeCategory(repoPath, "impl_results", preResetMem.implResults, NO_LIMIT); wroteMemory = true; } catch { /* best-effort */ }
       }
-      if (preResetMem.productKnowledge !== null) {
+      if (preResetMem.productKnowledge !== null && postCleanupMem.productKnowledge === null) {
         try { writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, NO_LIMIT); wroteMemory = true; } catch { /* best-effort */ }
       }
       // Commit any restored files so the next runPreflight's clean-worktree check does not
@@ -251,6 +283,25 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
   }
 
   async function cleanupProcesses(): Promise<void> {
+    const effectiveCheckPidAlive = deps.checkPidAlive ?? pidIsAlive;
+    const effectiveSleep = deps.sleep ?? msDelay;
+    const KILL_POLL_INTERVAL_MS = 200;
+    const KILL_MAX_POLLS = 15; // up to ~3 s of waiting
+
+    // Send SIGTERM then poll; escalate to SIGKILL for survivors (Finding 3 — Codex review).
+    async function termEscalate(pids: string[]): Promise<void> {
+      await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
+      let remaining = pids.filter(p => effectiveCheckPidAlive(parseInt(p, 10)));
+      for (let poll = 0; poll < KILL_MAX_POLLS && remaining.length > 0; poll++) {
+        await effectiveSleep(KILL_POLL_INTERVAL_MS);
+        remaining = remaining.filter(p => effectiveCheckPidAlive(parseInt(p, 10)));
+      }
+      if (remaining.length > 0) {
+        log(`scout: ${remaining.length} process(es) still alive after SIGTERM; escalating to SIGKILL: ${remaining.join(",")}`);
+        await runner.run("kill", ["-KILL", ...remaining], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
+      }
+    }
+
     try {
       let rawPids: string[];
       try {
@@ -293,7 +344,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
         if (pidsToKill.length > 0) {
           const pids = pidsToKill.map(String);
           log(`scout: (lsof unavailable) killing ${pids.length} process(es) in repo: ${pids.join(",")}`);
-          await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
+          await termEscalate(pids);
         }
         return;
       }
@@ -330,7 +381,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
 
       if (pids.length === 0) return;
       log(`scout: killing ${pids.length} orphaned process(es): ${pids.join(",")}`);
-      await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
+      await termEscalate(pids);
     } catch {
       // best-effort: process cleanup must not abort git cleanup
     }

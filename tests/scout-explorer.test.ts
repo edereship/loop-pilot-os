@@ -56,6 +56,9 @@ function setup(outcomes: AgentOutcome[]): {
     maxCostUsd: 2,
     timeoutMs: 30 * 60_000,
     log: (l) => logs.push(l),
+    // Prevent non-deterministic process.kill(pid, 0) calls against fake PIDs in tests.
+    checkPidAlive: () => false,
+    sleep: async () => {},
   };
   return { deps, agent, runner, logs };
 }
@@ -347,6 +350,50 @@ describe("runScoutExploration", () => {
     expect(killCall!.args).toContain("5678");
   });
 
+  // Finding 3 — Codex review: wait and escalate to SIGKILL when SIGTERM is ignored
+  it("escalates to SIGKILL for processes that survive SIGTERM", async () => {
+    const { deps, runner, logs } = setup([completed(VALID_JSON)]);
+    const stubPid = "1234";
+    runner.on(["lsof", "+D", REPO, "-t"], { stdout: `${stubPid}\n` });
+    runner.on(["kill"], {});
+    // Simulate a process that ignores SIGTERM (stays alive through all polls)
+    deps.checkPidAlive = () => true;
+    let sleepCalls = 0;
+    deps.sleep = async () => { sleepCalls++; };
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // SIGTERM must be sent first
+    const termCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-TERM");
+    expect(termCall).toBeDefined();
+    expect(termCall!.args).toContain(stubPid);
+    // SIGKILL must be sent after polling
+    const killCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-KILL");
+    expect(killCall).toBeDefined();
+    expect(killCall!.args).toContain(stubPid);
+    // SIGKILL must come after SIGTERM in call order
+    const termIdx = runner.calls.findIndex(c => c.cmd === "kill" && c.args[0] === "-TERM");
+    const killIdx = runner.calls.findIndex(c => c.cmd === "kill" && c.args[0] === "-KILL");
+    expect(killIdx).toBeGreaterThan(termIdx);
+    // sleep must have been called (polling)
+    expect(sleepCalls).toBeGreaterThan(0);
+    // escalation must be logged
+    expect(logs.some(l => l.includes("SIGKILL") || l.includes("escalating"))).toBe(true);
+  });
+
+  it("does not escalate to SIGKILL when process exits after SIGTERM", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    runner.on(["lsof", "+D", REPO, "-t"], { stdout: "1234\n" });
+    runner.on(["kill"], {});
+    // Process is already dead after SIGTERM (checkPidAlive returns false immediately)
+    deps.checkPidAlive = () => false;
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // SIGTERM must be sent
+    expect(runner.calls.some(c => c.cmd === "kill" && c.args[0] === "-TERM")).toBe(true);
+    // SIGKILL must NOT be sent
+    expect(runner.calls.some(c => c.cmd === "kill" && c.args[0] === "-KILL")).toBe(false);
+  });
+
   it("with getDescendantPids and getReparentedPids: kills reparented PIDs too", async () => {
     const { deps, runner } = setup([completed(VALID_JSON)]);
     const reparentedPid = "3333";
@@ -447,6 +494,51 @@ describe("runScoutExploration", () => {
     // Memory file must be restored even after git clean -fd deleted it during cleanup
     expect(existsSync(pmDecisionsPath)).toBe(true);
     expect(readFileSync(pmDecisionsPath, "utf-8")).toBe(memContent);
+  });
+
+  // Finding 1 — Codex review: do not overwrite upstream memory when reset brings newer content
+  it("with defaultBranch: does not overwrite upstream memory content after reset", async () => {
+    const tmpDir = makeTmpDir();
+    const memoryDir = path.join(tmpDir, "docs", "memory");
+    mkdirSync(memoryDir, { recursive: true });
+    const pmDecisionsPath = path.join(memoryDir, "pm-decisions.md");
+    // Local pre-reset content (older bootstrap)
+    const localContent = "# PM Decisions\n\nOld local decision.\n";
+    // Upstream content (newer, brought in by reset)
+    const upstreamContent = "# PM Decisions\n\nNewer upstream decision.\n";
+    writeFileSync(pmDecisionsPath, localContent, "utf-8");
+
+    const agent = new FakeAgentRunner();
+    agent.outcomes = [completed(VALID_JSON)];
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "rev-parse", "HEAD"], { stdout: "abc123\n" });
+    runner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "main\n" });
+    runner.on(["git", "fetch", "origin", "main"], {});
+    // Simulate reset writing upstream content to the memory file
+    runner.on(["git", "reset", "--hard", "origin/main"], (_args, _opts) => {
+      writeFileSync(pmDecisionsPath, upstreamContent, "utf-8");
+      return { stdout: "HEAD is now at abc123\n", code: 0 };
+    });
+    runner.on(["git", "checkout"], {});
+    runner.on(["git", "clean"], {});
+    runner.on(["git", "reset"], {});
+    const deps: ScoutExplorerDeps = {
+      agent,
+      runner,
+      repoPath: tmpDir,
+      prompt: "EXPLORE",
+      maxCostUsd: 2,
+      timeoutMs: 30 * 60_000,
+      log: () => {},
+      defaultBranch: "main",
+      checkPidAlive: () => false,
+      sleep: async () => {},
+    };
+
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // Upstream content must NOT be overwritten by the pre-reset local content
+    expect(readFileSync(pmDecisionsPath, "utf-8")).toBe(upstreamContent);
   });
 
   it("with defaultBranch and no local memory: does not create memory files after reset", async () => {
