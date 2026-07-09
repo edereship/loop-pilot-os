@@ -3,6 +3,9 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Orchestrator, isPidAlive } from "../src/orchestrator.js";
+import type { ScoutDeps } from "../src/orchestrator.js";
+import type { GroomBoardFetcher } from "../src/groom-board-fetcher.js";
+import type { GroomLinearClient } from "../src/groom-linear-client.js";
 import { SqliteStore } from "../src/store.js";
 import {
   FakeTaskSource,
@@ -20,6 +23,10 @@ import {
 } from "./fakes.js";
 import type { Config } from "../src/config.js";
 import type { EligibleIssue, PromptArgs, PlanRunner, PauseMeta, MergeReadiness } from "../src/types.js";
+
+type _AssertTrue<T extends true> = T;
+type _ScoutBoardFetcherSatisfies = _AssertTrue<GroomBoardFetcher extends ScoutDeps["boardFetcher"] ? true : false>;
+type _ScoutLinearClientSatisfies = _AssertTrue<GroomLinearClient extends ScoutDeps["linearClient"] ? true : false>;
 
 // ---- テストヘルパ ----
 function makeConfig(over: Partial<{
@@ -232,6 +239,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
     } : null,
+    scoutDeps: null,
     getDescendantPids: opts?.getDescendantPids,
     getReparentedPids: opts?.getReparentedPids,
     checkPidAlive: opts?.checkPidAlive,
@@ -795,6 +803,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
       runner: inlineMemoryRunner1,
       designReviewer: null,
       groomDeps: null,
+      scoutDeps: null,
     });
     source.queue = [issue("issue-A", "TY-1")];
     git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
@@ -3146,6 +3155,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
       designReviewer: null,
       runner: inlineMemoryRunner2,
       groomDeps: null,
+      scoutDeps: null,
     });
 
     source.queue = [issue("issue-A", "TY-1")];
@@ -3781,6 +3791,7 @@ describe("Orchestrator.interruptablePause", () => {
       recoveryTurn: null,
       runner: inlineMemoryRunner3,
       groomDeps: null,
+      scoutDeps: null,
     });
     orchRef = orch;
 
@@ -6407,6 +6418,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       recoveryTurn: null,
       runner: memoryRunner,
       groomDeps: null,
+      scoutDeps: null,
     });
 
     await orch.run();
@@ -6546,6 +6558,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       recoveryTurn: null,
       runner: memoryRunner,
       groomDeps: null,
+      scoutDeps: null,
     });
 
     // run() creates a NEW run (not reusing the old one), so we need
@@ -6638,6 +6651,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
       recoveryTurn: null,
       runner: memoryRunner,
       groomDeps: null,
+      scoutDeps: null,
     });
 
     await orch.run();
@@ -6709,6 +6723,7 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
         linearClient: groomLinearClient,
         knownLabels: ["looppilot-os"],
       },
+      scoutDeps: null,
     });
 
     await orch.run();
@@ -9227,6 +9242,7 @@ describe("VERIFY (ES-491)", () => {
       recoveryTurn: null,
       runner: lsofRunner,
       groomDeps: null,
+      scoutDeps: null,
     });
 
     await orch.run();

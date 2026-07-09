@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { config as dotenvConfig } from "dotenv";
 
-import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar } from "./config.js";
+import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar, SCOUT_DEFAULT_ALLOWED_TOOLS } from "./config.js";
 import { SqliteStore } from "./store.js";
 import { RealCommandRunner } from "./exec.js";
 import { ConsoleSlackNotifier } from "./notifier.js";
@@ -152,6 +152,7 @@ async function runLoop(configPath: string): Promise<number> {
     function buildPhaseAgent(
       phaseConfig: { model: string; effort: string } | undefined,
       permissionMode: string,
+      allowedTools?: string,
     ): ClaudeAgentRunner {
       const model = phaseConfig?.model ?? config.agent.model;
       const rawEffort = phaseConfig?.effort ?? config.agent.effort;
@@ -163,7 +164,7 @@ async function runLoop(configPath: string): Promise<number> {
         effort: supported && rawEffort !== "auto" ? rawEffort : undefined,
         effortEnvOverride: supported || rawEffort === "auto" ? rawEffort : undefined,
         permissionMode,
-        allowedTools: config.agent.allowedTools,
+        allowedTools: allowedTools ?? config.agent.allowedTools,
         extraArgs: config.agent.extraArgs,
         log: logLine,
         rateLimit: rateLimitOpts,
@@ -174,6 +175,11 @@ async function runLoop(configPath: string): Promise<number> {
     const selfReviewAgent = buildPhaseAgent(config.agent.selfReview, config.agent.permissionMode);
     const verifyAgent = buildPhaseAgent(config.agent.verify, config.agent.permissionMode);
     const recoveryAgent = buildPhaseAgent(config.agent.recovery, config.agent.permissionMode);
+    const scoutAgent = buildPhaseAgent(
+      config.agent.scout,
+      config.agent.permissionMode,
+      config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS,
+    );
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {
       maxCostUsd: config.safety.maxCostUsdPerDesign,
@@ -270,6 +276,13 @@ async function runLoop(configPath: string): Promise<number> {
         boardFetcher: groomBoardFetcher,
         linearClient: groomLinearClient,
         knownLabels: linearSetup.knownLabels,
+      } : null,
+      scoutDeps: config.scout.enabled ? {
+        agent: scoutAgent,
+        boardFetcher: groomBoardFetcher,
+        linearClient: groomLinearClient,
+        scoutLabelId: linearSetup.scoutLabelId,
+        scoutTriageLabelId: linearSetup.scoutTriageLabelId,
       } : null,
     });
 

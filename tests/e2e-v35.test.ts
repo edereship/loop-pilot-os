@@ -218,6 +218,7 @@ function makeHarness(config: Config, opts?: {
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
     } : null,
+    scoutDeps: null,
   });
   return { orch, store, source, agent, verifyAgent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
 }

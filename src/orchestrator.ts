@@ -72,6 +72,24 @@ export interface GroomDeps {
   knownLabels: string[];
 }
 
+export interface ScoutDeps {
+  agent: AgentRunner;
+  boardFetcher: {
+    getIssuesByLabel(label: string): Promise<Array<{ identifier: string; title: string; labels: string[] }>>;
+  };
+  linearClient: {
+    createIssue(fields: {
+      title: string;
+      description: string;
+      priority: number;
+      extraLabelIds?: string[];
+      includeOptIn?: boolean;
+    }): Promise<string>;
+  };
+  scoutLabelId: string | null;
+  scoutTriageLabelId: string | null;
+}
+
 export type RunOutcome = "finished" | "lock_rejected";
 
 export interface OrchestratorDeps {
@@ -100,6 +118,7 @@ export interface OrchestratorDeps {
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
   groomDeps: GroomDeps | null;
+  scoutDeps: ScoutDeps | null;
   /**
    * Returns the set of descendant PIDs of the given root PID (injectable for
    * testing). Returning `null` signals that the process tree cannot be
@@ -172,6 +191,7 @@ export class Orchestrator {
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
   private readonly groomDeps: GroomDeps | null;
+  private readonly scoutDeps: ScoutDeps | null;
   private readonly getDescendantPids: (rootPid: number) => Set<number> | null;
   private readonly getReparentedPids: (pids: number[]) => Set<number>;
   private readonly checkPidAlive: (pid: number) => boolean;
@@ -204,6 +224,7 @@ export class Orchestrator {
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
     this.groomDeps = deps.groomDeps;
+    this.scoutDeps = deps.scoutDeps;
     this.getDescendantPids = deps.getDescendantPids ?? procDescendantPids;
     this.getReparentedPids = deps.getReparentedPids ?? procReparentedPids;
     this.checkPidAlive = deps.checkPidAlive ?? isPidAlive;

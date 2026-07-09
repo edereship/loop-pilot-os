@@ -67,6 +67,11 @@ const rawSchema = z.object({
       model: z.string().optional(),
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     }).strict().optional(),
+    scout: z.object({
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+      allowed_tools: z.string().optional(),
+    }).strict().optional(),
   }).strict(),
   // Codex (PM) per-phase effort (ES-486). Absent → Codex gets no -m/-c flags (backward compat).
   // effort fields use z.string() so loadConfig can produce error messages that include the
@@ -121,6 +126,7 @@ const rawSchema = z.object({
     max_merge_gate_fix_attempts: z.number().int().positive().default(2),
     max_cost_usd_per_merge_gate_fix: z.number().positive().default(2),
     max_cost_usd_per_scout: z.number().positive().default(2),
+    scout_timeout_minutes: z.number().positive().default(30),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -169,6 +175,8 @@ const rawSchema = z.object({
 
 type RawConfig = z.infer<typeof rawSchema>;
 
+export const SCOUT_DEFAULT_ALLOWED_TOOLS = "Read,Grep,Glob,Bash";
+
 // ---- camelCase Config（このモジュールが唯一の定義元・types.ts には置かない。カーネル §3） ----
 export interface Config {
   product: {
@@ -206,6 +214,7 @@ export interface Config {
     selfReview: { model: string; effort: string } | undefined;
     recovery: { model: string; effort: string } | undefined;
     verify: { model: string; effort: string } | undefined;
+    scout: { model: string; effort: string; allowedTools: string } | undefined;
   };
   pm: {
     model: string;
@@ -254,6 +263,7 @@ export interface Config {
     maxMergeGateFixAttempts: number;
     maxCostUsdPerMergeGateFix: number;
     maxCostUsdPerScout: number;
+    scoutTimeoutMinutes: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -795,6 +805,7 @@ export function loadConfig(
       ["agent.self_review", result.data.agent.self_review],
       ["agent.recovery", result.data.agent.recovery],
       ["agent.verify", result.data.agent.verify],
+      ["agent.scout", result.data.agent.scout],
     ];
     for (const [phasePath, rawPhase] of phaseEntries) {
       if (rawPhase !== undefined) {
@@ -890,6 +901,13 @@ export function loadConfig(
       verify: raw.agent.verify
         ? { model: raw.agent.verify.model ?? raw.agent.model, effort: raw.agent.verify.effort ?? effectiveEffort }
         : undefined,
+      scout: raw.agent.scout
+        ? {
+            model: raw.agent.scout.model ?? raw.agent.model,
+            effort: raw.agent.scout.effort ?? effectiveEffort,
+            allowedTools: raw.agent.scout.allowed_tools ?? SCOUT_DEFAULT_ALLOWED_TOOLS,
+          }
+        : undefined,
     },
     pm: raw.pm !== undefined
       ? {
@@ -940,6 +958,7 @@ export function loadConfig(
       maxMergeGateFixAttempts: raw.safety.max_merge_gate_fix_attempts,
       maxCostUsdPerMergeGateFix: raw.safety.max_cost_usd_per_merge_gate_fix,
       maxCostUsdPerScout: raw.safety.max_cost_usd_per_scout,
+      scoutTimeoutMinutes: raw.safety.scout_timeout_minutes,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,

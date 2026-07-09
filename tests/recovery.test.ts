@@ -158,6 +158,7 @@ function makeHarness(config: Config): Harness {
     designReviewer: null,
     mergeGateJudge: null,
     groomDeps: null,
+    scoutDeps: null,
   });
   return { orch, store, source, agent, git, monitor, notifier, recovery, sleepCalls, logs, promptArgs };
 }
