@@ -1452,10 +1452,12 @@ export class SqliteStore {
     // (Finding 7 — ES-519).
     // NULL outcome (in-progress) is always included via the explicit IS NULL check;
     // using NOT (...) alone would silently exclude NULL rows due to SQL NULL semantics.
+    // Error rows are included only when they burned budget (cost_usd > 0) AND are not a
+    // creation-failure: zero-cost errors (e.g. transient quota/rate-limit rejections where
+    // no exploration ran) must not consume the full min_interval_hours window so SCOUT can
+    // retry at the next idle opportunity (Finding 3 — Codex review).
     // Creation-failure errors (all ticket creation calls failed, e.g. Linear outage) are
-    // excluded so SCOUT can retry sooner without waiting the full interval (Finding 4 — Codex review).
-    // Written as a positive predicate (not NOT) to preserve correct NULL semantics: NULL outcome
-    // rows (in-progress) must not be filtered out by the creation-failure exclusion.
+    // also excluded so SCOUT can retry sooner (Finding 4 — Codex review).
     const row = this.db
       .prepare(
         `SELECT MAX(fired_at) AS latest FROM scout_log
@@ -1464,8 +1466,8 @@ export class SqliteStore {
              OR (cost_usd IS NOT NULL AND cost_usd > 0))
            AND (outcome IS NULL
              OR outcome != 'error'
-             OR error_detail IS NULL
-             OR error_detail != 'all issue creation failed')`,
+             OR (cost_usd IS NOT NULL AND cost_usd > 0
+                 AND (error_detail IS NULL OR error_detail != 'all issue creation failed')))`,
       )
       .get() as { latest: string | null };
     return row.latest;

@@ -210,6 +210,11 @@ async function runLoop(configPath: string): Promise<number> {
       // Block MCP tools: --tools only restricts built-in tools, not MCP tools; deny MCP
       // explicitly so SCOUT cannot call write-capable MCP servers (Finding 1 — ES-519).
       out.push("--disallowedTools", "mcp__*");
+      // --bare skips auto-discovery of project hooks, skills, plugins, MCP servers,
+      // auto-memory, and CLAUDE.md so repository customizations cannot alter SCOUT's
+      // behaviour or allowlist boundary before the prompt runs.  SCOUT reads CLAUDE.md
+      // explicitly as data via the Read tool (Finding 2 — Codex review).
+      out.push("--bare");
       return out;
     })();
     const scoutTools = config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS;

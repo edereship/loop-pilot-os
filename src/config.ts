@@ -184,12 +184,16 @@ type RawConfig = z.infer<typeof rawSchema>;
 // wildcards, shell-metacharacter injection cannot piggyback on an allowed command
 // prefix.  Operators who need git-history exploration should configure an explicit
 // [agent.scout] allowed_tools list and accept the widened surface.
-// npm run * is intentionally excluded: repos may expose destructive scripts such as
-// "deploy" or "release" that SCOUT must not trigger unattended (Finding 1 — ES-519).
+// Wildcard `npm run *` is excluded — repos expose destructive scripts ("deploy",
+// "release") that SCOUT must not trigger unattended.  Three read-only analysis
+// commands are pre-approved explicitly because they are the signals SCOUT collects
+// on common npm projects and would otherwise require every operator to add a custom
+// [agent.scout] override (Finding 1 — ES-519, Finding 1 — Codex review).
 export const SCOUT_DEFAULT_ALLOWED_TOOLS = [
   "Read", "Grep", "Glob",
   "Bash(git status)",
   "Bash(npm test)", "Bash(npm audit)",
+  "Bash(npm run lint)", "Bash(npm run typecheck)", "Bash(npm run check)",
 ].join(",");
 
 // ---- camelCase Config（このモジュールが唯一の定義元・types.ts には置かない。カーネル §3） ----

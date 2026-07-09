@@ -1959,4 +1959,26 @@ describe("scout_log CRUD (ES-516)", () => {
     store.updateScoutLog(completedRow.id, { outcome: "completed", endedAt: "2026-07-08T06:30:00.000Z", costUsd: 1.5 });
     expect(store.latestScoutFiredAt()).toBe("2026-07-08T06:00:00.000Z");
   });
+
+  it("latestScoutFiredAt excludes zero-cost error rows so a transient rate-limit does not consume the interval (Finding 3 — Codex review)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Zero-cost error: quota/rate-limit rejection before any exploration ran
+    const rateLimitRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(rateLimitRow.id, { outcome: "error", endedAt: "2026-07-08T12:00:02.000Z", costUsd: 0, errorDetail: "rate limited" });
+    // No other rows — must return null so the interval is not blocked
+    expect(store.latestScoutFiredAt()).toBeNull();
+  });
+
+  it("latestScoutFiredAt includes a non-zero-cost error while ignoring a later zero-cost error (Finding 3 — Codex review)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Earlier non-zero-cost error (budget spent) — must count toward the interval
+    const budgetErrorRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T10:00:00.000Z" });
+    store.updateScoutLog(budgetErrorRow.id, { outcome: "error", endedAt: "2026-07-08T10:30:00.000Z", costUsd: 0.5, errorDetail: "scout agent cost exceeded" });
+    // Later zero-cost error — must not mask the earlier row
+    const zeroCostRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(zeroCostRow.id, { outcome: "error", endedAt: "2026-07-08T14:00:01.000Z", costUsd: 0, errorDetail: "rate limited" });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
+  });
 });
