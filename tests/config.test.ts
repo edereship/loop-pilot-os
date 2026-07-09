@@ -859,48 +859,48 @@ describe("loadConfig", () => {
       expect(config.scout.maxIssuesPerScout).toBe(3);
     });
   });
-});
 
-// ES-519: SCOUT 専用 per-phase ブロック [agent.scout] + safety.scout_timeout_minutes
-it("throws when extra_args contains --allowedTools (silently overrides per-phase tool restrictions)", () => {
-  expect(() =>
-    loadConfig(fixture("config-extra-args-allowed-tools.toml"), fullEnv),
-  ).toThrow(/agent\.extra_args.*--allowedTools/);
-});
+  // ES-519: SCOUT 専用 per-phase ブロック [agent.scout] + safety.scout_timeout_minutes
+  it("throws when extra_args contains --allowedTools (silently overrides per-phase tool restrictions)", () => {
+    expect(() =>
+      loadConfig(fixture("config-extra-args-allowed-tools.toml"), fullEnv),
+    ).toThrow(/agent\.extra_args.*--allowedTools/);
+  });
 
-describe("agent.scout (ES-519)", () => {
-  it("resolves [agent.scout] with explicit model/effort/allowed_tools", () => {
-    const config = loadConfig(fixture("config-agent-scout.toml"), fullEnv);
-    expect(config.agent.scout).toEqual({
-      model: "opus",
-      effort: "low",
-      allowedTools: "Read,Bash",
+  describe("agent.scout (ES-519)", () => {
+    it("resolves [agent.scout] with explicit model/effort/allowed_tools", () => {
+      const config = loadConfig(fixture("config-agent-scout.toml"), fullEnv);
+      expect(config.agent.scout).toEqual({
+        model: "opus",
+        effort: "low",
+        allowedTools: "Read,Bash",
+      });
+      expect(config.safety.scoutTimeoutMinutes).toBe(45);
     });
-    expect(config.safety.scoutTimeoutMinutes).toBe(45);
-  });
 
-  it("agent.scout is undefined when the block is absent; scout_timeout_minutes defaults to 30", () => {
-    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
-    expect(config.agent.scout).toBeUndefined();
-    expect(config.safety.scoutTimeoutMinutes).toBe(30);
-  });
+    it("agent.scout is undefined when the block is absent; scout_timeout_minutes defaults to 30", () => {
+      const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+      expect(config.agent.scout).toBeUndefined();
+      expect(config.safety.scoutTimeoutMinutes).toBe(30);
+    });
 
-  it("empty [agent.scout] block falls back to agent model/effort and SCOUT_DEFAULT_ALLOWED_TOOLS", () => {
-    const config = loadConfig(fixture("config-agent-scout-partial.toml"), fullEnv);
-    expect(config.agent.scout!.model).toBe("opus");
-    expect(config.agent.scout!.effort).toBe(config.agent.effort);
-    expect(config.agent.scout!.allowedTools).toBe(SCOUT_DEFAULT_ALLOWED_TOOLS);
-  });
+    it("empty [agent.scout] block falls back to agent model/effort and SCOUT_DEFAULT_ALLOWED_TOOLS", () => {
+      const config = loadConfig(fixture("config-agent-scout-partial.toml"), fullEnv);
+      expect(config.agent.scout!.model).toBe("opus");
+      expect(config.agent.scout!.effort).toBe(config.agent.effort);
+      expect(config.agent.scout!.allowedTools).toBe(SCOUT_DEFAULT_ALLOWED_TOOLS);
+    });
 
-  it("rejects invalid model/effort combination in [agent.scout] via validatePhaseModelEffort", () => {
-    expect(() =>
-      loadConfig(fixture("config-agent-scout-bad-model.toml"), fullEnv),
-    ).toThrow(/agent\.scout/);
-  });
+    it("rejects invalid model/effort combination in [agent.scout] via validatePhaseModelEffort", () => {
+      expect(() =>
+        loadConfig(fixture("config-agent-scout-bad-model.toml"), fullEnv),
+      ).toThrow(/agent\.scout/);
+    });
 
-  it("rejects unknown keys in [agent.scout] (strict schema)", () => {
-    expect(() =>
-      loadConfig(fixture("config-agent-scout-unknown-key.toml"), fullEnv),
-    ).toThrow();
+    it("rejects unknown keys in [agent.scout] (strict schema)", () => {
+      expect(() =>
+        loadConfig(fixture("config-agent-scout-unknown-key.toml"), fullEnv),
+      ).toThrow();
+    });
   });
 });

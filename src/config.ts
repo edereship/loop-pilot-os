@@ -38,7 +38,7 @@ const rawSchema = z.object({
   }).strict(),
   agent: z.object({
     model: z.string(),
-    allowed_tools: z.string(),
+    allowed_tools: z.string().min(1),
     extra_args: z.array(z.string()).default([]),
     effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     permission_mode: z.enum([
