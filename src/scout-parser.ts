@@ -71,18 +71,28 @@ function salvage(items: unknown[]): ScoutParseResult {
 }
 
 function* extractJsonCandidates(text: string): Generator<string> {
-  const fencePattern = /```json\s*\n([\s\S]*?)\n\s*```/g;
+  const fencePattern = /```json[ \t]*([\s\S]*?)[ \t]*```/g;
   let lastFenceMatch: string | null = null;
   let m: RegExpExecArray | null;
   while ((m = fencePattern.exec(text)) !== null) {
     lastFenceMatch = m[1];
   }
-  if (lastFenceMatch !== null) {
-    yield lastFenceMatch;
-    return;
-  }
+  if (lastFenceMatch !== null) { yield lastFenceMatch.trim(); }
 
   const lines = text.split("\n");
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line.startsWith("```json")) {
+      const afterMarker = line.slice("```json".length).trimStart();
+      const jsonStart = afterMarker.indexOf("{");
+      const jsonEnd = afterMarker.lastIndexOf("}");
+      if (jsonStart !== -1 && jsonEnd > jsonStart) {
+        yield afterMarker.slice(jsonStart, jsonEnd + 1);
+      }
+      break;
+    }
+  }
 
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
@@ -94,10 +104,7 @@ function* extractJsonCandidates(text: string): Generator<string> {
 
   let endLine = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trimEnd().endsWith("}")) {
-      endLine = i;
-      break;
-    }
+    if (lines[i].trimEnd().endsWith("}")) { endLine = i; break; }
   }
   if (endLine !== -1) {
     for (let startLine = endLine; startLine >= 0; startLine--) {

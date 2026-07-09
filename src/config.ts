@@ -70,7 +70,7 @@ const rawSchema = z.object({
     scout: z.object({
       model: z.string().optional(),
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
-      allowed_tools: z.string().optional(),
+      allowed_tools: z.string().min(1).optional(),
     }).strict().optional(),
   }).strict(),
   // Codex (PM) per-phase effort (ES-486). Absent → Codex gets no -m/-c flags (backward compat).
@@ -772,6 +772,13 @@ export function loadConfig(
         `agent.extra_args: "--effort" must not be set via extra_args; ` +
           `use agent.effort instead (the CLAUDE_CODE_EFFORT_LEVEL env override injected at launch ` +
           `takes precedence over --effort flags in extra_args)`,
+      );
+    }
+    if (extra_args.some((arg) => arg === "--allowedTools" || arg.startsWith("--allowedTools="))) {
+      errors.push(
+        `agent.extra_args: "--allowedTools" must not be set via extra_args; ` +
+          `use agent.allowed_tools or [agent.scout].allowed_tools instead ` +
+          `(extra_args flags silently override per-phase tool restrictions)`,
       );
     }
 

@@ -31,6 +31,9 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     .run("git", ["rev-parse", "HEAD"], { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS })
     .then((r) => (r.code === 0 ? r.stdout.trim() : null))
     .catch(() => null);
+  if (startSha === null) {
+    log("scout: warning: could not capture startSha (git rev-parse HEAD failed); reset --hard will be skipped in cleanup");
+  }
 
   let costUsd = 0;
   try {

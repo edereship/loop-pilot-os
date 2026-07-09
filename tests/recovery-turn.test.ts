@@ -170,6 +170,7 @@ function makeConfig(): Config {
       groomTimeoutMinutes: 10, groomBoardBudgetChars: 10000,
       transientRetryAttempts: 2,
       maxCostUsdPerScout: 2,
+      scoutTimeoutMinutes: 30,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300 },
     looppilot: { gateLabel: "loop-pilot" },

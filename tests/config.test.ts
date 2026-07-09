@@ -862,6 +862,12 @@ describe("loadConfig", () => {
 });
 
 // ES-519: SCOUT 専用 per-phase ブロック [agent.scout] + safety.scout_timeout_minutes
+it("throws when extra_args contains --allowedTools (silently overrides per-phase tool restrictions)", () => {
+  expect(() =>
+    loadConfig(fixture("config-extra-args-allowed-tools.toml"), fullEnv),
+  ).toThrow(/agent\.extra_args.*--allowedTools/);
+});
+
 describe("agent.scout (ES-519)", () => {
   it("resolves [agent.scout] with explicit model/effort/allowed_tools", () => {
     const config = loadConfig(fixture("config-agent-scout.toml"), fullEnv);

@@ -52,6 +52,7 @@ function makeConfig(over: Partial<{
       maxRecoveryAttempts: 2,
       transientRetryAttempts: 2,
       maxCostUsdPerScout: 2,
+      scoutTimeoutMinutes: 30,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,

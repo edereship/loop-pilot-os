@@ -75,6 +75,7 @@ function makeConfig(over: Partial<{
       maxMergeGateFixAttempts: 2,
       maxCostUsdPerMergeGateFix: 2,
       maxCostUsdPerScout: 2,
+      scoutTimeoutMinutes: 30,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,

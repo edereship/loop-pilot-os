@@ -62,6 +62,7 @@ function makeConfig(over: Partial<{
       maxRecoveryAttempts: over.maxRecoveryAttempts ?? 2,
       transientRetryAttempts: over.transientRetryAttempts ?? 2,
       maxCostUsdPerScout: 2,
+      scoutTimeoutMinutes: 30,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300, idleTimeoutMinutes: 120 },
     looppilot: { gateLabel: "loop-pilot" },
