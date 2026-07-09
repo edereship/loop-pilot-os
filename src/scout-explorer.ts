@@ -23,8 +23,12 @@ export interface ScoutExplorerDeps {
   maxCostUsd: number;
   timeoutMs: number;
   log: (line: string) => void;
-  /** When true, the reformat prompt forbids spec_mismatch candidates (no specs were provided). */
-  objectiveOnly?: boolean;
+  /**
+   * When true (or a function that returns true), the reformat prompt and candidate filter forbid
+   * spec_mismatch. Accepts a function so the caller can resolve this after the prompt builder
+   * runs and captures the actual spec-loading outcome (Finding 2 — ES-519).
+   */
+  objectiveOnly?: boolean | (() => boolean);
   /** When provided, fetch and reset to origin/<defaultBranch> before running the agent. */
   defaultBranch?: string;
   /**
@@ -87,6 +91,11 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
 
   // Resolve the prompt after any git reset so a builder receives fresh file contents (Finding 3).
   const prompt = typeof deps.prompt === "function" ? deps.prompt() : deps.prompt;
+  // Resolve objectiveOnly AFTER the prompt builder so dynamic callers (e.g. the orchestrator)
+  // can capture the actual spec-loading outcome from inside the builder (Finding 2 — ES-519).
+  const effectiveObjectiveOnly = typeof deps.objectiveOnly === "function"
+    ? deps.objectiveOnly()
+    : (deps.objectiveOnly ?? false);
 
   const startSha = await runner
     .run("git", ["rev-parse", "HEAD"], { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS })
@@ -126,7 +135,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     const raw = outcome.fullResult ?? outcome.summary;
     const parsed = parseScoutOutput(raw);
     if (parsed.kind === "ok") {
-      const filtered = applyObjectiveOnlyFilter(parsed, deps.objectiveOnly ?? false);
+      const filtered = applyObjectiveOnlyFilter(parsed, effectiveObjectiveOnly);
       return { kind: "ok", candidates: filtered.candidates, dropped: filtered.dropped, costUsd };
     }
 
@@ -145,7 +154,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     log("scout: retrying with reformat prompt");
     const retry = await agent.runSession({
       worktreePath: repoPath,
-      prompt: buildScoutReformatPrompt(raw.slice(-REFORMAT_RAW_TAIL_CHARS), deps.objectiveOnly ?? false),
+      prompt: buildScoutReformatPrompt(raw.slice(-REFORMAT_RAW_TAIL_CHARS), effectiveObjectiveOnly),
       maxCostUsd: remaining,
       hardTimeoutMs: REFORMAT_TIMEOUT_MS,
     });
@@ -157,7 +166,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     }
     const retryParsed = parseScoutOutput(retry.fullResult ?? retry.summary);
     if (retryParsed.kind === "ok") {
-      const filtered = applyObjectiveOnlyFilter(retryParsed, deps.objectiveOnly ?? false);
+      const filtered = applyObjectiveOnlyFilter(retryParsed, effectiveObjectiveOnly);
       return { kind: "ok", candidates: filtered.candidates, dropped: filtered.dropped, costUsd };
     }
     return {
@@ -199,7 +208,17 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
         });
         rawPids = lsofResult.stdout.trim().split("\n").filter(Boolean);
       } catch {
-        return; // lsof unavailable or failed — skip process cleanup
+        // lsof unavailable or failed — fall back to ancestry scan so spawned dev servers
+        // or watchers are still cleaned up in minimal containers (Finding 4 — ES-519).
+        if (deps.getDescendantPids) {
+          const descendants = deps.getDescendantPids(process.pid);
+          if (descendants !== null && descendants.size > 0) {
+            const pids = [...descendants].map(String);
+            log(`scout: (lsof unavailable) killing ${pids.length} descendant process(es): ${pids.join(",")}`);
+            await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
+          }
+        }
+        return;
       }
       const myPid = String(process.pid);
       const basicFiltered = rawPids.filter(p => /^\d+$/.test(p) && p !== "0" && p !== "1" && p !== myPid);

@@ -2309,10 +2309,12 @@ export class Orchestrator {
       const repoPath = this.config.repo.path;
       const specDir = this.config.product.specDir;
       const goal = this.config.product.goal ?? null;
-      // objectiveOnly: computed from config so it is stable across the git reset that
-      // runScoutExploration performs. If specDir is configured, spec_mismatch candidates
-      // are allowed (even if the spec file is temporarily absent) (Finding 3 — ES-519).
-      const objectiveOnly = specDir === undefined && goal === null;
+      // Track whether spec was actually loaded by the prompt builder so objectiveOnly
+      // reflects the real loaded state (not just config presence). When specDir is
+      // configured but loading fails and goal is null, the prompt already tells the
+      // agent that spec_mismatch is forbidden; this flag enforces the same rule in the
+      // parser/reformat path (Finding 2 — ES-519).
+      let specActuallyLoaded = false;
 
       this.log("scout: starting exploration");
       const explorationResult = await runScoutExploration({
@@ -2323,9 +2325,11 @@ export class Orchestrator {
         // spec content reflects the freshly-checked-out commit (Finding 3 — ES-519).
         prompt: () => {
           let specContent: SpecContent | null = null;
+          specActuallyLoaded = false;
           if (specDir !== undefined && this.specLoader !== null) {
             try {
               specContent = this.specLoader(repoPath, specDir);
+              specActuallyLoaded = specContent !== null;
             } catch (err) {
               this.log(`scout: spec loading failed (non-fatal): ${errMsg(err)}`);
             }
@@ -2342,7 +2346,8 @@ export class Orchestrator {
         maxCostUsd: this.config.safety.maxCostUsdPerScout,
         timeoutMs: this.config.safety.scoutTimeoutMinutes * 60_000,
         log: this.log,
-        objectiveOnly,
+        // Evaluated after the prompt builder runs so it captures specActuallyLoaded (Finding 2).
+        objectiveOnly: () => !specActuallyLoaded && goal === null,
         defaultBranch: this.config.repo.defaultBranch,
         // Pass process-tree helpers so SCOUT cleanup only kills processes it spawned,
         // not unrelated editors or watchers that have files open in repoPath (Finding 2 — ES-519).
