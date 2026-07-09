@@ -193,4 +193,31 @@ describe("runScoutExploration", () => {
     await runScoutExploration(deps);
     expect(agent.contexts[1].prompt).toContain('"spec_mismatch"');
   });
+
+  it("with defaultBranch: fetches and resets before recording startSha, then cleans up to refreshed state", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    runner.on(["git", "fetch"], {});
+    runner.on(["git", "reset", "--hard", "origin/main"], { stdout: "HEAD is now at abc123\n" });
+    deps.defaultBranch = "main";
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    const calls = gitCalls(runner);
+    // fetch and reset must come before rev-parse
+    const fetchIdx = calls.findIndex(a => a[0] === "fetch");
+    const revParseIdx = calls.findIndex(a => a[0] === "rev-parse");
+    expect(fetchIdx).toBeGreaterThanOrEqual(0);
+    expect(fetchIdx).toBeLessThan(revParseIdx);
+    expect(calls[fetchIdx]).toEqual(["fetch", "origin", "main"]);
+    const resetBeforeAgent = calls.slice(0, revParseIdx).find(a => a[0] === "reset" && a.includes("origin/main"));
+    expect(resetBeforeAgent).toBeDefined();
+  });
+
+  it("with defaultBranch: logs a warning and continues when fetch fails", async () => {
+    const { deps, runner, logs } = setup([completed(VALID_JSON)]);
+    runner.on(["git", "fetch"], { code: 1, stderr: "fatal: unable to connect" });
+    deps.defaultBranch = "main";
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    expect(logs.some(l => l.includes("warning") && l.includes("fetch"))).toBe(true);
+  });
 });

@@ -2292,7 +2292,18 @@ export class Orchestrator {
         existingScoutIssues = scoutIssues.map((i) => ({ identifier: i.identifier, title: i.title }));
         pendingTriageIssues = triageIssues.map((i) => ({ identifier: i.identifier, title: i.title }));
       } catch (err) {
-        this.log(`scout: board fetch failed (non-fatal): ${errMsg(err)}`);
+        this.log(`scout: board fetch failed, skipping: ${errMsg(err)}`);
+        try {
+          this.store.updateScoutLog(scoutLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "skipped",
+            errorDetail: `board fetch failed: ${errMsg(err)}`,
+            costUsd: 0,
+          });
+        } catch (logErr) {
+          this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+        }
+        return CONTINUE;
       }
 
       // Load spec content for the prompt
@@ -2307,9 +2318,11 @@ export class Orchestrator {
         }
       }
 
-      const objectiveOnly = specContent === null;
+      const goal = this.config.product.goal ?? null;
+      const objectiveOnly = specContent === null && goal === null;
       const prompt = buildScoutPrompt({
         specContent,
+        goal,
         specDir,
         existingScoutIssues,
         pendingTriageIssues,
@@ -2326,6 +2339,7 @@ export class Orchestrator {
         timeoutMs: this.config.safety.scoutTimeoutMinutes * 60_000,
         log: this.log,
         objectiveOnly,
+        defaultBranch: this.config.repo.defaultBranch,
       });
 
       // Advance idleStartedAt so SCOUT duration does not count toward idle timeout
@@ -2381,12 +2395,14 @@ export class Orchestrator {
           if (!isObjective && this.scoutDeps.scoutTriageLabelId !== null) {
             extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
           }
+          // Stage 2 (Codex verification) is not yet implemented; suppress opt-in for all
+          // SCOUT candidates so no ticket is auto-implemented without human or Stage 2 approval.
           const identifier = await this.scoutDeps.linearClient.createIssue({
             title: candidate.title,
             description: `${candidate.description}\n\n**Evidence (${candidate.evidence_type}):**\n\n${candidate.evidence}`,
             priority: candidate.priority,
             extraLabelIds,
-            ...(isObjective ? {} : { includeOptIn: false }),
+            includeOptIn: false,
           });
           createdIdentifiers.push(identifier);
           if (isObjective) objectiveCount++;
@@ -2424,10 +2440,8 @@ export class Orchestrator {
         return HALT;
       }
 
-      // When at least one objective ticket was created it already has the opt-in label and is
-      // immediately eligible; signal the loop to re-check eligibility so the new work is
-      // picked up without first sleeping the full idle_recheck_seconds (ES-519 Finding 6).
-      if (objectiveCount > 0) return RESELECT;
+      // Stage 2 verification is not yet built; all SCOUT candidates omit the opt-in label, so
+      // no newly filed ticket is immediately eligible — no RESELECT needed.
       return CONTINUE;
     } catch (err) {
       const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;

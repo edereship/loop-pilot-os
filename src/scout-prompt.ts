@@ -7,6 +7,7 @@ export interface ScoutKnownIssue {
 
 export interface ScoutPromptArgs {
   specContent: SpecContent | null;
+  goal?: string | null;
   specDir?: string;
   existingScoutIssues: ScoutKnownIssue[];
   pendingTriageIssues: ScoutKnownIssue[];
@@ -31,7 +32,8 @@ function renderIssueList(issues: ScoutKnownIssue[]): string {
 }
 
 export function buildScoutPrompt(args: ScoutPromptArgs): string {
-  const { specContent, specDir, existingScoutIssues, pendingTriageIssues, maxCandidates } = args;
+  const { specContent, goal, specDir, existingScoutIssues, pendingTriageIssues, maxCandidates } = args;
+  const hasProductAnchor = specContent !== null || (goal != null && goal.length > 0);
   const blocks: string[] = [];
 
   blocks.push(
@@ -51,6 +53,8 @@ export function buildScoutPrompt(args: ScoutPromptArgs): string {
       );
       blocks.push(["# Domain Specifications", "", ...sections].join("\n\n"));
     }
+  } else if (goal != null && goal.length > 0) {
+    blocks.push(["# Product Goal", "", goal].join("\n"));
   }
 
   const knownList = [
@@ -82,15 +86,17 @@ export function buildScoutPrompt(args: ScoutPromptArgs): string {
       "   If this is an npm project, also run `npm audit`.",
       "2. Work in this order to secure cheap objective signals first (budget or time may cut you off):",
       "   (a) run all commands and capture every failure,",
-      "   (b) read only the code needed to substantiate each failure — do not read the codebase exhaustively" + (specContent ? "," : "."),
+      "   (b) read only the code needed to substantiate each failure — do not read the codebase exhaustively" + (hasProductAnchor ? "," : "."),
       ...(specContent
         ? [`   (c) compare behaviour against the specs above (source: \`${specDir ?? "docs/specs/"}\`).`]
+        : goal != null && goal.length > 0
+        ? ["   (c) compare behaviour against the product goal above."]
         : []),
       "3. If a test fails, re-run that same test once. Fails both times = deterministic; alternates = flaky.",
       "   Include both outputs in the evidence.",
       "4. Every candidate MUST include evidence: command output, reproduction steps, or a spec quotation.",
       "   Candidates without evidence are forbidden — do not output them.",
-      ...(specContent
+      ...(hasProductAnchor
         ? [
             '5. evidence_type rules: use "objective" ONLY when the evidence contains reproducible command',
             '   output from this repository. Otherwise — including whenever you are unsure — use "spec_mismatch".',

@@ -38,6 +38,16 @@ describe("buildScoutPrompt", () => {
     expect(prompt).toContain('Do NOT output "spec_mismatch"');
   });
 
+  it("with null specContent and a goal: injects goal block, allows spec_mismatch, instructs goal comparison", () => {
+    const prompt = buildScoutPrompt(args({ specContent: null, goal: "ship a reliable sum library" }));
+    expect(prompt).toContain("# Product Goal");
+    expect(prompt).toContain("ship a reliable sum library");
+    expect(prompt).not.toContain("# Product Requirements");
+    expect(prompt).toContain("compare behaviour against the product goal");
+    expect(prompt).not.toContain('Do NOT output "spec_mismatch"');
+    expect(prompt).toContain('use "objective" ONLY when');
+  });
+
   it("with specContent: instructs conservative evidence_type rule (objective only with command output; unsure -> spec_mismatch)", () => {
     const prompt = buildScoutPrompt(args());
     expect(prompt).toContain('use "objective" ONLY when');

@@ -19,6 +19,8 @@ export interface ScoutExplorerDeps {
   log: (line: string) => void;
   /** When true, the reformat prompt forbids spec_mismatch candidates (no specs were provided). */
   objectiveOnly?: boolean;
+  /** When provided, fetch and reset to origin/<defaultBranch> before running the agent. */
+  defaultBranch?: string;
 }
 
 export type ScoutExplorationResult =
@@ -28,6 +30,25 @@ export type ScoutExplorationResult =
 
 export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<ScoutExplorationResult> {
   const { agent, runner, repoPath, prompt, maxCostUsd, timeoutMs, log } = deps;
+
+  // Refresh to the latest upstream state so SCOUT does not file tickets for bugs already fixed.
+  if (deps.defaultBranch) {
+    const fetchRes = await runner.run("git", ["fetch", "origin", deps.defaultBranch], {
+      cwd: repoPath,
+      timeoutMs: GIT_TIMEOUT_MS,
+    }).catch(() => null);
+    if (fetchRes === null || fetchRes.code !== 0) {
+      log(`scout: warning: git fetch origin ${deps.defaultBranch} failed; running on current HEAD`);
+    } else {
+      const resetRes = await runner.run("git", ["reset", "--hard", `origin/${deps.defaultBranch}`], {
+        cwd: repoPath,
+        timeoutMs: GIT_TIMEOUT_MS,
+      }).catch(() => null);
+      if (resetRes === null || resetRes.code !== 0) {
+        log(`scout: warning: git reset --hard origin/${deps.defaultBranch} failed; running on current HEAD`);
+      }
+    }
+  }
 
   const startSha = await runner
     .run("git", ["rev-parse", "HEAD"], { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS })

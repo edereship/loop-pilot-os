@@ -12,9 +12,9 @@ export interface ScoutCandidate {
 }
 
 const scoutCandidateSchema = z.object({
-  title: z.string().trim().min(1),
-  description: z.string().trim().min(1),
-  evidence: z.string().trim().min(1),
+  title: z.string().trim().min(1).refine(s => s !== "...", { message: "placeholder value" }),
+  description: z.string().trim().min(1).refine(s => s !== "...", { message: "placeholder value" }),
+  evidence: z.string().trim().min(1).refine(s => s !== "...", { message: "placeholder value" }),
   evidence_type: z.enum(["objective", "spec_mismatch"]),
   priority: z.number().int().min(1).max(4),
 });

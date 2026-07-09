@@ -115,4 +115,27 @@ describe("parseScoutOutput", () => {
       expect(result.candidates[0].title).toBe("sum() returns NaN for empty array");
     }
   });
+
+  it("drops a candidate whose title is the placeholder '...' from the schema example", () => {
+    const result = parseScoutOutput(fenced([candidate({ title: "..." }), candidate()]));
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.candidates).toHaveLength(1);
+      expect(result.dropped).toHaveLength(1);
+      expect(result.dropped[0]).toContain("candidate[0]");
+    }
+  });
+
+  it("drops candidates whose description or evidence is the placeholder '...'", () => {
+    const result = parseScoutOutput(fenced([
+      candidate({ description: "..." }),
+      candidate({ evidence: "..." }),
+      candidate(),
+    ]));
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.candidates).toHaveLength(1);
+      expect(result.dropped).toHaveLength(2);
+    }
+  });
 });
