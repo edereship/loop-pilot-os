@@ -774,7 +774,15 @@ export function loadConfig(
           `takes precedence over --effort flags in extra_args)`,
       );
     }
-    if (extra_args.some((arg) => arg === "--allowedTools" || arg.startsWith("--allowedTools="))) {
+    if (
+      extra_args.some(
+        (arg) =>
+          arg === "--allowedTools" ||
+          arg.startsWith("--allowedTools=") ||
+          arg === "--allowed-tools" ||
+          arg.startsWith("--allowed-tools="),
+      )
+    ) {
       errors.push(
         `agent.extra_args: "--allowedTools" must not be set via extra_args; ` +
           `use agent.allowed_tools or [agent.scout].allowed_tools instead ` +

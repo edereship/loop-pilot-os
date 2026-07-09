@@ -133,13 +133,16 @@ export function buildScoutPrompt(args: ScoutPromptArgs): string {
   return blocks.join("\n\n");
 }
 
-export function buildScoutReformatPrompt(raw: string): string {
+export function buildScoutReformatPrompt(raw: string, objectiveOnly = false): string {
   const fence = fenceFor(raw);
+  const evidenceTypeLine = objectiveOnly
+    ? "Required schema (evidence_type must be \"objective\" — spec_mismatch is forbidden (no specs were provided); priority is an integer 1-4;"
+    : "Required schema (evidence_type is \"objective\" or \"spec_mismatch\"; priority is an integer 1-4;";
   return [
     "A previous exploration session produced the report below, but its final JSON could not be parsed.",
     "Extract the findings into the required schema. Your reply must be ONLY a fenced ```json block with no surrounding prose.",
     "",
-    "Required schema (evidence_type is \"objective\" or \"spec_mismatch\"; priority is an integer 1-4;",
+    evidenceTypeLine,
     'output {"candidates": []} if the report contains no evidence-backed findings):',
     "",
     "```json",

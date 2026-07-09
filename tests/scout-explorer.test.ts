@@ -26,6 +26,7 @@ function setup(outcomes: AgentOutcome[]): {
   agent.outcomes = outcomes;
   const runner = new FakeCommandRunner();
   runner.on(["git", "rev-parse", "HEAD"], { stdout: "abc123\n" });
+  runner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "main\n" });
   runner.on(["git", "checkout"], {});
   runner.on(["git", "clean"], {});
   runner.on(["git", "reset"], {});
@@ -48,10 +49,13 @@ function gitCalls(runner: FakeCommandRunner): string[][] {
 
 function expectCleanup(runner: FakeCommandRunner, withReset = true): void {
   const calls = gitCalls(runner);
-  const tail = calls.slice(withReset ? -3 : -2);
+  // Cleanup sequence: checkout HEAD -- . → clean -fdx → checkout <startBranch> → [reset --hard <sha>]
+  const count = withReset ? 4 : 3;
+  const tail = calls.slice(-count);
   expect(tail[0]).toEqual(["checkout", "HEAD", "--", "."]);
-  expect(tail[1]).toEqual(["clean", "-fd"]);
-  if (withReset) expect(tail[2]).toEqual(["reset", "--hard", "abc123"]);
+  expect(tail[1]).toEqual(["clean", "-fdx"]);
+  expect(tail[2]).toEqual(["checkout", "main"]);
+  if (withReset) expect(tail[3]).toEqual(["reset", "--hard", "abc123"]);
 }
 
 describe("runScoutExploration", () => {
@@ -147,7 +151,7 @@ describe("runScoutExploration", () => {
     expectCleanup(runner);
   });
 
-  it("skips reset when rev-parse fails, but still runs checkout/clean; logs warning", async () => {
+  it("skips reset when rev-parse fails, but still runs checkout/clean/branch-restore; logs warning", async () => {
     const { deps, runner, logs } = setup([completed(VALID_JSON)]);
     runner.on(["git", "rev-parse", "HEAD"], { code: 1, stderr: "fatal" });
     const result = await runScoutExploration(deps);
@@ -156,5 +160,37 @@ describe("runScoutExploration", () => {
     expect(calls.some((a) => a[0] === "reset")).toBe(false);
     expectCleanup(runner, false);
     expect(logs.some((l) => l.includes("warning") && l.includes("startSha"))).toBe(true);
+  });
+
+  it("skips branch checkout when abbrev-ref rev-parse returns HEAD (detached HEAD state)", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    runner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "HEAD\n" });
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    const calls = gitCalls(runner);
+    // In detached HEAD state there is no branch to restore; cleanup omits the branch checkout
+    // but still resets to the starting SHA.
+    const checkoutCalls = calls.filter((a) => a[0] === "checkout");
+    // Only the "checkout HEAD -- ." cleanup call; no branch restore
+    expect(checkoutCalls.every((a) => a.includes("."))).toBe(true);
+    expect(calls.some((a) => a[0] === "reset")).toBe(true);
+  });
+
+  it("with objectiveOnly=true, reformat prompt forbids spec_mismatch", async () => {
+    const { deps, agent } = setup([completed("no json here", 0.5), completed(VALID_JSON, 0.2)]);
+    deps.objectiveOnly = true;
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    expect(agent.callCount).toBe(2);
+    // Reformat prompt must not present spec_mismatch as a valid evidence_type
+    expect(agent.contexts[1].prompt).not.toContain('"spec_mismatch"');
+    expect(agent.contexts[1].prompt).toContain("spec_mismatch is forbidden");
+  });
+
+  it("with objectiveOnly=false (default), reformat prompt allows spec_mismatch", async () => {
+    const { deps, agent } = setup([completed("no json here", 0.5), completed(VALID_JSON, 0.2)]);
+    // objectiveOnly omitted → defaults to false
+    await runScoutExploration(deps);
+    expect(agent.contexts[1].prompt).toContain('"spec_mismatch"');
   });
 });

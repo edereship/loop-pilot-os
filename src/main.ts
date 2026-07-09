@@ -175,9 +175,13 @@ async function runLoop(configPath: string): Promise<number> {
     const selfReviewAgent = buildPhaseAgent(config.agent.selfReview, config.agent.permissionMode);
     const verifyAgent = buildPhaseAgent(config.agent.verify, config.agent.permissionMode);
     const recoveryAgent = buildPhaseAgent(config.agent.recovery, config.agent.permissionMode);
+    // SCOUT always runs in "default" permission mode so that only the explicitly listed
+    // allowedTools auto-execute.  Inheriting "acceptEdits" or "bypassPermissions" would
+    // let the agent edit files despite the read-only-ish tool list (those modes
+    // auto-approve edits regardless of allowedTools).
     const scoutAgent = buildPhaseAgent(
       config.agent.scout,
-      config.agent.permissionMode,
+      "default",
       config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS,
     );
     const designAgent = buildPhaseAgent(config.agent.design, "plan");

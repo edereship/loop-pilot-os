@@ -873,6 +873,12 @@ describe("loadConfig", () => {
     ).toThrow(/agent\.extra_args.*--allowedTools/);
   });
 
+  it("throws when extra_args contains --allowed-tools (hyphenated alias, same override risk as --allowedTools)", () => {
+    expect(() =>
+      loadConfig(fixture("config-extra-args-allowed-tools-hyphen.toml"), fullEnv),
+    ).toThrow(/agent\.extra_args/);
+  });
+
   describe("agent.scout (ES-519)", () => {
     it("resolves [agent.scout] with explicit model/effort/allowed_tools", () => {
       const config = loadConfig(fixture("config-agent-scout.toml"), fullEnv);

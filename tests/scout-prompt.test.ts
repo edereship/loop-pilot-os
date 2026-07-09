@@ -92,4 +92,17 @@ describe("buildScoutReformatPrompt", () => {
     expect(prompt).toContain("````");
     expect(prompt).toContain("some exploration report");
   });
+
+  it("without objectiveOnly (default): allows both objective and spec_mismatch evidence types", () => {
+    const prompt = buildScoutReformatPrompt("report", false);
+    expect(prompt).toContain('"spec_mismatch"');
+    expect(prompt).toContain('"objective"');
+  });
+
+  it("with objectiveOnly=true: forbids spec_mismatch and describes objective as the only valid type", () => {
+    const prompt = buildScoutReformatPrompt("report", true);
+    expect(prompt).not.toContain('"spec_mismatch"');
+    expect(prompt).toContain("spec_mismatch is forbidden");
+    expect(prompt).toContain('"objective"');
+  });
 });

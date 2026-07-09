@@ -17,6 +17,8 @@ export interface ScoutExplorerDeps {
   maxCostUsd: number;
   timeoutMs: number;
   log: (line: string) => void;
+  /** When true, the reformat prompt forbids spec_mismatch candidates (no specs were provided). */
+  objectiveOnly?: boolean;
 }
 
 export type ScoutExplorationResult =
@@ -34,6 +36,16 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
   if (startSha === null) {
     log("scout: warning: could not capture startSha (git rev-parse HEAD failed); reset --hard will be skipped in cleanup");
   }
+
+  // Capture the branch name so cleanup can restore it if SCOUT checks out another branch.
+  // "HEAD" indicates a detached HEAD state; treat that as null (no branch to restore).
+  const startBranch = await runner
+    .run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS })
+    .then((r) => {
+      const b = r.code === 0 ? r.stdout.trim() : "";
+      return b && b !== "HEAD" ? b : null;
+    })
+    .catch(() => null);
 
   let costUsd = 0;
   try {
@@ -73,7 +85,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     log("scout: retrying with reformat prompt");
     const retry = await agent.runSession({
       worktreePath: repoPath,
-      prompt: buildScoutReformatPrompt(raw.slice(-REFORMAT_RAW_TAIL_CHARS)),
+      prompt: buildScoutReformatPrompt(raw.slice(-REFORMAT_RAW_TAIL_CHARS), deps.objectiveOnly ?? false),
       maxCostUsd: remaining,
       hardTimeoutMs: REFORMAT_TIMEOUT_MS,
     });
@@ -100,7 +112,12 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     };
   } finally {
     await cleanupStep(["checkout", "HEAD", "--", "."]);
-    await cleanupStep(["clean", "-fd"]);
+    // -fdx removes ignored files (build caches, coverage, etc.) that -fd would leave behind
+    // and that could affect later loop iterations while git status remains clean.
+    await cleanupStep(["clean", "-fdx"]);
+    // Restore the original branch before resetting to avoid rewinding a different branch
+    // if SCOUT ran git checkout during its session.
+    if (startBranch) await cleanupStep(["checkout", startBranch]);
     if (startSha) await cleanupStep(["reset", "--hard", startSha]);
   }
 
