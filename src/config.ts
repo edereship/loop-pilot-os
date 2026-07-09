@@ -182,7 +182,7 @@ export const SCOUT_DEFAULT_ALLOWED_TOOLS = [
   "Read", "Grep", "Glob",
   "Bash(git log *)", "Bash(git diff *)", "Bash(git show *)",
   "Bash(git status)", "Bash(git ls-files *)",
-  "Bash(npm test)", "Bash(npm run *)", "Bash(npm audit)", "Bash(npx *)",
+  "Bash(npm test)", "Bash(npm run *)", "Bash(npm audit)",
 ].join(",");
 
 // ---- camelCase Config（このモジュールが唯一の定義元・types.ts には置かない。カーネル §3） ----

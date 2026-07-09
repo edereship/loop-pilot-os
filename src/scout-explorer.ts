@@ -1,8 +1,28 @@
 import process from "node:process";
+import { readdirSync, readlinkSync } from "node:fs";
 import type { AgentRunner, CommandRunner } from "./types.js";
-import { parseScoutOutput, type ScoutCandidate } from "./scout-parser.js";
+import { parseScoutOutput, type ScoutCandidate, MAX_CANDIDATES } from "./scout-parser.js";
 import { buildScoutReformatPrompt } from "./scout-prompt.js";
 import { readAll as readMemoryAll, writeCategory } from "./memory-store.js";
+
+/** Read /proc/<pid>/cwd on Linux to find PIDs whose cwd is inside dir. */
+function readProcCwdPids(dir: string): number[] {
+  try {
+    const entries = readdirSync("/proc");
+    const result: number[] = [];
+    for (const entry of entries) {
+      const pid = parseInt(entry, 10);
+      if (isNaN(pid) || pid <= 1) continue;
+      try {
+        const cwd = readlinkSync(`/proc/${pid}/cwd`);
+        if (cwd === dir || cwd.startsWith(dir + "/")) result.push(pid);
+      } catch { /* process may have exited or /proc entry inaccessible */ }
+    }
+    return result;
+  } catch {
+    return [];
+  }
+}
 
 export const REFORMAT_TIMEOUT_MS = 5 * 60_000;
 export const REFORMAT_MIN_BUDGET_USD = 0.1;
@@ -43,6 +63,12 @@ export interface ScoutExplorerDeps {
    * Only consulted when getDescendantPids is provided (Finding 2 — ES-519).
    */
   getReparentedPids?: (pids: number[]) => Set<number>;
+  /**
+   * Maximum number of candidates the parser is allowed to return. When absent,
+   * defaults to MAX_CANDIDATES from scout-parser. Pass the operator-configured
+   * max_issues_per_scout so the cap in the parser matches the configured value.
+   */
+  maxCandidates?: number;
 }
 
 export type ScoutExplorationResult =
@@ -52,13 +78,18 @@ export type ScoutExplorationResult =
 
 export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<ScoutExplorationResult> {
   const { agent, runner, repoPath, maxCostUsd, timeoutMs, log } = deps;
+  const effectiveMaxCandidates = deps.maxCandidates ?? MAX_CANDIDATES;
+
+  // Hoisted so the finally block can re-apply these after git clean removes untracked files
+  // (Finding 2 — ES-519: restored memory must survive the cleanup git clean -fd).
+  let preResetMem: ReturnType<typeof readMemoryAll> | undefined;
 
   // Refresh to the latest upstream state so SCOUT does not file tickets for bugs already fixed.
   if (deps.defaultBranch) {
     // Preserve local memory content before the hard reset: a local-only bootstrap commit
     // in docs/memory (created when startup rebase fails) is discarded by the reset and
     // would permanently lose pm_decisions / product_knowledge (Finding 6 — ES-519).
-    const preResetMem = readMemoryAll(repoPath);
+    preResetMem = readMemoryAll(repoPath);
     const fetchRes = await runner.run("git", ["fetch", "origin", deps.defaultBranch], {
       cwd: repoPath,
       timeoutMs: GIT_TIMEOUT_MS,
@@ -133,7 +164,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     }
 
     const raw = outcome.fullResult ?? outcome.summary;
-    const parsed = parseScoutOutput(raw);
+    const parsed = parseScoutOutput(raw, effectiveMaxCandidates);
     if (parsed.kind === "ok") {
       const filtered = applyObjectiveOnlyFilter(parsed, effectiveObjectiveOnly);
       return { kind: "ok", candidates: filtered.candidates, dropped: filtered.dropped, costUsd };
@@ -164,7 +195,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       const detail = retry.kind === "error" ? retry.message : retry.kind;
       return { kind: "error", message: `parse failed (reformat ${detail})`, costUsd };
     }
-    const retryParsed = parseScoutOutput(retry.fullResult ?? retry.summary);
+    const retryParsed = parseScoutOutput(retry.fullResult ?? retry.summary, effectiveMaxCandidates);
     if (retryParsed.kind === "ok") {
       const filtered = applyObjectiveOnlyFilter(retryParsed, effectiveObjectiveOnly);
       return { kind: "ok", candidates: filtered.candidates, dropped: filtered.dropped, costUsd };
@@ -196,6 +227,21 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     } else if (startSha) {
       await cleanupStep(["reset", "--hard", startSha]);
     }
+    // Re-apply memory content after git clean -fd so a local-only bootstrap commit in
+    // docs/memory is not permanently lost (Finding 2 — ES-519): git clean deletes the
+    // untracked files we wrote back after git reset --hard.
+    if (preResetMem !== undefined) {
+      const NO_LIMIT = Number.MAX_SAFE_INTEGER;
+      if (preResetMem.pmDecisions !== null) {
+        try { writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, NO_LIMIT); } catch { /* best-effort */ }
+      }
+      if (preResetMem.implResults !== null) {
+        try { writeCategory(repoPath, "impl_results", preResetMem.implResults, NO_LIMIT); } catch { /* best-effort */ }
+      }
+      if (preResetMem.productKnowledge !== null) {
+        try { writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, NO_LIMIT); } catch { /* best-effort */ }
+      }
+    }
   }
 
   async function cleanupProcesses(): Promise<void> {
@@ -208,15 +254,26 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
         });
         rawPids = lsofResult.stdout.trim().split("\n").filter(Boolean);
       } catch {
-        // lsof unavailable or failed — fall back to ancestry scan so spawned dev servers
-        // or watchers are still cleaned up in minimal containers (Finding 4 — ES-519).
+        // lsof unavailable or failed — use /proc cwd scan (catches reparented processes that
+        // ancestry misses) combined with ancestry scan (catches descendants whose cwd changed).
+        // (Finding 3 — ES-519: reparented PIDs are no longer descendants of process.pid.)
+        const myPid = process.pid;
+        const candidateNums = new Set<number>();
+        for (const pid of readProcCwdPids(repoPath)) {
+          if (pid !== myPid) candidateNums.add(pid);
+        }
         if (deps.getDescendantPids) {
-          const descendants = deps.getDescendantPids(process.pid);
-          if (descendants !== null && descendants.size > 0) {
-            const pids = [...descendants].map(String);
-            log(`scout: (lsof unavailable) killing ${pids.length} descendant process(es): ${pids.join(",")}`);
-            await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
+          const descendants = deps.getDescendantPids(myPid);
+          if (descendants !== null) {
+            for (const pid of descendants) {
+              if (pid !== myPid) candidateNums.add(pid);
+            }
           }
+        }
+        if (candidateNums.size > 0) {
+          const pids = [...candidateNums].map(String);
+          log(`scout: (lsof unavailable) killing ${pids.length} process(es) in repo: ${pids.join(",")}`);
+          await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
         }
         return;
       }

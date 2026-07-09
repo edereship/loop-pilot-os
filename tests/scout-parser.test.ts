@@ -91,6 +91,27 @@ describe("parseScoutOutput", () => {
     }
   });
 
+  // Finding 4 — ES-519: honor maxCandidates parameter above and below the default cap
+  it("respects a custom maxCandidates lower than MAX_CANDIDATES", () => {
+    const items = Array.from({ length: 5 }, (_, i) => candidate({ title: `bug ${i}` }));
+    const result = parseScoutOutput(fenced(items), 3);
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.candidates).toHaveLength(3);
+      expect(result.dropped.some((d) => d.includes("MAX_CANDIDATES"))).toBe(true);
+    }
+  });
+
+  it("honors maxCandidates above MAX_CANDIDATES, returning more than the default cap", () => {
+    const items = Array.from({ length: MAX_CANDIDATES + 3 }, (_, i) => candidate({ title: `bug ${i}` }));
+    const result = parseScoutOutput(fenced(items), MAX_CANDIDATES + 2);
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.candidates).toHaveLength(MAX_CANDIDATES + 2);
+      expect(result.dropped.some((d) => d.includes("MAX_CANDIDATES"))).toBe(true);
+    }
+  });
+
   it("returns parse_error for empty text", () => {
     expect(parseScoutOutput("").kind).toBe("parse_error");
     expect(parseScoutOutput("   \n ").kind).toBe("parse_error");

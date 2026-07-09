@@ -27,7 +27,7 @@ export type ScoutParseResult =
   | { kind: "ok"; candidates: ScoutCandidate[]; dropped: string[] }
   | { kind: "parse_error"; raw: string };
 
-export function parseScoutOutput(text: string): ScoutParseResult {
+export function parseScoutOutput(text: string, maxCandidates = MAX_CANDIDATES): ScoutParseResult {
   const trimmed = text.trim();
   if (trimmed.length === 0) return { kind: "parse_error", raw: text };
 
@@ -40,13 +40,13 @@ export function parseScoutOutput(text: string): ScoutParseResult {
     }
     const top = scoutOutputSchema.safeParse(parsed);
     if (!top.success) continue;
-    return salvage(top.data.candidates);
+    return salvage(top.data.candidates, maxCandidates);
   }
 
   return { kind: "parse_error", raw: text };
 }
 
-function salvage(items: unknown[]): ScoutParseResult {
+function salvage(items: unknown[], maxCandidates: number): ScoutParseResult {
   const candidates: ScoutCandidate[] = [];
   const dropped: string[] = [];
   for (let i = 0; i < items.length; i++) {
@@ -61,11 +61,11 @@ function salvage(items: unknown[]): ScoutParseResult {
     const c = res.data;
     candidates.push({ ...c, title: c.title.slice(0, TITLE_MAX) });
   }
-  if (candidates.length > MAX_CANDIDATES) {
+  if (candidates.length > maxCandidates) {
     dropped.push(
-      `${candidates.length - MAX_CANDIDATES} valid candidate(s) beyond MAX_CANDIDATES=${MAX_CANDIDATES} truncated`,
+      `${candidates.length - maxCandidates} valid candidate(s) beyond MAX_CANDIDATES=${maxCandidates} truncated`,
     );
-    candidates.length = MAX_CANDIDATES;
+    candidates.length = maxCandidates;
   }
   return { kind: "ok", candidates, dropped };
 }

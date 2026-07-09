@@ -405,6 +405,50 @@ describe("runScoutExploration", () => {
     expect(readFileSync(pmDecisionsPath, "utf-8")).toBe(memContent);
   });
 
+  // Finding 2 — ES-519: memory must survive the cleanup git clean -fd that runs after SCOUT
+  it("with defaultBranch: memory survives git clean -fd in cleanup (post-cleanup re-apply)", async () => {
+    const tmpDir = makeTmpDir();
+    const memoryDir = path.join(tmpDir, "docs", "memory");
+    mkdirSync(memoryDir, { recursive: true });
+    const pmDecisionsPath = path.join(memoryDir, "pm-decisions.md");
+    const memContent = "# PM Decisions\n\nUse snake_case for all identifiers.\n";
+    writeFileSync(pmDecisionsPath, memContent, "utf-8");
+
+    const agent = new FakeAgentRunner();
+    agent.outcomes = [completed(VALID_JSON)];
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "rev-parse", "HEAD"], { stdout: "abc123\n" });
+    runner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "main\n" });
+    runner.on(["git", "fetch", "origin", "main"], {});
+    runner.on(["git", "reset", "--hard", "origin/main"], (_args, _opts) => {
+      try { rmSync(pmDecisionsPath); } catch { /* file may not exist */ }
+      return { stdout: "HEAD is now at abc123\n", code: 0 };
+    });
+    runner.on(["git", "checkout"], {});
+    // Simulate git clean -fd removing the restored memory file (the real bug scenario)
+    runner.on(["git", "clean", "-fd"], (_args, _opts) => {
+      try { rmSync(pmDecisionsPath); } catch { /* file may not exist */ }
+      return { stdout: "", code: 0 };
+    });
+    runner.on(["git", "reset"], {});
+    const deps: ScoutExplorerDeps = {
+      agent,
+      runner,
+      repoPath: tmpDir,
+      prompt: "EXPLORE",
+      maxCostUsd: 2,
+      timeoutMs: 30 * 60_000,
+      log: () => {},
+      defaultBranch: "main",
+    };
+
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // Memory file must be restored even after git clean -fd deleted it during cleanup
+    expect(existsSync(pmDecisionsPath)).toBe(true);
+    expect(readFileSync(pmDecisionsPath, "utf-8")).toBe(memContent);
+  });
+
   it("with defaultBranch and no local memory: does not create memory files after reset", async () => {
     const tmpDir = makeTmpDir();
     // No memory directory created — files don't exist

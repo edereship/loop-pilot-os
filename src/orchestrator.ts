@@ -2353,6 +2353,9 @@ export class Orchestrator {
         // not unrelated editors or watchers that have files open in repoPath (Finding 2 — ES-519).
         getDescendantPids: this.getDescendantPids,
         getReparentedPids: this.getReparentedPids,
+        // Align the parser cap with the operator-configured limit so values above 10 work
+        // correctly (Finding 4 — ES-519).
+        maxCandidates: this.config.scout.maxIssuesPerScout,
       });
 
       // Advance idleStartedAt so SCOUT duration does not count toward idle timeout
