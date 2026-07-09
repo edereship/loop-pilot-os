@@ -2425,12 +2425,17 @@ export class Orchestrator {
         }
       }
 
+      // When candidates were found but every createIssue call failed (e.g. Linear
+      // outage), mark as error so latestScoutFiredAt() does not count this run toward
+      // min_interval_hours and SCOUT can retry sooner (Finding 2 — Codex review).
+      const allCreationFailed = candidates.length > 0 && createdIdentifiers.length === 0;
       try {
         this.store.updateScoutLog(scoutLogRow.id, {
           endedAt: this.clock(),
           candidates: JSON.stringify(candidates),
           createdIssueIdentifiers: JSON.stringify(createdIdentifiers),
-          outcome: "completed",
+          outcome: allCreationFailed ? "error" : "completed",
+          errorDetail: allCreationFailed ? "all issue creation failed" : undefined,
           costUsd: explorationResult.costUsd,
         });
       } catch (logErr) {

@@ -151,12 +151,16 @@ async function runLoop(configPath: string): Promise<number> {
     // the per-phase model/effort; otherwise falls back to the global agent defaults.
     // `tools` (when set) passes --tools to restrict the tool set available to the agent;
     // this is distinct from `allowedTools` which only controls which tools auto-execute.
+    // `skipRateLimit` omits the rate-limit retry loop; use for idle/scheduled phases
+    // (e.g. SCOUT) so a Claude rate limit causes an immediate error rather than blocking
+    // the orchestrator for up to cap_hours (Finding 3 — Codex review).
     function buildPhaseAgent(
       phaseConfig: { model: string; effort: string } | undefined,
       permissionMode: string,
       allowedTools?: string,
       extraArgs?: string[],
       tools?: string,
+      skipRateLimit?: boolean,
     ): ClaudeAgentRunner {
       const model = phaseConfig?.model ?? config.agent.model;
       const rawEffort = phaseConfig?.effort ?? config.agent.effort;
@@ -172,7 +176,7 @@ async function runLoop(configPath: string): Promise<number> {
         tools,
         extraArgs: extraArgs ?? config.agent.extraArgs,
         log: logLine,
-        rateLimit: rateLimitOpts,
+        rateLimit: skipRateLimit ? undefined : rateLimitOpts,
       });
     }
 
@@ -218,6 +222,7 @@ async function runLoop(configPath: string): Promise<number> {
       scoutTools,
       scoutExtraArgs,
       scoutBareTools, // --tools restricts available tools; --allowedTools marks which auto-execute
+      true, // skipRateLimit: SCOUT is scheduled; retry at the next interval instead of blocking
     );
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {
