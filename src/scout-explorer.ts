@@ -254,7 +254,10 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       const restored = await cleanupStep(["checkout", startBranch]);
       if (restored && startSha) await cleanupStep(["reset", "--hard", startSha]);
     } else if (startSha) {
-      await cleanupStep(["reset", "--hard", startSha]);
+      // Detached HEAD: use "checkout --detach" to return to the original commit instead
+      // of "reset --hard", which would reset whichever branch the agent may have checked
+      // out during exploration rather than restoring the detached HEAD position.
+      await cleanupStep(["checkout", "--detach", startSha]);
     }
     // Re-apply memory content after git clean -fd so a local-only bootstrap commit in
     // docs/memory is not permanently lost (Finding 2 — ES-519): git clean deletes the
@@ -373,7 +376,10 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
             return descendants.has(pid) || reparented.has(pid) || reparentedDescendants.has(pid);
           });
         } else {
-          pids = basicFiltered;
+          // Ancestry cannot be determined (non-Linux host); skip the kill entirely to avoid
+          // terminating unrelated editors/watchers that happen to have files open in repoPath
+          // but were not spawned by SCOUT (Finding 3 — Codex review).
+          pids = [];
         }
       } else {
         pids = basicFiltered;

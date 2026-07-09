@@ -2401,13 +2401,15 @@ export class Orchestrator {
       for (const candidate of candidates) {
         if (this.interrupted) break;
         try {
-          // Objective findings: scout label + opt-in → immediately eligible for SELECT.
-          // Spec-mismatch findings: scout + scout-triage labels, no opt-in → human must
-          // relabel before LinearTaskSource picks them up (Finding 4 — ES-519).
+          // Stage 2 Codex verification is not yet implemented. Until it is, all SCOUT
+          // candidates are routed through triage (scout-triage label, no opt-in) regardless
+          // of evidence_type so unverified findings cannot enter SELECT automatically.
+          // When Stage 2 lands, objective candidates that pass the Codex verdict will be
+          // filed with opt-in instead (design spec §2 Stage 2, ES-519 Finding 1).
           const isObjective = candidate.evidence_type === "objective";
           const extraLabelIds: string[] = [];
           if (this.scoutDeps.scoutLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutLabelId);
-          if (!isObjective && this.scoutDeps.scoutTriageLabelId !== null) {
+          if (this.scoutDeps.scoutTriageLabelId !== null) {
             extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
           }
           const identifier = await this.scoutDeps.linearClient.createIssue({
@@ -2415,7 +2417,7 @@ export class Orchestrator {
             description: `${candidate.description}\n\n**Evidence (${candidate.evidence_type}):**\n\n${candidate.evidence}`,
             priority: candidate.priority,
             extraLabelIds,
-            includeOptIn: isObjective,
+            includeOptIn: false,
           });
           createdIdentifiers.push(identifier);
           if (isObjective) objectiveCount++;
@@ -2458,10 +2460,9 @@ export class Orchestrator {
         return HALT;
       }
 
-      // Return RESELECT when objective tickets were created: they carry opt-in so they are
-      // immediately eligible, but control would otherwise fall through to the idle-timeout
-      // check before a new SELECT runs and could halt the run prematurely (Finding 5 — ES-519).
-      return objectiveCount > 0 ? RESELECT : CONTINUE;
+      // All SCOUT candidates go to triage (no opt-in) until Stage 2 verification is in
+      // place, so none are immediately eligible for SELECT; always return CONTINUE.
+      return CONTINUE;
     } catch (err) {
       const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
       this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);

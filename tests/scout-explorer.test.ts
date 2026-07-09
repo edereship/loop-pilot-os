@@ -188,12 +188,12 @@ describe("runScoutExploration", () => {
     const result = await runScoutExploration(deps);
     expect(result.kind).toBe("ok");
     const calls = gitCalls(runner);
-    // In detached HEAD state there is no branch to restore; cleanup omits the branch checkout
-    // but still resets to the starting SHA.
-    const checkoutCalls = calls.filter((a) => a[0] === "checkout");
-    // Only the "checkout HEAD -- ." cleanup call; no branch restore
-    expect(checkoutCalls.every((a) => a.includes("."))).toBe(true);
-    expect(calls.some((a) => a[0] === "reset")).toBe(true);
+    // In detached HEAD state, cleanup uses "git checkout --detach <sha>" to return to the
+    // original commit safely, regardless of which branch the agent may have checked out
+    // during exploration. "git reset --hard <sha>" is NOT used because it would reset
+    // whichever branch is currently active rather than restoring the detached position.
+    expect(calls.some((a) => a[0] === "checkout" && a[1] === "--detach" && a[2] === "abc123")).toBe(true);
+    expect(calls.some((a) => a[0] === "reset" && a[1] === "--hard" && a[2] === "abc123")).toBe(false);
   });
 
   it("with objectiveOnly=true, reformat prompt forbids spec_mismatch", async () => {
@@ -336,18 +336,17 @@ describe("runScoutExploration", () => {
     expect(logs.some(l => l.includes("orphaned") && l.includes(descendantPid))).toBe(true);
   });
 
-  it("with getDescendantPids returning null (non-Linux): falls back to basic filtering", async () => {
+  it("with getDescendantPids returning null (non-Linux): skips kill when ancestry unavailable", async () => {
     const { deps, runner } = setup([completed(VALID_JSON)]);
     runner.on(["lsof", "+D", REPO, "-t"], { stdout: "1234\n5678\n" });
     runner.on(["kill"], {});
-    deps.getDescendantPids = () => null; // /proc unavailable
+    deps.getDescendantPids = () => null; // /proc unavailable — ancestry cannot be determined
     const result = await runScoutExploration(deps);
     expect(result.kind).toBe("ok");
-    // With null ancestry, falls back to basic-filtered list: both PIDs are killed
-    const killCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-TERM");
-    expect(killCall).toBeDefined();
-    expect(killCall!.args).toContain("1234");
-    expect(killCall!.args).toContain("5678");
+    // When getDescendantPids is provided but returns null, ancestry cannot be determined on
+    // this platform (e.g. non-Linux). Skip the kill entirely to avoid terminating unrelated
+    // editors/watchers with files open in repoPath that were not spawned by SCOUT.
+    expect(runner.calls.some(c => c.cmd === "kill")).toBe(false);
   });
 
   // Finding 3 — Codex review: wait and escalate to SIGKILL when SIGTERM is ignored
