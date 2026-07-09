@@ -3,7 +3,7 @@ import { readdirSync, readlinkSync } from "node:fs";
 import type { AgentRunner, CommandRunner } from "./types.js";
 import { parseScoutOutput, type ScoutCandidate, MAX_CANDIDATES } from "./scout-parser.js";
 import { buildScoutReformatPrompt } from "./scout-prompt.js";
-import { readAll as readMemoryAll, writeCategory } from "./memory-store.js";
+import { readAll as readMemoryAll, writeCategory, commitIfChanged } from "./memory-store.js";
 
 /** Read /proc/<pid>/cwd on Linux to find PIDs whose cwd is inside dir. */
 function readProcCwdPids(dir: string): number[] {
@@ -232,14 +232,20 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     // untracked files we wrote back after git reset --hard.
     if (preResetMem !== undefined) {
       const NO_LIMIT = Number.MAX_SAFE_INTEGER;
+      let wroteMemory = false;
       if (preResetMem.pmDecisions !== null) {
-        try { writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, NO_LIMIT); } catch { /* best-effort */ }
+        try { writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, NO_LIMIT); wroteMemory = true; } catch { /* best-effort */ }
       }
       if (preResetMem.implResults !== null) {
-        try { writeCategory(repoPath, "impl_results", preResetMem.implResults, NO_LIMIT); } catch { /* best-effort */ }
+        try { writeCategory(repoPath, "impl_results", preResetMem.implResults, NO_LIMIT); wroteMemory = true; } catch { /* best-effort */ }
       }
       if (preResetMem.productKnowledge !== null) {
-        try { writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, NO_LIMIT); } catch { /* best-effort */ }
+        try { writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, NO_LIMIT); wroteMemory = true; } catch { /* best-effort */ }
+      }
+      // Commit any restored files so the next runPreflight's clean-worktree check does not
+      // see uncommitted changes and strand the daemon (Finding 2 — ES-519).
+      if (wroteMemory) {
+        try { await commitIfChanged(runner, repoPath, "chore: restore scout memory after cleanup"); } catch { /* best-effort */ }
       }
     }
   }
@@ -258,20 +264,34 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
         // ancestry misses) combined with ancestry scan (catches descendants whose cwd changed).
         // (Finding 3 — ES-519: reparented PIDs are no longer descendants of process.pid.)
         const myPid = process.pid;
-        const candidateNums = new Set<number>();
-        for (const pid of readProcCwdPids(repoPath)) {
-          if (pid !== myPid) candidateNums.add(pid);
-        }
+        const cwdPids = readProcCwdPids(repoPath).filter(p => p !== myPid);
+
+        let pidsToKill: number[];
         if (deps.getDescendantPids) {
-          const descendants = deps.getDescendantPids(myPid);
-          if (descendants !== null) {
-            for (const pid of descendants) {
-              if (pid !== myPid) candidateNums.add(pid);
-            }
+          const descendants = deps.getDescendantPids(myPid) ?? new Set<number>();
+          // Union cwd-scan and descendant-scan results, then apply the same guard used in
+          // the lsof path: only kill PIDs that are confirmed descendants, reparented to init,
+          // or descendants of a reparented PID.  Unrelated editors/watchers/test runners
+          // whose cwd happens to be inside repoPath are NOT killed (Finding 3 — ES-519).
+          const allCandidates = [...new Set([...cwdPids, ...descendants])].filter(p => p !== myPid);
+          const reparented = deps.getReparentedPids
+            ? deps.getReparentedPids(allCandidates)
+            : new Set<number>();
+          const reparentedDescendants = new Set<number>();
+          for (const rp of reparented) {
+            const rpDescs = deps.getDescendantPids(rp);
+            if (rpDescs) for (const d of rpDescs) reparentedDescendants.add(d);
           }
+          pidsToKill = allCandidates.filter(p =>
+            descendants.has(p) || reparented.has(p) || reparentedDescendants.has(p)
+          );
+        } else {
+          // No ancestry guard available; kill all cwd-scan candidates as before.
+          pidsToKill = cwdPids;
         }
-        if (candidateNums.size > 0) {
-          const pids = [...candidateNums].map(String);
+
+        if (pidsToKill.length > 0) {
+          const pids = pidsToKill.map(String);
           log(`scout: (lsof unavailable) killing ${pids.length} process(es) in repo: ${pids.join(",")}`);
           await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
         }

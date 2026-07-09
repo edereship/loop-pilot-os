@@ -178,11 +178,13 @@ type RawConfig = z.infer<typeof rawSchema>;
 // Bash is scoped to read/test-safe commands so SCOUT cannot run arbitrary shell
 // operations (write to arbitrary paths, network calls, git mutations) when no
 // explicit [agent.scout] policy is configured (Finding 1 — ES-519).
+// npm run * is intentionally excluded: repos may expose destructive scripts such as
+// "deploy" or "release" that SCOUT must not trigger unattended (Finding 1 — ES-519).
 export const SCOUT_DEFAULT_ALLOWED_TOOLS = [
   "Read", "Grep", "Glob",
   "Bash(git log *)", "Bash(git diff *)", "Bash(git show *)",
   "Bash(git status)", "Bash(git ls-files *)",
-  "Bash(npm test)", "Bash(npm run *)", "Bash(npm audit)",
+  "Bash(npm test)", "Bash(npm audit)",
 ].join(",");
 
 // ---- camelCase Config（このモジュールが唯一の定義元・types.ts には置かない。カーネル §3） ----
