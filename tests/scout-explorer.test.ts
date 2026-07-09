@@ -147,13 +147,14 @@ describe("runScoutExploration", () => {
     expectCleanup(runner);
   });
 
-  it("skips reset when rev-parse fails, but still runs checkout/clean", async () => {
-    const { deps, runner } = setup([completed(VALID_JSON)]);
+  it("skips reset when rev-parse fails, but still runs checkout/clean; logs warning", async () => {
+    const { deps, runner, logs } = setup([completed(VALID_JSON)]);
     runner.on(["git", "rev-parse", "HEAD"], { code: 1, stderr: "fatal" });
     const result = await runScoutExploration(deps);
     expect(result.kind).toBe("ok");
     const calls = gitCalls(runner);
     expect(calls.some((a) => a[0] === "reset")).toBe(false);
     expectCleanup(runner, false);
+    expect(logs.some((l) => l.includes("warning") && l.includes("startSha"))).toBe(true);
   });
 });

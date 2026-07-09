@@ -105,4 +105,14 @@ describe("parseScoutOutput", () => {
   it("returns parse_error when top-level lacks a candidates array", () => {
     expect(parseScoutOutput('```json\n{"findings": []}\n```').kind).toBe("parse_error");
   });
+
+  it("parses a compact single-line fenced block (no newline after opening fence)", () => {
+    const text = '```json {"candidates":[' + JSON.stringify(candidate()) + "]} ```";
+    const result = parseScoutOutput(text);
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.candidates).toHaveLength(1);
+      expect(result.candidates[0].title).toBe("sum() returns NaN for empty array");
+    }
+  });
 });

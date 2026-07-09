@@ -860,6 +860,12 @@ describe("loadConfig", () => {
     });
   });
 
+  it("rejects empty agent.allowed_tools (ES-519 .min(1) guard)", () => {
+    expect(() =>
+      loadConfig(fixture("config-empty-allowed-tools.toml"), fullEnv),
+    ).toThrow(/allowed_tools/);
+  });
+
   // ES-519: SCOUT 専用 per-phase ブロック [agent.scout] + safety.scout_timeout_minutes
   it("throws when extra_args contains --allowedTools (silently overrides per-phase tool restrictions)", () => {
     expect(() =>
