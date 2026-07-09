@@ -43,6 +43,7 @@ function msDelay(ms: number): Promise<void> {
 export const REFORMAT_TIMEOUT_MS = 5 * 60_000;
 export const REFORMAT_MIN_BUDGET_USD = 0.1;
 export const REFORMAT_RAW_TAIL_CHARS = 20_000;
+export const REFORMAT_MIN_WALL_CLOCK_MS = 30_000;
 
 const RAW_PREVIEW_CHARS = 200;
 const GIT_TIMEOUT_MS = 60_000;
@@ -189,9 +190,16 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       const n = parseInt(p, 10);
       if (!isNaN(n)) preScanPids.add(n);
     });
-  } catch { /* lsof unavailable — preScanPids stays empty; cleanup falls back to ancestry alone */ }
+  } catch {
+    // lsof unavailable — fall back to /proc cwd scan so that pre-existing processes
+    // already reparented to init with cwd under repoPath are captured in preScanPids
+    // and excluded from reparented-orphan detection during cleanup (Finding 3 —
+    // Codex review, iteration 15). Returns [] on non-Linux or unreadable /proc.
+    readProcCwdPids(repoPath).forEach(p => preScanPids.add(p));
+  }
 
   let costUsd = 0;
+  const sessionStartMs = Date.now();
   try {
     const outcome = await agent.runSession({
       worktreePath: repoPath,
@@ -227,12 +235,23 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
         costUsd,
       };
     }
+    // Cap reformat retry within the configured wall-clock timeout so operators who lower
+    // scoutTimeoutMinutes are not surprised by an extra 5-minute retry window after the
+    // main session has already consumed the full budget (Finding 4 — Codex review, iteration 15).
+    const remainingWallClockMs = timeoutMs - (Date.now() - sessionStartMs);
+    if (remainingWallClockMs < REFORMAT_MIN_WALL_CLOCK_MS) {
+      return {
+        kind: "error",
+        message: `parse failed (reformat skipped: remaining wall-clock ${Math.round(remainingWallClockMs)}ms)`,
+        costUsd,
+      };
+    }
     log("scout: retrying with reformat prompt");
     const retry = await agent.runSession({
       worktreePath: repoPath,
       prompt: buildScoutReformatPrompt(raw.slice(-REFORMAT_RAW_TAIL_CHARS), effectiveObjectiveOnly),
       maxCostUsd: remaining,
-      hardTimeoutMs: REFORMAT_TIMEOUT_MS,
+      hardTimeoutMs: Math.min(REFORMAT_TIMEOUT_MS, remainingWallClockMs),
     });
     costUsd += retry.costUsd;
     if (retry.kind === "interrupted") return { kind: "interrupted", costUsd };

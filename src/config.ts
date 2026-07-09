@@ -175,7 +175,7 @@ const rawSchema = z.object({
 
 type RawConfig = z.infer<typeof rawSchema>;
 
-// Bash is scoped to read/test-safe commands so SCOUT cannot run arbitrary shell
+// Bash is scoped to read-safe commands so SCOUT cannot run arbitrary shell
 // operations (write to arbitrary paths, network calls, git mutations) when no
 // explicit [agent.scout] policy is configured (Finding 1 — ES-519).
 // Wildcard Bash(git diff *) / Bash(git log *) etc. are intentionally omitted: the
@@ -184,21 +184,14 @@ type RawConfig = z.infer<typeof rawSchema>;
 // wildcards, shell-metacharacter injection cannot piggyback on an allowed command
 // prefix.  Operators who need git-history exploration should configure an explicit
 // [agent.scout] allowed_tools list and accept the widened surface.
-// Wildcard `npm run *` is excluded — repos expose destructive scripts ("deploy",
-// "release") that SCOUT must not trigger unattended.  Three read-only analysis
-// commands are pre-approved explicitly because they are the signals SCOUT collects
-// on common npm projects and would otherwise require every operator to add a custom
-// [agent.scout] override (Finding 1 — ES-519, Finding 1 — Codex review).
-// `npm audit` is intentionally excluded from defaults: it makes a network call to the
-// npm registry, submitting private dependency metadata and potentially exposing registry
-// credentials/URLs during unattended SCOUT runs.  Operators who need vulnerability
-// scanning must add `Bash(npm audit)` to an explicit [agent.scout] allowed_tools list
-// and accept that network call (Finding 1 — Codex review, iteration 14).
+// npm scripts (npm test, npm run lint, etc.) are intentionally excluded: `npm run`
+// executes arbitrary package.json scripts, and a target repo can expose scripts that
+// write outside the checkout, make network calls, or mutate git state unattended.
+// Operators who need npm-script signals must add them to an explicit [agent.scout]
+// allowed_tools list and accept that surface (Finding 1 — Codex review, iteration 15).
 export const SCOUT_DEFAULT_ALLOWED_TOOLS = [
   "Read", "Grep", "Glob",
   "Bash(git status)",
-  "Bash(npm test)",
-  "Bash(npm run lint)", "Bash(npm run typecheck)", "Bash(npm run check)",
 ].join(",");
 
 // ---- camelCase Config（このモジュールが唯一の定義元・types.ts には置かない。カーネル §3） ----

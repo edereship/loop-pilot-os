@@ -205,6 +205,11 @@ async function runLoop(configPath: string): Promise<number> {
         // SCOUT-specific tool set (Finding 3 — ES-519).
         if (a.startsWith("--tools=")) continue;
         if (a === "--tools") { i++; continue; }
+        // Strip --add-dir flags: they expand the file-access surface beyond
+        // config.repo.path and SCOUT is intended to explore only the target
+        // repository (Finding 2 — Codex review, iteration 15).
+        if (a.startsWith("--add-dir=")) continue;
+        if (a === "--add-dir") { i++; continue; }
         out.push(a);
       }
       // Block MCP tools: --tools only restricts built-in tools, not MCP tools; deny MCP

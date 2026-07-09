@@ -1983,4 +1983,42 @@ describe("scout_log CRUD (ES-516)", () => {
     store.updateScoutLog(zeroCostRow.id, { outcome: "error", endedAt: "2026-07-08T14:00:01.000Z", costUsd: 0, errorDetail: "rate limited" });
     expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
   });
+
+  it("latestScoutFiredAt counts zero-cost hard-timeout errors toward the interval (Finding 5 — Codex review, iteration 15)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Hard timeout: Claude hung for the full scoutTimeoutMinutes; costUsd=0 because
+    // no tokens were billed before the kill. Must still count toward min_interval_hours
+    // so deterministic timeouts don't rerun on every idle tick.
+    const timeoutRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(timeoutRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T12:30:00.000Z",
+      costUsd: 0,
+      errorDetail: `scout exploration exception: command "claude" timed out after 1800000ms`,
+    });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt still excludes zero-cost rate-limit errors even when a timeout error exists at an earlier time", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Hard timeout at an earlier time — included
+    const timeoutRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T10:00:00.000Z" });
+    store.updateScoutLog(timeoutRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T10:30:00.000Z",
+      costUsd: 0,
+      errorDetail: `scout exploration exception: command "claude" timed out after 1800000ms`,
+    });
+    // Zero-cost rate-limit at a later time — must not mask the earlier timeout row
+    const rateLimitRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(rateLimitRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T14:00:01.000Z",
+      costUsd: 0,
+      errorDetail: "rate limited",
+    });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
+  });
 });
