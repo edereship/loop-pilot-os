@@ -175,6 +175,22 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     })
     .catch(() => null);
 
+  // Snapshot PIDs with files open in repoPath before SCOUT starts.  Cleanup uses this
+  // to exclude pre-existing processes (editors, daemons, LSPs) that happened to have
+  // PPID=1 but were not spawned by SCOUT — only PIDs that appear NEW after the agent
+  // runs are treated as reparented SCOUT orphans (Finding 3 — Codex review, iteration 14).
+  const preScanPids = new Set<number>();
+  try {
+    const preScan = await runner.run("lsof", ["+D", repoPath, "-t"], {
+      cwd: repoPath,
+      timeoutMs: 10_000,
+    });
+    preScan.stdout.trim().split("\n").filter(Boolean).forEach(p => {
+      const n = parseInt(p, 10);
+      if (!isNaN(n)) preScanPids.add(n);
+    });
+  } catch { /* lsof unavailable — preScanPids stays empty; cleanup falls back to ancestry alone */ }
+
   let costUsd = 0;
   try {
     const outcome = await agent.runSession({
@@ -329,7 +345,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
           // whose cwd happens to be inside repoPath are NOT killed (Finding 3 — ES-519).
           const allCandidates = [...new Set([...cwdPids, ...descendants])].filter(p => p !== myPid);
           const reparented = deps.getReparentedPids
-            ? deps.getReparentedPids(allCandidates)
+            ? new Set([...deps.getReparentedPids(allCandidates)].filter(p => !preScanPids.has(p)))
             : new Set<number>();
           const reparentedDescendants = new Set<number>();
           for (const rp of reparented) {
@@ -364,7 +380,7 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
         if (descendants !== null) {
           const candidateNums = basicFiltered.map(p => parseInt(p, 10));
           const reparented = deps.getReparentedPids
-            ? deps.getReparentedPids(candidateNums)
+            ? new Set([...deps.getReparentedPids(candidateNums)].filter(p => !preScanPids.has(p)))
             : new Set<number>();
           const reparentedDescendants = new Set<number>();
           for (const rp of reparented) {

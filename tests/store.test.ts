@@ -1914,10 +1914,11 @@ describe("scout_log CRUD (ES-516)", () => {
     expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
   });
 
-  it("latestScoutFiredAt excludes creation-failure errors so SCOUT can retry sooner (Finding 4 — Codex review)", () => {
+  it("latestScoutFiredAt includes costly creation-failure errors toward the interval (Finding 2 — Codex review, iteration 14)", () => {
     const store = newStore();
     const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
-    // Creation-failure error: candidates found but all Linear calls failed — must NOT consume the interval
+    // Creation-failure error with non-zero cost: exploration ran but all Linear calls failed.
+    // Must consume the interval to prevent deterministic failures from retrying every idle tick.
     const creationFailRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
     store.updateScoutLog(creationFailRow.id, {
       outcome: "error",
@@ -1925,8 +1926,8 @@ describe("scout_log CRUD (ES-516)", () => {
       costUsd: 0.8,
       errorDetail: "all issue creation failed",
     });
-    // No other rows — must return null so the interval is not blocked
-    expect(store.latestScoutFiredAt()).toBeNull();
+    // Burned budget → must count toward the interval
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
   });
 
   it("latestScoutFiredAt includes non-creation-failure error rows toward the interval", () => {
@@ -1943,10 +1944,10 @@ describe("scout_log CRUD (ES-516)", () => {
     expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
   });
 
-  it("latestScoutFiredAt excludes creation-failure but includes an earlier completed row", () => {
+  it("latestScoutFiredAt includes both a costly creation-failure and an earlier completed row — returns the later time", () => {
     const store = newStore();
     const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
-    // Creation-failure at a later time — excluded
+    // Creation-failure at a later time with non-zero cost — now included
     const creationFailRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
     store.updateScoutLog(creationFailRow.id, {
       outcome: "error",
@@ -1954,10 +1955,11 @@ describe("scout_log CRUD (ES-516)", () => {
       costUsd: 0.8,
       errorDetail: "all issue creation failed",
     });
-    // Earlier completed row — must be returned
+    // Earlier completed row — also included
     const completedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T06:00:00.000Z" });
     store.updateScoutLog(completedRow.id, { outcome: "completed", endedAt: "2026-07-08T06:30:00.000Z", costUsd: 1.5 });
-    expect(store.latestScoutFiredAt()).toBe("2026-07-08T06:00:00.000Z");
+    // MAX of the two included rows — the later creation-failure time wins
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T14:00:00.000Z");
   });
 
   it("latestScoutFiredAt excludes zero-cost error rows so a transient rate-limit does not consume the interval (Finding 3 — Codex review)", () => {

@@ -83,7 +83,6 @@ export function buildScoutPrompt(args: ScoutPromptArgs): string {
       "# Instructions",
       "",
       "1. Identify this repository's test / type-check / lint commands from CLAUDE.md, package.json, or the README, and run them.",
-      "   If this is an npm project, also run `npm audit`.",
       "2. Work in this order to secure cheap objective signals first (budget or time may cut you off):",
       "   (a) run all commands and capture every failure,",
       "   (b) read only the code needed to substantiate each failure — do not read the codebase exhaustively" + (hasProductAnchor ? "," : "."),

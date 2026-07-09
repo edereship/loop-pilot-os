@@ -189,10 +189,15 @@ type RawConfig = z.infer<typeof rawSchema>;
 // commands are pre-approved explicitly because they are the signals SCOUT collects
 // on common npm projects and would otherwise require every operator to add a custom
 // [agent.scout] override (Finding 1 — ES-519, Finding 1 — Codex review).
+// `npm audit` is intentionally excluded from defaults: it makes a network call to the
+// npm registry, submitting private dependency metadata and potentially exposing registry
+// credentials/URLs during unattended SCOUT runs.  Operators who need vulnerability
+// scanning must add `Bash(npm audit)` to an explicit [agent.scout] allowed_tools list
+// and accept that network call (Finding 1 — Codex review, iteration 14).
 export const SCOUT_DEFAULT_ALLOWED_TOOLS = [
   "Read", "Grep", "Glob",
   "Bash(git status)",
-  "Bash(npm test)", "Bash(npm audit)",
+  "Bash(npm test)",
   "Bash(npm run lint)", "Bash(npm run typecheck)", "Bash(npm run check)",
 ].join(",");
 

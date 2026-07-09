@@ -395,9 +395,17 @@ describe("runScoutExploration", () => {
 
   it("with getDescendantPids and getReparentedPids: kills reparented PIDs too", async () => {
     const { deps, runner } = setup([completed(VALID_JSON)]);
-    const reparentedPid = "3333";
+    const reparentedPid = "3333"; // dev server spawned by SCOUT agent, not yet running at pre-scan
     const unrelatedPid = "4444";
-    runner.on(["lsof", "+D", REPO, "-t"], { stdout: `${reparentedPid}\n${unrelatedPid}\n` });
+    // Pre-scan (before agent): reparentedPid not yet started; cleanup scan: both PIDs present
+    let lsofCalls = 0;
+    runner.on(["lsof", "+D", REPO, "-t"], () => {
+      lsofCalls++;
+      // First call is the pre-scan: reparentedPid not yet spawned
+      if (lsofCalls === 1) return { stdout: `${unrelatedPid}\n` };
+      // Cleanup scan: SCOUT agent started reparentedPid, which is now reparented to init
+      return { stdout: `${reparentedPid}\n${unrelatedPid}\n` };
+    });
     runner.on(["kill"], {});
     deps.getDescendantPids = () => new Set<number>(); // no direct descendants
     deps.getReparentedPids = (pids) => new Set(pids.filter(p => p === parseInt(reparentedPid, 10)));
@@ -407,6 +415,36 @@ describe("runScoutExploration", () => {
     expect(killCall).toBeDefined();
     expect(killCall!.args).toContain(reparentedPid);
     expect(killCall!.args).not.toContain(unrelatedPid);
+  });
+
+  // Finding 3 — Codex review (iteration 14): pre-existing processes with PPID=1 must not be killed
+  it("with getDescendantPids and getReparentedPids: spares pre-existing reparented processes (Finding 3 — Codex review)", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    const preExistingPid = "9999"; // daemon already running before SCOUT (PPID=1), e.g. an LSP
+    const scoutPid = "3333";       // dev server spawned by SCOUT agent, reparented to init after shell exits
+    // Both PIDs have PPID=1 but preExistingPid was running before SCOUT started
+    let lsofCalls = 0;
+    runner.on(["lsof", "+D", REPO, "-t"], () => {
+      lsofCalls++;
+      if (lsofCalls === 1) {
+        // Pre-scan: only the pre-existing daemon is running
+        return { stdout: `${preExistingPid}\n` };
+      }
+      // Cleanup scan: pre-existing daemon still present plus SCOUT's reparented process
+      return { stdout: `${preExistingPid}\n${scoutPid}\n` };
+    });
+    runner.on(["kill"], {});
+    deps.getDescendantPids = () => new Set<number>(); // no direct descendants
+    // getReparentedPids reports both as PPID=1 — the pre-scan filter must resolve the ambiguity
+    deps.getReparentedPids = (pids) => new Set(pids.filter(p => p === parseInt(preExistingPid, 10) || p === parseInt(scoutPid, 10)));
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    const killCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-TERM");
+    expect(killCall).toBeDefined();
+    // SCOUT's newly-spawned reparented process must be killed
+    expect(killCall!.args).toContain(scoutPid);
+    // Pre-existing daemon (present before SCOUT ran) must be spared
+    expect(killCall!.args).not.toContain(preExistingPid);
   });
 
   // Finding 6 — ES-519: preserve memory content across git reset --hard

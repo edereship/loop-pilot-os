@@ -88,7 +88,7 @@ describe("buildScoutPrompt", () => {
     expect(prompt).toContain("Do NOT commit, push, create branches, or open pull requests");
     expect(prompt).toContain("same language as the specs and known tickets");
     expect(prompt).toContain("FINAL message must be ONLY a fenced");
-    expect(prompt).toContain("npm audit");
+    expect(prompt).not.toContain("npm audit");
   });
 });
 
