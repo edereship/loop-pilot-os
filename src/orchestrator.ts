@@ -77,6 +77,7 @@ export interface GroomDeps {
 export interface ScoutDeps {
   agent: AgentRunner;
   boardFetcher: {
+    refresh(): void;
     getIssuesByLabel(label: string): Promise<Array<{ identifier: string; title: string; labels: string[] }>>;
   };
   linearClient: {
@@ -142,13 +143,15 @@ export interface OrchestratorDeps {
   checkPidAlive?: (pid: number) => boolean;
 }
 
-/** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
+/** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か、またはループ先頭から再選別するか */
 type RunControl =
   | { control: "continue" }
-  | { control: "halt" };
+  | { control: "halt" }
+  | { control: "reselect" };
 
 const CONTINUE: { control: "continue" } = { control: "continue" };
 const HALT: { control: "halt" } = { control: "halt" };
+const RESELECT: { control: "reselect" } = { control: "reselect" };
 
 // 累積 diff のプロンプト注入上限。巨大 diff は Codex をコンテキスト超過エラーに追い込み
 // フェイルオープン pass を誘発する（=最も検査が必要なケースほどゲートが無効化される）ため、
@@ -1165,6 +1168,25 @@ export class Orchestrator {
         eligible = eligible.filter((i) => !groomBlockedIds.has(i.identifier));
       }
       if (eligible.length === 0) {
+        // v4-A SCOUT（ES-519）: fire when idle long enough and min-interval has passed.
+        // Checked before the idle-timeout halt so SCOUT can run even when idle_timeout_minutes
+        // equals scout.idle_minutes — otherwise the timeout fires first (ES-519 Finding 4).
+        if (this.config.scout.enabled && this.scoutDeps !== null) {
+          const scoutRun = this.store.getRun(this.runId);
+          const idleElapsedMs = scoutRun.idleStartedAt !== null
+            ? Date.parse(this.clock()) - Date.parse(scoutRun.idleStartedAt)
+            : 0;
+          const scoutCtrl = await this.scout(idleElapsedMs);
+          if (scoutCtrl.control === "halt") return;
+          // SCOUT created opt-in objective tickets; restart the loop to re-check eligibility
+          // instead of sleeping through the idle period (ES-519 Finding 6).
+          if (scoutCtrl.control === "reselect") continue;
+          if (this.interrupted) {
+            await this.haltForInterrupt();
+            return;
+          }
+        }
+
         // 1.5) アイドルタイムアウトチェック（ES-475）
         // Checked after SELECT so that work that became eligible during the previous
         // idle sleep is claimed before the timeout fires (ES-475 Finding 1).
@@ -1180,20 +1202,6 @@ export class Orchestrator {
               this.log(detail);
               return;
             }
-          }
-        }
-
-        // v4-A SCOUT（ES-519）: fire when idle long enough and min-interval has passed.
-        if (this.config.scout.enabled && this.scoutDeps !== null) {
-          const scoutRun = this.store.getRun(this.runId);
-          const idleElapsedMs = scoutRun.idleStartedAt !== null
-            ? Date.parse(this.clock()) - Date.parse(scoutRun.idleStartedAt)
-            : 0;
-          const scoutCtrl = await this.scout(idleElapsedMs);
-          if (scoutCtrl.control === "halt") return;
-          if (this.interrupted) {
-            await this.haltForInterrupt();
-            return;
           }
         }
 
@@ -2270,7 +2278,10 @@ export class Orchestrator {
     const scoutStartMs = Date.parse(this.clock());
 
     try {
-      // Fetch known scout/triage issues for duplicate prevention
+      // Fetch known scout/triage issues for duplicate prevention.
+      // Refresh the cache first so GROOM actions or operator changes that happened after the
+      // earlier snapshot are reflected here (ES-519 Finding 5).
+      this.scoutDeps.boardFetcher.refresh();
       let existingScoutIssues: Array<{ identifier: string; title: string }> = [];
       let pendingTriageIssues: Array<{ identifier: string; title: string }> = [];
       try {
@@ -2360,17 +2371,25 @@ export class Orchestrator {
       for (const candidate of candidates) {
         if (this.interrupted) break;
         try {
+          // Objective findings get the scout label + opt-in so they become immediately eligible.
+          // Spec-mismatch findings need human review before implementation: add scout-triage label
+          // and suppress the opt-in label so LinearTaskSource does not pick them up autonomously
+          // (ES-519 Finding 2).
+          const isObjective = candidate.evidence_type === "objective";
           const extraLabelIds: string[] = [];
           if (this.scoutDeps.scoutLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutLabelId);
-          if (this.scoutDeps.scoutTriageLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
+          if (!isObjective && this.scoutDeps.scoutTriageLabelId !== null) {
+            extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
+          }
           const identifier = await this.scoutDeps.linearClient.createIssue({
             title: candidate.title,
             description: `${candidate.description}\n\n**Evidence (${candidate.evidence_type}):**\n\n${candidate.evidence}`,
             priority: candidate.priority,
             extraLabelIds,
+            ...(isObjective ? {} : { includeOptIn: false }),
           });
           createdIdentifiers.push(identifier);
-          if (candidate.evidence_type === "objective") objectiveCount++;
+          if (isObjective) objectiveCount++;
           else triageCount++;
         } catch (err) {
           this.log(`scout: failed to create issue for "${candidate.title}": ${errMsg(err)}`);
@@ -2405,6 +2424,10 @@ export class Orchestrator {
         return HALT;
       }
 
+      // When at least one objective ticket was created it already has the opt-in label and is
+      // immediately eligible; signal the loop to re-check eligibility so the new work is
+      // picked up without first sleeping the full idle_recheck_seconds (ES-519 Finding 6).
+      if (objectiveCount > 0) return RESELECT;
       return CONTINUE;
     } catch (err) {
       const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;

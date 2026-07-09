@@ -114,9 +114,9 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
     };
   } finally {
     await cleanupStep(["checkout", "HEAD", "--", "."]);
-    // -fdx removes ignored files (build caches, coverage, etc.) that -fd would leave behind
-    // and that could affect later loop iterations while git status remains clean.
-    await cleanupStep(["clean", "-fdx"]);
+    // Use -fd (not -fdx) to avoid deleting ignored files such as .env, *.db, and node_modules
+    // that the running process depends on (ES-519 Finding 3).
+    await cleanupStep(["clean", "-fd"]);
     // Restore the original branch before resetting; only reset if the restore succeeds so we
     // don't rewind a different branch when the original was removed during exploration.
     if (startBranch) {

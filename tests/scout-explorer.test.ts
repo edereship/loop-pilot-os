@@ -49,11 +49,11 @@ function gitCalls(runner: FakeCommandRunner): string[][] {
 
 function expectCleanup(runner: FakeCommandRunner, withReset = true): void {
   const calls = gitCalls(runner);
-  // Cleanup sequence: checkout HEAD -- . → clean -fdx → checkout <startBranch> → [reset --hard <sha>]
+  // Cleanup sequence: checkout HEAD -- . → clean -fd → checkout <startBranch> → [reset --hard <sha>]
   const count = withReset ? 4 : 3;
   const tail = calls.slice(-count);
   expect(tail[0]).toEqual(["checkout", "HEAD", "--", "."]);
-  expect(tail[1]).toEqual(["clean", "-fdx"]);
+  expect(tail[1]).toEqual(["clean", "-fd"]);
   expect(tail[2]).toEqual(["checkout", "main"]);
   if (withReset) expect(tail[3]).toEqual(["reset", "--hard", "abc123"]);
 }

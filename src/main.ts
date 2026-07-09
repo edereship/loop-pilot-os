@@ -180,10 +180,23 @@ async function runLoop(configPath: string): Promise<number> {
     // allowedTools auto-execute.  Inheriting "acceptEdits" or "bypassPermissions" would
     // let the agent edit files despite the read-only-ish tool list (those modes
     // auto-approve edits regardless of allowedTools).
-    // Strip --dangerously-skip-permissions from global extra_args: that flag is equivalent
-    // to bypassPermissions and would nullify the "default" permission boundary.
-    const SCOUT_BYPASS_ARGS = new Set(["--dangerously-skip-permissions"]);
-    const scoutExtraArgs = config.agent.extraArgs.filter((a) => !SCOUT_BYPASS_ARGS.has(a));
+    // Strip permission-mode overrides and --dangerously-skip-permissions from global extra_args.
+    // These flags, when appended after the SCOUT-specific "--permission-mode default", override
+    // that boundary (Claude Code uses the last occurrence) and nullify SCOUT's read-only intent
+    // (ES-519 Finding 1). Handles both "--permission-mode=bypassPermissions" (one arg) and
+    // "--permission-mode" "bypassPermissions" (two args) forms.
+    const scoutExtraArgs = (() => {
+      const out: string[] = [];
+      const raw = config.agent.extraArgs;
+      for (let i = 0; i < raw.length; i++) {
+        const a = raw[i];
+        if (a === "--dangerously-skip-permissions") continue;
+        if (a.startsWith("--permission-mode=")) continue;
+        if (a === "--permission-mode") { i++; continue; }
+        out.push(a);
+      }
+      return out;
+    })();
     const scoutAgent = buildPhaseAgent(
       config.agent.scout,
       "default",
