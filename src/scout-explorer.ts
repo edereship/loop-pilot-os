@@ -2,6 +2,7 @@ import process from "node:process";
 import type { AgentRunner, CommandRunner } from "./types.js";
 import { parseScoutOutput, type ScoutCandidate } from "./scout-parser.js";
 import { buildScoutReformatPrompt } from "./scout-prompt.js";
+import { readAll as readMemoryAll, writeCategory } from "./memory-store.js";
 
 export const REFORMAT_TIMEOUT_MS = 5 * 60_000;
 export const REFORMAT_MIN_BUDGET_USD = 0.1;
@@ -26,6 +27,18 @@ export interface ScoutExplorerDeps {
   objectiveOnly?: boolean;
   /** When provided, fetch and reset to origin/<defaultBranch> before running the agent. */
   defaultBranch?: string;
+  /**
+   * Resolve the set of process-tree descendants of rootPid (Linux: reads /proc).
+   * Returns null on non-Linux or when /proc is unreadable. When provided, SCOUT
+   * cleanup only kills processes descended from this orchestrator or reparented to
+   * init (Finding 2 — ES-519). When absent, the basic PID filter is used as fallback.
+   */
+  getDescendantPids?: (rootPid: number) => Set<number> | null;
+  /**
+   * Given a list of PIDs, return those whose PPID is 1 (reparented to init).
+   * Only consulted when getDescendantPids is provided (Finding 2 — ES-519).
+   */
+  getReparentedPids?: (pids: number[]) => Set<number>;
 }
 
 export type ScoutExplorationResult =
@@ -38,6 +51,10 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
 
   // Refresh to the latest upstream state so SCOUT does not file tickets for bugs already fixed.
   if (deps.defaultBranch) {
+    // Preserve local memory content before the hard reset: a local-only bootstrap commit
+    // in docs/memory (created when startup rebase fails) is discarded by the reset and
+    // would permanently lose pm_decisions / product_knowledge (Finding 6 — ES-519).
+    const preResetMem = readMemoryAll(repoPath);
     const fetchRes = await runner.run("git", ["fetch", "origin", deps.defaultBranch], {
       cwd: repoPath,
       timeoutMs: GIT_TIMEOUT_MS,
@@ -51,6 +68,19 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       }).catch(() => null);
       if (resetRes === null || resetRes.code !== 0) {
         log(`scout: warning: git reset --hard origin/${deps.defaultBranch} failed; running on current HEAD`);
+      } else {
+        // Reset succeeded: restore memory categories that had local content so SCOUT
+        // can read them and so the bootstrap commit is not permanently discarded.
+        const NO_LIMIT = Number.MAX_SAFE_INTEGER;
+        if (preResetMem.pmDecisions !== null) {
+          try { writeCategory(repoPath, "pm_decisions", preResetMem.pmDecisions, NO_LIMIT); } catch { /* best-effort */ }
+        }
+        if (preResetMem.implResults !== null) {
+          try { writeCategory(repoPath, "impl_results", preResetMem.implResults, NO_LIMIT); } catch { /* best-effort */ }
+        }
+        if (preResetMem.productKnowledge !== null) {
+          try { writeCategory(repoPath, "product_knowledge", preResetMem.productKnowledge, NO_LIMIT); } catch { /* best-effort */ }
+        }
       }
     }
   }
@@ -172,7 +202,36 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
         return; // lsof unavailable or failed — skip process cleanup
       }
       const myPid = String(process.pid);
-      const pids = rawPids.filter(p => /^\d+$/.test(p) && p !== "0" && p !== "1" && p !== myPid);
+      const basicFiltered = rawPids.filter(p => /^\d+$/.test(p) && p !== "0" && p !== "1" && p !== myPid);
+      if (basicFiltered.length === 0) return;
+
+      // Use the descendant/reparented guard when available so unrelated processes that happen
+      // to have files open in repoPath (editors, watchers, other test commands) are not killed
+      // (Finding 2 — ES-519). Falls back to basic filtering when ancestry is unavailable.
+      let pids: string[];
+      if (deps.getDescendantPids) {
+        const descendants = deps.getDescendantPids(process.pid);
+        if (descendants !== null) {
+          const candidateNums = basicFiltered.map(p => parseInt(p, 10));
+          const reparented = deps.getReparentedPids
+            ? deps.getReparentedPids(candidateNums)
+            : new Set<number>();
+          const reparentedDescendants = new Set<number>();
+          for (const rp of reparented) {
+            const rpDescs = deps.getDescendantPids(rp);
+            if (rpDescs) for (const d of rpDescs) reparentedDescendants.add(d);
+          }
+          pids = basicFiltered.filter(p => {
+            const pid = parseInt(p, 10);
+            return descendants.has(pid) || reparented.has(pid) || reparentedDescendants.has(pid);
+          });
+        } else {
+          pids = basicFiltered;
+        }
+      } else {
+        pids = basicFiltered;
+      }
+
       if (pids.length === 0) return;
       log(`scout: killing ${pids.length} orphaned process(es): ${pids.join(",")}`);
       await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);

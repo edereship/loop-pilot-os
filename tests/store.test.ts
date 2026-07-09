@@ -1890,4 +1890,27 @@ describe("scout_log CRUD (ES-516)", () => {
     store.updateScoutLog(skippedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:00:01.000Z", costUsd: 0 });
     expect(store.latestScoutFiredAt()).toBeNull();
   });
+
+  it("latestScoutFiredAt counts interrupted runs (outcome=skipped, cost>0) toward the interval (Finding 7 — ES-519)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Interrupted run: stored as 'skipped' but consumed non-zero budget
+    const interruptedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(interruptedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:30:00.000Z", costUsd: 0.5, errorDetail: "interrupted" });
+    // latestScoutFiredAt must return the interrupted row (it burned budget, so the interval applies)
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt still ignores zero-cost skipped rows (board-fetch failures) when an interrupted row exists", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Board-fetch failure (zero cost) at a later time — must be excluded
+    const boardFetchRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(boardFetchRow.id, { outcome: "skipped", endedAt: "2026-07-08T14:00:01.000Z", costUsd: 0, errorDetail: "board fetch failed" });
+    // Interrupted row at an earlier time — must be included
+    const interruptedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(interruptedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:30:00.000Z", costUsd: 0.5, errorDetail: "interrupted" });
+    // MAX(fired_at) over included rows → the interrupted row, not the board-fetch failure
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
+  });
 });

@@ -2344,6 +2344,10 @@ export class Orchestrator {
         log: this.log,
         objectiveOnly,
         defaultBranch: this.config.repo.defaultBranch,
+        // Pass process-tree helpers so SCOUT cleanup only kills processes it spawned,
+        // not unrelated editors or watchers that have files open in repoPath (Finding 2 — ES-519).
+        getDescendantPids: this.getDescendantPids,
+        getReparentedPids: this.getReparentedPids,
       });
 
       // Advance idleStartedAt so SCOUT duration does not count toward idle timeout
@@ -2441,9 +2445,10 @@ export class Orchestrator {
         return HALT;
       }
 
-      // Objective SCOUT tickets are immediately eligible (opt-in attached); the main loop will
-      // pick them up in the next SELECT cycle — no explicit RESELECT needed here.
-      return CONTINUE;
+      // Return RESELECT when objective tickets were created: they carry opt-in so they are
+      // immediately eligible, but control would otherwise fall through to the idle-timeout
+      // check before a new SELECT runs and could halt the run prematurely (Finding 5 — ES-519).
+      return objectiveCount > 0 ? RESELECT : CONTINUE;
     } catch (err) {
       const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
       this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);

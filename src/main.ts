@@ -184,11 +184,11 @@ async function runLoop(configPath: string): Promise<number> {
     // allowedTools auto-execute.  Inheriting "acceptEdits" or "bypassPermissions" would
     // let the agent edit files despite the read-only-ish tool list (those modes
     // auto-approve edits regardless of allowedTools).
-    // Strip permission-mode overrides and --dangerously-skip-permissions from global extra_args.
-    // These flags, when appended after the SCOUT-specific "--permission-mode default", override
-    // that boundary (Claude Code uses the last occurrence) and nullify SCOUT's read-only intent
-    // (ES-519 Finding 1). Handles both "--permission-mode=bypassPermissions" (one arg) and
-    // "--permission-mode" "bypassPermissions" (two args) forms.
+    // Strip permission-mode overrides, --dangerously-skip-permissions, and --tools overrides
+    // from global extra_args. These flags, when appended after the SCOUT-specific values,
+    // override the SCOUT boundary (Claude Code uses the last occurrence) and nullify SCOUT's
+    // read-only intent (ES-519 Finding 1, Finding 3).
+    // Handles both "--flag=value" (one arg) and "--flag" "value" (two args) forms.
     const scoutExtraArgs = (() => {
       const out: string[] = [];
       const raw = config.agent.extraArgs;
@@ -197,17 +197,27 @@ async function runLoop(configPath: string): Promise<number> {
         if (a === "--dangerously-skip-permissions") continue;
         if (a.startsWith("--permission-mode=")) continue;
         if (a === "--permission-mode") { i++; continue; }
+        // Strip --tools overrides so a global --tools value cannot change or defeat the
+        // SCOUT-specific tool set (Finding 3 — ES-519).
+        if (a.startsWith("--tools=")) continue;
+        if (a === "--tools") { i++; continue; }
         out.push(a);
       }
+      // Block MCP tools: --tools only restricts built-in tools, not MCP tools; deny MCP
+      // explicitly so SCOUT cannot call write-capable MCP servers (Finding 1 — ES-519).
+      out.push("--disallowedTools", "mcp__*");
       return out;
     })();
     const scoutTools = config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS;
+    // --tools only accepts bare tool names (e.g. "Read,Bash"), not permission-rule syntax
+    // like "Bash(npm test *)"; strip parenthesized suffixes before passing (Finding 4 — ES-519).
+    const scoutBareTools = scoutTools.split(",").map(t => t.split("(")[0].trim()).join(",");
     const scoutAgent = buildPhaseAgent(
       config.agent.scout,
       "default",
       scoutTools,
       scoutExtraArgs,
-      scoutTools, // --tools restricts available tools; --allowedTools marks which auto-execute
+      scoutBareTools, // --tools restricts available tools; --allowedTools marks which auto-execute
     );
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {

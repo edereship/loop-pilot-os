@@ -1,4 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   runScoutExploration,
   REFORMAT_TIMEOUT_MS,
@@ -7,6 +10,20 @@ import {
 } from "../src/scout-explorer.js";
 import { FakeAgentRunner, FakeCommandRunner } from "./fakes.js";
 import type { AgentOutcome } from "../src/types.js";
+
+const tmpDirs: string[] = [];
+afterEach(() => {
+  for (const d of tmpDirs) {
+    try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  tmpDirs.length = 0;
+});
+
+function makeTmpDir(): string {
+  const d = mkdtempSync(path.join(tmpdir(), "scout-test-"));
+  tmpDirs.push(d);
+  return d;
+}
 
 const REPO = "/repo";
 const VALID_JSON =
@@ -292,5 +309,132 @@ describe("runScoutExploration", () => {
     expect(result.kind).toBe("ok");
     // git cleanup must still run
     expectCleanup(runner);
+  });
+
+  // Finding 2 — ES-519: descendant/reparented guard prevents killing unrelated processes
+  it("with getDescendantPids: only kills descendant PIDs, spares unrelated processes", async () => {
+    const { deps, runner, logs } = setup([completed(VALID_JSON)]);
+    const descendantPid = "1234";
+    const unrelatedPid = "5678";
+    runner.on(["lsof", "+D", REPO, "-t"], { stdout: `${descendantPid}\n${unrelatedPid}\n` });
+    runner.on(["kill"], {});
+    deps.getDescendantPids = (rootPid) => {
+      // Simulate that 1234 is a descendant of our process, 5678 is not
+      void rootPid;
+      return new Set([parseInt(descendantPid, 10)]);
+    };
+    deps.getReparentedPids = () => new Set<number>();
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    const killCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-TERM");
+    expect(killCall).toBeDefined();
+    expect(killCall!.args).toContain(descendantPid);
+    expect(killCall!.args).not.toContain(unrelatedPid);
+    expect(logs.some(l => l.includes("orphaned") && l.includes(descendantPid))).toBe(true);
+  });
+
+  it("with getDescendantPids returning null (non-Linux): falls back to basic filtering", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    runner.on(["lsof", "+D", REPO, "-t"], { stdout: "1234\n5678\n" });
+    runner.on(["kill"], {});
+    deps.getDescendantPids = () => null; // /proc unavailable
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // With null ancestry, falls back to basic-filtered list: both PIDs are killed
+    const killCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-TERM");
+    expect(killCall).toBeDefined();
+    expect(killCall!.args).toContain("1234");
+    expect(killCall!.args).toContain("5678");
+  });
+
+  it("with getDescendantPids and getReparentedPids: kills reparented PIDs too", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    const reparentedPid = "3333";
+    const unrelatedPid = "4444";
+    runner.on(["lsof", "+D", REPO, "-t"], { stdout: `${reparentedPid}\n${unrelatedPid}\n` });
+    runner.on(["kill"], {});
+    deps.getDescendantPids = () => new Set<number>(); // no direct descendants
+    deps.getReparentedPids = (pids) => new Set(pids.filter(p => p === parseInt(reparentedPid, 10)));
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    const killCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-TERM");
+    expect(killCall).toBeDefined();
+    expect(killCall!.args).toContain(reparentedPid);
+    expect(killCall!.args).not.toContain(unrelatedPid);
+  });
+
+  // Finding 6 — ES-519: preserve memory content across git reset --hard
+  it("with defaultBranch: restores memory categories that had content before the reset", async () => {
+    const tmpDir = makeTmpDir();
+    const memoryDir = path.join(tmpDir, "docs", "memory");
+    mkdirSync(memoryDir, { recursive: true });
+    const pmDecisionsPath = path.join(memoryDir, "pm-decisions.md");
+    const memContent = "# PM Decisions\n\nUse snake_case for all identifiers.\n";
+    writeFileSync(pmDecisionsPath, memContent, "utf-8");
+
+    const agent = new FakeAgentRunner();
+    agent.outcomes = [completed(VALID_JSON)];
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "rev-parse", "HEAD"], { stdout: "abc123\n" });
+    runner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "main\n" });
+    runner.on(["git", "fetch", "origin", "main"], {});
+    // Simulate git reset --hard by deleting the memory file
+    runner.on(["git", "reset", "--hard", "origin/main"], (_args, _opts) => {
+      try { rmSync(pmDecisionsPath); } catch { /* file may not exist */ }
+      return { stdout: "HEAD is now at abc123\n", code: 0 };
+    });
+    runner.on(["git", "checkout"], {});
+    runner.on(["git", "clean"], {});
+    runner.on(["git", "reset"], {});
+    const logs: string[] = [];
+    const deps: ScoutExplorerDeps = {
+      agent,
+      runner,
+      repoPath: tmpDir,
+      prompt: "EXPLORE",
+      maxCostUsd: 2,
+      timeoutMs: 30 * 60_000,
+      log: (l) => logs.push(l),
+      defaultBranch: "main",
+    };
+
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // Memory file must be restored after the reset
+    expect(existsSync(pmDecisionsPath)).toBe(true);
+    expect(readFileSync(pmDecisionsPath, "utf-8")).toBe(memContent);
+  });
+
+  it("with defaultBranch and no local memory: does not create memory files after reset", async () => {
+    const tmpDir = makeTmpDir();
+    // No memory directory created — files don't exist
+
+    const agent = new FakeAgentRunner();
+    agent.outcomes = [completed(VALID_JSON)];
+    const runner = new FakeCommandRunner();
+    runner.on(["git", "rev-parse", "HEAD"], { stdout: "abc123\n" });
+    runner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "main\n" });
+    runner.on(["git", "fetch", "origin", "main"], {});
+    runner.on(["git", "reset", "--hard", "origin/main"], { stdout: "HEAD is now at abc123\n" });
+    runner.on(["git", "checkout"], {});
+    runner.on(["git", "clean"], {});
+    runner.on(["git", "reset"], {});
+    const deps: ScoutExplorerDeps = {
+      agent,
+      runner,
+      repoPath: tmpDir,
+      prompt: "EXPLORE",
+      maxCostUsd: 2,
+      timeoutMs: 30 * 60_000,
+      log: () => {},
+      defaultBranch: "main",
+    };
+
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // No memory directory should be created when there was nothing to restore
+    const memoryDir = path.join(tmpDir, "docs", "memory");
+    const pmPath = path.join(memoryDir, "pm-decisions.md");
+    expect(existsSync(pmPath)).toBe(false);
   });
 });

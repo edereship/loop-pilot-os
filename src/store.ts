@@ -1446,10 +1446,19 @@ export class SqliteStore {
    * 一度も発火していなければ null。
    */
   latestScoutFiredAt(): string | null {
-    // Exclude 'skipped' rows (e.g. board-fetch failures) so a $0 pre-check failure does not
-    // consume the full min_interval_hours window and suppress subsequent SCOUT runs (Finding 2 — ES-519).
+    // Exclude zero-cost skipped rows (board-fetch failures) so a $0 pre-check failure does not
+    // consume the full min_interval_hours window. Interrupted runs (outcome='skipped' but
+    // cost_usd > 0) are included: they burned budget and must count toward the interval
+    // (Finding 7 — ES-519).
+    // NULL outcome (in-progress) is always included via the explicit IS NULL check;
+    // using NOT (...) alone would silently exclude NULL rows due to SQL NULL semantics.
     const row = this.db
-      .prepare(`SELECT MAX(fired_at) AS latest FROM scout_log WHERE outcome IS NULL OR outcome != 'skipped'`)
+      .prepare(
+        `SELECT MAX(fired_at) AS latest FROM scout_log
+         WHERE outcome IS NULL
+            OR outcome != 'skipped'
+            OR (cost_usd IS NOT NULL AND cost_usd > 0)`,
+      )
       .get() as { latest: string | null };
     return row.latest;
   }
