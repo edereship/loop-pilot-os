@@ -1869,4 +1869,25 @@ describe("scout_log CRUD (ES-516)", () => {
     store.insertScoutLog({ runId: run2.id, firedAt: "2026-07-08T03:00:00.000Z" });
     expect(store.latestScoutFiredAt()).toBe("2026-07-08T09:00:00.000Z");
   });
+
+  it("latestScoutFiredAt ignores skipped rows so a board-fetch failure does not consume the interval (Finding 2 — ES-519)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // A skipped row (e.g. board-fetch failure) recorded at a later time
+    const skippedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(skippedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:00:01.000Z", costUsd: 0 });
+    // An earlier completed row
+    const completedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T06:00:00.000Z" });
+    store.updateScoutLog(completedRow.id, { outcome: "completed", endedAt: "2026-07-08T06:30:00.000Z", costUsd: 1.5 });
+    // latestScoutFiredAt must return the completed row, not the skipped one
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T06:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt returns null when all rows are skipped", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const skippedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(skippedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:00:01.000Z", costUsd: 0 });
+    expect(store.latestScoutFiredAt()).toBeNull();
+  });
 });

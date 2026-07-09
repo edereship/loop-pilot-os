@@ -2306,35 +2306,39 @@ export class Orchestrator {
         return CONTINUE;
       }
 
-      // Load spec content for the prompt
       const repoPath = this.config.repo.path;
-      let specContent: SpecContent | null = null;
       const specDir = this.config.product.specDir;
-      if (specDir !== undefined && this.specLoader !== null) {
-        try {
-          specContent = this.specLoader(repoPath, specDir);
-        } catch (err) {
-          this.log(`scout: spec loading failed (non-fatal): ${errMsg(err)}`);
-        }
-      }
-
       const goal = this.config.product.goal ?? null;
-      const objectiveOnly = specContent === null && goal === null;
-      const prompt = buildScoutPrompt({
-        specContent,
-        goal,
-        specDir,
-        existingScoutIssues,
-        pendingTriageIssues,
-        maxCandidates: this.config.scout.maxIssuesPerScout,
-      });
+      // objectiveOnly: computed from config so it is stable across the git reset that
+      // runScoutExploration performs. If specDir is configured, spec_mismatch candidates
+      // are allowed (even if the spec file is temporarily absent) (Finding 3 — ES-519).
+      const objectiveOnly = specDir === undefined && goal === null;
 
       this.log("scout: starting exploration");
       const explorationResult = await runScoutExploration({
         agent: this.scoutDeps.agent,
         runner: this.runner,
         repoPath,
-        prompt,
+        // Builder is called after the optional git reset inside runScoutExploration, so the
+        // spec content reflects the freshly-checked-out commit (Finding 3 — ES-519).
+        prompt: () => {
+          let specContent: SpecContent | null = null;
+          if (specDir !== undefined && this.specLoader !== null) {
+            try {
+              specContent = this.specLoader(repoPath, specDir);
+            } catch (err) {
+              this.log(`scout: spec loading failed (non-fatal): ${errMsg(err)}`);
+            }
+          }
+          return buildScoutPrompt({
+            specContent,
+            goal,
+            specDir,
+            existingScoutIssues,
+            pendingTriageIssues,
+            maxCandidates: this.config.scout.maxIssuesPerScout,
+          });
+        },
         maxCostUsd: this.config.safety.maxCostUsdPerScout,
         timeoutMs: this.config.safety.scoutTimeoutMinutes * 60_000,
         log: this.log,
@@ -2385,24 +2389,21 @@ export class Orchestrator {
       for (const candidate of candidates) {
         if (this.interrupted) break;
         try {
-          // Objective findings get the scout label + opt-in so they become immediately eligible.
-          // Spec-mismatch findings need human review before implementation: add scout-triage label
-          // and suppress the opt-in label so LinearTaskSource does not pick them up autonomously
-          // (ES-519 Finding 2).
+          // Objective findings: scout label + opt-in → immediately eligible for SELECT.
+          // Spec-mismatch findings: scout + scout-triage labels, no opt-in → human must
+          // relabel before LinearTaskSource picks them up (Finding 4 — ES-519).
           const isObjective = candidate.evidence_type === "objective";
           const extraLabelIds: string[] = [];
           if (this.scoutDeps.scoutLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutLabelId);
           if (!isObjective && this.scoutDeps.scoutTriageLabelId !== null) {
             extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
           }
-          // Stage 2 (Codex verification) is not yet implemented; suppress opt-in for all
-          // SCOUT candidates so no ticket is auto-implemented without human or Stage 2 approval.
           const identifier = await this.scoutDeps.linearClient.createIssue({
             title: candidate.title,
             description: `${candidate.description}\n\n**Evidence (${candidate.evidence_type}):**\n\n${candidate.evidence}`,
             priority: candidate.priority,
             extraLabelIds,
-            includeOptIn: false,
+            includeOptIn: isObjective,
           });
           createdIdentifiers.push(identifier);
           if (isObjective) objectiveCount++;
@@ -2440,8 +2441,8 @@ export class Orchestrator {
         return HALT;
       }
 
-      // Stage 2 verification is not yet built; all SCOUT candidates omit the opt-in label, so
-      // no newly filed ticket is immediately eligible — no RESELECT needed.
+      // Objective SCOUT tickets are immediately eligible (opt-in attached); the main loop will
+      // pick them up in the next SELECT cycle — no explicit RESELECT needed here.
       return CONTINUE;
     } catch (err) {
       const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;

@@ -1446,8 +1446,10 @@ export class SqliteStore {
    * 一度も発火していなければ null。
    */
   latestScoutFiredAt(): string | null {
+    // Exclude 'skipped' rows (e.g. board-fetch failures) so a $0 pre-check failure does not
+    // consume the full min_interval_hours window and suppress subsequent SCOUT runs (Finding 2 — ES-519).
     const row = this.db
-      .prepare(`SELECT MAX(fired_at) AS latest FROM scout_log`)
+      .prepare(`SELECT MAX(fired_at) AS latest FROM scout_log WHERE outcome IS NULL OR outcome != 'skipped'`)
       .get() as { latest: string | null };
     return row.latest;
   }

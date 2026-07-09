@@ -1,3 +1,4 @@
+import process from "node:process";
 import type { AgentRunner, CommandRunner } from "./types.js";
 import { parseScoutOutput, type ScoutCandidate } from "./scout-parser.js";
 import { buildScoutReformatPrompt } from "./scout-prompt.js";
@@ -13,7 +14,11 @@ export interface ScoutExplorerDeps {
   agent: AgentRunner;
   runner: CommandRunner;
   repoPath: string;
-  prompt: string;
+  /**
+   * Pre-built prompt string, or a builder called after any git reset so spec content reflects
+   * the freshly-checked-out commit rather than the pre-reset working tree (Finding 3 — ES-519).
+   */
+  prompt: string | (() => string);
   maxCostUsd: number;
   timeoutMs: number;
   log: (line: string) => void;
@@ -29,7 +34,7 @@ export type ScoutExplorationResult =
   | { kind: "interrupted"; costUsd: number };
 
 export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<ScoutExplorationResult> {
-  const { agent, runner, repoPath, prompt, maxCostUsd, timeoutMs, log } = deps;
+  const { agent, runner, repoPath, maxCostUsd, timeoutMs, log } = deps;
 
   // Refresh to the latest upstream state so SCOUT does not file tickets for bugs already fixed.
   if (deps.defaultBranch) {
@@ -49,6 +54,9 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       }
     }
   }
+
+  // Resolve the prompt after any git reset so a builder receives fresh file contents (Finding 3).
+  const prompt = typeof deps.prompt === "function" ? deps.prompt() : deps.prompt;
 
   const startSha = await runner
     .run("git", ["rev-parse", "HEAD"], { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS })
@@ -134,6 +142,9 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       costUsd,
     };
   } finally {
+    // Kill background processes started by the agent (e.g. dev servers launched via test commands)
+    // before restoring git state so they cannot hold locks on repo files (Finding 5 — ES-519).
+    await cleanupProcesses();
     await cleanupStep(["checkout", "HEAD", "--", "."]);
     // Use -fd (not -fdx) to avoid deleting ignored files such as .env, *.db, and node_modules
     // that the running process depends on (ES-519 Finding 3).
@@ -145,6 +156,28 @@ export async function runScoutExploration(deps: ScoutExplorerDeps): Promise<Scou
       if (restored && startSha) await cleanupStep(["reset", "--hard", startSha]);
     } else if (startSha) {
       await cleanupStep(["reset", "--hard", startSha]);
+    }
+  }
+
+  async function cleanupProcesses(): Promise<void> {
+    try {
+      let rawPids: string[];
+      try {
+        const lsofResult = await runner.run("lsof", ["+D", repoPath, "-t"], {
+          cwd: repoPath,
+          timeoutMs: 10_000,
+        });
+        rawPids = lsofResult.stdout.trim().split("\n").filter(Boolean);
+      } catch {
+        return; // lsof unavailable or failed — skip process cleanup
+      }
+      const myPid = String(process.pid);
+      const pids = rawPids.filter(p => /^\d+$/.test(p) && p !== "0" && p !== "1" && p !== myPid);
+      if (pids.length === 0) return;
+      log(`scout: killing ${pids.length} orphaned process(es): ${pids.join(",")}`);
+      await runner.run("kill", ["-TERM", ...pids], { cwd: repoPath, timeoutMs: 5_000 }).catch(() => null);
+    } catch {
+      // best-effort: process cleanup must not abort git cleanup
     }
   }
 

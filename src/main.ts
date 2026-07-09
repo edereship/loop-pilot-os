@@ -149,11 +149,14 @@ async function runLoop(configPath: string): Promise<number> {
 
     // Build a ClaudeAgentRunner for a specific phase. When phaseConfig is set, uses
     // the per-phase model/effort; otherwise falls back to the global agent defaults.
+    // `tools` (when set) passes --tools to restrict the tool set available to the agent;
+    // this is distinct from `allowedTools` which only controls which tools auto-execute.
     function buildPhaseAgent(
       phaseConfig: { model: string; effort: string } | undefined,
       permissionMode: string,
       allowedTools?: string,
       extraArgs?: string[],
+      tools?: string,
     ): ClaudeAgentRunner {
       const model = phaseConfig?.model ?? config.agent.model;
       const rawEffort = phaseConfig?.effort ?? config.agent.effort;
@@ -166,6 +169,7 @@ async function runLoop(configPath: string): Promise<number> {
         effortEnvOverride: supported || rawEffort === "auto" ? rawEffort : undefined,
         permissionMode,
         allowedTools: allowedTools ?? config.agent.allowedTools,
+        tools,
         extraArgs: extraArgs ?? config.agent.extraArgs,
         log: logLine,
         rateLimit: rateLimitOpts,
@@ -197,11 +201,13 @@ async function runLoop(configPath: string): Promise<number> {
       }
       return out;
     })();
+    const scoutTools = config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS;
     const scoutAgent = buildPhaseAgent(
       config.agent.scout,
       "default",
-      config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS,
+      scoutTools,
       scoutExtraArgs,
+      scoutTools, // --tools restricts available tools; --allowedTools marks which auto-execute
     );
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {

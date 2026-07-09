@@ -220,4 +220,77 @@ describe("runScoutExploration", () => {
     expect(result.kind).toBe("ok");
     expect(logs.some(l => l.includes("warning") && l.includes("fetch"))).toBe(true);
   });
+
+  // Finding 3 — ES-519: prompt builder called after git reset so spec content is fresh
+  it("with prompt builder and defaultBranch: builder is called after the git reset", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    runner.on(["git", "fetch"], {});
+    const callOrder: string[] = [];
+    runner.on(["git", "reset", "--hard", "origin/main"], () => {
+      callOrder.push("reset");
+      return { stdout: "HEAD is now at abc123\n" };
+    });
+    deps.defaultBranch = "main";
+    deps.prompt = () => {
+      callOrder.push("builder");
+      return "EXPLORE";
+    };
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    expect(callOrder.indexOf("reset")).toBeGreaterThanOrEqual(0);
+    expect(callOrder.indexOf("builder")).toBeGreaterThan(callOrder.indexOf("reset"));
+  });
+
+  it("with prompt builder (no defaultBranch): builder is called before the agent", async () => {
+    const { deps, agent } = setup([completed(VALID_JSON)]);
+    let builderCalled = false;
+    deps.prompt = () => {
+      builderCalled = true;
+      return "EXPLORE_FRESH";
+    };
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    expect(builderCalled).toBe(true);
+    expect(agent.contexts[0].prompt).toBe("EXPLORE_FRESH");
+  });
+
+  // Finding 5 — ES-519: process cleanup runs before git cleanup
+  it("runs lsof process cleanup in finally before git cleanup; kills discovered PIDs", async () => {
+    const { deps, runner, logs } = setup([completed(VALID_JSON)]);
+    runner.on(["lsof", "+D", REPO, "-t"], { stdout: "1234\n5678\n" });
+    runner.on(["kill"], {});
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // lsof must be called
+    expect(runner.calls.some(c => c.cmd === "lsof")).toBe(true);
+    // kill -TERM must be called with the discovered PIDs
+    const killCall = runner.calls.find(c => c.cmd === "kill" && c.args[0] === "-TERM");
+    expect(killCall).toBeDefined();
+    expect(killCall!.args).toContain("1234");
+    expect(killCall!.args).toContain("5678");
+    // log message expected
+    expect(logs.some(l => l.includes("orphaned") && l.includes("1234"))).toBe(true);
+    // process cleanup must precede git cleanup: kill call before first git-checkout call
+    const killIdx = runner.calls.findIndex(c => c.cmd === "kill");
+    const checkoutIdx = runner.calls.findIndex(c => c.cmd === "git" && c.args[0] === "checkout");
+    expect(killIdx).toBeLessThan(checkoutIdx);
+  });
+
+  it("skips process cleanup gracefully when lsof returns no PIDs", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    runner.on(["lsof", "+D", REPO, "-t"], { stdout: "\n" });
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // kill must NOT be called when there are no PIDs
+    expect(runner.calls.some(c => c.cmd === "kill")).toBe(false);
+  });
+
+  it("skips process cleanup gracefully when lsof is unavailable (no stub = throws)", async () => {
+    const { deps, runner } = setup([completed(VALID_JSON)]);
+    // lsof intentionally not stubbed → FakeCommandRunner throws → caught internally
+    const result = await runScoutExploration(deps);
+    expect(result.kind).toBe("ok");
+    // git cleanup must still run
+    expectCleanup(runner);
+  });
 });
