@@ -1869,4 +1869,156 @@ describe("scout_log CRUD (ES-516)", () => {
     store.insertScoutLog({ runId: run2.id, firedAt: "2026-07-08T03:00:00.000Z" });
     expect(store.latestScoutFiredAt()).toBe("2026-07-08T09:00:00.000Z");
   });
+
+  it("latestScoutFiredAt ignores skipped rows so a board-fetch failure does not consume the interval (Finding 2 — ES-519)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // A skipped row (e.g. board-fetch failure) recorded at a later time
+    const skippedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(skippedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:00:01.000Z", costUsd: 0 });
+    // An earlier completed row
+    const completedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T06:00:00.000Z" });
+    store.updateScoutLog(completedRow.id, { outcome: "completed", endedAt: "2026-07-08T06:30:00.000Z", costUsd: 1.5 });
+    // latestScoutFiredAt must return the completed row, not the skipped one
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T06:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt returns null when all rows are skipped", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    const skippedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(skippedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:00:01.000Z", costUsd: 0 });
+    expect(store.latestScoutFiredAt()).toBeNull();
+  });
+
+  it("latestScoutFiredAt counts interrupted runs (outcome=skipped, cost>0) toward the interval (Finding 7 — ES-519)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Interrupted run: stored as 'skipped' but consumed non-zero budget
+    const interruptedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(interruptedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:30:00.000Z", costUsd: 0.5, errorDetail: "interrupted" });
+    // latestScoutFiredAt must return the interrupted row (it burned budget, so the interval applies)
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt still ignores zero-cost skipped rows (board-fetch failures) when an interrupted row exists", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Board-fetch failure (zero cost) at a later time — must be excluded
+    const boardFetchRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(boardFetchRow.id, { outcome: "skipped", endedAt: "2026-07-08T14:00:01.000Z", costUsd: 0, errorDetail: "board fetch failed" });
+    // Interrupted row at an earlier time — must be included
+    const interruptedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(interruptedRow.id, { outcome: "skipped", endedAt: "2026-07-08T12:30:00.000Z", costUsd: 0.5, errorDetail: "interrupted" });
+    // MAX(fired_at) over included rows → the interrupted row, not the board-fetch failure
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt includes costly creation-failure errors toward the interval (Finding 2 — Codex review, iteration 14)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Creation-failure error with non-zero cost: exploration ran but all Linear calls failed.
+    // Must consume the interval to prevent deterministic failures from retrying every idle tick.
+    const creationFailRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(creationFailRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T12:05:00.000Z",
+      costUsd: 0.8,
+      errorDetail: "all issue creation failed",
+    });
+    // Burned budget → must count toward the interval
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt includes non-creation-failure error rows toward the interval", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // A different error (e.g. agent error) — should still count toward the interval
+    const errorRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T10:00:00.000Z" });
+    store.updateScoutLog(errorRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T10:30:00.000Z",
+      costUsd: 0.5,
+      errorDetail: "scout agent cost exceeded",
+    });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt includes both a costly creation-failure and an earlier completed row — returns the later time", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Creation-failure at a later time with non-zero cost — now included
+    const creationFailRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(creationFailRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T14:05:00.000Z",
+      costUsd: 0.8,
+      errorDetail: "all issue creation failed",
+    });
+    // Earlier completed row — also included
+    const completedRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T06:00:00.000Z" });
+    store.updateScoutLog(completedRow.id, { outcome: "completed", endedAt: "2026-07-08T06:30:00.000Z", costUsd: 1.5 });
+    // MAX of the two included rows — the later creation-failure time wins
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T14:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt excludes zero-cost error rows so a transient rate-limit does not consume the interval (Finding 3 — Codex review)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Zero-cost error: quota/rate-limit rejection before any exploration ran
+    const rateLimitRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(rateLimitRow.id, { outcome: "error", endedAt: "2026-07-08T12:00:02.000Z", costUsd: 0, errorDetail: "rate limited" });
+    // No other rows — must return null so the interval is not blocked
+    expect(store.latestScoutFiredAt()).toBeNull();
+  });
+
+  it("latestScoutFiredAt includes a non-zero-cost error while ignoring a later zero-cost error (Finding 3 — Codex review)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Earlier non-zero-cost error (budget spent) — must count toward the interval
+    const budgetErrorRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T10:00:00.000Z" });
+    store.updateScoutLog(budgetErrorRow.id, { outcome: "error", endedAt: "2026-07-08T10:30:00.000Z", costUsd: 0.5, errorDetail: "scout agent cost exceeded" });
+    // Later zero-cost error — must not mask the earlier row
+    const zeroCostRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(zeroCostRow.id, { outcome: "error", endedAt: "2026-07-08T14:00:01.000Z", costUsd: 0, errorDetail: "rate limited" });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt counts zero-cost hard-timeout errors toward the interval (Finding 5 — Codex review, iteration 15)", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Hard timeout: Claude hung for the full scoutTimeoutMinutes; costUsd=0 because
+    // no tokens were billed before the kill. Must still count toward min_interval_hours
+    // so deterministic timeouts don't rerun on every idle tick.
+    const timeoutRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T12:00:00.000Z" });
+    store.updateScoutLog(timeoutRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T12:30:00.000Z",
+      costUsd: 0,
+      errorDetail: `scout exploration exception: command "claude" timed out after 1800000ms`,
+    });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T12:00:00.000Z");
+  });
+
+  it("latestScoutFiredAt still excludes zero-cost rate-limit errors even when a timeout error exists at an earlier time", () => {
+    const store = newStore();
+    const run = store.createRun(3, "2026-07-08T00:00:00.000Z");
+    // Hard timeout at an earlier time — included
+    const timeoutRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T10:00:00.000Z" });
+    store.updateScoutLog(timeoutRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T10:30:00.000Z",
+      costUsd: 0,
+      errorDetail: `scout exploration exception: command "claude" timed out after 1800000ms`,
+    });
+    // Zero-cost rate-limit at a later time — must not mask the earlier timeout row
+    const rateLimitRow = store.insertScoutLog({ runId: run.id, firedAt: "2026-07-08T14:00:00.000Z" });
+    store.updateScoutLog(rateLimitRow.id, {
+      outcome: "error",
+      endedAt: "2026-07-08T14:00:01.000Z",
+      costUsd: 0,
+      errorDetail: "rate limited",
+    });
+    expect(store.latestScoutFiredAt()).toBe("2026-07-08T10:00:00.000Z");
+  });
 });

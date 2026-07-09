@@ -1446,8 +1446,33 @@ export class SqliteStore {
    * 一度も発火していなければ null。
    */
   latestScoutFiredAt(): string | null {
+    // Exclude zero-cost skipped rows (board-fetch failures) so a $0 pre-check failure does not
+    // consume the full min_interval_hours window. Interrupted runs (outcome='skipped' but
+    // cost_usd > 0) are included: they burned budget and must count toward the interval
+    // (Finding 7 — ES-519).
+    // NULL outcome (in-progress) is always included via the explicit IS NULL check;
+    // using NOT (...) alone would silently exclude NULL rows due to SQL NULL semantics.
+    // Error rows are included when they burned budget (cost_usd > 0), regardless of error_detail.
+    // Zero-cost errors due to transient quota/rate-limit rejections must not consume the full
+    // min_interval_hours window so SCOUT can retry at the next idle opportunity (Finding 3 —
+    // Codex review). Zero-cost hard-timeout errors (error_detail LIKE '%timed out after%') ARE
+    // included: the SCOUT session ran for the full timeout, so the interval must still advance
+    // to prevent deterministic retries on every idle tick (Finding 5 — Codex review, iteration 15).
+    // Creation-failure errors (all ticket creation calls failed) with non-zero cost ARE included:
+    // excluding them causes deterministic validation/content failures (e.g. oversized description)
+    // to silently retry at every idle tick, burning SCOUT budget without operator intervention
+    // (Finding 2 — Codex review, iteration 14).
     const row = this.db
-      .prepare(`SELECT MAX(fired_at) AS latest FROM scout_log`)
+      .prepare(
+        `SELECT MAX(fired_at) AS latest FROM scout_log
+         WHERE (outcome IS NULL
+             OR outcome != 'skipped'
+             OR (cost_usd IS NOT NULL AND cost_usd > 0))
+           AND (outcome IS NULL
+             OR outcome != 'error'
+             OR (cost_usd IS NOT NULL AND cost_usd > 0)
+             OR (error_detail IS NOT NULL AND error_detail LIKE '%timed out after%'))`,
+      )
       .get() as { latest: string | null };
     return row.latest;
   }

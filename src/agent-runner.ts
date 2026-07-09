@@ -85,7 +85,14 @@ interface AgentRunnerOptions {
   /** Claude Code の --permission-mode に渡す権限モード。
    *  隔離コンテナでは "bypassPermissions" を選択する。既定は "acceptEdits"。 */
   permissionMode: string;
+  /** --allowedTools: tools that auto-execute without a permission prompt. */
   allowedTools: string;
+  /**
+   * --tools: restricts the set of tools the CLI loads at all. When set, tools not in this
+   * list are unavailable regardless of settings.json or other flags (Finding 1 — ES-519).
+   * Omit for non-SCOUT agents where all tools should remain available.
+   */
+  tools?: string;
   extraArgs: string[];
   log: (line: string) => void;
   rateLimit?: RateLimitOpts;
@@ -357,6 +364,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       this.opts.permissionMode,
       "--allowedTools",
       this.opts.allowedTools,
+      ...(this.opts.tools !== undefined ? ["--tools", this.opts.tools] : []),
       "--model",
       this.opts.model,
       ...(this.opts.effort !== undefined ? ["--effort", this.opts.effort] : []),

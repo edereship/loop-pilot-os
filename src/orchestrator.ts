@@ -46,6 +46,8 @@ import { buildGroomPrompt } from "./groom-prompt.js";
 import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
 import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
+import { runScoutExploration } from "./scout-explorer.js";
+import { buildScoutPrompt } from "./scout-prompt.js";
 import { retryTransient } from "./transient-retry.js";
 import { readdirSync, readFileSync, readlinkSync, mkdirSync, appendFileSync } from "node:fs";
 import path from "node:path";
@@ -70,6 +72,25 @@ export interface GroomDeps {
   boardFetcher: IGroomBoardFetcher;
   linearClient: IGroomLinearClient;
   knownLabels: string[];
+}
+
+export interface ScoutDeps {
+  agent: AgentRunner;
+  boardFetcher: {
+    refresh(): void;
+    getIssuesByLabel(label: string): Promise<Array<{ identifier: string; title: string; labels: string[] }>>;
+  };
+  linearClient: {
+    createIssue(fields: {
+      title: string;
+      description: string;
+      priority: number;
+      extraLabelIds?: string[];
+      includeOptIn?: boolean;
+    }): Promise<string>;
+  };
+  scoutLabelId: string | null;
+  scoutTriageLabelId: string | null;
 }
 
 export type RunOutcome = "finished" | "lock_rejected";
@@ -100,6 +121,7 @@ export interface OrchestratorDeps {
   recoveryTurn: RecoveryTurnDeps | null;
   runner: CommandRunner;
   groomDeps: GroomDeps | null;
+  scoutDeps: ScoutDeps | null;
   /**
    * Returns the set of descendant PIDs of the given root PID (injectable for
    * testing). Returning `null` signals that the process tree cannot be
@@ -121,13 +143,15 @@ export interface OrchestratorDeps {
   checkPidAlive?: (pid: number) => boolean;
 }
 
-/** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か */
+/** フェーズの返り値: 続行か、HALT 済み（ループを脱出すべき）か、またはループ先頭から再選別するか */
 type RunControl =
   | { control: "continue" }
-  | { control: "halt" };
+  | { control: "halt" }
+  | { control: "reselect" };
 
 const CONTINUE: { control: "continue" } = { control: "continue" };
 const HALT: { control: "halt" } = { control: "halt" };
+const RESELECT: { control: "reselect" } = { control: "reselect" };
 
 // 累積 diff のプロンプト注入上限。巨大 diff は Codex をコンテキスト超過エラーに追い込み
 // フェイルオープン pass を誘発する（=最も検査が必要なケースほどゲートが無効化される）ため、
@@ -172,6 +196,7 @@ export class Orchestrator {
   private readonly recoveryTurn: RecoveryTurnDeps | null;
   private readonly runner: CommandRunner;
   private readonly groomDeps: GroomDeps | null;
+  private readonly scoutDeps: ScoutDeps | null;
   private readonly getDescendantPids: (rootPid: number) => Set<number> | null;
   private readonly getReparentedPids: (pids: number[]) => Set<number>;
   private readonly checkPidAlive: (pid: number) => boolean;
@@ -204,6 +229,7 @@ export class Orchestrator {
     this.recoveryTurn = deps.recoveryTurn;
     this.runner = deps.runner;
     this.groomDeps = deps.groomDeps;
+    this.scoutDeps = deps.scoutDeps;
     this.getDescendantPids = deps.getDescendantPids ?? procDescendantPids;
     this.getReparentedPids = deps.getReparentedPids ?? procReparentedPids;
     this.checkPidAlive = deps.checkPidAlive ?? isPidAlive;
@@ -1142,6 +1168,25 @@ export class Orchestrator {
         eligible = eligible.filter((i) => !groomBlockedIds.has(i.identifier));
       }
       if (eligible.length === 0) {
+        // v4-A SCOUT（ES-519）: fire when idle long enough and min-interval has passed.
+        // Checked before the idle-timeout halt so SCOUT can run even when idle_timeout_minutes
+        // equals scout.idle_minutes — otherwise the timeout fires first (ES-519 Finding 4).
+        if (this.config.scout.enabled && this.scoutDeps !== null) {
+          const scoutRun = this.store.getRun(this.runId);
+          const idleElapsedMs = scoutRun.idleStartedAt !== null
+            ? Date.parse(this.clock()) - Date.parse(scoutRun.idleStartedAt)
+            : 0;
+          const scoutCtrl = await this.scout(idleElapsedMs);
+          if (scoutCtrl.control === "halt") return;
+          // SCOUT created opt-in objective tickets; restart the loop to re-check eligibility
+          // instead of sleeping through the idle period (ES-519 Finding 6).
+          if (scoutCtrl.control === "reselect") continue;
+          if (this.interrupted) {
+            await this.haltForInterrupt();
+            return;
+          }
+        }
+
         // 1.5) アイドルタイムアウトチェック（ES-475）
         // Checked after SELECT so that work that became eligible during the previous
         // idle sleep is claimed before the timeout fires (ES-475 Finding 1).
@@ -2205,6 +2250,233 @@ export class Orchestrator {
         this.log(`groom: failed to update groom_log in error handler: ${errMsg(logErr)}`);
       }
       return { control: "continue", summary: null, blockedIds: new Set<string>() };
+    }
+  }
+
+  // ---- SCOUT（v4-A 自律バグ発見・ES-519） ----
+  private async scout(idleElapsedMs: number): Promise<RunControl> {
+    if (!this.config.scout.enabled || this.scoutDeps === null) return CONTINUE;
+
+    // Check idle threshold
+    if (idleElapsedMs < this.config.scout.idleMinutes * 60_000) return CONTINUE;
+
+    // Check min interval between SCOUT runs
+    const lastFiredAt = this.store.latestScoutFiredAt();
+    if (lastFiredAt !== null) {
+      const sinceLastMs = Date.parse(this.clock()) - Date.parse(lastFiredAt);
+      if (sinceLastMs < this.config.scout.minIntervalHours * 60 * 60_000) return CONTINUE;
+    }
+
+    let scoutLogRow: { id: number };
+    try {
+      scoutLogRow = this.store.insertScoutLog({ runId: this.runId, firedAt: this.clock() });
+    } catch (err) {
+      this.log(`scout: failed to insert scout_log, skipping: ${errMsg(err)}`);
+      return CONTINUE;
+    }
+
+    const scoutStartMs = Date.parse(this.clock());
+
+    try {
+      // Fetch known scout/triage issues for duplicate prevention.
+      // Refresh the cache first so GROOM actions or operator changes that happened after the
+      // earlier snapshot are reflected here (ES-519 Finding 5).
+      this.scoutDeps.boardFetcher.refresh();
+      let existingScoutIssues: Array<{ identifier: string; title: string }> = [];
+      let pendingTriageIssues: Array<{ identifier: string; title: string }> = [];
+      try {
+        const [scoutIssues, triageIssues] = await Promise.all([
+          this.scoutDeps.boardFetcher.getIssuesByLabel(this.config.linear.scoutLabel),
+          this.scoutDeps.boardFetcher.getIssuesByLabel(this.config.linear.scoutTriageLabel),
+        ]);
+        existingScoutIssues = scoutIssues.map((i) => ({ identifier: i.identifier, title: i.title }));
+        pendingTriageIssues = triageIssues.map((i) => ({ identifier: i.identifier, title: i.title }));
+      } catch (err) {
+        this.log(`scout: board fetch failed, skipping: ${errMsg(err)}`);
+        try {
+          this.store.updateScoutLog(scoutLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "skipped",
+            errorDetail: `board fetch failed: ${errMsg(err)}`,
+            costUsd: 0,
+          });
+        } catch (logErr) {
+          this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+        }
+        return CONTINUE;
+      }
+
+      const repoPath = this.config.repo.path;
+      const specDir = this.config.product.specDir;
+      const goal = this.config.product.goal ?? null;
+      // Track whether spec was actually loaded by the prompt builder so objectiveOnly
+      // reflects the real loaded state (not just config presence). When specDir is
+      // configured but loading fails and goal is null, the prompt already tells the
+      // agent that spec_mismatch is forbidden; this flag enforces the same rule in the
+      // parser/reformat path (Finding 2 — ES-519).
+      let specActuallyLoaded = false;
+
+      this.log("scout: starting exploration");
+      const explorationResult = await runScoutExploration({
+        agent: this.scoutDeps.agent,
+        runner: this.runner,
+        repoPath,
+        // Builder is called after the optional git reset inside runScoutExploration, so the
+        // spec content reflects the freshly-checked-out commit (Finding 3 — ES-519).
+        prompt: () => {
+          let specContent: SpecContent | null = null;
+          specActuallyLoaded = false;
+          if (specDir !== undefined && this.specLoader !== null) {
+            try {
+              specContent = this.specLoader(repoPath, specDir);
+              specActuallyLoaded = specContent !== null;
+            } catch (err) {
+              this.log(`scout: spec loading failed (non-fatal): ${errMsg(err)}`);
+            }
+          }
+          return buildScoutPrompt({
+            specContent,
+            goal,
+            specDir,
+            existingScoutIssues,
+            pendingTriageIssues,
+            maxCandidates: this.config.scout.maxIssuesPerScout,
+          });
+        },
+        maxCostUsd: this.config.safety.maxCostUsdPerScout,
+        timeoutMs: this.config.safety.scoutTimeoutMinutes * 60_000,
+        log: this.log,
+        // Evaluated after the prompt builder runs so it captures specActuallyLoaded (Finding 2).
+        objectiveOnly: () => !specActuallyLoaded && goal === null,
+        defaultBranch: this.config.repo.defaultBranch,
+        // Pass process-tree helpers so SCOUT cleanup only kills processes it spawned,
+        // not unrelated editors or watchers that have files open in repoPath (Finding 2 — ES-519).
+        getDescendantPids: this.getDescendantPids,
+        getReparentedPids: this.getReparentedPids,
+        // Align the parser cap with the operator-configured limit so values above 10 work
+        // correctly (Finding 4 — ES-519).
+        maxCandidates: this.config.scout.maxIssuesPerScout,
+      });
+
+      // Advance idleStartedAt so SCOUT duration does not count toward idle timeout
+      const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
+      this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);
+
+      if (explorationResult.kind === "interrupted") {
+        try {
+          this.store.updateScoutLog(scoutLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "skipped",
+            errorDetail: "interrupted",
+            costUsd: explorationResult.costUsd,
+          });
+        } catch (logErr) {
+          this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+        }
+        await this.haltForInterrupt();
+        return HALT;
+      }
+
+      if (explorationResult.kind === "error") {
+        this.log(`scout: exploration failed: ${explorationResult.message}`);
+        try {
+          this.store.updateScoutLog(scoutLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: explorationResult.message,
+            costUsd: explorationResult.costUsd,
+          });
+        } catch (logErr) {
+          this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+        }
+        return CONTINUE;
+      }
+
+      // Create Linear issues for each candidate
+      const candidates = explorationResult.candidates.slice(0, this.config.scout.maxIssuesPerScout);
+      const createdIdentifiers: string[] = [];
+      let objectiveCount = 0;
+      let triageCount = 0;
+
+      for (const candidate of candidates) {
+        if (this.interrupted) break;
+        try {
+          // Stage 2 Codex verification is not yet implemented. Until it is, all SCOUT
+          // candidates are routed through triage (scout-triage label, no opt-in) regardless
+          // of evidence_type so unverified findings cannot enter SELECT automatically.
+          // When Stage 2 lands, objective candidates that pass the Codex verdict will be
+          // filed with opt-in instead (design spec §2 Stage 2, ES-519 Finding 1).
+          const isObjective = candidate.evidence_type === "objective";
+          const extraLabelIds: string[] = [];
+          if (this.scoutDeps.scoutLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutLabelId);
+          if (this.scoutDeps.scoutTriageLabelId !== null) {
+            extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
+          }
+          const identifier = await this.scoutDeps.linearClient.createIssue({
+            title: candidate.title,
+            description: `${candidate.description}\n\n**Evidence (${candidate.evidence_type}):**\n\n${candidate.evidence}`,
+            priority: candidate.priority,
+            extraLabelIds,
+            includeOptIn: false,
+          });
+          createdIdentifiers.push(identifier);
+          if (isObjective) objectiveCount++;
+          else triageCount++;
+        } catch (err) {
+          this.log(`scout: failed to create issue for "${candidate.title}": ${errMsg(err)}`);
+        }
+      }
+
+      // When candidates were found but every createIssue call failed (e.g. Linear
+      // outage), mark as error so latestScoutFiredAt() does not count this run toward
+      // min_interval_hours and SCOUT can retry sooner (Finding 2 — Codex review).
+      const allCreationFailed = candidates.length > 0 && createdIdentifiers.length === 0;
+      try {
+        this.store.updateScoutLog(scoutLogRow.id, {
+          endedAt: this.clock(),
+          candidates: JSON.stringify(candidates),
+          createdIssueIdentifiers: JSON.stringify(createdIdentifiers),
+          outcome: allCreationFailed ? "error" : "completed",
+          errorDetail: allCreationFailed ? "all issue creation failed" : undefined,
+          costUsd: explorationResult.costUsd,
+        });
+      } catch (logErr) {
+        this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+      }
+
+      this.log(`scout: completed (candidates=${candidates.length}, created=${createdIdentifiers.length})`);
+
+      if (createdIdentifiers.length > 0) {
+        await this.notifier.notify({
+          kind: "scout_completed",
+          createdCount: createdIdentifiers.length,
+          objectiveCount,
+          triageCount,
+        });
+      }
+
+      if (this.interrupted) {
+        await this.haltForInterrupt();
+        return HALT;
+      }
+
+      // All SCOUT candidates go to triage (no opt-in) until Stage 2 verification is in
+      // place, so none are immediately eligible for SELECT; always return CONTINUE.
+      return CONTINUE;
+    } catch (err) {
+      const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
+      this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);
+      this.log(`scout: unexpected error, skipping: ${errMsg(err)}`);
+      try {
+        this.store.updateScoutLog(scoutLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "error",
+          errorDetail: `unexpected: ${errMsg(err)}`,
+        });
+      } catch (logErr) {
+        this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+      }
+      return CONTINUE;
     }
   }
 

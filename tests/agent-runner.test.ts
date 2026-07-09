@@ -96,6 +96,34 @@ describe("ClaudeAgentRunner.runSession", () => {
     expect(runner.calls[0]!.opts.timeoutMs).toBe(7_200_000);
   });
 
+  it("--tools flag is added after --allowedTools when `tools` option is set (Finding 1 — ES-519)", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+    const logs: string[] = [];
+    const agent = new ClaudeAgentRunner(runner, {
+      model: "opus",
+      effort: "low",
+      permissionMode: "default",
+      allowedTools: "Read,Grep,Glob,Bash",
+      tools: "Read,Grep,Glob,Bash",
+      extraArgs: [],
+      log: (line: string) => logs.push(line),
+    });
+    await agent.runSession(ctx);
+    const args = runner.calls[0]!.args;
+    const allowedIdx = args.indexOf("--allowedTools");
+    const toolsIdx = args.indexOf("--tools");
+    expect(allowedIdx).toBeGreaterThanOrEqual(0);
+    expect(toolsIdx).toBeGreaterThan(allowedIdx);
+    expect(args[toolsIdx + 1]).toBe("Read,Grep,Glob,Bash");
+  });
+
+  it("omits --tools when `tools` option is not set (non-SCOUT agents)", async () => {
+    const { runner } = runnerEmitting([INIT_LINE, RESULT_SUCCESS_LINE]);
+    const logs: string[] = [];
+    await makeRunner(runner, logs).runSession(ctx);
+    expect(runner.calls[0]!.args).not.toContain("--tools");
+  });
+
   it("claude 子プロセスに機密 env（Linear/Slack/GitHub トークン）を渡さない（IPI 漏えい・権限昇格防止）", async () => {
     const SECRETS = {
       LINEAR_API_KEY: "lin_secret_should_not_leak",

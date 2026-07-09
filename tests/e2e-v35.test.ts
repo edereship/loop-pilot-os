@@ -62,6 +62,7 @@ function makeConfig(over: Partial<{
       maxRecoveryAttempts: over.maxRecoveryAttempts ?? 2,
       transientRetryAttempts: over.transientRetryAttempts ?? 2,
       maxCostUsdPerScout: 2,
+      scoutTimeoutMinutes: 30,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300, idleTimeoutMinutes: 120 },
     looppilot: { gateLabel: "loop-pilot" },
@@ -218,6 +219,7 @@ function makeHarness(config: Config, opts?: {
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
     } : null,
+    scoutDeps: null,
   });
   return { orch, store, source, agent, verifyAgent, git, monitor, notifier, sleepCalls, logs, promptArgs, recoveryRunner, memoryRunner, groomBoardFetcher, groomLinearClient };
 }

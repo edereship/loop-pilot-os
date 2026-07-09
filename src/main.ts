@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { config as dotenvConfig } from "dotenv";
 
-import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar } from "./config.js";
+import { loadConfig, modelSupportsEffort, modelHasEffortCapabilityEnvVar, SCOUT_DEFAULT_ALLOWED_TOOLS } from "./config.js";
 import { SqliteStore } from "./store.js";
 import { RealCommandRunner } from "./exec.js";
 import { ConsoleSlackNotifier } from "./notifier.js";
@@ -149,9 +149,18 @@ async function runLoop(configPath: string): Promise<number> {
 
     // Build a ClaudeAgentRunner for a specific phase. When phaseConfig is set, uses
     // the per-phase model/effort; otherwise falls back to the global agent defaults.
+    // `tools` (when set) passes --tools to restrict the tool set available to the agent;
+    // this is distinct from `allowedTools` which only controls which tools auto-execute.
+    // `skipRateLimit` omits the rate-limit retry loop; use for idle/scheduled phases
+    // (e.g. SCOUT) so a Claude rate limit causes an immediate error rather than blocking
+    // the orchestrator for up to cap_hours (Finding 3 — Codex review).
     function buildPhaseAgent(
       phaseConfig: { model: string; effort: string } | undefined,
       permissionMode: string,
+      allowedTools?: string,
+      extraArgs?: string[],
+      tools?: string,
+      skipRateLimit?: boolean,
     ): ClaudeAgentRunner {
       const model = phaseConfig?.model ?? config.agent.model;
       const rawEffort = phaseConfig?.effort ?? config.agent.effort;
@@ -163,10 +172,11 @@ async function runLoop(configPath: string): Promise<number> {
         effort: supported && rawEffort !== "auto" ? rawEffort : undefined,
         effortEnvOverride: supported || rawEffort === "auto" ? rawEffort : undefined,
         permissionMode,
-        allowedTools: config.agent.allowedTools,
-        extraArgs: config.agent.extraArgs,
+        allowedTools: allowedTools ?? config.agent.allowedTools,
+        tools,
+        extraArgs: extraArgs ?? config.agent.extraArgs,
         log: logLine,
-        rateLimit: rateLimitOpts,
+        rateLimit: skipRateLimit ? undefined : rateLimitOpts,
       });
     }
 
@@ -174,6 +184,56 @@ async function runLoop(configPath: string): Promise<number> {
     const selfReviewAgent = buildPhaseAgent(config.agent.selfReview, config.agent.permissionMode);
     const verifyAgent = buildPhaseAgent(config.agent.verify, config.agent.permissionMode);
     const recoveryAgent = buildPhaseAgent(config.agent.recovery, config.agent.permissionMode);
+    // SCOUT always runs in "default" permission mode so that only the explicitly listed
+    // allowedTools auto-execute.  Inheriting "acceptEdits" or "bypassPermissions" would
+    // let the agent edit files despite the read-only-ish tool list (those modes
+    // auto-approve edits regardless of allowedTools).
+    // Strip permission-mode overrides, --dangerously-skip-permissions, and --tools overrides
+    // from global extra_args. These flags, when appended after the SCOUT-specific values,
+    // override the SCOUT boundary (Claude Code uses the last occurrence) and nullify SCOUT's
+    // read-only intent (ES-519 Finding 1, Finding 3).
+    // Handles both "--flag=value" (one arg) and "--flag" "value" (two args) forms.
+    const scoutExtraArgs = (() => {
+      const out: string[] = [];
+      const raw = config.agent.extraArgs;
+      for (let i = 0; i < raw.length; i++) {
+        const a = raw[i];
+        if (a === "--dangerously-skip-permissions") continue;
+        if (a.startsWith("--permission-mode=")) continue;
+        if (a === "--permission-mode") { i++; continue; }
+        // Strip --tools overrides so a global --tools value cannot change or defeat the
+        // SCOUT-specific tool set (Finding 3 — ES-519).
+        if (a.startsWith("--tools=")) continue;
+        if (a === "--tools") { i++; continue; }
+        // Strip --add-dir flags: they expand the file-access surface beyond
+        // config.repo.path and SCOUT is intended to explore only the target
+        // repository (Finding 2 — Codex review, iteration 15).
+        if (a.startsWith("--add-dir=")) continue;
+        if (a === "--add-dir") { i++; continue; }
+        out.push(a);
+      }
+      // Block MCP tools: --tools only restricts built-in tools, not MCP tools; deny MCP
+      // explicitly so SCOUT cannot call write-capable MCP servers (Finding 1 — ES-519).
+      out.push("--disallowedTools", "mcp__*");
+      // --bare skips auto-discovery of project hooks, skills, plugins, MCP servers,
+      // auto-memory, and CLAUDE.md so repository customizations cannot alter SCOUT's
+      // behaviour or allowlist boundary before the prompt runs.  SCOUT reads CLAUDE.md
+      // explicitly as data via the Read tool (Finding 2 — Codex review).
+      out.push("--bare");
+      return out;
+    })();
+    const scoutTools = config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS;
+    // --tools only accepts bare tool names (e.g. "Read,Bash"), not permission-rule syntax
+    // like "Bash(npm test *)"; strip parenthesized suffixes before passing (Finding 4 — ES-519).
+    const scoutBareTools = scoutTools.split(",").map(t => t.split("(")[0].trim()).join(",");
+    const scoutAgent = buildPhaseAgent(
+      config.agent.scout,
+      "default",
+      scoutTools,
+      scoutExtraArgs,
+      scoutBareTools, // --tools restricts available tools; --allowedTools marks which auto-execute
+      true, // skipRateLimit: SCOUT is scheduled; retry at the next interval instead of blocking
+    );
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {
       maxCostUsd: config.safety.maxCostUsdPerDesign,
@@ -270,6 +330,13 @@ async function runLoop(configPath: string): Promise<number> {
         boardFetcher: groomBoardFetcher,
         linearClient: groomLinearClient,
         knownLabels: linearSetup.knownLabels,
+      } : null,
+      scoutDeps: config.scout.enabled ? {
+        agent: scoutAgent,
+        boardFetcher: groomBoardFetcher,
+        linearClient: groomLinearClient,
+        scoutLabelId: linearSetup.scoutLabelId,
+        scoutTriageLabelId: linearSetup.scoutTriageLabelId,
       } : null,
     });
 

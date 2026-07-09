@@ -67,6 +67,10 @@ export class GroomBoardFetcher {
   private readonly optInLabel: string;
   private readonly fetchFn: FetchFn;
   private cachedNodes: BoardIssueNode[] | null = null;
+  // In-flight promise shared by concurrent callers so two simultaneous getIssuesByLabel
+  // calls (e.g. the Promise.all in the SCOUT phase) don't each trigger a full board query
+  // (Finding 4 — Codex review).
+  private fetchInFlight: Promise<BoardIssueNode[]> | null = null;
 
   constructor(opts: GroomBoardFetcherOptions) {
     this.apiKey = opts.apiKey;
@@ -79,13 +83,24 @@ export class GroomBoardFetcher {
   /** Clear the cached nodes so the next call re-fetches from the API. */
   refresh(): void {
     this.cachedNodes = null;
+    this.fetchInFlight = null;
   }
 
   private async ensureFetched(): Promise<BoardIssueNode[]> {
-    if (this.cachedNodes === null) {
-      this.cachedNodes = await this.fetchAll();
-    }
-    return this.cachedNodes;
+    if (this.cachedNodes !== null) return this.cachedNodes;
+    if (this.fetchInFlight !== null) return this.fetchInFlight;
+    this.fetchInFlight = this.fetchAll().then(
+      (nodes) => {
+        this.cachedNodes = nodes;
+        this.fetchInFlight = null;
+        return nodes;
+      },
+      (err) => {
+        this.fetchInFlight = null;
+        throw err;
+      },
+    );
+    return this.fetchInFlight;
   }
 
   private async fetchAll(): Promise<BoardIssueNode[]> {

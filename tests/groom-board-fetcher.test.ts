@@ -465,4 +465,32 @@ describe("GroomBoardFetcher", () => {
     await fetcher.getIssuesByLabel("scout-triage");
     expect(fetchCount).toBe(1);
   });
+
+  it("concurrent getIssuesByLabel calls share one in-flight fetch (Finding 4 — Codex review)", async () => {
+    let fetchCount = 0;
+    const countingFetch: FetchFn = async () => {
+      fetchCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: {
+            issues: {
+              nodes: [makeNode("id-1", "ES-60", stateIds.todo, { labels: ["scout"] })],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+      };
+    };
+    const fetcher = new GroomBoardFetcher({ ...BASE_OPTS, fetchFn: countingFetch });
+    // Fire both concurrently before either resolves
+    const [r1, r2] = await Promise.all([
+      fetcher.getIssuesByLabel("scout"),
+      fetcher.getIssuesByLabel("scout-triage"),
+    ]);
+    expect(fetchCount).toBe(1);
+    expect(r1).toHaveLength(1);
+    expect(r2).toHaveLength(0); // "scout-triage" label not present on ES-60
+  });
 });
