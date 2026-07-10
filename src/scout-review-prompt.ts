@@ -122,7 +122,7 @@ export function buildScoutReviewPrompt(args: ScoutReviewPromptArgs): string {
         "# No Specifications Provided",
         "",
         "No product requirements are available, so criterion 2 (spec alignment) cannot be judged.",
-        "Judge only criteria 1 and 3. Do NOT reject a candidate solely because no specification",
+        "Judge criteria 1, 3, and 4. Do NOT reject a candidate solely because no specification",
         "backs it.",
       ].join("\n"),
     );
