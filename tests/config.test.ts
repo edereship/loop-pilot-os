@@ -810,6 +810,21 @@ describe("loadConfig", () => {
     expect(config.pm?.effort.mergeGate).toBe("high");
   });
 
+  it("pm.effort.scout_review の既定は high", () => {
+    const config = loadConfig(fixture("config-per-phase-merge-gate.toml"), fullEnv);
+    expect(config.pm?.effort.scoutReview).toBe("high");
+  });
+
+  it("pm.effort.scout_review に不正値を渡すと値入りのエラーメッセージで落ちる", () => {
+    expect(() => loadConfig(fixture("config-per-phase-codex-scout-review-max.toml"), fullEnv))
+      .toThrow(/pm\.effort\.scout_review: "ultra" is not a valid Codex effort level/);
+  });
+
+  it("safety.scout_review_timeout_minutes の既定は 15", () => {
+    const config = loadConfig(fixture("config-minimal.toml"), fullEnv);
+    expect(config.safety.scoutReviewTimeoutMinutes).toBe(15);
+  });
+
   it("reads explicit verify/safety/linear values from config-per-phase-verify fixture", () => {
     const config = loadConfig(fixture("config-per-phase-verify.toml"), fullEnv);
     expect(config.verify.enabled).toBe(false);
