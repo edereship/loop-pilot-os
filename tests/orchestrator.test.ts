@@ -10504,4 +10504,100 @@ describe("SCOUT オーケ統合（ES-522）", () => {
     expect(h.notifier.events.some((e) => e.kind === "scout_completed")).toBe(true);
     expect(h.store.latestScoutFiredAt()).not.toBeNull();
   });
+
+  function verdictsOk(verdicts: Array<{ index: number; verdict: "accept" | "reject"; reasons: string[] }>): { kind: "completed"; text: string } {
+    return { kind: "completed", text: "```json\n" + JSON.stringify({ verdicts }) + "\n```" };
+  }
+
+  it("Stage 2: accept×objective は opt-in 起票、accept×spec_mismatch は triage、reject と verdict 欠落は起票しない", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "accept", reasons: [] },
+      { index: 2, verdict: "reject", reasons: ["works as specified"] },
+    ])];
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 4 };
+    const h = makeScoutHarness({
+      reviewer,
+      config,
+      agentOutcomes: [stage1Ok([
+        cand({ title: "obj bug", evidence_type: "objective" }),
+        cand({ title: "spec drift", evidence_type: "spec_mismatch" }),
+        cand({ title: "rejected", evidence_type: "objective" }),
+        cand({ title: "no verdict", evidence_type: "objective" }),
+      ])],
+    });
+
+    await h.orch.run();
+
+    const calls = createIssueCalls(h.linearClient);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].title).toBe("obj bug");
+    expect(calls[0].includeOptIn).toBe(true);
+    expect(calls[0].extraLabelIds).toEqual(["scout-label-id"]);
+    expect(calls[1].title).toBe("spec drift");
+    expect(calls[1].includeOptIn).toBe(false);
+    expect(calls[1].extraLabelIds).toEqual(["scout-label-id", "scout-triage-label-id"]);
+
+    expect(reviewer.calls[0].worktreePath).toBe("/repo");
+    expect(reviewer.calls[0].timeoutMs).toBe(15 * 60_000);
+  });
+
+  it("Stage 2: 全裁定（dropped 込み）が scout_log.verdicts に JSON 記録される", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "reject", reasons: ["duplicate of candidate 0"] },
+    ])];
+    const h = makeScoutHarness({
+      reviewer,
+      agentOutcomes: [stage1Ok([cand({ title: "a" }), cand({ title: "b" })])],
+    });
+
+    await h.orch.run();
+
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("completed");
+    const recorded = JSON.parse(logRow.verdicts!) as { verdicts: unknown[]; dropped: string[] };
+    expect(recorded.verdicts).toHaveLength(2);
+    expect(recorded.dropped).toEqual([]);
+  });
+
+  it("Stage 2: 全件 reject でも outcome は completed（allCreationFailed 誤発火の回帰）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([{ index: 0, verdict: "reject", reasons: ["not a bug"] }])];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("completed");
+    expect(logRow.errorDetail).toBeNull();
+    expect(h.notifier.events.some((e) => e.kind === "scout_completed")).toBe(false);
+  });
+
+  it("Stage 2: 候補 0 件なら reviewer を呼ばない", async () => {
+    const reviewer = new FakePlanRunner();
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(0);
+    expect(h.store.getScoutLog(1).outcome).toBe("completed");
+  });
+
+  it("Stage 2 実行後に main checkout の git 状態を復元する（checkout HEAD -- . / clean -fd / reset --hard）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([{ index: 0, verdict: "accept", reasons: [] }])];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    const cleans = h.memoryRunner.calls.filter((c) => c.cmd === "git" && c.args[0] === "clean" && c.args[1] === "-fd");
+    expect(cleans.length).toBeGreaterThanOrEqual(2);
+    const resets = h.memoryRunner.calls.filter((c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard");
+    expect(resets.length).toBeGreaterThanOrEqual(2);
+  });
 });

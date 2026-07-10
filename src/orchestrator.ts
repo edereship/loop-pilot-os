@@ -46,8 +46,11 @@ import { buildGroomPrompt } from "./groom-prompt.js";
 import { parseGroomOutput } from "./groom-parser.js";
 import { validateGroomActions, type ValidationContext } from "./groom-validator.js";
 import { executeGroomActions, type ExecutionResult, type ExecutorContext, type IExecutorLinearClient } from "./groom-executor.js";
-import { runScoutExploration } from "./scout-explorer.js";
+import { runScoutExploration, REFORMAT_MIN_WALL_CLOCK_MS, REFORMAT_RAW_TAIL_CHARS, REFORMAT_TIMEOUT_MS } from "./scout-explorer.js";
 import { buildScoutPrompt } from "./scout-prompt.js";
+import { buildScoutReviewPrompt, buildScoutReviewReformatPrompt } from "./scout-review-prompt.js";
+import { parseScoutReviewOutput, type ScoutReviewVerdict } from "./scout-review-parser.js";
+import type { ScoutCandidate } from "./scout-parser.js";
 import { retryTransient } from "./transient-retry.js";
 import { readdirSync, readFileSync, readlinkSync, mkdirSync, appendFileSync } from "node:fs";
 import path from "node:path";
@@ -2316,6 +2319,7 @@ export class Orchestrator {
       // agent that spec_mismatch is forbidden; this flag enforces the same rule in the
       // parser/reformat path (Finding 2 — ES-519).
       let specActuallyLoaded = false;
+      let loadedSpecContent: SpecContent | null = null;
 
       this.log("scout: starting exploration");
       const explorationResult = await runScoutExploration({
@@ -2327,10 +2331,12 @@ export class Orchestrator {
         prompt: () => {
           let specContent: SpecContent | null = null;
           specActuallyLoaded = false;
+          loadedSpecContent = null;
           if (specDir !== undefined && this.specLoader !== null) {
             try {
               specContent = this.specLoader(repoPath, specDir);
               specActuallyLoaded = specContent !== null;
+              loadedSpecContent = specContent;
             } catch (err) {
               this.log(`scout: spec loading failed (non-fatal): ${errMsg(err)}`);
             }
@@ -2393,24 +2399,76 @@ export class Orchestrator {
         return CONTINUE;
       }
 
-      // Create Linear issues for each candidate
       const candidates = explorationResult.candidates.slice(0, this.config.scout.maxIssuesPerScout);
+
+      let stage2: { verdicts: ScoutReviewVerdict[]; dropped: string[] } | null = null;
+      if (candidates.length > 0 && this.scoutDeps.reviewer !== null) {
+        const reviewResult = await this.runScoutReview({
+          reviewer: this.scoutDeps.reviewer,
+          candidates,
+          specContent: loadedSpecContent,
+          goal,
+          existingScoutIssues,
+          pendingTriageIssues,
+        });
+        if (reviewResult.kind === "interrupted") {
+          try {
+            this.store.updateScoutLog(scoutLogRow.id, {
+              endedAt: this.clock(),
+              candidates: JSON.stringify(candidates),
+              outcome: "skipped",
+              errorDetail: "stage2 interrupted",
+              costUsd: explorationResult.costUsd,
+            });
+          } catch (logErr) {
+            this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+          }
+          await this.haltForInterrupt();
+          return HALT;
+        }
+        if (reviewResult.kind === "error") {
+          this.log(`scout: stage2 verification failed, skipping all filing: ${reviewResult.message}`);
+          try {
+            this.store.updateScoutLog(scoutLogRow.id, {
+              endedAt: this.clock(),
+              candidates: JSON.stringify(candidates),
+              outcome: "error",
+              errorDetail: `stage2: ${reviewResult.message}`,
+              costUsd: explorationResult.costUsd,
+            });
+          } catch (logErr) {
+            this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
+          }
+          return CONTINUE;
+        }
+        stage2 = { verdicts: reviewResult.verdicts, dropped: reviewResult.dropped };
+      }
+      const verdictByIndex = new Map<number, ScoutReviewVerdict>();
+      if (stage2 !== null) {
+        for (const v of stage2.verdicts) verdictByIndex.set(v.index, v);
+      }
+
       const createdIdentifiers: string[] = [];
       let objectiveCount = 0;
       let triageCount = 0;
+      let attemptedCount = 0;
 
-      for (const candidate of candidates) {
+      for (let i = 0; i < candidates.length; i++) {
         if (this.interrupted) break;
+        const candidate = candidates[i];
+        let route: "opt_in" | "triage";
+        if (stage2 === null) {
+          route = "triage";
+        } else {
+          const verdict = verdictByIndex.get(i);
+          if (verdict === undefined || verdict.verdict === "reject") continue;
+          route = candidate.evidence_type === "objective" ? "opt_in" : "triage";
+        }
+        attemptedCount++;
         try {
-          // Stage 2 Codex verification is not yet implemented. Until it is, all SCOUT
-          // candidates are routed through triage (scout-triage label, no opt-in) regardless
-          // of evidence_type so unverified findings cannot enter SELECT automatically.
-          // When Stage 2 lands, objective candidates that pass the Codex verdict will be
-          // filed with opt-in instead (design spec §2 Stage 2, ES-519 Finding 1).
-          const isObjective = candidate.evidence_type === "objective";
           const extraLabelIds: string[] = [];
           if (this.scoutDeps.scoutLabelId !== null) extraLabelIds.push(this.scoutDeps.scoutLabelId);
-          if (this.scoutDeps.scoutTriageLabelId !== null) {
+          if (route === "triage" && this.scoutDeps.scoutTriageLabelId !== null) {
             extraLabelIds.push(this.scoutDeps.scoutTriageLabelId);
           }
           const identifier = await this.scoutDeps.linearClient.createIssue({
@@ -2418,24 +2476,22 @@ export class Orchestrator {
             description: `${candidate.description}\n\n**Evidence (${candidate.evidence_type}):**\n\n${candidate.evidence}`,
             priority: candidate.priority,
             extraLabelIds,
-            includeOptIn: false,
+            includeOptIn: route === "opt_in",
           });
           createdIdentifiers.push(identifier);
-          if (isObjective) objectiveCount++;
+          if (candidate.evidence_type === "objective") objectiveCount++;
           else triageCount++;
         } catch (err) {
           this.log(`scout: failed to create issue for "${candidate.title}": ${errMsg(err)}`);
         }
       }
 
-      // When candidates were found but every createIssue call failed (e.g. Linear
-      // outage), mark as error so latestScoutFiredAt() does not count this run toward
-      // min_interval_hours and SCOUT can retry sooner (Finding 2 — Codex review).
-      const allCreationFailed = candidates.length > 0 && createdIdentifiers.length === 0;
+      const allCreationFailed = attemptedCount > 0 && createdIdentifiers.length === 0;
       try {
         this.store.updateScoutLog(scoutLogRow.id, {
           endedAt: this.clock(),
           candidates: JSON.stringify(candidates),
+          verdicts: stage2 === null ? undefined : JSON.stringify(stage2),
           createdIssueIdentifiers: JSON.stringify(createdIdentifiers),
           outcome: allCreationFailed ? "error" : "completed",
           errorDetail: allCreationFailed ? "all issue creation failed" : undefined,
@@ -2461,8 +2517,6 @@ export class Orchestrator {
         return HALT;
       }
 
-      // All SCOUT candidates go to triage (no opt-in) until Stage 2 verification is in
-      // place, so none are immediately eligible for SELECT; always return CONTINUE.
       return CONTINUE;
     } catch (err) {
       const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
@@ -2478,6 +2532,94 @@ export class Orchestrator {
         this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
       }
       return CONTINUE;
+    }
+  }
+
+  private async runScoutReview(args: {
+    reviewer: PlanRunner;
+    candidates: ScoutCandidate[];
+    specContent: SpecContent | null;
+    goal: string | null;
+    existingScoutIssues: Array<{ identifier: string; title: string }>;
+    pendingTriageIssues: Array<{ identifier: string; title: string }>;
+  }): Promise<
+    | { kind: "ok"; verdicts: ScoutReviewVerdict[]; dropped: string[] }
+    | { kind: "error"; message: string }
+    | { kind: "interrupted" }
+  > {
+    const repoPath = this.config.repo.path;
+    const timeoutMs = this.config.safety.scoutReviewTimeoutMinutes * 60_000;
+
+    const startSha = await this.runner
+      .run("git", ["rev-parse", "HEAD"], { cwd: repoPath, timeoutMs: 60_000 })
+      .then((r) => (r.code === 0 ? r.stdout.trim() || null : null))
+      .catch(() => null);
+    const startBranch = await this.runner
+      .run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoPath, timeoutMs: 60_000 })
+      .then((r) => {
+        const b = r.code === 0 ? r.stdout.trim() : "";
+        return b && b !== "HEAD" ? b : null;
+      })
+      .catch(() => null);
+
+    try {
+      const prompt = buildScoutReviewPrompt({
+        candidates: args.candidates,
+        specContent: args.specContent,
+        goal: args.goal,
+        existingScoutIssues: args.existingScoutIssues,
+        pendingTriageIssues: args.pendingTriageIssues,
+      });
+      let outcome: PlanOutcome;
+      try {
+        outcome = await args.reviewer.run({
+          worktreePath: repoPath,
+          prompt,
+          timeoutMs,
+          model: this.config.pm?.model,
+          effort: this.config.pm?.effort.scoutReview,
+        });
+      } catch (err) {
+        return { kind: "error", message: `reviewer exception: ${errMsg(err)}` };
+      }
+      if (outcome.kind === "interrupted") return { kind: "interrupted" };
+      if (outcome.kind === "error") return { kind: "error", message: outcome.message };
+
+      const parsed = parseScoutReviewOutput(outcome.text, args.candidates.length);
+      if (parsed.kind === "ok") {
+        return { kind: "ok", verdicts: parsed.verdicts, dropped: parsed.dropped };
+      }
+      return { kind: "error", message: `parse failed: ${parsed.raw.slice(0, 200)}` };
+    } finally {
+      await this.restoreScoutReviewGitState(repoPath, startSha, startBranch);
+    }
+  }
+
+  private async restoreScoutReviewGitState(
+    repoPath: string,
+    startSha: string | null,
+    startBranch: string | null,
+  ): Promise<void> {
+    const step = async (gitArgs: string[]): Promise<boolean> => {
+      try {
+        const res = await this.runner.run("git", gitArgs, { cwd: repoPath, timeoutMs: 60_000 });
+        if (res.code !== 0) {
+          this.log(`scout: stage2 cleanup "git ${gitArgs.join(" ")}" exited ${res.code}`);
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.log(`scout: stage2 cleanup "git ${gitArgs.join(" ")}" failed: ${errMsg(err)}`);
+        return false;
+      }
+    };
+    await step(["checkout", "HEAD", "--", "."]);
+    await step(["clean", "-fd"]);
+    if (startBranch) {
+      const restored = await step(["checkout", startBranch]);
+      if (restored && startSha) await step(["reset", "--hard", startSha]);
+    } else if (startSha) {
+      await step(["checkout", "--detach", startSha]);
     }
   }
 
