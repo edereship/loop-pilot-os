@@ -22,7 +22,8 @@ import {
   instantSleep,
 } from "./fakes.js";
 import type { Config } from "../src/config.js";
-import type { EligibleIssue, PromptArgs, PlanRunner, PauseMeta, MergeReadiness } from "../src/types.js";
+import type { EligibleIssue, PromptArgs, PlanRunner, PauseMeta, MergeReadiness, AgentOutcome } from "../src/types.js";
+import type { ScoutCandidate } from "../src/scout-parser.js";
 
 type _AssertTrue<T extends true> = T;
 type _ScoutBoardFetcherSatisfies = _AssertTrue<GroomBoardFetcher extends ScoutDeps["boardFetcher"] ? true : false>;
@@ -76,6 +77,7 @@ function makeConfig(over: Partial<{
       maxCostUsdPerMergeGateFix: 2,
       maxCostUsdPerScout: 2,
       scoutTimeoutMinutes: 30,
+      scoutReviewTimeoutMinutes: 15,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -125,7 +127,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; mergeGateJudge?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean; store?: SqliteStore }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; mergeGateJudge?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean; store?: SqliteStore; scoutDeps?: ScoutDeps | null; clock?: () => string; onSleep?: (ms: number) => void }): Harness {
   const store = opts?.store ?? new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -136,6 +138,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   const sleepCalls: number[] = [];
   const sleep = async (ms: number): Promise<void> => {
     sleepCalls.push(ms);
+    opts?.onSleep?.(ms);
     await sleepInner(ms);
   };
   const logs: string[] = [];
@@ -216,7 +219,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
     store,
     buildPrompt,
     specLoader: null,
-    clock: fixedClock("2026-06-05T00:00:00.000Z"),
+    clock: opts?.clock ?? fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,
     recovery,
@@ -240,7 +243,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
     } : null,
-    scoutDeps: null,
+    scoutDeps: opts?.scoutDeps ?? null,
     getDescendantPids: opts?.getDescendantPids,
     getReparentedPids: opts?.getReparentedPids,
     checkPidAlive: opts?.checkPidAlive,
@@ -10389,5 +10392,116 @@ describe("v4-B マージゲート fix ループ（ES-521 Task 8）— fix成功�
     expect(run.state).toBe("halted");
     const s = h.store.sessionsForRun(run.id)[0];
     expect(s.costUsd).toBe(1.2); // interrupted でも fix コストは加算
+  });
+});
+
+describe("SCOUT オーケ統合（ES-522）", () => {
+  function makeScoutHarness(opts: {
+    reviewer: PlanRunner | null;
+    agentOutcomes: AgentOutcome[];
+    config?: Config;
+    sleepAdvancesMin?: number[];
+    store?: SqliteStore;
+  }) {
+    const config = opts.config ?? (() => {
+      const c = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+      c.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+      return c;
+    })();
+    let nowMs = Date.parse("2026-06-05T00:00:00.000Z");
+    const advances = [...(opts.sleepAdvancesMin ?? [31, 61])];
+    const scoutAgent = new FakeAgentRunner();
+    scoutAgent.outcomes = [...opts.agentOutcomes];
+    const boardFetcher = new FakeGroomBoardFetcher();
+    const linearClient = new FakeGroomLinearClient();
+    const scoutDeps: ScoutDeps = {
+      agent: scoutAgent,
+      boardFetcher,
+      linearClient,
+      reviewer: opts.reviewer,
+      scoutLabelId: "scout-label-id",
+      scoutTriageLabelId: "scout-triage-label-id",
+    };
+    const h = makeHarness(config, {
+      scoutDeps,
+      store: opts.store,
+      clock: () => new Date(nowMs).toISOString(),
+      onSleep: (ms) => {
+        if (ms === config.loop.idleRecheckSeconds * 1000) {
+          nowMs += (advances.shift() ?? 61) * 60_000;
+        }
+      },
+    });
+    h.source.getAllEligible = async () => [];
+    h.memoryRunner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { code: 0, stdout: "main\n" });
+    h.memoryRunner.on(["git", "checkout", "--detach"], { code: 0 });
+    return { ...h, scoutAgent, boardFetcher, linearClient };
+  }
+
+  function cand(over: Partial<ScoutCandidate> = {}): ScoutCandidate {
+    return {
+      title: over.title ?? "Found a bug",
+      description: over.description ?? "desc",
+      evidence: over.evidence ?? "npm test output: 1 failed",
+      evidence_type: over.evidence_type ?? "objective",
+      priority: over.priority ?? 2,
+    };
+  }
+
+  function stage1Ok(candidates: ScoutCandidate[]): AgentOutcome {
+    return {
+      kind: "completed",
+      costUsd: 0.5,
+      summary: "",
+      fullResult: "```json\n" + JSON.stringify({ candidates }) + "\n```",
+    };
+  }
+
+  function createIssueCalls(linearClient: FakeGroomLinearClient) {
+    return linearClient.calls
+      .filter((c) => c.method === "createIssue")
+      .map((c) => c.args[0] as { title: string; extraLabelIds?: string[]; includeOptIn?: boolean });
+  }
+
+  it("idle が scout.idle_minutes 未満では発火しない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 90, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    const h = makeScoutHarness({ reviewer: null, agentOutcomes: [], config, sleepAdvancesMin: [61] });
+
+    await h.orch.run();
+
+    expect(h.scoutAgent.callCount).toBe(0);
+    expect(h.store.latestScoutFiredAt()).toBeNull();
+    expect(h.store.latestRun()!.haltReason).toContain("idle timeout");
+  });
+
+  it("前回実行から min_interval_hours 未経過では発火しない", async () => {
+    const store = new SqliteStore(":memory:");
+    const prevRun = store.createRun(3, "2026-06-04T23:00:00.000Z");
+    store.setRunState(prevRun.id, "halted", "test seed");
+    const row = store.insertScoutLog({ runId: prevRun.id, firedAt: "2026-06-04T23:30:00.000Z" });
+    store.updateScoutLog(row.id, { endedAt: "2026-06-04T23:40:00.000Z", outcome: "completed", costUsd: 0.5 });
+
+    const h = makeScoutHarness({ reviewer: null, agentOutcomes: [], store });
+    await h.orch.run();
+
+    expect(h.scoutAgent.callCount).toBe(0);
+    expect(h.store.latestScoutFiredAt()).toBe("2026-06-04T23:30:00.000Z");
+  });
+
+  it("reviewer が null なら全候補を triage 起票する（opt-in なし・現行挙動の回帰）", async () => {
+    const h = makeScoutHarness({
+      reviewer: null,
+      agentOutcomes: [stage1Ok([cand({ evidence_type: "spec_mismatch", title: "Spec drift" })])],
+    });
+
+    await h.orch.run();
+
+    const calls = createIssueCalls(h.linearClient);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].includeOptIn).toBe(false);
+    expect(calls[0].extraLabelIds).toEqual(["scout-label-id", "scout-triage-label-id"]);
+    expect(h.notifier.events.some((e) => e.kind === "scout_completed")).toBe(true);
+    expect(h.store.latestScoutFiredAt()).not.toBeNull();
   });
 });

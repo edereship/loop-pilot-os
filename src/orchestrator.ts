@@ -89,6 +89,7 @@ export interface ScoutDeps {
       includeOptIn?: boolean;
     }): Promise<string>;
   };
+  reviewer: PlanRunner | null;
   scoutLabelId: string | null;
   scoutTriageLabelId: string | null;
 }

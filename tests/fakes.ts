@@ -425,7 +425,7 @@ export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
   private _failNextMethods = new Map<string, Error>();
 
   /** Make the next call to `method` throw `error` (or a generic error). */
-  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds" | "getOptInIssueIds" | "getActiveIssueIds" | "getNeedsHumanIssueIds", error?: Error): void {
+  failNext(method: "getBoardState" | "getProjectIssueIds" | "getDoneIssueIds" | "getOptInIssueIds" | "getActiveIssueIds" | "getNeedsHumanIssueIds" | "getIssuesByLabel", error?: Error): void {
     this._failNextMethods.set(method, error ?? new Error(`FakeGroomBoardFetcher.${method} forced failure`));
   }
 
@@ -472,6 +472,14 @@ export class FakeGroomBoardFetcher implements IGroomBoardFetcher {
     this._maybeThrow("getNeedsHumanIssueIds");
     return this.needsHumanIssueIds;
   }
+
+  issuesByLabel = new Map<string, Array<{ identifier: string; title: string; labels: string[] }>>();
+
+  async getIssuesByLabel(label: string): Promise<Array<{ identifier: string; title: string; labels: string[] }>> {
+    this.calls.push(`getIssuesByLabel:${label}`);
+    this._maybeThrow("getIssuesByLabel");
+    return this.issuesByLabel.get(label) ?? [];
+  }
 }
 
 // ---- FakeGroomLinearClient ----
@@ -484,7 +492,7 @@ export class FakeGroomLinearClient implements IGroomLinearClient {
   async updateIssue(issueId: string, fields: { title?: string; description?: string }): Promise<void> {
     this.calls.push({ method: "updateIssue", args: [issueId, fields] });
   }
-  async createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[] }): Promise<string> {
+  async createIssue(fields: { title: string; description: string; priority: number; extraLabelIds?: string[]; includeOptIn?: boolean }): Promise<string> {
     this.calls.push({ method: "createIssue", args: [fields] });
     return "FAKE-NEW";
   }
