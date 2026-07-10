@@ -198,6 +198,29 @@ describe("parseScoutReviewOutput", () => {
     expect(result.dropped[1]).toContain("verdict[1]");
   });
 
+  it("invalidates an earlier accept when a duplicate reject has a stringified index — fail-closed even for string \"0\"", () => {
+    // judge emits index as string "0" instead of number 0; the entry fails zod but
+    // the fail-closed guard must still recognize the reject intent and drop the earlier accept.
+    const input = [
+      "```json",
+      '{"verdicts": [',
+      '  {"index": 0, "verdict": "accept", "reasons": []},',
+      '  {"index": "0", "verdict": "reject", "reasons": ["reconsidered"]}',
+      "]}",
+      "```",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") return;
+    // The accept must be gone; stringified "0" is treated as numeric 0 for fail-closed guard.
+    expect(result.verdicts).toEqual([]);
+    // Two dropped entries: the invalidated accept and the malformed reject (string index fails zod).
+    expect(result.dropped).toHaveLength(2);
+    expect(result.dropped[0]).toContain("duplicate index 0");
+    expect(result.dropped[0]).toContain("malformed reject");
+    expect(result.dropped[1]).toContain("verdict[1]");
+  });
+
   it("prefers reject over accept when a duplicate index has accept first then reject (fail-closed)", () => {
     const input = [
       "```json",

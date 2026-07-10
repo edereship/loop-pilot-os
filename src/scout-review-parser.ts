@@ -71,19 +71,26 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
       if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
         const r = raw as Record<string, unknown>;
         const rawIdx = r["index"];
+        // Normalize integer-like string indices (e.g. "0") so the fail-closed guard fires
+        // even when the model stringifies the index field and the entry fails schema validation.
+        let numIdx: number | undefined;
+        if (typeof rawIdx === "number" && Number.isInteger(rawIdx) && rawIdx >= 0) {
+          numIdx = rawIdx;
+        } else if (typeof rawIdx === "string" && rawIdx.trim().length > 0) {
+          const parsed = Number(rawIdx);
+          if (Number.isInteger(parsed) && parsed >= 0) numIdx = parsed;
+        }
         if (
           r["verdict"] === "reject" &&
-          typeof rawIdx === "number" &&
-          Number.isInteger(rawIdx) &&
-          rawIdx >= 0 &&
-          rawIdx < candidateCount
+          numIdx !== undefined &&
+          numIdx < candidateCount
         ) {
-          const prev = active.get(rawIdx);
+          const prev = active.get(numIdx);
           if (prev !== undefined && prev.verdict.verdict === "accept") {
             dropped.push(
-              `verdict[${prev.itemIdx}]: duplicate index ${rawIdx} (accept superseded by malformed reject at verdict[${i}])`,
+              `verdict[${prev.itemIdx}]: duplicate index ${numIdx} (accept superseded by malformed reject at verdict[${i}])`,
             );
-            active.delete(rawIdx);
+            active.delete(numIdx);
           }
         }
       }
