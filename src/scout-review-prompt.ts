@@ -207,9 +207,11 @@ export function buildScoutReviewReformatPrompt(raw: string, candidateCount: numb
   return [
     "A previous verification session judged bug candidates and produced the report below,",
     "but its final JSON could not be parsed.",
-    "Extract the verdicts into the required schema. Your reply must be ONLY a fenced ```json block with no surrounding prose.",
+    "Extract only the verdicts that are **explicitly stated** in the report into the required schema.",
+    "Omit any candidate for which the report gives no clear verdict — do NOT invent or guess verdicts.",
+    "Your reply must be ONLY a fenced ```json block with no surrounding prose.",
     "",
-    `Required schema (one entry per candidate; index is an integer 0 to ${candidateCount - 1};`,
+    `Required schema (index is an integer 0 to ${candidateCount - 1};`,
     'verdict is "accept" or "reject"; reject requires at least one non-empty reason):',
     "",
     "```json",

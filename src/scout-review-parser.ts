@@ -55,10 +55,13 @@ export function parseScoutReviewOutput(text: string, candidateCount: number): Sc
 
 // scout-parser の salvage と同流儀: エントリ単位で検証し、不正なものは dropped に
 // 診断を残して除外する。1 エントリの不備で他候補の verdict まで失わない。
+// 重複 index は reject が accept より優先される（フェイルクローズ）: accept の後に
+// reject が来た場合は reject に差し替える。
 function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResult {
   const verdicts: ScoutReviewVerdict[] = [];
   const dropped: string[] = [];
-  const seen = new Set<number>();
+  // Maps candidate index → { position in verdicts[], item-array index }
+  const seen = new Map<number, { pos: number; itemIdx: number }>();
   for (let i = 0; i < items.length; i++) {
     const res = verdictEntrySchema.safeParse(items[i]);
     if (!res.success) {
@@ -74,10 +77,18 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
       continue;
     }
     if (seen.has(v.index)) {
-      dropped.push(`verdict[${i}]: duplicate index ${v.index} (first occurrence wins)`);
+      const { pos, itemIdx: prevI } = seen.get(v.index)!;
+      if (v.verdict === "reject" && verdicts[pos].verdict === "accept") {
+        // Reject supersedes earlier accept: fail closed
+        dropped.push(`verdict[${prevI}]: duplicate index ${v.index} (accept superseded by reject at verdict[${i}])`);
+        verdicts[pos] = v;
+        seen.set(v.index, { pos, itemIdx: i });
+      } else {
+        dropped.push(`verdict[${i}]: duplicate index ${v.index} (reject wins)`);
+      }
       continue;
     }
-    seen.add(v.index);
+    seen.set(v.index, { pos: verdicts.length, itemIdx: i });
     verdicts.push(v);
   }
   verdicts.sort((a, b) => a.index - b.index);
@@ -87,17 +98,27 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
 // merge-gate-parser の extractJsonCandidates を踏襲（compact 1 行フェンス対応 +
 // スキーマ不適合でも素の JSON へフォールバック。design-review の早期 return は
 // 踏襲しない）。
+// セキュリティ方針: フェンスブロックはレスポンスの最終非空白コンテンツである場合のみ
+// 受け入れる（引用された証拠例が最後のフェンスとして誤採用されるのを防ぐ）。素の JSON
+// フォールバックも同様に最後の非空白行にあることを要求する。
 function* extractJsonCandidates(text: string): Generator<string> {
   // Accept both multiline and compact single-line fenced blocks:
   //   ```json\n{...}\n```   (standard)
   //   ```json {...} ```     (compact — produced by some judge responses)
+  // Only yield the last fence if it is the final non-whitespace content: this guards against
+  // a model that quotes a verdict-shaped example after emitting the real verdict.
   const fencePattern = /```json[ \t]*([\s\S]*?)[ \t]*```/g;
-  let lastFenceMatch: string | null = null;
+  let lastFenceM: RegExpExecArray | null = null;
   let m: RegExpExecArray | null;
   while ((m = fencePattern.exec(text)) !== null) {
-    lastFenceMatch = m[1];
+    lastFenceM = m;
   }
-  if (lastFenceMatch !== null) { yield lastFenceMatch.trim(); }
+  if (lastFenceM !== null) {
+    const afterFence = text.slice(lastFenceM.index + lastFenceM[0].length);
+    if (afterFence.trim().length === 0) {
+      yield lastFenceM[1].trim();
+    }
+  }
 
   const lines = text.split("\n");
 
@@ -117,22 +138,22 @@ function* extractJsonCandidates(text: string): Generator<string> {
     }
   }
 
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (line.startsWith("{") && line.endsWith("}")) {
-      yield line;
-      break;
+  // Bare JSON fallbacks: only accept if the JSON is the final non-whitespace content.
+  // This prevents picking up quoted JSON that appears in prose before the model's conclusion.
+  let lastNonEmpty = lines.length - 1;
+  while (lastNonEmpty >= 0 && lines[lastNonEmpty].trim().length === 0) lastNonEmpty--;
+
+  if (lastNonEmpty >= 0) {
+    const lastLine = lines[lastNonEmpty].trim();
+    if (lastLine.startsWith("{") && lastLine.endsWith("}")) {
+      yield lastLine;
     }
   }
 
-  let endLine = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trimEnd().endsWith("}")) { endLine = i; break; }
-  }
-  if (endLine !== -1) {
-    for (let startLine = endLine; startLine >= 0; startLine--) {
+  if (lastNonEmpty >= 0 && lines[lastNonEmpty].trimEnd().endsWith("}")) {
+    for (let startLine = lastNonEmpty; startLine >= 0; startLine--) {
       if (lines[startLine].trimStart().startsWith("{")) {
-        yield lines.slice(startLine, endLine + 1).join("\n");
+        yield lines.slice(startLine, lastNonEmpty + 1).join("\n");
       }
     }
   }

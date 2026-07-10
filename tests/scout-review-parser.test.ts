@@ -174,6 +174,23 @@ describe("parseScoutReviewOutput", () => {
     expect(result.dropped[0]).toContain("duplicate index 0");
   });
 
+  it("prefers reject over accept when a duplicate index has accept first then reject (fail-closed)", () => {
+    const input = [
+      "```json",
+      '{"verdicts": [',
+      '  {"index": 0, "verdict": "accept", "reasons": []},',
+      '  {"index": 0, "verdict": "reject", "reasons": ["reconsidered: not reproducible"]}',
+      "]}",
+      "```",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") return;
+    expect(result.verdicts).toEqual([{ index: 0, verdict: "reject", reasons: ["reconsidered: not reproducible"] }]);
+    expect(result.dropped).toHaveLength(1);
+    expect(result.dropped[0]).toContain("duplicate index 0");
+  });
+
   it("tolerates missing indices (unverified candidates are the caller's concern)", () => {
     const input = '{"verdicts": [{"index": 2, "verdict": "accept", "reasons": []}]}';
     const result = parseScoutReviewOutput(input, 3);
@@ -232,5 +249,35 @@ describe("parseScoutReviewOutput", () => {
       verdicts: [{ index: 0, verdict: "accept", reasons: [] }],
       dropped: [],
     });
+  });
+
+  it("returns parse_error when a bare JSON object is not the final non-whitespace content", () => {
+    // The JSON appears before concluding prose; the model explained it could not judge.
+    const input = [
+      '{"verdicts": [{"index": 0, "verdict": "accept", "reasons": []}]}',
+      "",
+      "I could not produce a structured verdict for all candidates.",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result).toEqual({ kind: "parse_error", raw: input });
+  });
+
+  it("returns parse_error when the last fenced block is not the final non-whitespace content", () => {
+    // A quoted example follows the real verdict block; the quoted accept should not win.
+    const input = [
+      "```json",
+      '{"verdicts": [{"index": 0, "verdict": "reject", "reasons": ["not reproducible"]}]}',
+      "```",
+      "",
+      "For reference, an accepted candidate would look like:",
+      "```json",
+      '{"verdicts": [{"index": 0, "verdict": "accept", "reasons": []}]}',
+      "```",
+      "",
+      "The above is just an example, not my verdict.",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    // Neither fenced block is the final content; no bare JSON either → parse_error.
+    expect(result).toEqual({ kind: "parse_error", raw: input });
   });
 });

@@ -167,4 +167,11 @@ describe("buildScoutReviewReformatPrompt", () => {
     const prompt = buildScoutReviewReformatPrompt("report with ````backticks````", 1);
     expect(prompt).toContain("`````");
   });
+
+  it("instructs the reformatter to extract only explicitly stated verdicts and not invent missing ones", () => {
+    const prompt = buildScoutReviewReformatPrompt("some raw judge output", 3);
+    expect(prompt).toContain("explicitly");
+    expect(prompt).toContain("Omit");
+    expect(prompt).toContain("do NOT invent");
+  });
 });
