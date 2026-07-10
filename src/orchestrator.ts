@@ -2554,14 +2554,14 @@ export class Orchestrator {
     const startSha = await this.runner
       .run("git", ["rev-parse", "HEAD"], { cwd: repoPath, timeoutMs: 60_000 })
       .then((r) => (r.code === 0 ? r.stdout.trim() || null : null))
-      .catch(() => null);
+      .catch((err) => { this.log(`scout: stage2 rev-parse HEAD failed (best-effort): ${errMsg(err)}`); return null; });
     const startBranch = await this.runner
       .run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoPath, timeoutMs: 60_000 })
       .then((r) => {
         const b = r.code === 0 ? r.stdout.trim() : "";
         return b && b !== "HEAD" ? b : null;
       })
-      .catch(() => null);
+      .catch((err) => { this.log(`scout: stage2 rev-parse branch failed (best-effort): ${errMsg(err)}`); return null; });
 
     try {
       const stage2StartMs = Date.parse(this.clock());
@@ -2620,7 +2620,11 @@ export class Orchestrator {
       }
       return { kind: "error", message: `parse failed: ${retryParsed.raw.slice(0, 200)}` };
     } finally {
-      await this.restoreScoutReviewGitState(repoPath, startSha, startBranch);
+      try {
+        await this.restoreScoutReviewGitState(repoPath, startSha, startBranch);
+      } catch (err) {
+        this.log(`scout: stage2 git restore failed: ${errMsg(err)}`);
+      }
     }
   }
 
@@ -2644,6 +2648,7 @@ export class Orchestrator {
     };
     await step(["checkout", "HEAD", "--", "."]);
     await step(["clean", "-fd"]);
+    await step(["clean", "-fdx", "--", MEMORY_DIR + "/"]);
     if (startBranch) {
       const restored = await step(["checkout", startBranch]);
       if (restored && startSha) await step(["reset", "--hard", startSha]);
