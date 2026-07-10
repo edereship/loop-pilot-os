@@ -238,6 +238,29 @@ describe("parseScoutReviewOutput", () => {
     expect(result.dropped[0]).toContain("duplicate index 0");
   });
 
+  it("blocks a later valid accept when a malformed reject appeared first for the same index — tombstone even without prior active accept", () => {
+    // Scenario: malformed reject (no reasons) → valid accept for the same index.
+    // The malformed reject must be tombstoned so the later accept is blocked.
+    const input = [
+      "```json",
+      '{"verdicts": [',
+      '  {"index": 0, "verdict": "reject", "reasons": []},',
+      '  {"index": 0, "verdict": "accept", "reasons": []}',
+      "]}",
+      "```",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") return;
+    // The accept must not survive; the malformed reject tombstones index 0.
+    expect(result.verdicts).toEqual([]);
+    // Two dropped entries: the malformed reject and the blocked accept.
+    expect(result.dropped).toHaveLength(2);
+    expect(result.dropped[0]).toContain("verdict[0]");
+    expect(result.dropped[1]).toContain("verdict[1]");
+    expect(result.dropped[1]).toContain("malformed reject");
+  });
+
   it("tolerates missing indices (unverified candidates are the caller's concern)", () => {
     const input = '{"verdicts": [{"index": 2, "verdict": "accept", "reasons": []}]}';
     const result = parseScoutReviewOutput(input, 3);

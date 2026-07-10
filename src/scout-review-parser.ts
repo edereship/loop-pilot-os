@@ -62,6 +62,9 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
   const dropped: string[] = [];
   // Maps candidate index → { verdict, item-array index }
   const active = new Map<number, { verdict: ScoutReviewVerdict; itemIdx: number }>();
+  // Indices where a reject intent was observed (even if malformed); a later valid accept
+  // for the same index is still blocked (fail-closed).
+  const tombstoned = new Set<number>();
   for (let i = 0; i < items.length; i++) {
     const res = verdictEntrySchema.safeParse(items[i]);
     if (!res.success) {
@@ -92,6 +95,9 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
             );
             active.delete(numIdx);
           }
+          // Tombstone even when there was no prior active accept, so a later valid accept
+          // for the same index is also blocked (fail-closed).
+          tombstoned.add(numIdx);
         }
       }
       const schemaErrors = res.error.issues
@@ -103,6 +109,11 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
     const v = res.data;
     if (v.index >= candidateCount) {
       dropped.push(`verdict[${i}]: index ${v.index} out of range (candidateCount=${candidateCount})`);
+      continue;
+    }
+    // Fail-closed: a malformed reject was already seen for this index; block a later valid accept.
+    if (tombstoned.has(v.index) && v.verdict === "accept") {
+      dropped.push(`verdict[${i}]: index ${v.index} (accept superseded by earlier malformed reject)`);
       continue;
     }
     const prev = active.get(v.index);

@@ -188,7 +188,7 @@ export function buildScoutReviewPrompt(args: ScoutReviewPromptArgs): string {
   const exampleLines: string[] = [
     "# Output Format",
     "",
-    `Respond with a single JSON object in a fenced \`\`\`json block, with exactly one verdict entry for each of the ${candidates.length} candidate(s) above:`,
+    `Respond with ONLY a fenced \`\`\`json block — no prose before or after — with exactly one verdict entry for each of the ${candidates.length} candidate(s) above:`,
     "",
     "```json",
     "{",

@@ -150,6 +150,14 @@ describe("buildScoutReviewPrompt", () => {
     expect(prompt).toContain("(+ 3 more omitted)");
   });
 
+  it("forbids surrounding prose so the parser's final-block guard can accept the fenced JSON", () => {
+    const prompt = buildScoutReviewPrompt(baseArgs());
+    // The output format section must prohibit prose before/after the fenced JSON block so that
+    // the parser's final-non-whitespace guard does not reject a well-formed response.
+    expect(prompt).toContain("ONLY");
+    expect(prompt).toContain("no prose");
+  });
+
   it("instructs one verdict entry per candidate with the JSON schema example", () => {
     const args = baseArgs({ candidates: [makeCandidate(), makeCandidate({ title: "Another" })] });
     const prompt = buildScoutReviewPrompt(args);
