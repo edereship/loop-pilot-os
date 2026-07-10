@@ -10779,4 +10779,70 @@ describe("SCOUT オーケ統合（ES-522）", () => {
 
     expect(h.store.latestRun()!.idleStartedAt).toBe("2026-06-05T00:05:00.000Z");
   });
+
+  it("Stage 2: reviewer.run() が例外を throw したら起票を全スキップし scout_log error に reviewer exception を記録する", async () => {
+    const reviewer: PlanRunner = {
+      run: async () => { throw new Error("ECONNRESET"); },
+    };
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("stage2:");
+    expect(logRow.errorDetail).toContain("reviewer exception");
+    expect(logRow.errorDetail).toContain("ECONNRESET");
+    expect(h.store.latestRun()!.haltReason).toContain("idle timeout");
+  });
+
+  it("Stage 2: reformat リトライ中に interrupted → HALT（scout_log は skipped）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: "garbage, not json" },
+      { kind: "interrupted" },
+    ];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(2);
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("skipped");
+    expect(logRow.errorDetail).toBe("stage2 interrupted");
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("Stage 2: createIssue が一部だけ失敗しても成功分は起票され outcome は completed", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "accept", reasons: [] },
+    ])];
+    const h = makeScoutHarness({
+      reviewer,
+      agentOutcomes: [stage1Ok([
+        cand({ title: "will succeed", evidence_type: "objective" }),
+        cand({ title: "will fail", evidence_type: "objective" }),
+      ])],
+    });
+    let callCount = 0;
+    const origCreateIssue = h.linearClient.createIssue.bind(h.linearClient);
+    h.linearClient.createIssue = async (fields) => {
+      callCount++;
+      if (callCount === 2) throw new Error("Linear 503");
+      return origCreateIssue(fields);
+    };
+
+    await h.orch.run();
+
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("completed");
+    expect(JSON.parse(logRow.createdIssueIdentifiers!)).toHaveLength(1);
+    const ev = h.notifier.events.find((e) => e.kind === "scout_completed") as
+      { kind: "scout_completed"; createdCount: number };
+    expect(ev.createdCount).toBe(1);
+  });
 });
