@@ -10600,4 +10600,85 @@ describe("SCOUT オーケ統合（ES-522）", () => {
     const resets = h.memoryRunner.calls.filter((c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard");
     expect(resets.length).toBeGreaterThanOrEqual(2);
   });
+
+  it("Stage 2 が error のとき起票を全スキップし scout_log を error 記録して idle 継続する", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "error", message: "codex exploded" }];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("stage2:");
+    expect(logRow.errorDetail).toContain("codex exploded");
+    expect(logRow.verdicts).toBeNull();
+    expect(h.store.latestRun()!.haltReason).toContain("idle timeout");
+  });
+
+  it("Stage 2 が interrupted のとき HALT し scout_log は skipped になる", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "interrupted" }];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("skipped");
+    expect(logRow.errorDetail).toBe("stage2 interrupted");
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.store.latestRun()!.haltReason).not.toContain("idle timeout");
+  });
+
+  it("Stage 2 パース不能 → reformat リトライ 1 回で回復して起票する", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: "garbage, not json at all" },
+      verdictsOk([{ index: 0, verdict: "accept", reasons: [] }]),
+    ];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand({ evidence_type: "objective" })])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(2);
+    expect(reviewer.calls[1].prompt).toContain("garbage, not json at all");
+    expect(createIssueCalls(h.linearClient)).toHaveLength(1);
+    expect(createIssueCalls(h.linearClient)[0].includeOptIn).toBe(true);
+    expect(h.store.getScoutLog(1).outcome).toBe("completed");
+  });
+
+  it("Stage 2 reformat リトライも失敗したら起票全スキップ（error 記録）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: "garbage one" },
+      { kind: "completed", text: "garbage two" },
+    ];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(2);
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("parse failed");
+  });
+
+  it("Stage 2 残り wall-clock が 30 秒未満なら reformat リトライを省略する", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "completed", text: "garbage" }];
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    config.safety.scoutReviewTimeoutMinutes = 0.0001;
+    const h = makeScoutHarness({ reviewer, config, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(1);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("reformat skipped");
+  });
 });

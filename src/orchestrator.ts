@@ -2563,6 +2563,7 @@ export class Orchestrator {
       .catch(() => null);
 
     try {
+      const stage2StartMs = Date.parse(this.clock());
       const prompt = buildScoutReviewPrompt({
         candidates: args.candidates,
         specContent: args.specContent,
@@ -2589,7 +2590,34 @@ export class Orchestrator {
       if (parsed.kind === "ok") {
         return { kind: "ok", verdicts: parsed.verdicts, dropped: parsed.dropped };
       }
-      return { kind: "error", message: `parse failed: ${parsed.raw.slice(0, 200)}` };
+
+      const remainingMs = timeoutMs - (Date.parse(this.clock()) - stage2StartMs);
+      if (remainingMs < REFORMAT_MIN_WALL_CLOCK_MS) {
+        return {
+          kind: "error",
+          message: `parse failed (reformat skipped: remaining wall-clock ${Math.round(remainingMs)}ms)`,
+        };
+      }
+      this.log("scout: stage2 parse failed, retrying with reformat prompt");
+      let retry: PlanOutcome;
+      try {
+        retry = await args.reviewer.run({
+          worktreePath: repoPath,
+          prompt: buildScoutReviewReformatPrompt(parsed.raw.slice(-REFORMAT_RAW_TAIL_CHARS), args.candidates.length),
+          timeoutMs: Math.min(REFORMAT_TIMEOUT_MS, remainingMs),
+          model: this.config.pm?.model,
+          effort: this.config.pm?.effort.scoutReview,
+        });
+      } catch (err) {
+        return { kind: "error", message: `reformat exception: ${errMsg(err)}` };
+      }
+      if (retry.kind === "interrupted") return { kind: "interrupted" };
+      if (retry.kind === "error") return { kind: "error", message: `reformat: ${retry.message}` };
+      const retryParsed = parseScoutReviewOutput(retry.text, args.candidates.length);
+      if (retryParsed.kind === "ok") {
+        return { kind: "ok", verdicts: retryParsed.verdicts, dropped: retryParsed.dropped };
+      }
+      return { kind: "error", message: `parse failed: ${retryParsed.raw.slice(0, 200)}` };
     } finally {
       await this.restoreScoutReviewGitState(repoPath, startSha, startBranch);
     }
