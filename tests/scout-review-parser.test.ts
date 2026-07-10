@@ -280,4 +280,35 @@ describe("parseScoutReviewOutput", () => {
     // Neither fenced block is the final content; no bare JSON either → parse_error.
     expect(result).toEqual({ kind: "parse_error", raw: input });
   });
+
+  it("returns parse_error when a compact fenced block is not the final non-whitespace content", () => {
+    // A compact ```json {...} ``` followed by trailing prose must not be treated as final.
+    const input = [
+      '```json {"verdicts": [{"index": 0, "verdict": "accept", "reasons": []}]} ```',
+      "",
+      "The above is only an example, not my verdict.",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result).toEqual({ kind: "parse_error", raw: input });
+  });
+
+  it("parses a multiline fenced verdict whose reason string contains backtick sequences", () => {
+    // When the judge quotes a spec or code passage inside a reason string, the closing ```
+    // must not be matched against backticks that appear inside the JSON content.
+    const input = [
+      "```json",
+      "{",
+      '  "verdicts": [',
+      '    {"index": 0, "verdict": "reject", "reasons": ["contradicts ```spec rule 3```"]}',
+      "  ]",
+      "}",
+      "```",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result).toEqual({
+      kind: "ok",
+      verdicts: [{ index: 0, verdict: "reject", reasons: ["contradicts ```spec rule 3```"] }],
+      dropped: [],
+    });
+  });
 });

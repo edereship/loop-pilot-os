@@ -52,6 +52,14 @@ describe("buildScoutReviewPrompt", () => {
     expect(prompt).toContain("best evidence");
   });
 
+  it("requires objective candidates to contain reproducible command output, rejecting spec-only evidence", () => {
+    const prompt = buildScoutReviewPrompt(baseArgs());
+    // Criterion 4 guards against Stage-1 mislabels entering the no-human-review queue.
+    expect(prompt).toContain("4.");
+    expect(prompt).toContain("command output");
+    expect(prompt).toContain("autonomous implementation queue without human review");
+  });
+
   it("injects requirements and domain specs inside fences with data-only guards", () => {
     const prompt = buildScoutReviewPrompt(baseArgs());
     expect(prompt).toContain("# Product Requirements");

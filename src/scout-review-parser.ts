@@ -102,29 +102,48 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
 // 受け入れる（引用された証拠例が最後のフェンスとして誤採用されるのを防ぐ）。素の JSON
 // フォールバックも同様に最後の非空白行にあることを要求する。
 function* extractJsonCandidates(text: string): Generator<string> {
-  // Accept both multiline and compact single-line fenced blocks:
-  //   ```json\n{...}\n```   (standard)
-  //   ```json {...} ```     (compact — produced by some judge responses)
-  // Only yield the last fence if it is the final non-whitespace content: this guards against
-  // a model that quotes a verdict-shaped example after emitting the real verdict.
-  const fencePattern = /```json[ \t]*([\s\S]*?)[ \t]*```/g;
-  let lastFenceM: RegExpExecArray | null = null;
-  let m: RegExpExecArray | null;
-  while ((m = fencePattern.exec(text)) !== null) {
-    lastFenceM = m;
+  const lines = text.split("\n");
+
+  // Find the last complete multiline ```json...``` block using line-by-line scanning.
+  // A lazy regex stops early when the JSON content contains backtick runs (e.g. when the
+  // judge quotes a code or spec passage inside a reason string), but the closing ``` is only
+  // recognised here when it appears alone on a line, so embedded sequences are ignored.
+  // Yields only when the closing fence is the final non-whitespace content.
+  const openRe = /^[ \t]*```json[ \t]*$/;
+  const closeRe = /^[ \t]*```[ \t]*$/;
+  let lastFenceContent: string | null = null;
+  let lastFenceEndIdx = -1;
+  {
+    let li = 0;
+    while (li < lines.length) {
+      if (openRe.test(lines[li])) {
+        let found = false;
+        for (let cl = li + 1; cl < lines.length; cl++) {
+          if (closeRe.test(lines[cl])) {
+            lastFenceContent = lines.slice(li + 1, cl).join("\n");
+            lastFenceEndIdx = cl;
+            li = cl + 1;
+            found = true;
+            break;
+          }
+        }
+        if (!found) li++;
+      } else {
+        li++;
+      }
+    }
   }
-  if (lastFenceM !== null) {
-    const afterFence = text.slice(lastFenceM.index + lastFenceM[0].length);
-    if (afterFence.trim().length === 0) {
-      yield lastFenceM[1].trim();
+  if (lastFenceContent !== null) {
+    if (lines.slice(lastFenceEndIdx + 1).every((l) => l.trim().length === 0)) {
+      yield lastFenceContent.trim();
     }
   }
 
-  const lines = text.split("\n");
-
-  // Compact single-line fenced block fallback: when JSON content contains backtick runs the
-  // lazy fence regex above terminates early, yielding truncated invalid JSON.  Recover by
-  // locating the outermost {} pair on the fence-opening line instead.
+  // Compact single-line fenced block fallback: handles ```json {...} ``` on one line.
+  // Locates the outermost {} pair on the fence-opening line rather than relying on a regex,
+  // so backtick runs inside the JSON do not confuse it.
+  // Only yield when this compact fence is the final non-whitespace content (same guard as
+  // the multiline path above and the bare-JSON paths below).
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (line.startsWith("```json")) {
@@ -132,7 +151,9 @@ function* extractJsonCandidates(text: string): Generator<string> {
       const jsonStart = afterMarker.indexOf("{");
       const jsonEnd = afterMarker.lastIndexOf("}");
       if (jsonStart !== -1 && jsonEnd > jsonStart) {
-        yield afterMarker.slice(jsonStart, jsonEnd + 1);
+        if (lines.slice(i + 1).every((l) => l.trim().length === 0)) {
+          yield afterMarker.slice(jsonStart, jsonEnd + 1);
+        }
       }
       break;
     }
