@@ -174,6 +174,30 @@ describe("parseScoutReviewOutput", () => {
     expect(result.dropped[0]).toContain("duplicate index 0");
   });
 
+  it("invalidates an earlier accept when a later duplicate reject is malformed — fail-closed even without reasons", () => {
+    // If the model emits accept then reject(no reasons), the malformed reject must still
+    // supersede the accept. Otherwise the candidate enters the autonomous queue even though
+    // the model also tried to reject it.
+    const input = [
+      "```json",
+      '{"verdicts": [',
+      '  {"index": 0, "verdict": "accept", "reasons": []},',
+      '  {"index": 0, "verdict": "reject", "reasons": []}',
+      "]}",
+      "```",
+    ].join("\n");
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") return;
+    // The accept must be gone; index 0 is unverified (neither accepted nor rejected cleanly).
+    expect(result.verdicts).toEqual([]);
+    // Two dropped entries: the invalidated accept and the malformed reject.
+    expect(result.dropped).toHaveLength(2);
+    expect(result.dropped[0]).toContain("duplicate index 0");
+    expect(result.dropped[0]).toContain("malformed reject");
+    expect(result.dropped[1]).toContain("verdict[1]");
+  });
+
   it("prefers reject over accept when a duplicate index has accept first then reject (fail-closed)", () => {
     const input = [
       "```json",

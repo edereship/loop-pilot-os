@@ -181,27 +181,29 @@ export function buildScoutReviewPrompt(args: ScoutReviewPromptArgs): string {
     ].join("\n\n"),
   );
 
-  blocks.push(
-    [
-      "# Output Format",
-      "",
-      `Respond with a single JSON object in a fenced \`\`\`json block, with exactly one verdict entry for each of the ${candidates.length} candidate(s) above:`,
-      "",
-      "```json",
-      "{",
-      '  "verdicts": [',
-      '    { "index": 0, "verdict": "reject", "reasons": ["specific, actionable reason"] },',
-      '    { "index": 1, "verdict": "reject", "reasons": ["specific, actionable reason"] }',
-      "  ]",
-      "}",
-      "```",
-      "",
-      '- `index`: Echo the candidate index shown in the "Candidates Under Review" section (0-based).',
-      '- `verdict`: `"accept"` if the candidate passes all applicable criteria, `"reject"` otherwise.',
-      "- `reasons`: When rejecting, list at least one specific reason (e.g. the spec passage it",
-      "  contradicts, or the duplicate ticket identifier / candidate index). When accepting, use an empty array.",
-    ].join("\n"),
+  const exampleEntryLines = candidates.map(
+    (_, i) =>
+      `    { "index": ${i}, "verdict": "reject", "reasons": ["specific, actionable reason"] }`,
   );
+  const exampleLines: string[] = [
+    "# Output Format",
+    "",
+    `Respond with a single JSON object in a fenced \`\`\`json block, with exactly one verdict entry for each of the ${candidates.length} candidate(s) above:`,
+    "",
+    "```json",
+    "{",
+    '  "verdicts": [',
+    ...exampleEntryLines.map((line, i) => (i < exampleEntryLines.length - 1 ? line + "," : line)),
+    "  ]",
+    "}",
+    "```",
+    "",
+    '- `index`: Echo the candidate index shown in the "Candidates Under Review" section (0-based).',
+    '- `verdict`: `"accept"` if the candidate passes all applicable criteria, `"reject"` otherwise.',
+    "- `reasons`: When rejecting, list at least one specific reason (e.g. the spec passage it",
+    "  contradicts, or the duplicate ticket identifier / candidate index). When accepting, use an empty array.",
+  ];
+  blocks.push(exampleLines.join("\n"));
 
   return blocks.join("\n\n");
 }

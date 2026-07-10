@@ -56,19 +56,41 @@ export function parseScoutReviewOutput(text: string, candidateCount: number): Sc
 // scout-parser の salvage と同流儀: エントリ単位で検証し、不正なものは dropped に
 // 診断を残して除外する。1 エントリの不備で他候補の verdict まで失わない。
 // 重複 index は reject が accept より優先される（フェイルクローズ）: accept の後に
-// reject が来た場合は reject に差し替える。
+// reject が来た場合は reject に差し替える。スキーマ違反の reject（reasons 欠落等）も
+// 同様に earlier accept を無効化する — 意図が reject なら accept を温存しない。
 function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResult {
-  const verdicts: ScoutReviewVerdict[] = [];
   const dropped: string[] = [];
-  // Maps candidate index → { position in verdicts[], item-array index }
-  const seen = new Map<number, { pos: number; itemIdx: number }>();
+  // Maps candidate index → { verdict, item-array index }
+  const active = new Map<number, { verdict: ScoutReviewVerdict; itemIdx: number }>();
   for (let i = 0; i < items.length; i++) {
     const res = verdictEntrySchema.safeParse(items[i]);
     if (!res.success) {
-      const reasons = res.error.issues
+      // Before discarding, check whether this is a reject intent for an already-accepted
+      // index. Even a malformed reject must apply fail-closed: invalidate the earlier accept.
+      const raw = items[i];
+      if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+        const r = raw as Record<string, unknown>;
+        const rawIdx = r["index"];
+        if (
+          r["verdict"] === "reject" &&
+          typeof rawIdx === "number" &&
+          Number.isInteger(rawIdx) &&
+          rawIdx >= 0 &&
+          rawIdx < candidateCount
+        ) {
+          const prev = active.get(rawIdx);
+          if (prev !== undefined && prev.verdict.verdict === "accept") {
+            dropped.push(
+              `verdict[${prev.itemIdx}]: duplicate index ${rawIdx} (accept superseded by malformed reject at verdict[${i}])`,
+            );
+            active.delete(rawIdx);
+          }
+        }
+      }
+      const schemaErrors = res.error.issues
         .map((iss) => `${iss.path.join(".")}: ${iss.message}`)
         .join("; ");
-      dropped.push(`verdict[${i}]: ${reasons}`);
+      dropped.push(`verdict[${i}]: ${schemaErrors}`);
       continue;
     }
     const v = res.data;
@@ -76,22 +98,22 @@ function salvage(items: unknown[], candidateCount: number): ScoutReviewParseResu
       dropped.push(`verdict[${i}]: index ${v.index} out of range (candidateCount=${candidateCount})`);
       continue;
     }
-    if (seen.has(v.index)) {
-      const { pos, itemIdx: prevI } = seen.get(v.index)!;
-      if (v.verdict === "reject" && verdicts[pos].verdict === "accept") {
+    const prev = active.get(v.index);
+    if (prev !== undefined) {
+      if (v.verdict === "reject" && prev.verdict.verdict === "accept") {
         // Reject supersedes earlier accept: fail closed
-        dropped.push(`verdict[${prevI}]: duplicate index ${v.index} (accept superseded by reject at verdict[${i}])`);
-        verdicts[pos] = v;
-        seen.set(v.index, { pos, itemIdx: i });
+        dropped.push(`verdict[${prev.itemIdx}]: duplicate index ${v.index} (accept superseded by reject at verdict[${i}])`);
+        active.set(v.index, { verdict: v, itemIdx: i });
       } else {
         dropped.push(`verdict[${i}]: duplicate index ${v.index} (reject wins)`);
       }
       continue;
     }
-    seen.set(v.index, { pos: verdicts.length, itemIdx: i });
-    verdicts.push(v);
+    active.set(v.index, { verdict: v, itemIdx: i });
   }
-  verdicts.sort((a, b) => a.index - b.index);
+  const verdicts = Array.from(active.values())
+    .map(({ verdict }) => verdict)
+    .sort((a, b) => a.index - b.index);
   return { kind: "ok", verdicts, dropped };
 }
 

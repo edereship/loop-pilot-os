@@ -160,6 +160,25 @@ describe("buildScoutReviewPrompt", () => {
     expect(prompt).toContain('"accept"');
     expect(prompt).toContain('"reject"');
   });
+
+  it("generates an example with only index 0 for a single candidate (no out-of-range index)", () => {
+    const args = baseArgs({ candidates: [makeCandidate()] });
+    const prompt = buildScoutReviewPrompt(args);
+    expect(prompt).toContain('"index": 0');
+    // index 1 must not appear in the example — it would be out of range for a 1-candidate batch
+    // and could cause the parser to drop it as an out-of-range entry.
+    expect(prompt).not.toContain('"index": 1');
+  });
+
+  it("generates example entries for every index when batch has 3 candidates", () => {
+    const args = baseArgs({
+      candidates: [makeCandidate(), makeCandidate({ title: "B" }), makeCandidate({ title: "C" })],
+    });
+    const prompt = buildScoutReviewPrompt(args);
+    expect(prompt).toContain('"index": 0');
+    expect(prompt).toContain('"index": 1');
+    expect(prompt).toContain('"index": 2');
+  });
 });
 
 describe("buildScoutReviewReformatPrompt", () => {
