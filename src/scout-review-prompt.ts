@@ -82,7 +82,7 @@ export function buildScoutReviewPrompt(args: ScoutReviewPromptArgs): string {
       "",
       "STRICT SCOPE: This is NOT a code review. Do NOT judge code style, naming, formatting,",
       "general quality, or refactoring opportunities. A reject verdict is reserved for",
-      "candidates that fail one of the three criteria above.",
+      "candidates that fail one of the four criteria above.",
     ].join("\n"),
   );
 

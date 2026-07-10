@@ -151,7 +151,10 @@ function* extractJsonCandidates(text: string): Generator<string> {
       const jsonStart = afterMarker.indexOf("{");
       const jsonEnd = afterMarker.lastIndexOf("}");
       if (jsonStart !== -1 && jsonEnd > jsonStart) {
-        if (lines.slice(i + 1).every((l) => l.trim().length === 0)) {
+        // Guard: after the last } there must be only optional whitespace + optional closing fence.
+        // Prose after the fence (e.g. "} ``` not my verdict") must not be treated as final content.
+        const afterJson = afterMarker.slice(jsonEnd + 1);
+        if (/^[ \t]*(`{3,}[ \t]*)?$/.test(afterJson) && lines.slice(i + 1).every((l) => l.trim().length === 0)) {
           yield afterMarker.slice(jsonStart, jsonEnd + 1);
         }
       }

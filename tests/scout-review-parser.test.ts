@@ -292,6 +292,15 @@ describe("parseScoutReviewOutput", () => {
     expect(result).toEqual({ kind: "parse_error", raw: input });
   });
 
+  it("returns parse_error when a compact fenced block has same-line prose after the JSON", () => {
+    // All on one line: } followed by ``` and then prose. The following-line guard passes
+    // trivially (no next line) but the same-line suffix makes it non-final content.
+    const input =
+      '```json {"verdicts": [{"index": 0, "verdict": "accept", "reasons": []}]} ``` not my verdict';
+    const result = parseScoutReviewOutput(input, 1);
+    expect(result).toEqual({ kind: "parse_error", raw: input });
+  });
+
   it("parses a multiline fenced verdict whose reason string contains backtick sequences", () => {
     // When the judge quotes a spec or code passage inside a reason string, the closing ```
     // must not be matched against backticks that appear inside the JSON content.
