@@ -109,8 +109,8 @@ function* extractJsonCandidates(text: string): Generator<string> {
   // judge quotes a code or spec passage inside a reason string), but the closing ``` is only
   // recognised here when it appears alone on a line, so embedded sequences are ignored.
   // Yields only when the closing fence is the final non-whitespace content.
-  const openRe = /^[ \t]*```json[ \t]*$/;
-  const closeRe = /^[ \t]*```[ \t]*$/;
+  const openRe = /^[ \t]*```json[ \t]*\r?$/;
+  const closeRe = /^[ \t]*```[ \t]*\r?$/;
   let lastFenceContent: string | null = null;
   let lastFenceEndIdx = -1;
   {

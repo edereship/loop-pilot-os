@@ -151,6 +151,7 @@ export function buildScoutReviewPrompt(args: ScoutReviewPromptArgs): string {
 
   const candidateSections = candidates.map((c, i) => {
     const body = [
+      `- title: ${singleLine(c.title)}`,
       "description:",
       c.description,
       "",
@@ -161,7 +162,6 @@ export function buildScoutReviewPrompt(args: ScoutReviewPromptArgs): string {
     return [
       `## Candidate ${i}`,
       "",
-      `- title: ${singleLine(c.title)}`,
       `- evidence_type: ${c.evidence_type}`,
       `- suggested priority: ${c.priority}`,
       "",
@@ -190,7 +190,7 @@ export function buildScoutReviewPrompt(args: ScoutReviewPromptArgs): string {
       "```json",
       "{",
       '  "verdicts": [',
-      '    { "index": 0, "verdict": "accept", "reasons": [] },',
+      '    { "index": 0, "verdict": "reject", "reasons": ["specific, actionable reason"] },',
       '    { "index": 1, "verdict": "reject", "reasons": ["specific, actionable reason"] }',
       "  ]",
       "}",
