@@ -2365,10 +2365,6 @@ export class Orchestrator {
         maxCandidates: this.config.scout.maxIssuesPerScout,
       });
 
-      // Advance idleStartedAt so SCOUT duration does not count toward idle timeout
-      const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
-      this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);
-
       if (explorationResult.kind === "interrupted") {
         try {
           this.store.updateScoutLog(scoutLogRow.id, {
@@ -2479,7 +2475,7 @@ export class Orchestrator {
             includeOptIn: route === "opt_in",
           });
           createdIdentifiers.push(identifier);
-          if (candidate.evidence_type === "objective") objectiveCount++;
+          if (route === "opt_in") objectiveCount++;
           else triageCount++;
         } catch (err) {
           this.log(`scout: failed to create issue for "${candidate.title}": ${errMsg(err)}`);
@@ -2517,10 +2513,8 @@ export class Orchestrator {
         return HALT;
       }
 
-      return CONTINUE;
+      return objectiveCount > 0 ? RESELECT : CONTINUE;
     } catch (err) {
-      const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
-      this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);
       this.log(`scout: unexpected error, skipping: ${errMsg(err)}`);
       try {
         this.store.updateScoutLog(scoutLogRow.id, {
@@ -2532,6 +2526,13 @@ export class Orchestrator {
         this.log(`scout: failed to update scout_log: ${errMsg(logErr)}`);
       }
       return CONTINUE;
+    } finally {
+      try {
+        const scoutDurationMs = Date.parse(this.clock()) - scoutStartMs;
+        this.store.advanceIdleStartedAt(this.runId, scoutDurationMs);
+      } catch (err) {
+        this.log(`scout: failed to advance idle timer: ${errMsg(err)}`);
+      }
     }
   }
 

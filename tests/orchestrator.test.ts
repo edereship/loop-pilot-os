@@ -10681,4 +10681,102 @@ describe("SCOUT オーケ統合（ES-522）", () => {
     expect(logRow.outcome).toBe("error");
     expect(logRow.errorDetail).toContain("reformat skipped");
   });
+
+  it("opt-in 起票 ≥1 件で RESELECT — idle スリープを挟まず次の SELECT で新チケットを即クレームする", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([{ index: 0, verdict: "accept", reasons: [] }])];
+    const config = makeConfig({ maxTasksPerRun: 1, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    const h = makeScoutHarness({
+      reviewer,
+      config,
+      agentOutcomes: [stage1Ok([cand({ evidence_type: "objective" })])],
+    });
+    let selectCalls = 0;
+    h.source.getAllEligible = async () => {
+      selectCalls++;
+      return selectCalls >= 3 ? [issue("issue-scout", "ES-900")] : [];
+    };
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "did it" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.sleepCalls.filter((ms) => ms === 300_000)).toHaveLength(1);
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].linearIdentifier).toBe("ES-900");
+  });
+
+  it("scout_completed の objectiveCount は opt-in 起票数、triageCount は triage 起票数（経路基準）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "accept", reasons: [] },
+    ])];
+    const h = makeScoutHarness({
+      reviewer,
+      agentOutcomes: [stage1Ok([
+        cand({ evidence_type: "objective" }),
+        cand({ evidence_type: "spec_mismatch" }),
+      ])],
+    });
+
+    await h.orch.run();
+
+    const ev = h.notifier.events.find((e) => e.kind === "scout_completed") as
+      { kind: "scout_completed"; createdCount: number; objectiveCount: number; triageCount: number };
+    expect(ev.createdCount).toBe(2);
+    expect(ev.objectiveCount).toBe(1);
+    expect(ev.triageCount).toBe(1);
+  });
+
+  it("reviewer null の全件 triage 起票では objectiveCount は 0（経路基準）", async () => {
+    const h = makeScoutHarness({
+      reviewer: null,
+      agentOutcomes: [stage1Ok([cand({ evidence_type: "objective" })])],
+    });
+
+    await h.orch.run();
+
+    const ev = h.notifier.events.find((e) => e.kind === "scout_completed") as
+      { kind: "scout_completed"; objectiveCount: number; triageCount: number };
+    expect(ev.objectiveCount).toBe(0);
+    expect(ev.triageCount).toBe(1);
+  });
+
+  it("idle 不算入は Stage 2 の所要時間も含む（idleStartedAt が全所要時間分だけ前方シフト）", async () => {
+    let advanceInReview: () => void = () => {};
+    const reviewer: PlanRunner = {
+      run: async () => {
+        advanceInReview();
+        return verdictsOk([{ index: 0, verdict: "reject", reasons: ["not a bug"] }]);
+      },
+    };
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    let nowMs = Date.parse("2026-06-05T00:00:00.000Z");
+    const advances = [31, 61];
+    const scoutAgent = new FakeAgentRunner();
+    scoutAgent.outcomes = [stage1Ok([cand()])];
+    const boardFetcher = new FakeGroomBoardFetcher();
+    const linearClient = new FakeGroomLinearClient();
+    advanceInReview = () => { nowMs += 5 * 60_000; };
+    const h = makeHarness(config, {
+      scoutDeps: { agent: scoutAgent, boardFetcher, linearClient, reviewer, scoutLabelId: "scout-label-id", scoutTriageLabelId: "scout-triage-label-id" },
+      clock: () => new Date(nowMs).toISOString(),
+      onSleep: (ms) => {
+        if (ms === config.loop.idleRecheckSeconds * 1000) {
+          nowMs += (advances.shift() ?? 61) * 60_000;
+        }
+      },
+    });
+    h.source.getAllEligible = async () => [];
+    h.memoryRunner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { code: 0, stdout: "main\n" });
+    h.memoryRunner.on(["git", "checkout", "--detach"], { code: 0 });
+
+    await h.orch.run();
+
+    expect(h.store.latestRun()!.idleStartedAt).toBe("2026-06-05T00:05:00.000Z");
+  });
 });
