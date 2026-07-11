@@ -86,6 +86,7 @@ const rawSchema = z.object({
       recovery: z.string().default("high"),
       verify: z.string().default("high"),
       merge_gate: z.string().default("high"),
+      scout_review: z.string().default("high"),
     }).strict().optional(),
   }).strict().optional(),
   handoff: z.object({
@@ -127,6 +128,7 @@ const rawSchema = z.object({
     max_cost_usd_per_merge_gate_fix: z.number().positive().default(2),
     max_cost_usd_per_scout: z.number().positive().default(2),
     scout_timeout_minutes: z.number().positive().default(30),
+    scout_review_timeout_minutes: z.number().positive().default(15),
   }).strict(),
   loop: z.object({
     monitor_poll_seconds: z.number().int().positive(),
@@ -242,6 +244,7 @@ export interface Config {
       recovery: string | undefined;
       verify: string | undefined;
       mergeGate: string | undefined;
+      scoutReview: string | undefined;
     };
   } | undefined;
   handoff: {
@@ -281,6 +284,7 @@ export interface Config {
     maxCostUsdPerMergeGateFix: number;
     maxCostUsdPerScout: number;
     scoutTimeoutMinutes: number;
+    scoutReviewTimeoutMinutes: number;
   };
   loop: {
     monitorPollSeconds: number;
@@ -819,6 +823,7 @@ export function loadConfig(
         ["recovery", pmEffort.recovery],
         ["verify", pmEffort.verify],
         ["merge_gate", pmEffort.merge_gate],
+        ["scout_review", pmEffort.scout_review],
       ] as [string, string][]) {
         if (!VALID_CODEX_EFFORT.includes(value)) {
           errors.push(
@@ -951,6 +956,7 @@ export function loadConfig(
             recovery: raw.pm.effort?.recovery,
             verify: raw.pm.effort?.verify,
             mergeGate: raw.pm.effort?.merge_gate,
+            scoutReview: raw.pm.effort?.scout_review,
           },
         }
       : undefined,
@@ -991,6 +997,7 @@ export function loadConfig(
       maxCostUsdPerMergeGateFix: raw.safety.max_cost_usd_per_merge_gate_fix,
       maxCostUsdPerScout: raw.safety.max_cost_usd_per_scout,
       scoutTimeoutMinutes: raw.safety.scout_timeout_minutes,
+      scoutReviewTimeoutMinutes: raw.safety.scout_review_timeout_minutes,
     },
     loop: {
       monitorPollSeconds: raw.loop.monitor_poll_seconds,

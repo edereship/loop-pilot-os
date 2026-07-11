@@ -335,6 +335,7 @@ async function runLoop(configPath: string): Promise<number> {
         agent: scoutAgent,
         boardFetcher: groomBoardFetcher,
         linearClient: groomLinearClient,
+        reviewer: codexPlanner,
         scoutLabelId: linearSetup.scoutLabelId,
         scoutTriageLabelId: linearSetup.scoutTriageLabelId,
       } : null,

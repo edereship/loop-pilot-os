@@ -22,7 +22,8 @@ import {
   instantSleep,
 } from "./fakes.js";
 import type { Config } from "../src/config.js";
-import type { EligibleIssue, PromptArgs, PlanRunner, PauseMeta, MergeReadiness } from "../src/types.js";
+import type { EligibleIssue, PromptArgs, PlanRunner, PauseMeta, MergeReadiness, AgentOutcome } from "../src/types.js";
+import type { ScoutCandidate } from "../src/scout-parser.js";
 
 type _AssertTrue<T extends true> = T;
 type _ScoutBoardFetcherSatisfies = _AssertTrue<GroomBoardFetcher extends ScoutDeps["boardFetcher"] ? true : false>;
@@ -76,6 +77,7 @@ function makeConfig(over: Partial<{
       maxCostUsdPerMergeGateFix: 2,
       maxCostUsdPerScout: 2,
       scoutTimeoutMinutes: 30,
+      scoutReviewTimeoutMinutes: 15,
     },
     loop: {
       monitorPollSeconds: over.monitorPollSeconds ?? 60,
@@ -125,7 +127,7 @@ interface Harness {
   groomLinearClient: FakeGroomLinearClient;
 }
 
-function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; mergeGateJudge?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean; store?: SqliteStore }): Harness {
+function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; designer?: PlanRunner | null; designReviewer?: PlanRunner | null; mergeGateJudge?: PlanRunner | null; selfReviewAgent?: FakeAgentRunner; verifyAgent?: FakeAgentRunner; getDescendantPids?: (rootPid: number) => Set<number> | null; getReparentedPids?: (pids: number[]) => Set<number>; checkPidAlive?: (pid: number) => boolean; store?: SqliteStore; scoutDeps?: ScoutDeps | null; clock?: () => string; onSleep?: (ms: number) => void }): Harness {
   const store = opts?.store ?? new SqliteStore(":memory:");
   const source = new FakeTaskSource();
   const agent = new FakeAgentRunner();
@@ -136,6 +138,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
   const sleepCalls: number[] = [];
   const sleep = async (ms: number): Promise<void> => {
     sleepCalls.push(ms);
+    opts?.onSleep?.(ms);
     await sleepInner(ms);
   };
   const logs: string[] = [];
@@ -216,7 +219,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
     store,
     buildPrompt,
     specLoader: null,
-    clock: fixedClock("2026-06-05T00:00:00.000Z"),
+    clock: opts?.clock ?? fixedClock("2026-06-05T00:00:00.000Z"),
     sleep,
     log,
     recovery,
@@ -240,7 +243,7 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
     } : null,
-    scoutDeps: null,
+    scoutDeps: opts?.scoutDeps ?? null,
     getDescendantPids: opts?.getDescendantPids,
     getReparentedPids: opts?.getReparentedPids,
     checkPidAlive: opts?.checkPidAlive,
@@ -10389,5 +10392,457 @@ describe("v4-B マージゲート fix ループ（ES-521 Task 8）— fix成功�
     expect(run.state).toBe("halted");
     const s = h.store.sessionsForRun(run.id)[0];
     expect(s.costUsd).toBe(1.2); // interrupted でも fix コストは加算
+  });
+});
+
+describe("SCOUT オーケ統合（ES-522）", () => {
+  function makeScoutHarness(opts: {
+    reviewer: PlanRunner | null;
+    agentOutcomes: AgentOutcome[];
+    config?: Config;
+    sleepAdvancesMin?: number[];
+    store?: SqliteStore;
+  }) {
+    const config = opts.config ?? (() => {
+      const c = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+      c.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+      return c;
+    })();
+    let nowMs = Date.parse("2026-06-05T00:00:00.000Z");
+    const advances = [...(opts.sleepAdvancesMin ?? [31, 61])];
+    const scoutAgent = new FakeAgentRunner();
+    scoutAgent.outcomes = [...opts.agentOutcomes];
+    const boardFetcher = new FakeGroomBoardFetcher();
+    const linearClient = new FakeGroomLinearClient();
+    const scoutDeps: ScoutDeps = {
+      agent: scoutAgent,
+      boardFetcher,
+      linearClient,
+      reviewer: opts.reviewer,
+      scoutLabelId: "scout-label-id",
+      scoutTriageLabelId: "scout-triage-label-id",
+    };
+    const h = makeHarness(config, {
+      scoutDeps,
+      store: opts.store,
+      clock: () => new Date(nowMs).toISOString(),
+      onSleep: (ms) => {
+        if (ms === config.loop.idleRecheckSeconds * 1000) {
+          nowMs += (advances.shift() ?? 61) * 60_000;
+        }
+      },
+    });
+    h.source.getAllEligible = async () => [];
+    h.memoryRunner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { code: 0, stdout: "main\n" });
+    h.memoryRunner.on(["git", "checkout", "--detach"], { code: 0 });
+    return { ...h, scoutAgent, boardFetcher, linearClient };
+  }
+
+  function cand(over: Partial<ScoutCandidate> = {}): ScoutCandidate {
+    return {
+      title: over.title ?? "Found a bug",
+      description: over.description ?? "desc",
+      evidence: over.evidence ?? "npm test output: 1 failed",
+      evidence_type: over.evidence_type ?? "objective",
+      priority: over.priority ?? 2,
+    };
+  }
+
+  function stage1Ok(candidates: ScoutCandidate[]): AgentOutcome {
+    return {
+      kind: "completed",
+      costUsd: 0.5,
+      summary: "",
+      fullResult: "```json\n" + JSON.stringify({ candidates }) + "\n```",
+    };
+  }
+
+  function createIssueCalls(linearClient: FakeGroomLinearClient) {
+    return linearClient.calls
+      .filter((c) => c.method === "createIssue")
+      .map((c) => c.args[0] as { title: string; extraLabelIds?: string[]; includeOptIn?: boolean });
+  }
+
+  it("idle が scout.idle_minutes 未満では発火しない", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 90, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    const h = makeScoutHarness({ reviewer: null, agentOutcomes: [], config, sleepAdvancesMin: [61] });
+
+    await h.orch.run();
+
+    expect(h.scoutAgent.callCount).toBe(0);
+    expect(h.store.latestScoutFiredAt()).toBeNull();
+    expect(h.store.latestRun()!.haltReason).toContain("idle timeout");
+  });
+
+  it("前回実行から min_interval_hours 未経過では発火しない", async () => {
+    const store = new SqliteStore(":memory:");
+    const prevRun = store.createRun(3, "2026-06-04T23:00:00.000Z");
+    store.setRunState(prevRun.id, "halted", "test seed");
+    const row = store.insertScoutLog({ runId: prevRun.id, firedAt: "2026-06-04T23:30:00.000Z" });
+    store.updateScoutLog(row.id, { endedAt: "2026-06-04T23:40:00.000Z", outcome: "completed", costUsd: 0.5 });
+
+    const h = makeScoutHarness({ reviewer: null, agentOutcomes: [], store });
+    await h.orch.run();
+
+    expect(h.scoutAgent.callCount).toBe(0);
+    expect(h.store.latestScoutFiredAt()).toBe("2026-06-04T23:30:00.000Z");
+  });
+
+  it("reviewer が null なら全候補を triage 起票する（opt-in なし・現行挙動の回帰）", async () => {
+    const h = makeScoutHarness({
+      reviewer: null,
+      agentOutcomes: [stage1Ok([cand({ evidence_type: "spec_mismatch", title: "Spec drift" })])],
+    });
+
+    await h.orch.run();
+
+    const calls = createIssueCalls(h.linearClient);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].includeOptIn).toBe(false);
+    expect(calls[0].extraLabelIds).toEqual(["scout-label-id", "scout-triage-label-id"]);
+    expect(h.notifier.events.some((e) => e.kind === "scout_completed")).toBe(true);
+    expect(h.store.latestScoutFiredAt()).not.toBeNull();
+  });
+
+  function verdictsOk(verdicts: Array<{ index: number; verdict: "accept" | "reject"; reasons: string[] }>): { kind: "completed"; text: string } {
+    return { kind: "completed", text: "```json\n" + JSON.stringify({ verdicts }) + "\n```" };
+  }
+
+  it("Stage 2: accept×objective は opt-in 起票、accept×spec_mismatch は triage、reject と verdict 欠落は起票しない", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "accept", reasons: [] },
+      { index: 2, verdict: "reject", reasons: ["works as specified"] },
+    ])];
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 4 };
+    const h = makeScoutHarness({
+      reviewer,
+      config,
+      agentOutcomes: [stage1Ok([
+        cand({ title: "obj bug", evidence_type: "objective" }),
+        cand({ title: "spec drift", evidence_type: "spec_mismatch" }),
+        cand({ title: "rejected", evidence_type: "objective" }),
+        cand({ title: "no verdict", evidence_type: "objective" }),
+      ])],
+    });
+
+    await h.orch.run();
+
+    const calls = createIssueCalls(h.linearClient);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].title).toBe("obj bug");
+    expect(calls[0].includeOptIn).toBe(true);
+    expect(calls[0].extraLabelIds).toEqual(["scout-label-id"]);
+    expect(calls[1].title).toBe("spec drift");
+    expect(calls[1].includeOptIn).toBe(false);
+    expect(calls[1].extraLabelIds).toEqual(["scout-label-id", "scout-triage-label-id"]);
+
+    expect(reviewer.calls[0].worktreePath).toBe("/repo");
+    expect(reviewer.calls[0].timeoutMs).toBe(15 * 60_000);
+  });
+
+  it("Stage 2: 全裁定（dropped 込み）が scout_log.verdicts に JSON 記録される", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "reject", reasons: ["duplicate of candidate 0"] },
+    ])];
+    const h = makeScoutHarness({
+      reviewer,
+      agentOutcomes: [stage1Ok([cand({ title: "a" }), cand({ title: "b" })])],
+    });
+
+    await h.orch.run();
+
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("completed");
+    const recorded = JSON.parse(logRow.verdicts!) as { verdicts: unknown[]; dropped: string[] };
+    expect(recorded.verdicts).toHaveLength(2);
+    expect(recorded.dropped).toEqual([]);
+  });
+
+  it("Stage 2: 全件 reject でも outcome は completed（allCreationFailed 誤発火の回帰）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([{ index: 0, verdict: "reject", reasons: ["not a bug"] }])];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("completed");
+    expect(logRow.errorDetail).toBeNull();
+    expect(h.notifier.events.some((e) => e.kind === "scout_completed")).toBe(false);
+  });
+
+  it("Stage 2: 候補 0 件なら reviewer を呼ばない", async () => {
+    const reviewer = new FakePlanRunner();
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(0);
+    expect(h.store.getScoutLog(1).outcome).toBe("completed");
+  });
+
+  it("Stage 2 実行後に main checkout の git 状態を復元する（checkout HEAD -- . / clean -fd / reset --hard）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([{ index: 0, verdict: "accept", reasons: [] }])];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    const cleans = h.memoryRunner.calls.filter((c) => c.cmd === "git" && c.args[0] === "clean" && c.args[1] === "-fd");
+    expect(cleans.length).toBeGreaterThanOrEqual(2);
+    const resets = h.memoryRunner.calls.filter((c) => c.cmd === "git" && c.args[0] === "reset" && c.args[1] === "--hard");
+    expect(resets.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("Stage 2 が error のとき起票を全スキップし scout_log を error 記録して idle 継続する", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "error", message: "codex exploded" }];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("stage2:");
+    expect(logRow.errorDetail).toContain("codex exploded");
+    expect(logRow.verdicts).toBeNull();
+    expect(h.store.latestRun()!.haltReason).toContain("idle timeout");
+  });
+
+  it("Stage 2 が interrupted のとき HALT し scout_log は skipped になる", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "interrupted" }];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("skipped");
+    expect(logRow.errorDetail).toBe("stage2 interrupted");
+    expect(h.store.latestRun()!.state).toBe("halted");
+    expect(h.store.latestRun()!.haltReason).not.toContain("idle timeout");
+  });
+
+  it("Stage 2 パース不能 → reformat リトライ 1 回で回復して起票する", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: "garbage, not json at all" },
+      verdictsOk([{ index: 0, verdict: "accept", reasons: [] }]),
+    ];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand({ evidence_type: "objective" })])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(2);
+    expect(reviewer.calls[1].prompt).toContain("garbage, not json at all");
+    expect(createIssueCalls(h.linearClient)).toHaveLength(1);
+    expect(createIssueCalls(h.linearClient)[0].includeOptIn).toBe(true);
+    expect(h.store.getScoutLog(1).outcome).toBe("completed");
+  });
+
+  it("Stage 2 reformat リトライも失敗したら起票全スキップ（error 記録）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: "garbage one" },
+      { kind: "completed", text: "garbage two" },
+    ];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(2);
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("parse failed");
+  });
+
+  it("Stage 2 残り wall-clock が 30 秒未満なら reformat リトライを省略する", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [{ kind: "completed", text: "garbage" }];
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    config.safety.scoutReviewTimeoutMinutes = 0.0001;
+    const h = makeScoutHarness({ reviewer, config, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(1);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("reformat skipped");
+  });
+
+  it("opt-in 起票 ≥1 件で RESELECT — idle スリープを挟まず次の SELECT で新チケットを即クレームする", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([{ index: 0, verdict: "accept", reasons: [] }])];
+    const config = makeConfig({ maxTasksPerRun: 1, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    const h = makeScoutHarness({
+      reviewer,
+      config,
+      agentOutcomes: [stage1Ok([cand({ evidence_type: "objective" })])],
+    });
+    let selectCalls = 0;
+    h.source.getAllEligible = async () => {
+      selectCalls++;
+      return selectCalls >= 3 ? [issue("issue-scout", "ES-900")] : [];
+    };
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "did it" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(h.sleepCalls.filter((ms) => ms === 300_000)).toHaveLength(1);
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].linearIdentifier).toBe("ES-900");
+  });
+
+  it("scout_completed の objectiveCount は opt-in 起票数、triageCount は triage 起票数（経路基準）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "accept", reasons: [] },
+    ])];
+    const h = makeScoutHarness({
+      reviewer,
+      agentOutcomes: [stage1Ok([
+        cand({ evidence_type: "objective" }),
+        cand({ evidence_type: "spec_mismatch" }),
+      ])],
+    });
+
+    await h.orch.run();
+
+    const ev = h.notifier.events.find((e) => e.kind === "scout_completed") as
+      { kind: "scout_completed"; createdCount: number; objectiveCount: number; triageCount: number };
+    expect(ev.createdCount).toBe(2);
+    expect(ev.objectiveCount).toBe(1);
+    expect(ev.triageCount).toBe(1);
+  });
+
+  it("reviewer null の全件 triage 起票では objectiveCount は 0（経路基準）", async () => {
+    const h = makeScoutHarness({
+      reviewer: null,
+      agentOutcomes: [stage1Ok([cand({ evidence_type: "objective" })])],
+    });
+
+    await h.orch.run();
+
+    const ev = h.notifier.events.find((e) => e.kind === "scout_completed") as
+      { kind: "scout_completed"; objectiveCount: number; triageCount: number };
+    expect(ev.objectiveCount).toBe(0);
+    expect(ev.triageCount).toBe(1);
+  });
+
+  it("idle 不算入は Stage 2 の所要時間も含む（idleStartedAt が全所要時間分だけ前方シフト）", async () => {
+    let advanceInReview: () => void = () => {};
+    const reviewer: PlanRunner = {
+      run: async () => {
+        advanceInReview();
+        return verdictsOk([{ index: 0, verdict: "reject", reasons: ["not a bug"] }]);
+      },
+    };
+    const config = makeConfig({ maxTasksPerRun: 3, idleTimeoutMinutes: 60 });
+    config.scout = { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 };
+    let nowMs = Date.parse("2026-06-05T00:00:00.000Z");
+    const advances = [31, 61];
+    const scoutAgent = new FakeAgentRunner();
+    scoutAgent.outcomes = [stage1Ok([cand()])];
+    const boardFetcher = new FakeGroomBoardFetcher();
+    const linearClient = new FakeGroomLinearClient();
+    advanceInReview = () => { nowMs += 5 * 60_000; };
+    const h = makeHarness(config, {
+      scoutDeps: { agent: scoutAgent, boardFetcher, linearClient, reviewer, scoutLabelId: "scout-label-id", scoutTriageLabelId: "scout-triage-label-id" },
+      clock: () => new Date(nowMs).toISOString(),
+      onSleep: (ms) => {
+        if (ms === config.loop.idleRecheckSeconds * 1000) {
+          nowMs += (advances.shift() ?? 61) * 60_000;
+        }
+      },
+    });
+    h.source.getAllEligible = async () => [];
+    h.memoryRunner.on(["git", "rev-parse", "--abbrev-ref", "HEAD"], { code: 0, stdout: "main\n" });
+    h.memoryRunner.on(["git", "checkout", "--detach"], { code: 0 });
+
+    await h.orch.run();
+
+    expect(h.store.latestRun()!.idleStartedAt).toBe("2026-06-05T00:05:00.000Z");
+  });
+
+  it("Stage 2: reviewer.run() が例外を throw したら起票を全スキップし scout_log error に reviewer exception を記録する", async () => {
+    const reviewer: PlanRunner = {
+      run: async () => { throw new Error("ECONNRESET"); },
+    };
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("error");
+    expect(logRow.errorDetail).toContain("stage2:");
+    expect(logRow.errorDetail).toContain("reviewer exception");
+    expect(logRow.errorDetail).toContain("ECONNRESET");
+    expect(h.store.latestRun()!.haltReason).toContain("idle timeout");
+  });
+
+  it("Stage 2: reformat リトライ中に interrupted → HALT（scout_log は skipped）", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [
+      { kind: "completed", text: "garbage, not json" },
+      { kind: "interrupted" },
+    ];
+    const h = makeScoutHarness({ reviewer, agentOutcomes: [stage1Ok([cand()])] });
+
+    await h.orch.run();
+
+    expect(reviewer.calls).toHaveLength(2);
+    expect(createIssueCalls(h.linearClient)).toHaveLength(0);
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("skipped");
+    expect(logRow.errorDetail).toBe("stage2 interrupted");
+    expect(h.store.latestRun()!.state).toBe("halted");
+  });
+
+  it("Stage 2: createIssue が一部だけ失敗しても成功分は起票され outcome は completed", async () => {
+    const reviewer = new FakePlanRunner();
+    reviewer.outcomes = [verdictsOk([
+      { index: 0, verdict: "accept", reasons: [] },
+      { index: 1, verdict: "accept", reasons: [] },
+    ])];
+    const h = makeScoutHarness({
+      reviewer,
+      agentOutcomes: [stage1Ok([
+        cand({ title: "will succeed", evidence_type: "objective" }),
+        cand({ title: "will fail", evidence_type: "objective" }),
+      ])],
+    });
+    let callCount = 0;
+    const origCreateIssue = h.linearClient.createIssue.bind(h.linearClient);
+    h.linearClient.createIssue = async (fields) => {
+      callCount++;
+      if (callCount === 2) throw new Error("Linear 503");
+      return origCreateIssue(fields);
+    };
+
+    await h.orch.run();
+
+    const logRow = h.store.getScoutLog(1);
+    expect(logRow.outcome).toBe("completed");
+    expect(JSON.parse(logRow.createdIssueIdentifiers!)).toHaveLength(1);
+    const ev = h.notifier.events.find((e) => e.kind === "scout_completed") as
+      { kind: "scout_completed"; createdCount: number };
+    expect(ev.createdCount).toBe(1);
   });
 });

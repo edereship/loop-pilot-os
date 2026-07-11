@@ -60,6 +60,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       maxCostUsdPerMergeGateFix: 2,
       maxCostUsdPerScout: 2,
       scoutTimeoutMinutes: 30,
+      scoutReviewTimeoutMinutes: 15,
     },
     loop: { monitorPollSeconds: 60, idleRecheckSeconds: 300, idleTimeoutMinutes: 120 },
     digest: { recentMergedCount: 5, enabled: true },
