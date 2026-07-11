@@ -1449,8 +1449,10 @@ async function checkStateCommentAuthors(
 // ---- §9.7 Linear 解決 ----
 async function checkLinear(deps: PreflightDeps, errors: string[]): Promise<void> {
   const { config, fetchFn } = deps;
-  // ラベル解決対象は buildLinearSetupRequest が決める（scout.enabled 時は scout ラベルも必須・ES-516）。
-  const req = buildLinearSetupRequest(config);
+  // ES-535: SCOUT の実効的な可用性（config.scout.enabled かつ ANTHROPIC_API_KEY 設定済み）を
+  // ラベル解決に反映する。API キー不在時は SCOUT が無効化されるため scout ラベルを解決対象から除く。
+  const scoutEffective = config.scout.enabled && !!process.env.ANTHROPIC_API_KEY;
+  const req = buildLinearSetupRequest(config, scoutEffective);
   try {
     // resolveLinearSetup: viewer 取得（APIキー検証）/ team・project・4状態・opt_in_label の解決。
     // いずれか解決不能なら欠落を 1 回でまとめて throw する契約（task-source.ts）。

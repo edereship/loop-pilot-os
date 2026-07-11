@@ -740,6 +740,16 @@ describe("buildLinearSetupRequest (ES-516)", () => {
     expect(req.scoutLabel).toBe("bug-scout");
     expect(req.scoutTriageLabel).toBe("bug-scout-triage");
   });
+
+  it("omits scout labels when scout.enabled=true but scoutEffectivelyEnabled=false (ES-535)", () => {
+    // Simulates the case where scout is enabled in config but ANTHROPIC_API_KEY is absent.
+    // The caller computes the effective availability and passes it here so that scout
+    // labels are not required in Linear, preventing a spurious preflight failure.
+    const config = loadConfig(join(here, "fixtures", "config-scout.toml"), configFixtureEnv);
+    const req = buildLinearSetupRequest(config, false);
+    expect(req.scoutLabel).toBeUndefined();
+    expect(req.scoutTriageLabel).toBeUndefined();
+  });
 });
 
 describe("LinearTaskSource.postComment", () => {

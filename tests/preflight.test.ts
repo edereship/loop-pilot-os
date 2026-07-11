@@ -612,6 +612,24 @@ describe("runPreflight", () => {
     expect(errors.filter((e) => e.includes("Linear"))).toEqual([]);
   });
 
+  it("scout.enabled=true かつ ANTHROPIC_API_KEY 未設定時は scout ラベル未登録でも Linear エラーにならない（ES-535）", async () => {
+    // passingFetch には scout ラベルが含まれない。scout.enabled=true のまま API キーを除去し、
+    // SCOUT が実効的に無効化されるため scout ラベルの解決が不要になることを確認する。
+    const savedKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const cfg = makeConfig({
+        scout: { enabled: true, idleMinutes: 30, minIntervalHours: 24, maxIssuesPerScout: 3 },
+      });
+      const errors = await runPreflight({ config: cfg, runner: passingRunner(), notifier: passingNotifier, fetchFn: passingFetch() });
+      expect(errors.filter((e) => e.includes("Linear"))).toEqual([]);
+    } finally {
+      if (savedKey !== undefined) {
+        process.env.ANTHROPIC_API_KEY = savedKey;
+      }
+    }
+  });
+
   it("claude が起動できないと NG（仕様 §9.8）", async () => {
     const r = passingRunner();
     r.on(["claude", "--version"], { code: 127, stdout: "", stderr: "command not found" });

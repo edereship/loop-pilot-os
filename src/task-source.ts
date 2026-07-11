@@ -572,8 +572,13 @@ export async function resolveLinearSetup(
  * config.linear.states は camelCase、stateNames は TicketState キーのため明示写像する。
  * SCOUT ラベルは scout.enabled のときのみ解決対象に含める
  * （無効ユーザーに Linear ラベル作成を強制しない）。
+ *
+ * scoutEffectivelyEnabled が指定された場合、config.scout.enabled の代わりにその値を使う。
+ * これにより ANTHROPIC_API_KEY 未設定時（実行時 SCOUT 無効）の scout ラベル解決を省略できる
+ * （ES-535: API キー不在時に scout ラベルが Linear にないと preflight が失敗する問題の修正）。
  */
-export function buildLinearSetupRequest(config: Config): LinearSetupRequest {
+export function buildLinearSetupRequest(config: Config, scoutEffectivelyEnabled?: boolean): LinearSetupRequest {
+  const includeScout = scoutEffectivelyEnabled ?? config.scout.enabled;
   const stateNames: Record<TicketState, string> = {
     todo: config.linear.states.todo,
     in_progress: config.linear.states.inProgress,
@@ -586,7 +591,7 @@ export function buildLinearSetupRequest(config: Config): LinearSetupRequest {
     stateNames,
     optInLabel: config.linear.optInLabel,
     needsHumanLabel: config.linear.needsHumanLabel,
-    ...(config.scout.enabled
+    ...(includeScout
       ? {
           scoutLabel: config.linear.scoutLabel,
           scoutTriageLabel: config.linear.scoutTriageLabel,
