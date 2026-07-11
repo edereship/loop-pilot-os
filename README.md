@@ -43,11 +43,14 @@ GROOM ─→ SELECT ─→ CLAIM ─→ DESIGN ─→ DESIGN REVIEW ─→ IMPLE
   │         │         │         │                 └─ reject → reasons注入 → DESIGN へ戻る
   │         │         └─ worktree/遷移 失敗 → STOPPED → HALT
   │         └─ 適格なし → IDLE（定期再確認） ／ idle_timeout超過 or タスク上限到達 → HALT（通知）
+  │              └─ SCOUT（idle中・v4-A）: idle 30分継続 + 前回から24h → 探索（Claude・証拠必須）→ 検証（Codex）→ 自動起票（上限3件/回・重複禁止）
+  │                   objective（コマンド出力で裏が取れる）→ opt-in付き＝次ループで即着手 ／ spec_mismatch → scout-triage（人間トリアージ待ち）
   └─ Codex失敗/タイムアウト → スキップして SELECT へ（HALT しない）
 ```
 
 - **GROOM**（v3）: SELECT の前に毎ループ実行。Codex（PM）に Linear 盤面全体 + 横断メモリ + 要求/要件定義を見せ、アクション列（reprioritize / create / update / split / close / label / update_memory）を JSON で出力させ、オーケストレーターが検証・代理実行する。失敗時はスキップして SELECT へ（HALT しない）。`groom.enabled = false` で無効化可能。
 - **SELECT**: Codex（PM）が盤面 + 直前差分 + メモリを見て「次の 1 件 + 一行根拠」を出す意味的選別。Codex 障害時は決定的順序（Urgent>High>Medium>Low>No → sortOrder → id）にフォールバック。進行中セッション・放棄済みチケットは除外。
+- **SCOUT**（v4-A）: 適格チケットが尽きて idle が `scout.idle_minutes`（既定 30 分）続き、前回実行から `scout.min_interval_hours`（既定 24h）経過すると発火する自律バグ発見フェーズ。**2 段パイプライン**: 探索 = Claude Code（read-only 寄りツールで test/型/lint 実行 + spec 照合、全候補に証拠必須）→ 検証 = Codex（①実在するか ②要求/要件定義からズレていないかのブロッキング裁定）。通過した候補のみ Linear に自動起票し、`objective`（コマンド出力で再現可能）は opt-in ラベル付きで即適格＝完全自走、`spec_mismatch`（解釈が絡む）は `scout-triage` ラベルで人間の判断待ち。暴走防止 3 重（起票上限 `scout.max_issues_per_scout`・24h 間隔・既存チケット注入による重複起票禁止）。SCOUT 実行時間は idle 経過に不算入。起票 0 件なら従来どおり idle_timeout で自動停止する。全実行は `scout_log` に監査記録。`scout.enabled = false`（既定）で無効。`ANTHROPIC_API_KEY` 必須（`--bare` モードのため OAuth 不可）。
 - **CLAIM**: デフォルトブランチから `<prefix>/<identifier小文字>-<slug>` ブランチ + worktree を切り、Linear を In Progress に。
 - **DESIGN**（v3）: Claude Code が read-only セッションで設計 brief（Goal / Change Targets / Implementation Steps / Acceptance Criteria / Out of Scope）を生成。spec・横断メモリを注入し、brief をチケットにコメント書き戻し。
 - **DESIGN REVIEW**（v3）: Codex が brief を要求適合・スコープ逸脱・抜け漏れ・リスクの 4 観点でレビュー。**明示的な reject 判定のみ**が DESIGN へ戻す（fail-open: レビュアー例外・コスト超・出力パースエラーは approve 扱いで IMPLEMENT へ進む）。reject 時は reasons を添えて DESIGN へ戻る（最大 `max_design_review_attempts` 回、既定 2）。超過で `design_rejected` HALT。
@@ -151,6 +154,9 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `linear.scout_label` | SCOUT 起票チケットに付与する出所ラベル名（既定 `scout`） |
 | `linear.scout_triage_label` | spec_mismatch 候補の人間トリアージ用ラベル名（既定 `scout-triage`・SELECT 対象外） |
 | `safety.max_cost_usd_per_scout` | SCOUT 探索（Claude）のコスト上限（既定 $2） |
+| `safety.scout_timeout_minutes` | SCOUT 探索セッションのタイムアウト（既定 30 分） |
+| `safety.scout_review_timeout_minutes` | SCOUT 検証（Codex）のタイムアウト（既定 15 分） |
+| `agent.scout.{model,effort,allowed_tools}` | SCOUT 探索のオーバーライド。allowed_tools 未設定時は read-only 既定 `Read,Grep,Glob,Bash(git status)`（テスト実行で objective 証拠を取らせるには Bash の明示追加が必要） |
 
 #### model × effort 対応表
 

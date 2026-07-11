@@ -193,6 +193,13 @@ async function runLoop(configPath: string): Promise<number> {
     // override the SCOUT boundary (Claude Code uses the last occurrence) and nullify SCOUT's
     // read-only intent (ES-519 Finding 1, Finding 3).
     // Handles both "--flag=value" (one arg) and "--flag" "value" (two args) forms.
+    // ES-534: --bare disables OAuth; SCOUT requires ANTHROPIC_API_KEY.
+    if (config.scout.enabled && !process.env.ANTHROPIC_API_KEY) {
+      throw new Error(
+        "scout.enabled=true requires ANTHROPIC_API_KEY in the environment. " +
+        "SCOUT uses --bare which only supports API-key authentication (OAuth is disabled).",
+      );
+    }
     const scoutExtraArgs = (() => {
       const out: string[] = [];
       const raw = config.agent.extraArgs;
