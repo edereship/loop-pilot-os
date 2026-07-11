@@ -167,8 +167,9 @@ const MERGE_GATE_DIFF_HEAD_CHARS = 150_000;
 // stopDetail への流し込み前に件数と長さを cap する（レビュー所見#6）。
 const MERGE_GATE_MAX_VIOLATIONS = 10;
 const MERGE_GATE_MAX_VIOLATION_CHARS = 500;
-// 60s base poll × 5 = ~5 分。GH API の head 伝播猶予として十分（ES-532）。
-const MAX_STALE_READINESS_POLLS = 5;
+// GH API head 伝播猶予の目標時間（ES-532）。poll 間隔設定に依存せず一定の猶予を確保するため
+// 固定カウントではなく秒数で定義し、runMergeGate 内で poll 数に換算する。
+const STALE_READINESS_GRACE_SECONDS = 300;
 
 /**
  * v4-B マージゲート（ES-521）の poll 間で共有する in-memory ガード状態。
@@ -4882,14 +4883,32 @@ export class Orchestrator {
     // ES-532: 上限超過で park — GH API が恒久的に旧 head を返す病的条件でのハング防止。
     if (gateCtx.lastFixedHeadSha !== null && headSha === gateCtx.lastFixedHeadSha) {
       gateCtx.staleSkipCount += 1;
-      if (gateCtx.staleSkipCount >= MAX_STALE_READINESS_POLLS) {
-        this.log(`merge gate: stale readiness guard exceeded ${MAX_STALE_READINESS_POLLS} polls for ${session.linearIdentifier}; parking to avoid hang`);
+      // poll 間隔設定に応じて STALE_READINESS_GRACE_SECONDS 秒間の猶予に相当するカウント上限を算出。
+      // 短い poll 間隔でも猶予期間が短縮されないよう最低 5 を保証する。
+      const maxStalePollsForGracePeriod = Math.max(5, Math.ceil(STALE_READINESS_GRACE_SECONDS / this.config.loop.monitorPollSeconds));
+      if (gateCtx.staleSkipCount >= maxStalePollsForGracePeriod) {
+        this.log(`merge gate: stale readiness guard exceeded ${maxStalePollsForGracePeriod} polls for ${session.linearIdentifier}; parking to avoid hang`);
         const detail = `stale readiness: GitHub API returned headSha ${headSha} for ${gateCtx.staleSkipCount} consecutive polls after fix push`;
+        const priorLogs = this.store.getMergeGateLogsForSession(session.id);
+        const staleLogRow = this.store.insertMergeGateLog({
+          runId: this.runId,
+          sessionId: session.id,
+          attempt: priorLogs.length + 1,
+          startedAt: this.clock(),
+        });
+        this.store.updateMergeGateLog(staleLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "parked",
+          errorDetail: detail.slice(0, 2000),
+        });
         const ctrl = await this.stopSession(session, "merge_gate_failed", detail);
         return ctrl.control === "halt" ? "halt" : "parked";
       }
       return "continue";
     }
+    // stale window を抜けた（または未入場）— 連続 stale streak をリセットし、次の stale
+    // エピソードが独立したカウントで上限を測定できるようにする。
+    gateCtx.staleSkipCount = 0;
 
     // 同一 head を一度 pass 判定したら Codex を再起動しない（二重判定防止）。mergePr が失敗して
     // 次ポーリングに同一 head が再入した場合など。ログ行も作らず即 pass を返す。in-memory ガード
