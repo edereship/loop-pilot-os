@@ -5186,6 +5186,13 @@ export class Orchestrator {
       return { kind: "readiness_failed", error: errMsg(err) };
     }
     if (!readiness.ready) {
+      // A not-ready result means GitHub is no longer serving the old head as ready,
+      // which breaks any consecutive stale-ready streak. Reset here so staleSkipCount
+      // counts only continuous stale runs, not scattered ones interleaved with fresh
+      // not-ready polls (e.g. ci_pending for the new head after a fix push).
+      if (gateCtx.staleSkipCount > 0) {
+        gateCtx.staleSkipCount = 0;
+      }
       switch (readiness.reason) {
         case "ci_pending":
         case "unknown":
