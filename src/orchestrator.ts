@@ -167,14 +167,18 @@ const MERGE_GATE_DIFF_HEAD_CHARS = 150_000;
 // stopDetail への流し込み前に件数と長さを cap する（レビュー所見#6）。
 const MERGE_GATE_MAX_VIOLATIONS = 10;
 const MERGE_GATE_MAX_VIOLATION_CHARS = 500;
+// GH API head 伝播猶予の目標時間（ES-532）。poll 間隔設定に依存せず一定の猶予を確保するため
+// 固定カウントではなく秒数で定義し、runMergeGate 内で poll 数に換算する。
+const STALE_READINESS_GRACE_SECONDS = 300;
 
 /**
  * v4-B マージゲート（ES-521）の poll 間で共有する in-memory ガード状態。
  * - lastFixedHeadSha: 修正 push 直後、gh が旧 head を ready と返す stale readiness の再判定抑止。
  * - lastPassedHeadSha: 一度 pass 判定した head の再判定（Codex 二重判定）抑止。
- * どちらも揮発してよい（クラッシュ後の再判定は冪等・安全側に倒れるだけ）。
+ * - staleSkipCount: stale readiness の連続スキップ回数。fix push でリセット。上限超過で park（ES-532）。
+ * すべて揮発してよい（クラッシュ後の再判定は冪等・安全側に倒れるだけ）。
  */
-type GateCtx = { lastFixedHeadSha: string | null; lastPassedHeadSha: string | null };
+type GateCtx = { lastFixedHeadSha: string | null; lastPassedHeadSha: string | null; staleSkipCount: number };
 
 export class Orchestrator {
   private readonly config: Config;
@@ -4300,7 +4304,7 @@ export class Orchestrator {
     let firstPoll = true;
     // v4-B（ES-521）: 修正 push 直後の stale readiness ガード / pass 済み head のメモ化用
     // （runMergeGate が読み書き）
-    const gateCtx: GateCtx = { lastFixedHeadSha: null, lastPassedHeadSha: null };
+    const gateCtx: GateCtx = { lastFixedHeadSha: null, lastPassedHeadSha: null, staleSkipCount: 0 };
     while (true) {
       // ES-450 Finding 2: if recovery abandoned the session, exit the monitor loop so the
       // outer loop can proceed to SELECT the next task instead of continuing to poll a
@@ -4876,9 +4880,35 @@ export class Orchestrator {
     // 修正 push 直後、gh が旧 head の green を ready と返す stale readiness の窓で
     // 同一 diff を再判定して attempt を二重消費しない（in-memory ガード。クラッシュで
     // 揮発しても再判定は冪等・安全側に倒れるだけ）。
+    // ES-532: 上限超過で park — GH API が恒久的に旧 head を返す病的条件でのハング防止。
     if (gateCtx.lastFixedHeadSha !== null && headSha === gateCtx.lastFixedHeadSha) {
+      gateCtx.staleSkipCount += 1;
+      // poll 間隔設定に応じて STALE_READINESS_GRACE_SECONDS 秒間の猶予に相当するカウント上限を算出。
+      // 短い poll 間隔でも猶予期間が短縮されないよう最低 5 を保証する。
+      const maxStalePollsForGracePeriod = Math.max(5, Math.ceil(STALE_READINESS_GRACE_SECONDS / this.config.loop.monitorPollSeconds));
+      if (gateCtx.staleSkipCount >= maxStalePollsForGracePeriod) {
+        this.log(`merge gate: stale readiness guard exceeded ${maxStalePollsForGracePeriod} polls for ${session.linearIdentifier}; parking to avoid hang`);
+        const detail = `stale readiness: GitHub API returned headSha ${headSha} for ${gateCtx.staleSkipCount} consecutive polls after fix push`;
+        const priorLogs = this.store.getMergeGateLogsForSession(session.id);
+        const staleLogRow = this.store.insertMergeGateLog({
+          runId: this.runId,
+          sessionId: session.id,
+          attempt: priorLogs.length + 1,
+          startedAt: this.clock(),
+        });
+        this.store.updateMergeGateLog(staleLogRow.id, {
+          endedAt: this.clock(),
+          outcome: "parked",
+          errorDetail: detail.slice(0, 2000),
+        });
+        const ctrl = await this.stopSession(session, "merge_gate_failed", detail);
+        return ctrl.control === "halt" ? "halt" : "parked";
+      }
       return "continue";
     }
+    // stale window を抜けた（または未入場）— 連続 stale streak をリセットし、次の stale
+    // エピソードが独立したカウントで上限を測定できるようにする。
+    gateCtx.staleSkipCount = 0;
 
     // 同一 head を一度 pass 判定したら Codex を再起動しない（二重判定防止）。mergePr が失敗して
     // 次ポーリングに同一 head が再入した場合など。ログ行も作らず即 pass を返す。in-memory ガード
@@ -5113,6 +5143,7 @@ export class Orchestrator {
       this.store.updateMergeGateLog(row.id, { endedAt: this.clock(), outcome: "fixed", costUsd: fixCostUsd ?? null });
       // 修正 push → CI 再通過待ち（done 再待機は monitorSession のポーリングに乗る。spec §4）
       gateCtx.lastFixedHeadSha = headSha;
+      gateCtx.staleSkipCount = 0;
       return "continue";
     }
     // failed: fix 自体の不調。次ポーリングで再ゲート（fail 行の蓄積により park で有界）
@@ -5155,6 +5186,13 @@ export class Orchestrator {
       return { kind: "readiness_failed", error: errMsg(err) };
     }
     if (!readiness.ready) {
+      // A not-ready result means GitHub is no longer serving the old head as ready,
+      // which breaks any consecutive stale-ready streak. Reset here so staleSkipCount
+      // counts only continuous stale runs, not scattered ones interleaved with fresh
+      // not-ready polls (e.g. ci_pending for the new head after a fix push).
+      if (gateCtx.staleSkipCount > 0) {
+        gateCtx.staleSkipCount = 0;
+      }
       switch (readiness.reason) {
         case "ci_pending":
         case "unknown":
