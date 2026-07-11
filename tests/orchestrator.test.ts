@@ -10393,6 +10393,42 @@ describe("v4-B マージゲート fix ループ（ES-521 Task 8）— fix成功�
     const s = h.store.sessionsForRun(run.id)[0];
     expect(s.costUsd).toBe(1.2); // interrupted でも fix コストは加算
   });
+
+  it("stale readiness が MAX_STALE_READINESS_POLLS 回続くと park する（ES-532: 無限 continue 防止）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const judge = new FakePlanRunner();
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { mergeGateJudge: judge, planner });
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 1, summary: "impl" },
+      { kind: "error", costUsd: 0, message: "self-review skipped" },
+      { kind: "completed", costUsd: 0.5, summary: "gate fix" },
+    ];
+    h.memoryRunner.on(["git", "diff"], { code: 0, stdout: "" });
+    h.memoryRunner.on(["git", "cat-file"], { code: 1 });
+    h.recoveryRunner.on(["git", "-C", "/wt/ty-1", "status"], { code: 0, stdout: "" });
+    h.recoveryRunner.on(["git", "-C", "/wt/ty-1", "log"], { code: 0, stdout: "fix123 gate fix\n" });
+    // GH API が恒久的に旧 head を返し続ける病的条件
+    h.monitor.checkMergeReadiness = async () => ({ ready: true, headSha: "stale-sha" });
+    // poll 1(judge fail → fix) + poll 2..6(stale skip ×5 → 5 回目で park)
+    h.monitor.verdicts = [
+      { kind: "done" }, { kind: "done" }, { kind: "done" },
+      { kind: "done" }, { kind: "done" }, { kind: "done" },
+    ];
+    judge.outcomes = [{ kind: "completed", text: failJson(["breaking change"]) }];
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("merge_gate_failed");
+    expect(s.stopDetail).toContain("stale readiness");
+    expect(s.stopDetail).toContain("stale-sha");
+    expect(h.notifier.events.some((e) => e.kind === "merge_gate_parked")).toBe(true);
+    // judge は 1 回だけ（stale 中は呼ばれない）
+    expect(judge.calls).toHaveLength(1);
+  });
 });
 
 describe("SCOUT オーケ統合（ES-522）", () => {
