@@ -99,6 +99,12 @@ async function runLoop(configPath: string): Promise<number> {
       timedFetch,
     );
 
+    // ES-534 / ES-535: --bare disables OAuth; SCOUT requires ANTHROPIC_API_KEY.
+    // Compute effective SCOUT availability before preflight so that Linear label
+    // resolution (checkLinear) and the post-preflight resolveLinearSetup both omit
+    // scout labels when the key is absent, preventing spurious preflight failures.
+    const scoutAvailable = config.scout.enabled && !!process.env.ANTHROPIC_API_KEY;
+
     // プリフライト: 違反を全件収集 → 列挙して exit 1（仕様 §8 / カーネル §9）。
     // fetchFn は Node 24 ネイティブ fetch。Linear 解決もこの中で fetch を使う。
     const preflightErrors = await runPreflight({
@@ -117,7 +123,8 @@ async function runLoop(configPath: string): Promise<number> {
     }
 
     // Linear の team/project/4状態/ラベル（opt-in / needs-human / scout）を ID へ解決（ES-516）。
-    const setupRequest = buildLinearSetupRequest(config);
+    // scoutAvailable を渡すことで API キー不在時に scout ラベル解決をスキップする（ES-535）。
+    const setupRequest = buildLinearSetupRequest(config, scoutAvailable);
     const linearSetup = await resolveLinearSetup(
       config.linearApiKey,
       setupRequest,
@@ -193,9 +200,6 @@ async function runLoop(configPath: string): Promise<number> {
     // override the SCOUT boundary (Claude Code uses the last occurrence) and nullify SCOUT's
     // read-only intent (ES-519 Finding 1, Finding 3).
     // Handles both "--flag=value" (one arg) and "--flag" "value" (two args) forms.
-    // ES-534 / ES-535: --bare disables OAuth; SCOUT requires ANTHROPIC_API_KEY.
-    // When the key is missing, warn and skip SCOUT instead of stopping the entire daemon.
-    const scoutAvailable = config.scout.enabled && !!process.env.ANTHROPIC_API_KEY;
     if (config.scout.enabled && !scoutAvailable) {
       logLine("SCOUT disabled: ANTHROPIC_API_KEY not set (--bare requires API-key auth)");
     }
