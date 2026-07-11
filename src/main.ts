@@ -193,54 +193,42 @@ async function runLoop(configPath: string): Promise<number> {
     // override the SCOUT boundary (Claude Code uses the last occurrence) and nullify SCOUT's
     // read-only intent (ES-519 Finding 1, Finding 3).
     // Handles both "--flag=value" (one arg) and "--flag" "value" (two args) forms.
-    // ES-534: --bare disables OAuth; SCOUT requires ANTHROPIC_API_KEY.
-    if (config.scout.enabled && !process.env.ANTHROPIC_API_KEY) {
-      throw new Error(
-        "scout.enabled=true requires ANTHROPIC_API_KEY in the environment. " +
-        "SCOUT uses --bare which only supports API-key authentication (OAuth is disabled).",
-      );
+    // ES-534 / ES-535: --bare disables OAuth; SCOUT requires ANTHROPIC_API_KEY.
+    // When the key is missing, warn and skip SCOUT instead of stopping the entire daemon.
+    const scoutAvailable = config.scout.enabled && !!process.env.ANTHROPIC_API_KEY;
+    if (config.scout.enabled && !scoutAvailable) {
+      logLine("SCOUT disabled: ANTHROPIC_API_KEY not set (--bare requires API-key auth)");
     }
-    const scoutExtraArgs = (() => {
-      const out: string[] = [];
-      const raw = config.agent.extraArgs;
-      for (let i = 0; i < raw.length; i++) {
-        const a = raw[i];
-        if (a === "--dangerously-skip-permissions") continue;
-        if (a.startsWith("--permission-mode=")) continue;
-        if (a === "--permission-mode") { i++; continue; }
-        // Strip --tools overrides so a global --tools value cannot change or defeat the
-        // SCOUT-specific tool set (Finding 3 — ES-519).
-        if (a.startsWith("--tools=")) continue;
-        if (a === "--tools") { i++; continue; }
-        // Strip --add-dir flags: they expand the file-access surface beyond
-        // config.repo.path and SCOUT is intended to explore only the target
-        // repository (Finding 2 — Codex review, iteration 15).
-        if (a.startsWith("--add-dir=")) continue;
-        if (a === "--add-dir") { i++; continue; }
-        out.push(a);
-      }
-      // Block MCP tools: --tools only restricts built-in tools, not MCP tools; deny MCP
-      // explicitly so SCOUT cannot call write-capable MCP servers (Finding 1 — ES-519).
-      out.push("--disallowedTools", "mcp__*");
-      // --bare skips auto-discovery of project hooks, skills, plugins, MCP servers,
-      // auto-memory, and CLAUDE.md so repository customizations cannot alter SCOUT's
-      // behaviour or allowlist boundary before the prompt runs.  SCOUT reads CLAUDE.md
-      // explicitly as data via the Read tool (Finding 2 — Codex review).
-      out.push("--bare");
-      return out;
-    })();
-    const scoutTools = config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS;
-    // --tools only accepts bare tool names (e.g. "Read,Bash"), not permission-rule syntax
-    // like "Bash(npm test *)"; strip parenthesized suffixes before passing (Finding 4 — ES-519).
-    const scoutBareTools = scoutTools.split(",").map(t => t.split("(")[0].trim()).join(",");
-    const scoutAgent = buildPhaseAgent(
-      config.agent.scout,
-      "default",
-      scoutTools,
-      scoutExtraArgs,
-      scoutBareTools, // --tools restricts available tools; --allowedTools marks which auto-execute
-      true, // skipRateLimit: SCOUT is scheduled; retry at the next interval instead of blocking
-    );
+    const scoutAgent = scoutAvailable ? (() => {
+      const scoutExtraArgs = (() => {
+        const out: string[] = [];
+        const raw = config.agent.extraArgs;
+        for (let i = 0; i < raw.length; i++) {
+          const a = raw[i];
+          if (a === "--dangerously-skip-permissions") continue;
+          if (a.startsWith("--permission-mode=")) continue;
+          if (a === "--permission-mode") { i++; continue; }
+          if (a.startsWith("--tools=")) continue;
+          if (a === "--tools") { i++; continue; }
+          if (a.startsWith("--add-dir=")) continue;
+          if (a === "--add-dir") { i++; continue; }
+          out.push(a);
+        }
+        out.push("--disallowedTools", "mcp__*");
+        out.push("--bare");
+        return out;
+      })();
+      const scoutTools = config.agent.scout?.allowedTools ?? SCOUT_DEFAULT_ALLOWED_TOOLS;
+      const scoutBareTools = scoutTools.split(",").map(t => t.split("(")[0].trim()).join(",");
+      return buildPhaseAgent(
+        config.agent.scout,
+        "default",
+        scoutTools,
+        scoutExtraArgs,
+        scoutBareTools,
+        true,
+      );
+    })() : null;
     const designAgent = buildPhaseAgent(config.agent.design, "plan");
     const designer = new ClaudePlanRunner(designAgent, {
       maxCostUsd: config.safety.maxCostUsdPerDesign,
@@ -338,7 +326,7 @@ async function runLoop(configPath: string): Promise<number> {
         linearClient: groomLinearClient,
         knownLabels: linearSetup.knownLabels,
       } : null,
-      scoutDeps: config.scout.enabled ? {
+      scoutDeps: scoutAgent !== null ? {
         agent: scoutAgent,
         boardFetcher: groomBoardFetcher,
         linearClient: groomLinearClient,
