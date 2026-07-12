@@ -130,6 +130,7 @@ export interface GitPrManager {
   hasUncommittedChanges(worktreePath: string): Promise<boolean>; // git status --porcelain
   discardUncommittedChanges(worktreePath: string): Promise<void>; // git restore --staged . && git restore . && git clean -ffdx
   findOpenPrForBranch(branch: string): Promise<number | null>;
+  findOpenPrsForIssue(issueIdentifier: string): Promise<number[]>;
   pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number>;
   addLabel(prNumber: number, label: string): Promise<void>;
   mergePr(prNumber: number, headSha: string): Promise<void>;     // squash --match-head-commit

@@ -192,6 +192,29 @@ export class GitPrManager implements GitPrManagerInterface {
     return rows[0].number;
   }
 
+  async findOpenPrsForIssue(issueIdentifier: string): Promise<number[]> {
+    const { repoPath, remote, branchPrefix } = this.opts;
+    const searchPrefix = `${branchPrefix}/${issueIdentifier.toLowerCase()}-`;
+    const res = await this.runner.run(
+      "gh",
+      [
+        "pr", "list", "-R", remote,
+        "--search", `head:${searchPrefix}`,
+        "--state", "open",
+        "--json", "number,headRefName",
+      ],
+      { cwd: repoPath, timeoutMs: 60_000 },
+    );
+    if (res.code !== 0) {
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      throw new Error(`gh pr list failed for issue ${issueIdentifier}: ${rawErr}`, { cause: rawErr });
+    }
+    const rows = JSON.parse(res.stdout) as Array<{ number: number; headRefName: string }>;
+    return rows
+      .filter(r => r.headRefName.startsWith(searchPrefix))
+      .map(r => r.number);
+  }
+
   async pushAndOpenPr(
     branch: string,
     worktreePath: string,

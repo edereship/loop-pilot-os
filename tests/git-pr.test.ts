@@ -1168,3 +1168,71 @@ describe("GitPrManager.fetchCiLogs", () => {
     expect(result).toBeNull();
   });
 });
+
+describe("GitPrManager.findOpenPrsForIssue", () => {
+  it("returns PR numbers for branches matching the issue identifier prefix", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 10, headRefName: "looppilot/ty-123-add-the-login-flow" },
+        { number: 15, headRefName: "looppilot/ty-123-add-the-login-flow-2" },
+      ]),
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.findOpenPrsForIssue("TY-123");
+
+    expect(result).toEqual([10, 15]);
+    expect(runner.calls[0].args).toEqual([
+      "pr", "list", "-R", "owner/name",
+      "--search", "head:looppilot/ty-123-",
+      "--state", "open",
+      "--json", "number,headRefName",
+    ]);
+  });
+
+  it("returns empty array when no matching PRs exist", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: "[]",
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.findOpenPrsForIssue("TY-999");
+
+    expect(result).toEqual([]);
+  });
+
+  it("throws on non-zero exit", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 1,
+      stdout: "",
+      stderr: "auth required",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.findOpenPrsForIssue("TY-123")).rejects.toThrow(/auth required/);
+  });
+
+  it("filters out branches that do not match the identifier prefix", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 10, headRefName: "looppilot/ty-123-add-login" },
+        { number: 20, headRefName: "looppilot/ty-1234-other-issue" },
+      ]),
+      stderr: "",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.findOpenPrsForIssue("TY-123");
+
+    expect(result).toEqual([10]);
+  });
+});
