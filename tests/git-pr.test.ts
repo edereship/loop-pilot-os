@@ -32,6 +32,7 @@ describe("GitPrManager.prepareWorktree", () => {
   // カーネル §5.2: fetch origin <defaultBranch> → worktree add -b <branch> <wtPath> origin/<defaultBranch>
   it("fetches default branch then adds a worktree from origin/<defaultBranch> with slugified branch", async () => {
     const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
     runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
     runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
@@ -43,12 +44,13 @@ describe("GitPrManager.prepareWorktree", () => {
     const wtPath = "/wt/ty-123-add-the-login-flow";
     expect(result).toEqual({ branch, worktreePath: wtPath });
 
-    expect(runner.calls[0]).toEqual({
+    // calls[0] is the ES-531 stale-PR lookup (gh pr list); fetch/worktree add follow.
+    expect(runner.calls[1]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "fetch", "origin", "main"],
       opts: { cwd: "/repo", timeoutMs: 120_000 },
     });
-    expect(runner.calls[1]).toEqual({
+    expect(runner.calls[2]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "worktree", "add", "-b", branch, wtPath, "origin/main"],
       opts: { cwd: "/repo", timeoutMs: 30_000 },
@@ -57,6 +59,7 @@ describe("GitPrManager.prepareWorktree", () => {
 
   it("appends -2 on 'already exists' collision and adds the worktree on the retried branch", async () => {
     const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
     runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
     // 最初のブランチは衝突、-2 は成功（args[5] = -b の次 = branch 名で分岐）
     runner.on(["git", "-C", "/repo", "worktree", "add"], (args) => {
@@ -74,8 +77,12 @@ describe("GitPrManager.prepareWorktree", () => {
       branch: "looppilot/ty-123-add-the-login-flow-2",
       worktreePath: "/wt/ty-123-add-the-login-flow-2",
     });
-    // fetch + 2 回の worktree add
-    expect(runner.calls.map((c) => c.args[5]).filter(Boolean)).toEqual([
+    // fetch + 2 回の worktree add（gh pr list の args[5] も truthy になり得るため、
+    // worktree add の呼び出しに絞って branch 引数を検証する）
+    const worktreeAddBranches = runner.calls
+      .filter((c) => c.cmd === "git" && c.args[3] === "add")
+      .map((c) => c.args[5]);
+    expect(worktreeAddBranches).toEqual([
       "looppilot/ty-123-add-the-login-flow",
       "looppilot/ty-123-add-the-login-flow-2",
     ]);
@@ -115,6 +122,7 @@ describe("GitPrManager.prepareWorktree", () => {
 
   it("throws when 'git fetch' exits non-zero and never calls worktree add", async () => {
     const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
     // fetch が非0（ネットワーク断・remote 不達等）。worktree add は登録するが呼ばれてはならない
     runner.on(["git", "-C", "/repo", "fetch"], {
       code: 128,
@@ -126,9 +134,11 @@ describe("GitPrManager.prepareWorktree", () => {
     const mgr = new GitPrManager(runner, OPTS);
     // 契約（カーネル §2）: prepareWorktree は失敗を throw。陳腐化した base 上で worktree を作らない
     await expect(mgr.prepareWorktree(issue())).rejects.toThrow(/fetch origin main failed/);
-    // fetch のみ実行し、worktree add は一切呼ばない（calls 長 1）
-    expect(runner.calls).toHaveLength(1);
-    expect(runner.calls[0].args).toEqual(["-C", "/repo", "fetch", "origin", "main"]);
+    // gh pr list（ES-531 の旧PR検索）+ fetch のみ実行し、worktree add は一切呼ばない
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls[1].args).toEqual(["-C", "/repo", "fetch", "origin", "main"]);
+    const adds = runner.calls.filter((c) => c.args[3] === "add");
+    expect(adds).toHaveLength(0);
   });
 
   it("truncates the slug to 30 chars and strips a trailing hyphen", async () => {
@@ -160,6 +170,62 @@ describe("GitPrManager.prepareWorktree", () => {
     // branch = "<branchPrefix>/<id小文字>-" (末尾ハイフンは slugify 後に id との連結部として残る)
     expect(result.branch).toBe("looppilot/ty-123-");
     expect(result.worktreePath.endsWith("ty-123-")).toBe(true);
+  });
+
+  // ES-531: 旧セッションで park された PR を worktree 作成前にクローズする
+  it("closes existing open PRs for the same issue before creating the worktree", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 7, headRefName: "looppilot/ty-123-add-the-login-flow" },
+      ]),
+      stderr: "",
+    });
+    runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    const result = await mgr.prepareWorktree(issue());
+
+    // PR close should happen before fetch
+    const closeCall = runner.calls.find(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    const fetchCall = runner.calls.find(c => c.cmd === "git" && c.args.includes("fetch"));
+    expect(closeCall).toBeDefined();
+    expect(closeCall!.args).toEqual(["pr", "close", "7", "-R", "owner/name"]);
+    const closeIdx = runner.calls.indexOf(closeCall!);
+    const fetchIdx = runner.calls.indexOf(fetchCall!);
+    expect(closeIdx).toBeLessThan(fetchIdx);
+
+    expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
+  });
+
+  it("skips PR close when no existing PRs are found", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.prepareWorktree(issue());
+
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(0);
+  });
+
+  it("logs and continues when findOpenPrsForIssue fails (non-fatal)", async () => {
+    const logs: string[] = [];
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 1, stdout: "", stderr: "rate limit" });
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
+    const result = await mgr.prepareWorktree(issue());
+
+    expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
+    expect(logs.some(l => l.includes("close stale PRs"))).toBe(true);
   });
 });
 

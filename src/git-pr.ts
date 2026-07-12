@@ -51,8 +51,25 @@ export class GitPrManager implements GitPrManagerInterface {
   }
 
   async prepareWorktree(issue: EligibleIssue): Promise<ClaimResult> {
-    const { repoPath, defaultBranch, branchPrefix, worktreeRoot } = this.opts;
+    const { repoPath, defaultBranch, branchPrefix, worktreeRoot, log } = this.opts;
     const slug = `${issue.identifier.toLowerCase()}-${slugify(issue.title)}`;
+
+    // Close stale PRs from a prior parked session for the same issue (ES-531).
+    // Non-fatal: if detection or close fails, proceed — the worst case is a
+    // stale PR that the operator must close manually (status quo).
+    try {
+      const stalePrs = await this.findOpenPrsForIssue(issue.identifier);
+      for (const pr of stalePrs) {
+        try {
+          await this.closePr(pr);
+          log?.(`prepareWorktree: closed stale PR #${pr} for ${issue.identifier}`);
+        } catch (err) {
+          log?.(`prepareWorktree: failed to close stale PR #${pr} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    } catch (err) {
+      log?.(`prepareWorktree: failed to close stale PRs for ${issue.identifier} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     const fetch = await this.runner.run(
       "git",
