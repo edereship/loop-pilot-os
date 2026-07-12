@@ -54,21 +54,15 @@ export class GitPrManager implements GitPrManagerInterface {
     const { repoPath, defaultBranch, branchPrefix, worktreeRoot, log } = this.opts;
     const slug = `${issue.identifier.toLowerCase()}-${slugify(issue.title)}`;
 
-    // Close stale PRs from a prior parked session for the same issue (ES-531).
-    // Non-fatal: if detection or close fails, proceed — the worst case is a
-    // stale PR that the operator must close manually (status quo).
+    // Gather stale PR details before fetch so we know what to clean up, but defer
+    // the actual close until after the worktree is claimed.  If fetch or worktree-add
+    // fails transiently, closing the old PR before that point would leave the ticket
+    // with no open PR to continue or monitor (ES-531 Finding 1).
+    let stalePrDetails: Array<{ number: number; headRefName: string }> = [];
     try {
-      const stalePrs = await this.findOpenPrsForIssue(issue.identifier);
-      for (const pr of stalePrs) {
-        try {
-          await this.closePr(pr);
-          log?.(`prepareWorktree: closed stale PR #${pr} for ${issue.identifier}`);
-        } catch (err) {
-          log?.(`prepareWorktree: failed to close stale PR #${pr} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
+      stalePrDetails = await this.fetchStalePrDetails(issue.identifier);
     } catch (err) {
-      log?.(`prepareWorktree: failed to close stale PRs for ${issue.identifier} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      log?.(`prepareWorktree: failed to find stale PRs for ${issue.identifier} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
 
     const fetch = await this.runner.run(
@@ -101,6 +95,26 @@ export class GitPrManager implements GitPrManagerInterface {
         { cwd: repoPath, timeoutMs: 30_000 },
       );
       if (res.code === 0) {
+        // Worktree claimed — now safe to close stale PRs and delete their remote
+        // branches.  Both steps are non-fatal: worst case is a stale PR / remote
+        // branch that the operator must clean up manually.
+        for (const stalePr of stalePrDetails) {
+          try {
+            await this.closePr(stalePr.number);
+            log?.(`prepareWorktree: closed stale PR #${stalePr.number} for ${issue.identifier}`);
+          } catch (err) {
+            log?.(`prepareWorktree: failed to close stale PR #${stalePr.number} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+          }
+          // Delete the stale remote branch so a subsequent git push for the
+          // same deterministic branch name is not rejected as non-fast-forward
+          // (ES-531 Finding 2).  "remote ref does not exist" is benign — GitHub
+          // may auto-delete the branch when the PR is closed.
+          try {
+            await this.deleteRemoteBranch(stalePr.headRefName);
+          } catch (err) {
+            log?.(`prepareWorktree: failed to delete stale remote branch ${stalePr.headRefName} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
         return { branch, worktreePath };
       }
       if (!res.stderr.includes("already exists")) {
@@ -210,6 +224,11 @@ export class GitPrManager implements GitPrManagerInterface {
   }
 
   async findOpenPrsForIssue(issueIdentifier: string): Promise<number[]> {
+    const details = await this.fetchStalePrDetails(issueIdentifier);
+    return details.map(d => d.number);
+  }
+
+  private async fetchStalePrDetails(issueIdentifier: string): Promise<Array<{ number: number; headRefName: string }>> {
     const { repoPath, remote, branchPrefix } = this.opts;
     const searchPrefix = `${branchPrefix}/${issueIdentifier.toLowerCase()}-`;
     const res = await this.runner.run(
@@ -234,9 +253,21 @@ export class GitPrManager implements GitPrManagerInterface {
         `gh pr list for issue ${issueIdentifier} returned unparseable JSON: ${res.stdout.slice(0, 200)}`,
       );
     }
-    return rows
-      .filter(r => r.headRefName.startsWith(searchPrefix))
-      .map(r => r.number);
+    return rows.filter(r => r.headRefName.startsWith(searchPrefix));
+  }
+
+  private async deleteRemoteBranch(branch: string): Promise<void> {
+    const { repoPath } = this.opts;
+    const res = await this.runner.run(
+      "git",
+      ["-C", repoPath, "push", "origin", "--delete", branch],
+      { cwd: repoPath, timeoutMs: 60_000 },
+    );
+    if (res.code !== 0) {
+      const stderr = res.stderr.trim();
+      if (/remote ref does not exist/i.test(stderr)) return;
+      throw new Error(`git push origin --delete ${branch} failed: ${stderr || `exit ${res.code}`}`);
+    }
   }
 
   async closePr(prNumber: number): Promise<void> {
