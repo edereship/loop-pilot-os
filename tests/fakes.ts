@@ -228,6 +228,8 @@ export class FakeGitPr implements GitPrManager {
   uncommitted = new Map<string, boolean>();
   /** findOpenPrForBranch の戻り値（branch → number | null）。既定 null */
   openPrForBranch = new Map<string, number | null>();
+  /** findOpenPrsForIssue の戻り値（issueIdentifier → number[]）。既定 [] */
+  openPrsForIssue = new Map<string, number[]>();
   /** pushAndOpenPr の戻り値（branch → number）。既定は連番 */
   pushPrNumber = new Map<string, number>();
   private nextPr = 100;
@@ -278,6 +280,22 @@ export class FakeGitPr implements GitPrManager {
     this.calls.push({ method: "findOpenPrForBranch", args: [branch] });
     this.takeFailure("findOpenPrForBranch");
     return this.openPrForBranch.get(branch) ?? null;
+  }
+
+  async findOpenPrsForIssue(issueIdentifier: string): Promise<number[]> {
+    this.calls.push({ method: "findOpenPrsForIssue", args: [issueIdentifier] });
+    this.takeFailure("findOpenPrsForIssue");
+    return this.openPrsForIssue.get(issueIdentifier) ?? [];
+  }
+
+  async closePr(prNumber: number): Promise<void> {
+    this.calls.push({ method: "closePr", args: [prNumber] });
+    this.takeFailure("closePr");
+  }
+
+  async closeStalePrsForIssue(issueIdentifier: string, exceptPrNumber: number): Promise<void> {
+    this.calls.push({ method: "closeStalePrsForIssue", args: [issueIdentifier, exceptPrNumber] });
+    this.takeFailure("closeStalePrsForIssue");
   }
 
   async pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number> {

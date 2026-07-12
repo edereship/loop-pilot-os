@@ -97,6 +97,42 @@ export class GitPrManager implements GitPrManagerInterface {
     );
   }
 
+  // Close all stale PRs for the issue (those created by previous sessions) now that the
+  // replacement PR `exceptPrNumber` has been successfully opened.  Deferring to this
+  // point (rather than in prepareWorktree) ensures we never leave the ticket with no
+  // open PR: if IMPLEMENT fails (cost_exceeded, agent_no_change) the old PR stays open
+  // as a recovery anchor (ES-531 Finding 1).
+  async closeStalePrsForIssue(issueIdentifier: string, exceptPrNumber: number): Promise<void> {
+    const { log } = this.opts;
+    let stalePrDetails: Array<{ number: number; headRefName: string }> = [];
+    try {
+      stalePrDetails = await this.fetchStalePrDetails(issueIdentifier);
+    } catch (err) {
+      log?.(`closeStalePrsForIssue: failed to find stale PRs for ${issueIdentifier} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    for (const stalePr of stalePrDetails) {
+      if (stalePr.number === exceptPrNumber) continue;
+      let closedOk = false;
+      try {
+        await this.closePr(stalePr.number);
+        closedOk = true;
+        log?.(`closeStalePrsForIssue: closed stale PR #${stalePr.number} for ${issueIdentifier}`);
+      } catch (err) {
+        log?.(`closeStalePrsForIssue: failed to close stale PR #${stalePr.number} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // Only delete the stale remote branch when the PR was successfully closed.
+      // Deleting the branch of an open PR would leave it in a broken state.
+      if (!closedOk) continue;
+      try {
+        await this.deleteRemoteBranch(stalePr.headRefName);
+      } catch (err) {
+        log?.(`closeStalePrsForIssue: failed to delete stale remote branch ${stalePr.headRefName} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
   async hasCommitsWithDiff(worktreePath: string): Promise<boolean> {
     const { defaultBranch } = this.opts;
     const range = `origin/${defaultBranch}..HEAD`;
@@ -190,6 +226,68 @@ export class GitPrManager implements GitPrManagerInterface {
       return null;
     }
     return rows[0].number;
+  }
+
+  async findOpenPrsForIssue(issueIdentifier: string): Promise<number[]> {
+    const details = await this.fetchStalePrDetails(issueIdentifier);
+    return details.map(d => d.number);
+  }
+
+  private async fetchStalePrDetails(issueIdentifier: string): Promise<Array<{ number: number; headRefName: string }>> {
+    const { repoPath, remote, branchPrefix } = this.opts;
+    const searchPrefix = `${branchPrefix}/${issueIdentifier.toLowerCase()}-`;
+    const res = await this.runner.run(
+      "gh",
+      [
+        "pr", "list", "-R", remote,
+        "--search", `head:${searchPrefix}`,
+        "--state", "open",
+        "--json", "number,headRefName,isCrossRepository",
+        "--limit", "200",
+      ],
+      { cwd: repoPath, timeoutMs: 60_000 },
+    );
+    if (res.code !== 0) {
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      throw new Error(`gh pr list failed for issue ${issueIdentifier}: ${rawErr}`, { cause: rawErr });
+    }
+    let rows: Array<{ number: number; headRefName: string; isCrossRepository?: boolean }>;
+    try {
+      rows = JSON.parse(res.stdout) as Array<{ number: number; headRefName: string; isCrossRepository?: boolean }>;
+    } catch {
+      throw new Error(
+        `gh pr list for issue ${issueIdentifier} returned unparseable JSON: ${res.stdout.slice(0, 200)}`,
+      );
+    }
+    return rows.filter(r => r.headRefName.startsWith(searchPrefix) && !r.isCrossRepository);
+  }
+
+  private async deleteRemoteBranch(branch: string): Promise<void> {
+    const { repoPath } = this.opts;
+    const res = await this.runner.run(
+      "git",
+      ["-C", repoPath, "push", "origin", "--delete", branch],
+      { cwd: repoPath, timeoutMs: 60_000 },
+    );
+    if (res.code !== 0) {
+      const stderr = res.stderr.trim();
+      if (/remote ref does not exist/i.test(stderr)) return;
+      throw new Error(`git push origin --delete ${branch} failed: ${stderr || `exit ${res.code}`}`);
+    }
+  }
+
+  async closePr(prNumber: number): Promise<void> {
+    const { repoPath, remote } = this.opts;
+    const res = await this.runner.run(
+      "gh",
+      ["pr", "close", String(prNumber), "-R", remote],
+      { cwd: repoPath, timeoutMs: 60_000 },
+    );
+    if (res.code !== 0) {
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      if (/already\s*closed/i.test(rawErr)) return;
+      throw new Error(`gh pr close failed for PR #${prNumber}: ${rawErr}`, { cause: rawErr });
+    }
   }
 
   async pushAndOpenPr(
