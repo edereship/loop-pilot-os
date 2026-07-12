@@ -51,19 +51,8 @@ export class GitPrManager implements GitPrManagerInterface {
   }
 
   async prepareWorktree(issue: EligibleIssue): Promise<ClaimResult> {
-    const { repoPath, defaultBranch, branchPrefix, worktreeRoot, log } = this.opts;
+    const { repoPath, defaultBranch, branchPrefix, worktreeRoot } = this.opts;
     const slug = `${issue.identifier.toLowerCase()}-${slugify(issue.title)}`;
-
-    // Gather stale PR details before fetch so we know what to clean up, but defer
-    // the actual close until after the worktree is claimed.  If fetch or worktree-add
-    // fails transiently, closing the old PR before that point would leave the ticket
-    // with no open PR to continue or monitor (ES-531 Finding 1).
-    let stalePrDetails: Array<{ number: number; headRefName: string }> = [];
-    try {
-      stalePrDetails = await this.fetchStalePrDetails(issue.identifier);
-    } catch (err) {
-      log?.(`prepareWorktree: failed to find stale PRs for ${issue.identifier} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-    }
 
     const fetch = await this.runner.run(
       "git",
@@ -95,28 +84,6 @@ export class GitPrManager implements GitPrManagerInterface {
         { cwd: repoPath, timeoutMs: 30_000 },
       );
       if (res.code === 0) {
-        // Worktree claimed — now safe to close stale PRs and delete their remote
-        // branches.  Both steps are non-fatal: worst case is a stale PR / remote
-        // branch that the operator must clean up manually.
-        for (const stalePr of stalePrDetails) {
-          let closedOk = false;
-          try {
-            await this.closePr(stalePr.number);
-            closedOk = true;
-            log?.(`prepareWorktree: closed stale PR #${stalePr.number} for ${issue.identifier}`);
-          } catch (err) {
-            log?.(`prepareWorktree: failed to close stale PR #${stalePr.number} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-          }
-          // Only delete the stale remote branch when the PR was successfully
-          // closed (or was already closed).  Deleting the branch of an open PR
-          // would leave the PR in a broken state that is hard to recover.
-          if (!closedOk) continue;
-          try {
-            await this.deleteRemoteBranch(stalePr.headRefName);
-          } catch (err) {
-            log?.(`prepareWorktree: failed to delete stale remote branch ${stalePr.headRefName} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
         return { branch, worktreePath };
       }
       if (!res.stderr.includes("already exists")) {
@@ -128,6 +95,42 @@ export class GitPrManager implements GitPrManagerInterface {
     throw new Error(
       `git worktree add failed: branch name collision exhausted for ${branchPrefix}/${slug}`,
     );
+  }
+
+  // Close all stale PRs for the issue (those created by previous sessions) now that the
+  // replacement PR `exceptPrNumber` has been successfully opened.  Deferring to this
+  // point (rather than in prepareWorktree) ensures we never leave the ticket with no
+  // open PR: if IMPLEMENT fails (cost_exceeded, agent_no_change) the old PR stays open
+  // as a recovery anchor (ES-531 Finding 1).
+  async closeStalePrsForIssue(issueIdentifier: string, exceptPrNumber: number): Promise<void> {
+    const { log } = this.opts;
+    let stalePrDetails: Array<{ number: number; headRefName: string }> = [];
+    try {
+      stalePrDetails = await this.fetchStalePrDetails(issueIdentifier);
+    } catch (err) {
+      log?.(`closeStalePrsForIssue: failed to find stale PRs for ${issueIdentifier} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    for (const stalePr of stalePrDetails) {
+      if (stalePr.number === exceptPrNumber) continue;
+      let closedOk = false;
+      try {
+        await this.closePr(stalePr.number);
+        closedOk = true;
+        log?.(`closeStalePrsForIssue: closed stale PR #${stalePr.number} for ${issueIdentifier}`);
+      } catch (err) {
+        log?.(`closeStalePrsForIssue: failed to close stale PR #${stalePr.number} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // Only delete the stale remote branch when the PR was successfully closed.
+      // Deleting the branch of an open PR would leave it in a broken state.
+      if (!closedOk) continue;
+      try {
+        await this.deleteRemoteBranch(stalePr.headRefName);
+      } catch (err) {
+        log?.(`closeStalePrsForIssue: failed to delete stale remote branch ${stalePr.headRefName} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   async hasCommitsWithDiff(worktreePath: string): Promise<boolean> {

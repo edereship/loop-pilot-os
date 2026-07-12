@@ -134,6 +134,10 @@ export interface GitPrManager {
    *  @param issueIdentifier Linear ticket identifier in "XX-NNN" format (e.g. "ES-123"). */
   findOpenPrsForIssue(issueIdentifier: string): Promise<number[]>;
   closePr(prNumber: number): Promise<void>;
+  /** Close all open PRs for the issue whose branch matches the naming prefix, except
+   *  the newly-created PR identified by `exceptPrNumber`.  Non-fatal: lookup and
+   *  close/delete errors are logged but do not propagate. */
+  closeStalePrsForIssue(issueIdentifier: string, exceptPrNumber: number): Promise<void>;
   pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number>;
   addLabel(prNumber: number, label: string): Promise<void>;
   mergePr(prNumber: number, headSha: string): Promise<void>;     // squash --match-head-commit

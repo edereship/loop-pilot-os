@@ -4254,6 +4254,13 @@ export class Orchestrator {
       const ctrl = await this.stopSession(session, "handoff_failed", `handoff failed (${prText}): ${errMsg(err)}`);
       return ctrl;
     }
+    // Close stale PRs from previous sessions now that the replacement PR is open.
+    // Non-fatal: a lookup or close failure must not block HANDOFF completion.
+    try {
+      await this.git.closeStalePrsForIssue(issue.identifier, prNumber);
+    } catch (err) {
+      this.log(`handoff: closeStalePrsForIssue failed (non-fatal): ${errMsg(err)}`);
+    }
     // v4-B（ES-521）: HANDOFF 完了直後の PR head SHA を記録 — マージゲートの累積差分基点。
     // 取得失敗は NULL のまま = ゲートはフェイルオープンでスキップ（spec §1）。HANDOFF は失敗させない。
     let handoffHeadSha: string | null = null;

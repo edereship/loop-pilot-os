@@ -293,6 +293,11 @@ export class FakeGitPr implements GitPrManager {
     this.takeFailure("closePr");
   }
 
+  async closeStalePrsForIssue(issueIdentifier: string, exceptPrNumber: number): Promise<void> {
+    this.calls.push({ method: "closeStalePrsForIssue", args: [issueIdentifier, exceptPrNumber] });
+    this.takeFailure("closeStalePrsForIssue");
+  }
+
   async pushAndOpenPr(branch: string, worktreePath: string, issue: EligibleIssue): Promise<number> {
     this.calls.push({ method: "pushAndOpenPr", args: [branch, worktreePath, issue.id] });
     this.takeFailure("pushAndOpenPr");

@@ -32,7 +32,6 @@ describe("GitPrManager.prepareWorktree", () => {
   // カーネル §5.2: fetch origin <defaultBranch> → worktree add -b <branch> <wtPath> origin/<defaultBranch>
   it("fetches default branch then adds a worktree from origin/<defaultBranch> with slugified branch", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
     runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
     runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
@@ -44,13 +43,12 @@ describe("GitPrManager.prepareWorktree", () => {
     const wtPath = "/wt/ty-123-add-the-login-flow";
     expect(result).toEqual({ branch, worktreePath: wtPath });
 
-    // calls[0] is the ES-531 stale-PR lookup (gh pr list); fetch/worktree add follow.
-    expect(runner.calls[1]).toEqual({
+    expect(runner.calls[0]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "fetch", "origin", "main"],
       opts: { cwd: "/repo", timeoutMs: 120_000 },
     });
-    expect(runner.calls[2]).toEqual({
+    expect(runner.calls[1]).toEqual({
       cmd: "git",
       args: ["-C", "/repo", "worktree", "add", "-b", branch, wtPath, "origin/main"],
       opts: { cwd: "/repo", timeoutMs: 30_000 },
@@ -59,7 +57,6 @@ describe("GitPrManager.prepareWorktree", () => {
 
   it("appends -2 on 'already exists' collision and adds the worktree on the retried branch", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
     runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
     // 最初のブランチは衝突、-2 は成功（args[5] = -b の次 = branch 名で分岐）
     runner.on(["git", "-C", "/repo", "worktree", "add"], (args) => {
@@ -122,7 +119,6 @@ describe("GitPrManager.prepareWorktree", () => {
 
   it("throws when 'git fetch' exits non-zero and never calls worktree add", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
     // fetch が非0（ネットワーク断・remote 不達等）。worktree add は登録するが呼ばれてはならない
     runner.on(["git", "-C", "/repo", "fetch"], {
       code: 128,
@@ -134,9 +130,9 @@ describe("GitPrManager.prepareWorktree", () => {
     const mgr = new GitPrManager(runner, OPTS);
     // 契約（カーネル §2）: prepareWorktree は失敗を throw。陳腐化した base 上で worktree を作らない
     await expect(mgr.prepareWorktree(issue())).rejects.toThrow(/fetch origin main failed/);
-    // gh pr list（ES-531 の旧PR検索）+ fetch のみ実行し、worktree add は一切呼ばない
-    expect(runner.calls).toHaveLength(2);
-    expect(runner.calls[1].args).toEqual(["-C", "/repo", "fetch", "origin", "main"]);
+    // fetch のみ実行し、worktree add は一切呼ばない
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0].args).toEqual(["-C", "/repo", "fetch", "origin", "main"]);
     const adds = runner.calls.filter((c) => c.args[3] === "add");
     expect(adds).toHaveLength(0);
   });
@@ -172,44 +168,56 @@ describe("GitPrManager.prepareWorktree", () => {
     expect(result.worktreePath.endsWith("ty-123-")).toBe(true);
   });
 
-  // ES-531: 旧セッションで park された PR を worktree 作成後にクローズし、リモートブランチも削除する
-  // Finding 1: close is deferred until after worktree creation so a transient fetch/add
-  // failure does not leave the ticket with no open PR.
-  // Finding 2: the stale remote branch is deleted to prevent non-fast-forward push failures.
-  it("closes existing open PRs AFTER worktree creation and deletes their remote branches (ES-531 F1+F2)", async () => {
+  // ES-531 Finding 1: stale PR closure is now deferred to closeStalePrsForIssue (called
+  // from handoff after pushAndOpenPr).  prepareWorktree must NOT close any PRs — doing so
+  // before IMPLEMENT completes would leave the ticket with no open PR if IMPLEMENT
+  // returns cost_exceeded or agent_no_change without ever reaching pushAndOpenPr.
+  it("does not close stale PRs — closure is deferred until after the new PR is opened (ES-531 F1)", async () => {
     const runner = new FakeCommandRunner();
-    runner.on(["gh", "pr", "list"], {
-      code: 0,
-      stdout: JSON.stringify([
-        { number: 7, headRefName: "looppilot/ty-123-add-the-login-flow" },
-      ]),
-      stderr: "",
-    });
-    runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "push", "origin", "--delete"], { code: 0, stdout: "", stderr: "" });
     runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
     runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
     const mgr = new GitPrManager(runner, OPTS);
     const result = await mgr.prepareWorktree(issue());
 
-    // PR close must happen AFTER worktree add (Finding 1: defer until claim succeeds)
-    const closeCall = runner.calls.find(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
-    const addCall = runner.calls.find(c => c.cmd === "git" && c.args[2] === "worktree" && c.args[3] === "add");
-    expect(closeCall).toBeDefined();
-    expect(closeCall!.args).toEqual(["pr", "close", "7", "-R", "owner/name"]);
-    const closeIdx = runner.calls.indexOf(closeCall!);
-    const addIdx = runner.calls.indexOf(addCall!);
-    expect(closeIdx).toBeGreaterThan(addIdx);
-
-    // Remote branch must be deleted after PR close (Finding 2: prevent non-fast-forward push)
-    const deleteCall = runner.calls.find(c => c.cmd === "git" && c.args.includes("--delete"));
-    expect(deleteCall).toBeDefined();
-    expect(deleteCall!.args).toEqual(["-C", "/repo", "push", "origin", "--delete", "looppilot/ty-123-add-the-login-flow"]);
-    const deleteIdx = runner.calls.indexOf(deleteCall!);
-    expect(deleteIdx).toBeGreaterThan(closeIdx);
-
     expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(0);
+    const deleteCalls = runner.calls.filter(c => c.cmd === "git" && c.args.includes("--delete"));
+    expect(deleteCalls).toHaveLength(0);
+  });
+});
+
+// ES-531 Finding 1: stale PR closure happens in closeStalePrsForIssue, called from
+// handoff after pushAndOpenPr succeeds.
+// ES-531 Finding 2: the stale remote branch is deleted to prevent non-fast-forward push
+// failures; cross-repo fork PRs are excluded from closure.
+describe("GitPrManager.closeStalePrsForIssue", () => {
+  it("closes stale PRs and deletes their remote branches, skipping the new PR (ES-531 F1+F2)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 7, headRefName: "looppilot/ty-123-add-the-login-flow" },
+        { number: 99, headRefName: "looppilot/ty-123-add-the-login-flow-2" }, // new PR
+      ]),
+      stderr: "",
+    });
+    runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "push", "origin", "--delete"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.closeStalePrsForIssue("TY-123", 99);
+
+    // Only PR #7 must be closed; PR #99 (new) must be skipped
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(1);
+    expect(closeCalls[0].args).toEqual(["pr", "close", "7", "-R", "owner/name"]);
+
+    // PR #7's remote branch must also be deleted
+    const deleteCalls = runner.calls.filter(c => c.cmd === "git" && c.args.includes("--delete"));
+    expect(deleteCalls).toHaveLength(1);
+    expect(deleteCalls[0].args).toEqual(["-C", "/repo", "push", "origin", "--delete", "looppilot/ty-123-add-the-login-flow"]);
   });
 
   // ES-531 Finding 2: cross-repository (fork) PRs whose branch name matches the prefix
@@ -226,11 +234,9 @@ describe("GitPrManager.prepareWorktree", () => {
     });
     runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
     runner.on(["git", "-C", "/repo", "push", "origin", "--delete"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
     const mgr = new GitPrManager(runner, OPTS);
-    await mgr.prepareWorktree(issue());
+    await mgr.closeStalePrsForIssue("TY-123", 999);
 
     // Only the same-repo PR (#7) must be closed; the fork PR (#8) must be ignored
     const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
@@ -243,34 +249,7 @@ describe("GitPrManager.prepareWorktree", () => {
     expect(deleteCalls[0].args[5]).toBe("looppilot/ty-123-add-the-login-flow");
   });
 
-  it("skips PR close when no existing PRs are found", async () => {
-    const runner = new FakeCommandRunner();
-    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
-    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
-
-    const mgr = new GitPrManager(runner, OPTS);
-    await mgr.prepareWorktree(issue());
-
-    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
-    expect(closeCalls).toHaveLength(0);
-  });
-
-  it("logs and continues when stale PR lookup fails (non-fatal)", async () => {
-    const logs: string[] = [];
-    const runner = new FakeCommandRunner();
-    runner.on(["gh", "pr", "list"], { code: 1, stdout: "", stderr: "rate limit" });
-    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
-
-    const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
-    const result = await mgr.prepareWorktree(issue());
-
-    expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
-    expect(logs.some(l => l.includes("stale PRs") && l.includes("non-fatal"))).toBe(true);
-  });
-
-  it("closes multiple stale PRs for the same issue and deletes their remote branches", async () => {
+  it("closes multiple stale PRs and deletes their remote branches", async () => {
     const runner = new FakeCommandRunner();
     runner.on(["gh", "pr", "list"], {
       code: 0,
@@ -282,25 +261,22 @@ describe("GitPrManager.prepareWorktree", () => {
     });
     runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
     runner.on(["git", "-C", "/repo", "push", "origin", "--delete"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
     const mgr = new GitPrManager(runner, OPTS);
-    await mgr.prepareWorktree(issue());
+    await mgr.closeStalePrsForIssue("TY-123", 999);
 
     const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
     expect(closeCalls).toHaveLength(2);
     expect(closeCalls[0].args[2]).toBe("7");
     expect(closeCalls[1].args[2]).toBe("12");
 
-    // Remote branches must also be deleted for each stale PR (Finding 2)
     const deleteCalls = runner.calls.filter(c => c.cmd === "git" && c.args.includes("--delete"));
     expect(deleteCalls).toHaveLength(2);
     expect(deleteCalls[0].args[5]).toBe("looppilot/ty-123-add-the-login-flow");
     expect(deleteCalls[1].args[5]).toBe("looppilot/ty-123-add-the-login-flow-2");
   });
 
-  it("continues closing remaining PRs when one closePr fails, and still deletes remote branches", async () => {
+  it("continues closing remaining PRs when one closePr fails, and still deletes others", async () => {
     const logs: string[] = [];
     const runner = new FakeCommandRunner();
     runner.on(["gh", "pr", "list"], {
@@ -316,20 +292,16 @@ describe("GitPrManager.prepareWorktree", () => {
       return { code: 0, stdout: "", stderr: "" };
     });
     runner.on(["git", "-C", "/repo", "push", "origin", "--delete"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
     const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
-    const result = await mgr.prepareWorktree(issue());
+    await mgr.closeStalePrsForIssue("TY-123", 999);
 
-    expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
     // PR #7 close failed but #12 was still attempted
     const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
     expect(closeCalls).toHaveLength(2);
     expect(logs.some(l => l.includes("#7") && l.includes("non-fatal"))).toBe(true);
     expect(logs.some(l => l.includes("closed stale PR #12"))).toBe(true);
-    // Branch delete is skipped for PR #7 (close failed) to avoid orphaning an open PR;
-    // only PR #12's branch is deleted (close succeeded).
+    // Branch delete is skipped for PR #7 (close failed); only PR #12's branch is deleted.
     const deleteCalls = runner.calls.filter(c => c.cmd === "git" && c.args.includes("--delete"));
     expect(deleteCalls).toHaveLength(1);
     expect(deleteCalls[0].args[5]).toBe("looppilot/ty-123-add-the-login-flow-2");
@@ -348,24 +320,18 @@ describe("GitPrManager.prepareWorktree", () => {
       stderr: "",
     });
     runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
-    // Simulate GitHub already having deleted the branch when the PR was closed
     runner.on(["git", "-C", "/repo", "push", "origin", "--delete"], {
       code: 1,
       stdout: "",
       stderr: "error: remote ref does not exist",
     });
-    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
     const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
-    // Must not throw — "remote ref does not exist" is treated as already-deleted
-    await expect(mgr.prepareWorktree(issue())).resolves.toBeDefined();
+    await expect(mgr.closeStalePrsForIssue("TY-123", 999)).resolves.toBeUndefined();
     // No non-fatal log for the benign "does not exist" case
     expect(logs.some(l => l.includes("failed to delete stale remote branch"))).toBe(false);
   });
 
-  // ES-531 Finding 2: a genuine remote branch delete failure (e.g. network error) is
-  // non-fatal — prepareWorktree succeeds and the failure is logged.
   it("remote branch delete failure is non-fatal and is logged", async () => {
     const logs: string[] = [];
     const runner = new FakeCommandRunner();
@@ -382,14 +348,34 @@ describe("GitPrManager.prepareWorktree", () => {
       stdout: "",
       stderr: "fatal: unable to access remote",
     });
-    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
-    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
 
     const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
-    const result = await mgr.prepareWorktree(issue());
-
-    expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
+    await expect(mgr.closeStalePrsForIssue("TY-123", 999)).resolves.toBeUndefined();
     expect(logs.some(l => l.includes("failed to delete stale remote branch") && l.includes("non-fatal"))).toBe(true);
+  });
+
+  it("logs and continues when stale PR lookup fails (non-fatal)", async () => {
+    const logs: string[] = [];
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 1, stdout: "", stderr: "rate limit" });
+
+    const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
+    await expect(mgr.closeStalePrsForIssue("TY-123", 999)).resolves.toBeUndefined();
+    expect(logs.some(l => l.includes("stale PRs") && l.includes("non-fatal"))).toBe(true);
+    // No close or delete calls if lookup failed
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(0);
+  });
+
+  it("skips all closes when no stale PRs exist (empty list)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], { code: 0, stdout: "[]", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.closeStalePrsForIssue("TY-123", 999)).resolves.toBeUndefined();
+
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(0);
   });
 });
 

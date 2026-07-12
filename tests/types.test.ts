@@ -396,6 +396,7 @@ describe("モジュールインターフェース（カーネル §2 / 仕様 §
       findOpenPrForBranch: async (_branch: string): Promise<number | null> => null,
       findOpenPrsForIssue: async (_issueIdentifier: string): Promise<number[]> => [],
       closePr: async (_prNumber: number): Promise<void> => {},
+      closeStalePrsForIssue: async (_issueIdentifier: string, _exceptPrNumber: number): Promise<void> => {},
       pushAndOpenPr: async (
         _branch: string,
         _worktreePath: string,
