@@ -239,7 +239,7 @@ export class GitPrManager implements GitPrManagerInterface {
         "pr", "list", "-R", remote,
         "--search", `head:${searchPrefix}`,
         "--state", "open",
-        "--json", "number,headRefName",
+        "--json", "number,headRefName,isCrossRepository",
         "--limit", "200",
       ],
       { cwd: repoPath, timeoutMs: 60_000 },
@@ -248,15 +248,15 @@ export class GitPrManager implements GitPrManagerInterface {
       const rawErr = res.stderr.trim() || `exit ${res.code}`;
       throw new Error(`gh pr list failed for issue ${issueIdentifier}: ${rawErr}`, { cause: rawErr });
     }
-    let rows: Array<{ number: number; headRefName: string }>;
+    let rows: Array<{ number: number; headRefName: string; isCrossRepository?: boolean }>;
     try {
-      rows = JSON.parse(res.stdout) as Array<{ number: number; headRefName: string }>;
+      rows = JSON.parse(res.stdout) as Array<{ number: number; headRefName: string; isCrossRepository?: boolean }>;
     } catch {
       throw new Error(
         `gh pr list for issue ${issueIdentifier} returned unparseable JSON: ${res.stdout.slice(0, 200)}`,
       );
     }
-    return rows.filter(r => r.headRefName.startsWith(searchPrefix));
+    return rows.filter(r => r.headRefName.startsWith(searchPrefix) && !r.isCrossRepository);
   }
 
   private async deleteRemoteBranch(branch: string): Promise<void> {

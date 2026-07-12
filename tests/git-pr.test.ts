@@ -195,7 +195,7 @@ describe("GitPrManager.prepareWorktree", () => {
 
     // PR close must happen AFTER worktree add (Finding 1: defer until claim succeeds)
     const closeCall = runner.calls.find(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
-    const addCall = runner.calls.find(c => c.cmd === "git" && c.args[3] === "worktree" && c.args[4] === "add");
+    const addCall = runner.calls.find(c => c.cmd === "git" && c.args[2] === "worktree" && c.args[3] === "add");
     expect(closeCall).toBeDefined();
     expect(closeCall!.args).toEqual(["pr", "close", "7", "-R", "owner/name"]);
     const closeIdx = runner.calls.indexOf(closeCall!);
@@ -210,6 +210,37 @@ describe("GitPrManager.prepareWorktree", () => {
     expect(deleteIdx).toBeGreaterThan(closeIdx);
 
     expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
+  });
+
+  // ES-531 Finding 2: cross-repository (fork) PRs whose branch name matches the prefix
+  // must not be treated as stale LoopPilot PRs — only same-repo PRs should be closed.
+  it("ignores cross-repository fork PRs and only closes same-repo stale PRs (ES-531 F2 cross-repo)", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 7, headRefName: "looppilot/ty-123-add-the-login-flow", isCrossRepository: false },
+        { number: 8, headRefName: "looppilot/ty-123-add-the-login-flow-fork", isCrossRepository: true },
+      ]),
+      stderr: "",
+    });
+    runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "push", "origin", "--delete"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.prepareWorktree(issue());
+
+    // Only the same-repo PR (#7) must be closed; the fork PR (#8) must be ignored
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(1);
+    expect(closeCalls[0].args[2]).toBe("7");
+
+    // Only PR #7's branch should be deleted
+    const deleteCalls = runner.calls.filter(c => c.cmd === "git" && c.args.includes("--delete"));
+    expect(deleteCalls).toHaveLength(1);
+    expect(deleteCalls[0].args[5]).toBe("looppilot/ty-123-add-the-login-flow");
   });
 
   it("skips PR close when no existing PRs are found", async () => {
@@ -1388,7 +1419,7 @@ describe("GitPrManager.findOpenPrsForIssue", () => {
       "pr", "list", "-R", "owner/name",
       "--search", "head:looppilot/ty-123-",
       "--state", "open",
-      "--json", "number,headRefName",
+      "--json", "number,headRefName,isCrossRepository",
       "--limit", "200",
     ]);
   });
