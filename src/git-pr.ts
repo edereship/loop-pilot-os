@@ -99,16 +99,18 @@ export class GitPrManager implements GitPrManagerInterface {
         // branches.  Both steps are non-fatal: worst case is a stale PR / remote
         // branch that the operator must clean up manually.
         for (const stalePr of stalePrDetails) {
+          let closedOk = false;
           try {
             await this.closePr(stalePr.number);
+            closedOk = true;
             log?.(`prepareWorktree: closed stale PR #${stalePr.number} for ${issue.identifier}`);
           } catch (err) {
             log?.(`prepareWorktree: failed to close stale PR #${stalePr.number} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
           }
-          // Delete the stale remote branch so a subsequent git push for the
-          // same deterministic branch name is not rejected as non-fast-forward
-          // (ES-531 Finding 2).  "remote ref does not exist" is benign — GitHub
-          // may auto-delete the branch when the PR is closed.
+          // Only delete the stale remote branch when the PR was successfully
+          // closed (or was already closed).  Deleting the branch of an open PR
+          // would leave the PR in a broken state that is hard to recover.
+          if (!closedOk) continue;
           try {
             await this.deleteRemoteBranch(stalePr.headRefName);
           } catch (err) {
@@ -238,6 +240,7 @@ export class GitPrManager implements GitPrManagerInterface {
         "--search", `head:${searchPrefix}`,
         "--state", "open",
         "--json", "number,headRefName",
+        "--limit", "200",
       ],
       { cwd: repoPath, timeoutMs: 60_000 },
     );

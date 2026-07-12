@@ -297,9 +297,11 @@ describe("GitPrManager.prepareWorktree", () => {
     expect(closeCalls).toHaveLength(2);
     expect(logs.some(l => l.includes("#7") && l.includes("non-fatal"))).toBe(true);
     expect(logs.some(l => l.includes("closed stale PR #12"))).toBe(true);
-    // Remote branch deletes are attempted for both PRs regardless of close outcome (Finding 2)
+    // Branch delete is skipped for PR #7 (close failed) to avoid orphaning an open PR;
+    // only PR #12's branch is deleted (close succeeded).
     const deleteCalls = runner.calls.filter(c => c.cmd === "git" && c.args.includes("--delete"));
-    expect(deleteCalls).toHaveLength(2);
+    expect(deleteCalls).toHaveLength(1);
+    expect(deleteCalls[0].args[5]).toBe("looppilot/ty-123-add-the-login-flow-2");
   });
 
   // ES-531 Finding 2: "remote ref does not exist" is benign — GitHub may auto-delete
@@ -1387,6 +1389,7 @@ describe("GitPrManager.findOpenPrsForIssue", () => {
       "--search", "head:looppilot/ty-123-",
       "--state", "open",
       "--json", "number,headRefName",
+      "--limit", "200",
     ]);
   });
 
