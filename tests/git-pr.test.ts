@@ -1236,3 +1236,41 @@ describe("GitPrManager.findOpenPrsForIssue", () => {
     expect(result).toEqual([10]);
   });
 });
+
+describe("GitPrManager.closePr", () => {
+  it("closes the PR via gh pr close", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.closePr(42);
+
+    expect(runner.calls[0].args).toEqual([
+      "pr", "close", "42", "-R", "owner/name",
+    ]);
+  });
+
+  it("tolerates already-closed errors", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "close"], {
+      code: 1,
+      stdout: "",
+      stderr: "already closed",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.closePr(42)).resolves.toBeUndefined();
+  });
+
+  it("throws on other non-zero exits", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "close"], {
+      code: 1,
+      stdout: "",
+      stderr: "network error",
+    });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await expect(mgr.closePr(42)).rejects.toThrow(/network error/);
+  });
+});

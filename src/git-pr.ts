@@ -215,6 +215,20 @@ export class GitPrManager implements GitPrManagerInterface {
       .map(r => r.number);
   }
 
+  async closePr(prNumber: number): Promise<void> {
+    const { repoPath, remote } = this.opts;
+    const res = await this.runner.run(
+      "gh",
+      ["pr", "close", String(prNumber), "-R", remote],
+      { cwd: repoPath, timeoutMs: 60_000 },
+    );
+    if (res.code !== 0) {
+      const rawErr = res.stderr.trim() || `exit ${res.code}`;
+      if (/already\s*closed/i.test(rawErr)) return;
+      throw new Error(`gh pr close failed for PR #${prNumber}: ${rawErr}`, { cause: rawErr });
+    }
+  }
+
   async pushAndOpenPr(
     branch: string,
     worktreePath: string,
