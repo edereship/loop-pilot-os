@@ -630,6 +630,15 @@ export class Orchestrator {
         monitorStartedAt,
         ...handoffHeadShaPatch,
       });
+      // Close any stale PRs that were not cleaned up before the crash. handoff()
+      // calls closeStalePrsForIssue after creating the PR, so if the process died
+      // between PR creation and that call the old parked PR stays open. Running
+      // the cleanup here (idempotent) closes it on the next startup (ES-531).
+      try {
+        await this.git.closeStalePrsForIssue(session.linearIdentifier, prNumber);
+      } catch (err) {
+        this.log(`recovery: closeStalePrsForIssue failed (non-fatal): ${errMsg(err)}`);
+      }
       return await this.adoptAndMonitor(session, prNumber, monitorStartedAt);
     }
     // PLAN is read-only: a claimed session can never have agent implementation
@@ -4250,7 +4259,18 @@ export class Orchestrator {
       );
       await retry(3, () => this.source.transition(issue.id, "in_review"));
     } catch (err) {
-      const prText = describePr(this.store.getSession(session.id).prNumber);
+      const freshSession = this.store.getSession(session.id);
+      const prText = describePr(freshSession.prNumber);
+      // If the replacement PR was already created and persisted before this error
+      // (e.g. addLabel or in_review transition threw), close stale PRs now so the
+      // repo is not left with both the old parked PR and the new PR open (ES-531).
+      if (freshSession.prNumber !== null) {
+        try {
+          await this.git.closeStalePrsForIssue(issue.identifier, freshSession.prNumber);
+        } catch (closeErr) {
+          this.log(`handoff: closeStalePrsForIssue failed on handoff_failed path (non-fatal): ${errMsg(closeErr)}`);
+        }
+      }
       const ctrl = await this.stopSession(session, "handoff_failed", `handoff failed (${prText}): ${errMsg(err)}`);
       return ctrl;
     }

@@ -855,6 +855,33 @@ describe("Orchestrator 失敗系 — HANDOFF（仕様 §5.4 / カーネル §7.5
     expect(h.notifier.events[1]).toMatchObject({ kind: "halted", reason: "handoff_failed" });
   });
 
+  it("addLabel が throw で handoff_failed になっても closeStalePrsForIssue を呼んで旧PRを締める (ES-531)", async () => {
+    // When addLabel throws after pushAndOpenPr has already opened the replacement PR, the
+    // old parked PR must still be closed even though HANDOFF ultimately fails.
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+    h.source.queue = [issue("issue-A", "TY-1")];
+    h.git.claimResults.set("TY-1", { branch: "looppilot/ty-1-x", worktreePath: "/wt/ty-1" });
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "ok" }];
+    h.git.pushPrNumber.set("looppilot/ty-1-x", 100);
+    h.git.addLabel = async (prNumber: number, label: string) => {
+      h.git.calls.push({ method: "addLabel", args: [prNumber, label] });
+      throw new Error("gh: label not found");
+    };
+
+    await h.orch.run();
+
+    const s = h.store.sessionsForRun(h.store.latestRun()!.id)[0];
+    expect(s.state).toBe("stopped");
+    expect(s.failureReason).toBe("handoff_failed");
+    expect(s.prNumber).toBe(100);
+    // closeStalePrsForIssue must be called with the persisted prNumber so the old
+    // parked PR is closed even though HANDOFF did not complete.
+    const staleCalls = h.git.calls.filter(c => c.method === "closeStalePrsForIssue");
+    expect(staleCalls).toHaveLength(1);
+    expect(staleCalls[0].args).toEqual(["TY-1", 100]);
+  });
+
   it("pushAndOpenPr 自体が throw → PR 未作成なので stop_detail は 'no PR created'", async () => {
     const config = makeConfig({ maxTasksPerRun: 3 });
     const h = makeHarness(config);
@@ -10121,6 +10148,39 @@ describe("v4-B マージゲート（ES-521 / spec §1・§3・§5）— 評価�
     expect(s.state).toBe("merged");
     // handoffHeadSha == readiness.headSha なのでゲートはスキップ（judge 不呼び出し）
     expect(judge.calls).toHaveLength(0);
+  });
+
+  it("recoverByOpenPr は PR 採用時に closeStalePrsForIssue を呼んでクラッシュ前の旧PRを締める (ES-531 Finding 2)", async () => {
+    // Simulate a crash that happened after pushAndOpenPr created PR #100 but before
+    // closeStalePrsForIssue ran in handoff(). On restart, recoverByOpenPr must call
+    // closeStalePrsForIssue so the old parked PR is closed.
+    const config = makeConfig({ maxTasksPerRun: 1 });
+    const h = makeHarness(config);
+    const oldRun = h.store.createRun(1, "2026-06-04T00:00:00.000Z");
+    const seeded = h.store.createSession({
+      runId: oldRun.id,
+      linearIssueId: "issue-A",
+      linearIdentifier: "TY-1",
+      issueTitle: "handoff crash before stale close",
+      branch: "looppilot/ty-1-x",
+      worktreePath: "/wt/ty-1",
+      now: "2026-06-04T00:00:01.000Z",
+    });
+    h.store.updateSession(seeded.id, {
+      state: "handing_off",
+      prNumber: 100,
+    });
+    h.git.openPrForBranch.set("looppilot/ty-1-x", 100);
+    h.source.queue = [];
+    h.monitor.verdicts = [{ kind: "merged" }];
+
+    await h.orch.run();
+
+    // closeStalePrsForIssue must have been called during recovery with the issue
+    // identifier and the replacement PR number so the old parked PR is closed.
+    const staleCalls = h.git.calls.filter(c => c.method === "closeStalePrsForIssue");
+    expect(staleCalls.length).toBeGreaterThanOrEqual(1);
+    expect(staleCalls[0].args).toEqual(["TY-1", 100]);
   });
 
   it("park 済みセッションは再起動時に再採用されない（recoverInReview / stoppedSessions* 経路）", async () => {
