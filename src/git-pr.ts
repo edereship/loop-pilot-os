@@ -226,7 +226,14 @@ export class GitPrManager implements GitPrManagerInterface {
       const rawErr = res.stderr.trim() || `exit ${res.code}`;
       throw new Error(`gh pr list failed for issue ${issueIdentifier}: ${rawErr}`, { cause: rawErr });
     }
-    const rows = JSON.parse(res.stdout) as Array<{ number: number; headRefName: string }>;
+    let rows: Array<{ number: number; headRefName: string }>;
+    try {
+      rows = JSON.parse(res.stdout) as Array<{ number: number; headRefName: string }>;
+    } catch {
+      throw new Error(
+        `gh pr list for issue ${issueIdentifier} returned unparseable JSON: ${res.stdout.slice(0, 200)}`,
+      );
+    }
     return rows
       .filter(r => r.headRefName.startsWith(searchPrefix))
       .map(r => r.number);

@@ -227,6 +227,58 @@ describe("GitPrManager.prepareWorktree", () => {
     expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
     expect(logs.some(l => l.includes("close stale PRs"))).toBe(true);
   });
+
+  it("closes multiple stale PRs for the same issue", async () => {
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 7, headRefName: "looppilot/ty-123-add-the-login-flow" },
+        { number: 12, headRefName: "looppilot/ty-123-add-the-login-flow-2" },
+      ]),
+      stderr: "",
+    });
+    runner.on(["gh", "pr", "close"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, OPTS);
+    await mgr.prepareWorktree(issue());
+
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(2);
+    expect(closeCalls[0].args[2]).toBe("7");
+    expect(closeCalls[1].args[2]).toBe("12");
+  });
+
+  it("continues closing remaining PRs when one closePr fails", async () => {
+    const logs: string[] = [];
+    const runner = new FakeCommandRunner();
+    runner.on(["gh", "pr", "list"], {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 7, headRefName: "looppilot/ty-123-add-the-login-flow" },
+        { number: 12, headRefName: "looppilot/ty-123-add-the-login-flow-2" },
+      ]),
+      stderr: "",
+    });
+    runner.on(["gh", "pr", "close"], (args) => {
+      if (args[2] === "7") return { code: 1, stdout: "", stderr: "network timeout" };
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    runner.on(["git", "-C", "/repo", "fetch"], { code: 0, stdout: "", stderr: "" });
+    runner.on(["git", "-C", "/repo", "worktree", "add"], { code: 0, stdout: "", stderr: "" });
+
+    const mgr = new GitPrManager(runner, { ...OPTS, log: (line) => logs.push(line) });
+    const result = await mgr.prepareWorktree(issue());
+
+    expect(result.branch).toBe("looppilot/ty-123-add-the-login-flow");
+    // PR #7 failed but #12 was still attempted
+    const closeCalls = runner.calls.filter(c => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close");
+    expect(closeCalls).toHaveLength(2);
+    expect(logs.some(l => l.includes("#7") && l.includes("non-fatal"))).toBe(true);
+    expect(logs.some(l => l.includes("closed stale PR #12"))).toBe(true);
+  });
 });
 
 describe("GitPrManager.hasCommitsWithDiff", () => {
