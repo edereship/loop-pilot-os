@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS run (
   task_cap INTEGER NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('running','idle','halted','paused')),
   halt_reason TEXT,
-  pause_meta TEXT
+  pause_meta TEXT,
+  checkout_dirty INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS task_session (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +169,7 @@ interface RawRunRow {
   halt_reason: string | null;
   pause_meta: string | null;
   idle_started_at: string | null;
+  checkout_dirty: number;
 }
 function parsePauseMeta(raw: string | null): PauseMeta | null {
   if (raw === null) return null;
@@ -186,6 +188,7 @@ function toRunRow(r: RawRunRow): RunRow {
     haltReason: r.halt_reason,
     pauseMeta: parsePauseMeta(r.pause_meta),
     idleStartedAt: r.idle_started_at,
+    checkoutDirty: r.checkout_dirty ?? 0,
   };
 }
 
@@ -703,6 +706,9 @@ export class SqliteStore {
     if (!runColumns.has("idle_started_at")) {
       this.db.exec(`ALTER TABLE run ADD COLUMN idle_started_at TEXT`);
     }
+    if (!runColumns.has("checkout_dirty")) {
+      this.db.exec(`ALTER TABLE run ADD COLUMN checkout_dirty INTEGER NOT NULL DEFAULT 0`);
+    }
 
     const verifyLogColumns = new Set(
       (
@@ -785,6 +791,11 @@ export class SqliteStore {
     this.db.prepare(
       `UPDATE run SET idle_started_at = NULL WHERE id = ?`,
     ).run(id);
+  }
+
+  /** Mark the run's checkout as dirty so the next startup runs cleanup before committing memory (ES-512 Finding 6). */
+  setRunCheckoutDirty(id: number): void {
+    this.db.prepare(`UPDATE run SET checkout_dirty = 1 WHERE id = ?`).run(id);
   }
 
   /**
