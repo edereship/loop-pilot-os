@@ -281,6 +281,12 @@ export class Orchestrator {
         // alone cannot remove Codex-authored commits that a prior failed git reset --hard
         // left on HEAD. Without this reset, rebaseGuardAndCommitMemory would replay those
         // commits onto origin/<defaultBranch> and publish them as ancestors (ES-512 Finding 8).
+        // Abort any stale in-progress rebase before fetch+reset: git reset --hard does not
+        // remove .git/rebase-merge or .git/rebase-apply state directories, so without this
+        // rebaseGuardAndCommitMemory would fail with "rebase already in progress" and its
+        // subsequent --abort would undo the reset and move HEAD to the pre-rebase commit
+        // (ES-512 Finding 1).
+        await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
         await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
         const startupResetRes = await this.runner.run("git", ["reset", "--hard", `origin/${defaultBranch}`], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
         if (!startupResetRes || startupResetRes.code !== 0) {
@@ -1661,6 +1667,35 @@ export class Orchestrator {
   }
 
   // ---- DESIGN REVIEW（ES-477: Codex ブロッキングレビュー） ----
+
+  /**
+   * Reverts an issue to Todo with retries, stops the session, and applies needs-human
+   * triage if the revert fails. Pre-PR halt paths that call stopSession with pr_number
+   * null are not picked up by startup recovery, so a failed revert leaves the ticket
+   * stuck In Progress with no retry path (ES-512 Finding 2).
+   */
+  private async haltDesignReviewWithTodoRevert(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+    haltDetail: string,
+  ): Promise<void> {
+    let revertErr: string | null = null;
+    try {
+      await retryTransient(this.config.safety.transientRetryAttempts, () =>
+        this.source.transition(issue.id, "todo"),
+        { onRetry: (n, e) => this.log(`transient retry ${n}: todo revert for ${issue.identifier}: ${errMsg(e)}`) },
+      );
+    } catch (err) {
+      revertErr = errMsg(err);
+      this.log(`designReview: todo revert failed (ticket may be stuck In Progress): ${revertErr}`);
+    }
+    const stopDetail = revertErr ? `${haltDetail}; todo revert failed: ${revertErr}` : haltDetail;
+    await this.stopSession(session, "exception", stopDetail);
+    if (revertErr !== null) {
+      await this.applyNeedsHumanTriage(session, "exception", stopDetail);
+    }
+  }
+
   private async designReview(
     session: TaskSessionRow,
     issue: EligibleIssue,
@@ -1762,9 +1797,7 @@ export class Orchestrator {
       if (catchCheckoutRes.code !== 0) {
         const haltDetail = `designReview: branch restore failed in error path for ${session.branch} (exit ${catchCheckoutRes.code}); halting to avoid IMPLEMENT on wrong branch`;
         this.log(haltDetail);
-        // Revert the ticket before stopping — this is pre-PR so recovery ignores it otherwise (ES-512 Finding 2).
-        await bestEffort(() => this.source.transition(issue.id, "todo"));
-        await this.stopSession(session, "exception", haltDetail);
+        await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
         return { control: "halt" };
       }
       if (reviewStartSha) {
@@ -1772,9 +1805,7 @@ export class Orchestrator {
         if (catchResetRes.code !== 0) {
           const haltDetail = `designReview: reviewer reset to ${reviewStartSha} failed in error path; halting to prevent reviewer-authored commits from reaching IMPLEMENT`;
           this.log(haltDetail);
-          // Revert the ticket before stopping — this is pre-PR so recovery ignores it otherwise (ES-512 Finding 2).
-          await bestEffort(() => this.source.transition(issue.id, "todo"));
-          await this.stopSession(session, "exception", haltDetail);
+          await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
           return { control: "halt" };
         }
       }
@@ -1789,9 +1820,7 @@ export class Orchestrator {
     if (checkoutRes.code !== 0) {
       const haltDetail = `designReview: branch restore failed for ${session.branch} (exit ${checkoutRes.code}); halting to avoid IMPLEMENT on wrong branch`;
       this.log(haltDetail);
-      // Revert the ticket before stopping — this is pre-PR so recovery ignores it otherwise (ES-512 Finding 2).
-      await bestEffort(() => this.source.transition(issue.id, "todo"));
-      await this.stopSession(session, "exception", haltDetail);
+      await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
       return { control: "halt" };
     }
     // Reset to the pre-review SHA to undo any commits the reviewer created.
@@ -1800,9 +1829,7 @@ export class Orchestrator {
       if (resetRes.code !== 0) {
         const haltDetail = `designReview: reviewer reset to ${reviewStartSha} failed; halting to prevent reviewer-authored commits from reaching IMPLEMENT`;
         this.log(haltDetail);
-        // Revert the ticket before stopping — this is pre-PR so recovery ignores it otherwise (ES-512 Finding 2).
-        await bestEffort(() => this.source.transition(issue.id, "todo"));
-        await this.stopSession(session, "exception", haltDetail);
+        await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
         return { control: "halt" };
       }
     }
@@ -6607,8 +6634,16 @@ export class Orchestrator {
       } else {
         // Halt-path: restore any dirty docs/memory files so the clean-worktree
         // preflight on the next startup does not fail (ES-452 Finding 1).
-        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        const haltPathCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        const haltPathCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!haltPathCheckoutRes || haltPathCheckoutRes.code !== 0 || !haltPathCleanRes || haltPathCleanRes.code !== 0) {
+          // Cleanup timed out or failed — docs/memory/ may still be dirty. Persist the
+          // flag so the next startup runs its own cleanup before bootstrapping (ES-512 Finding 3).
+          if (this.runId !== 0) {
+            try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+          }
+          return true;
+        }
       }
       return false;
     }
@@ -6639,13 +6674,19 @@ export class Orchestrator {
       return unknownCleanupFailed;
     }
     if (unmergedRes.stdout.trim().length > 0) {
-      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+      const conflictCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
       this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
       if (beforeCommit !== undefined) {
         // Bootstrap path: seed memory, then commit locally (ES-503).
         // checkout HEAD already ran above to clear conflict markers; untracked
         // stale files are handled by git clean so initializeMemory starts fresh.
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        const conflictCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!conflictCheckoutRes || conflictCheckoutRes.code !== 0 || !conflictCleanRes || conflictCleanRes.code !== 0) {
+          // Cleanup failed or timed out: conflicted or stale memory files may remain.
+          // Treat the bootstrap as unsafe to avoid committing stale artifacts (ES-512 Finding 4).
+          this.log("warning: conflict cleanup failed; skipping memory bootstrap to avoid committing stale artifacts");
+          return true;
+        }
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in autostash-conflict path: ${err instanceof Error ? err.message : String(err)}`);
           // Revert tracked modifications and remove untracked files so commitIfChanged
