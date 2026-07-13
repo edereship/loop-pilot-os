@@ -105,6 +105,11 @@ async function runLoop(configPath: string): Promise<number> {
     // scout labels when the key is absent, preventing spurious preflight failures.
     const scoutAvailable = config.scout.enabled && !!process.env.ANTHROPIC_API_KEY;
 
+    // When the previous run persisted checkout_dirty=1, the working tree may still contain
+    // Codex artifacts. Skip the dirty-tree check so the daemon can start and let the
+    // orchestrator's startup cleanup restore the checkout before any work runs (ES-512 Finding 1).
+    const allowDirtyCheckout = (store.latestRun()?.checkoutDirty ?? 0) !== 0;
+
     // プリフライト: 違反を全件収集 → 列挙して exit 1（仕様 §8 / カーネル §9）。
     // fetchFn は Node 24 ネイティブ fetch。Linear 解決もこの中で fetch を使う。
     const preflightErrors = await runPreflight({
@@ -113,6 +118,7 @@ async function runLoop(configPath: string): Promise<number> {
       notifier,
       fetchFn: timedFetch,
       getuid: process.getuid?.bind(process),
+      allowDirtyCheckout,
     });
     if (preflightErrors.length > 0) {
       process.stderr.write("Preflight failed:\n");

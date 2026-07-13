@@ -286,18 +286,26 @@ export class Orchestrator {
         // rebaseGuardAndCommitMemory would fail with "rebase already in progress" and its
         // subsequent --abort would undo the reset and move HEAD to the pre-rebase commit
         // (ES-512 Finding 1).
-        await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-        await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
-        const startupResetRes = await this.runner.run("git", ["reset", "--hard", `origin/${defaultBranch}`], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
-        if (!startupResetRes || startupResetRes.code !== 0) {
-          this.log("warning: checkout_dirty startup reset to origin/<defaultBranch> failed; skipping memory bootstrap to prevent publishing Codex commits as ancestors");
+        const startupAbortRes = await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => ({ code: 1, stdout: "", stderr: "abort threw" }));
+        if (startupAbortRes.code !== 0 && !startupAbortRes.stderr.includes("No rebase in progress")) {
+          // The abort failed with an unexpected error — the checkout may be mid-rebase or
+          // in a corrupt state. Skip fetch+reset to avoid acting on unknown git state, and
+          // treat the cleanup as failed so the run halts (ES-512 Finding 2).
+          this.log("warning: checkout_dirty rebase --abort failed with unexpected error; halting startup cleanup to avoid acting on a potentially mid-rebase checkout");
           startupCheckoutDirtyResetFailed = true;
         } else {
-          const startupCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
-          const startupMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
-          if (!startupCleanRes || startupCleanRes.code !== 0 || !startupMemCleanRes || startupMemCleanRes.code !== 0) {
-            this.log("warning: checkout_dirty startup git clean failed; checkout may still contain Codex artifacts");
+          await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
+          const startupResetRes = await this.runner.run("git", ["reset", "--hard", `origin/${defaultBranch}`], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!startupResetRes || startupResetRes.code !== 0) {
+            this.log("warning: checkout_dirty startup reset to origin/<defaultBranch> failed; skipping memory bootstrap to prevent publishing Codex commits as ancestors");
             startupCheckoutDirtyResetFailed = true;
+          } else {
+            const startupCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+            const startupMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+            if (!startupCleanRes || startupCleanRes.code !== 0 || !startupMemCleanRes || startupMemCleanRes.code !== 0) {
+              this.log("warning: checkout_dirty startup git clean failed; checkout may still contain Codex artifacts");
+              startupCheckoutDirtyResetFailed = true;
+            }
           }
         }
       }
@@ -1688,6 +1696,11 @@ export class Orchestrator {
     } catch (err) {
       revertErr = errMsg(err);
       this.log(`designReview: todo revert failed (ticket may be stuck In Progress): ${revertErr}`);
+    }
+    // Discard the worktree and branch so repeated halt+requeue cycles do not exhaust
+    // prepareWorktree's suffix space (ES-512 Finding 4).
+    if (session.worktreePath) {
+      await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
     }
     const stopDetail = revertErr ? `${haltDetail}; todo revert failed: ${revertErr}` : haltDetail;
     await this.stopSession(session, "exception", stopDetail);
@@ -6704,9 +6717,18 @@ export class Orchestrator {
           this.log(`warning: bootstrap memory commit failed after autostash conflict; ${reseeded ? "files re-seeded but uncommitted" : "re-seed also failed, memory unavailable"}`);
         }
       } else {
-        // Halt-path: remove untracked files so the next startup's clean-worktree
-        // preflight does not fail.
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        // Halt-path: restore tracked files and remove untracked files so the next
+        // startup's clean-worktree preflight does not fail.
+        const haltConflictCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!conflictCheckoutRes || conflictCheckoutRes.code !== 0 || !haltConflictCleanRes || haltConflictCleanRes.code !== 0) {
+          // Cleanup failed or timed out: docs/memory/ may remain dirty. Persist the
+          // flag so the next startup runs its own cleanup before bootstrapping
+          // (ES-512 Finding 3).
+          if (this.runId !== 0) {
+            try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+          }
+          return true;
+        }
       }
       return false;
     }

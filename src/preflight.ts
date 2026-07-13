@@ -11,6 +11,12 @@ export interface PreflightDeps {
   fetchFn: FetchFn;
   /** process.getuid の注入口。未提供（Windows/非 POSIX）時は root チェックをスキップする。 */
   getuid?: () => number;
+  /**
+   * When true, the working-tree dirty check in §9.2 is skipped. Set by main.ts when the
+   * previous run persisted checkout_dirty=1, so the orchestrator's startup cleanup can run
+   * before the porcelain state is re-verified (ES-512 Finding 1).
+   */
+  allowDirtyCheckout?: boolean;
 }
 
 // gh api は HTTP エラー時 code != 0 で終了し、stderr に "(HTTP 404)" 等を含む。
@@ -45,7 +51,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<string[]> {
   const opts = { cwd: repoPath, timeoutMs: 30_000 };
 
   // カーネル §9: 全項目を実行して集約。各 check 内で try/catch し、途中 throw しない。
-  await checkGitClean(runner, repoPath, branch, opts, errors);          // §9.2
+  await checkGitClean(runner, repoPath, branch, opts, errors, deps.allowDirtyCheckout);  // §9.2
   await checkOriginMatchesRemote(runner, repoPath, repoSlug, opts, errors); // ES-415
   await checkRemote(runner, repoPath, opts, errors);                   // §9.3（Step 4b で追加）
   await checkGhAuth(runner, opts, errors);                             // §9.4 認証（Step 4b で追加）
@@ -71,6 +77,7 @@ async function checkGitClean(
   branch: string,
   opts: { cwd: string },
   errors: string[],
+  allowDirtyCheckout?: boolean,
 ): Promise<void> {
   try {
     const head = await runner.run("git", ["-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD"], opts);
@@ -80,11 +87,15 @@ async function checkGitClean(
     } else if (current !== branch) {
       errors.push(`git: 現在のブランチが '${current}' です。default_branch '${branch}' 上で起動してください`);
     }
-    const status = await runner.run("git", ["-C", repoPath, "status", "--porcelain"], opts);
-    if (status.code !== 0) {
-      errors.push(`git: 作業ツリーの状態を取得できません（${status.stderr.trim()}）`);
-    } else if (status.stdout.trim() !== "") {
-      errors.push("git: 作業ツリーがクリーンではありません。未コミットの変更を解消してください");
+    // Skip dirty-tree check when the previous run persisted checkout_dirty: the orchestrator's
+    // startup cleanup will restore the working tree before any work is done (ES-512 Finding 1).
+    if (!allowDirtyCheckout) {
+      const status = await runner.run("git", ["-C", repoPath, "status", "--porcelain"], opts);
+      if (status.code !== 0) {
+        errors.push(`git: 作業ツリーの状態を取得できません（${status.stderr.trim()}）`);
+      } else if (status.stdout.trim() !== "") {
+        errors.push("git: 作業ツリーがクリーンではありません。未コミットの変更を解消してください");
+      }
     }
   } catch (e) {
     errors.push(`git: 状態確認に失敗しました（${(e as Error).message}）`);
