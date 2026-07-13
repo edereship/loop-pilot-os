@@ -6578,8 +6578,16 @@ export class Orchestrator {
         // — a push would be non-fast-forward. Both steps are best-effort.
         // Clean memory dir first: checkout restores tracked files to HEAD; clean removes
         // untracked stale files from a prior crashed run that initializeMemory would skip.
-        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        const rebaseSkipCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        const rebaseSkipCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!rebaseSkipCheckoutRes || rebaseSkipCheckoutRes.code !== 0 || !rebaseSkipCleanRes || rebaseSkipCleanRes.code !== 0) {
+          // Cleanup timed out or failed: docs/memory/ may still contain stale Codex-authored
+          // files. Skip beforeCommit()/commitIfChanged() to avoid committing stale artifacts
+          // as bootstrap memory; return true so the caller persists the dirty flag and halts
+          // (ES-512 Codex Finding 1 — rebase-skip cleanup guard).
+          this.log("warning: rebase-skip memory cleanup failed; skipping memory bootstrap to avoid committing stale Codex artifacts");
+          return true;
+        }
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in rebase-skip path: ${err instanceof Error ? err.message : String(err)}`);
           // Revert tracked modifications and remove untracked files so commitIfChanged
