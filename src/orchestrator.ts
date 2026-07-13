@@ -295,13 +295,14 @@ export class Orchestrator {
           }
         }
       }
+      let startupRebaseLeftCheckoutUnsafe = false;
       if (!startupCheckoutDirtyResetFailed) {
         try {
           // Seed/initialize the local memory files for this run inside the rebase guard so
           // the bootstrap commit follows the same conflict-marker protection as the halt
           // commit (ES-452 Findings 2/3/4). initializeMemory always runs (even when the
           // commit is skipped) so the run has memory available regardless.
-          await this.rebaseGuardAndCommitMemory(() =>
+          startupRebaseLeftCheckoutUnsafe = await this.rebaseGuardAndCommitMemory(() =>
             initializeMemory(
               this.config.repo.path,
               this.store,
@@ -332,6 +333,17 @@ export class Orchestrator {
         const haltDetail = "startup: checkout_dirty cleanup failed; halting to prevent SELECT/GROOM from running against unsafe checkout";
         // Persist the dirty flag on the new run so the next startup knows to re-run cleanup
         // rather than treating this halted row as a clean baseline (ES-512 Finding 1).
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+        this.store.setRunState(this.runId, "halted", haltDetail);
+        await this.notifier.notify({ kind: "halted", reason: "startup_checkout_dirty", detail: haltDetail });
+        this.log(haltDetail);
+        return "finished";
+      }
+      // Finding 1/2 (ES-512): rebaseGuardAndCommitMemory() ran before createRun() so runId
+      // was 0 and it could not persist checkout_dirty inline. Halt now that we have a run row
+      // so the next startup knows to clean up before bootstrapping (ES-512 Findings 1/2).
+      if (startupRebaseLeftCheckoutUnsafe) {
+        const haltDetail = "startup: rebase --abort failed or post-rebase cleanup failed; checkout may be mid-rebase or detached; halting to prevent SELECT/GROOM from running against unsafe checkout";
         try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
         this.store.setRunState(this.runId, "halted", haltDetail);
         await this.notifier.notify({ kind: "halted", reason: "startup_checkout_dirty", detail: haltDetail });
@@ -6510,7 +6522,13 @@ export class Orchestrator {
       return;
     }
     try {
-      await this.rebaseGuardAndCommitMemory();
+      const checkoutUnsafe = await this.rebaseGuardAndCommitMemory();
+      // Finding 1/2 (ES-512): if the rebase guard left the checkout in an unsafe state
+      // (mid-rebase or unknown index after failed cleanup), persist the dirty flag so the
+      // next startup knows to run cleanup before proceeding (ES-512 Codex Findings 1/2).
+      if (checkoutUnsafe && this.runId !== 0) {
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+      }
     } catch (err) {
       this.log(`warning: failed to commit memory on halt: ${errMsg(err)}`);
     }
@@ -6525,7 +6543,7 @@ export class Orchestrator {
    * can seed/initialize memory locally for the run even when the commit itself is skipped.
    * All steps are best-effort.
    */
-  private async rebaseGuardAndCommitMemory(beforeCommit?: () => void): Promise<void> {
+  private async rebaseGuardAndCommitMemory(beforeCommit?: () => void): Promise<boolean> {
     const repoPath = this.config.repo.path;
     const defaultBranch = this.config.repo.defaultBranch;
     await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
@@ -6546,7 +6564,7 @@ export class Orchestrator {
           // checkout may be mid-rebase or detached. Skip all memory operations to
           // avoid seeding or committing in that state (ES-512 Codex Finding 4).
           this.log("warning: rebase --abort also failed; skipping memory operations to avoid acting on a mid-rebase or detached checkout");
-          return;
+          return true; // checkout may be mid-rebase or detached; caller must persist dirty marker
         }
         // "No rebase in progress" means the rebase failed before creating any rebase
         // state; the checkout is in a clean pre-rebase state. Fall through to run
@@ -6584,7 +6602,7 @@ export class Orchestrator {
         await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
         await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
       }
-      return;
+      return false;
     }
     // Even when rebase exits 0, the autostash pop may leave conflict markers in the
     // working tree. Detect unmerged files, restore them to HEAD, and skip the commit to
@@ -6603,11 +6621,14 @@ export class Orchestrator {
       // Finding 3: if either cleanup fails, docs/memory/ may remain dirty while no
       // checkout_dirty marker is set, so next startup would bootstrap against unknown index
       // state. Persist the flag so next startup runs its own cleanup (ES-512 Finding 3).
-      if ((!unknownCheckoutRes || unknownCheckoutRes.code !== 0 || !unknownCleanRes || unknownCleanRes.code !== 0) && this.runId !== 0) {
+      // Finding 2 (ES-512): when runId === 0 (startup bootstrap), setRunCheckoutDirty cannot
+      // be called yet — propagate via return value so run() sets it after createRun().
+      const unknownCleanupFailed = (!unknownCheckoutRes || unknownCheckoutRes.code !== 0 || !unknownCleanRes || unknownCleanRes.code !== 0);
+      if (unknownCleanupFailed && this.runId !== 0) {
         try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
       }
       this.log("warning: unmerged-file check timed out or failed; skipping memory commit to avoid acting on unknown index state");
-      return;
+      return unknownCleanupFailed;
     }
     if (unmergedRes.stdout.trim().length > 0) {
       await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
@@ -6638,7 +6659,7 @@ export class Orchestrator {
         // preflight does not fail.
         await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
       }
-      return;
+      return false;
     }
     beforeCommit?.();
     // Do not swallow commitIfChanged errors: let them propagate so the outer catch in
@@ -6713,6 +6734,7 @@ export class Orchestrator {
         }
       }
     }
+    return false;
   }
 
   /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。

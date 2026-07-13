@@ -782,6 +782,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
     const inlineMemoryRunner1 = new FakeCommandRunner();
     inlineMemoryRunner1.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner1.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
     inlineMemoryRunner1.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
@@ -3161,6 +3162,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
     const inlineMemoryRunner2 = new FakeCommandRunner();
     inlineMemoryRunner2.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner2.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
     inlineMemoryRunner2.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
