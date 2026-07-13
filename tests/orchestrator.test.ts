@@ -5612,12 +5612,19 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     // Run halted (not completed).
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("abandon cap reached");
-    // Halt notification sent with the cap detail.
+    // Halt notification sent with the cap detail, including the triggering ticket's identifier.
     const halts = h.notifier.events.filter((e) => e.kind === "halted");
     expect(halts.length).toBeGreaterThanOrEqual(1);
     expect(
       halts.some((e) => (e as { detail?: string }).detail?.includes("abandon cap reached")),
     ).toBe(true);
+    expect(
+      halts.some((e) => (e as { detail?: string }).detail?.includes("TY-3")),
+    ).toBe(true);
+    // ES-509 review: cap-halt must perform the same ticket cleanup as other abandon paths —
+    // needs-human label applied and the 3rd (halted) ticket reverted to todo.
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-C", labelName: config.linear.needsHumanLabel });
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-C", state: "todo" });
   });
 
   it("abandon count is DB-derived (survives fresh store instance) (ES-509)", async () => {

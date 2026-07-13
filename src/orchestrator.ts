@@ -6313,7 +6313,7 @@ export class Orchestrator {
       // ES-509: per-run abandon cap — halt instead of abandoning when the limit is reached.
       const abandonCount = this.store.countAbandons(this.runId);
       if (abandonCount >= this.config.safety.maxAbandonsPerRun) {
-        const capDetail = `abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
+        const capDetail = `${session.linearIdentifier}: abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
         this.log(capDetail);
         await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
         this.store.updateSession(session.id, {
@@ -6323,6 +6323,22 @@ export class Orchestrator {
           endedAt: this.clock(),
           ...patch,
         });
+        // ES-509 review: the cap-halt path must perform the same ticket cleanup as
+        // every other abandon path — discard the worktree, revert the ticket to
+        // todo, and apply the needs-human label — so the ticket doesn't stay stuck
+        // "In Progress" with no signal for a human to pick it up.
+        if (session.worktreePath) {
+          await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+        }
+        try {
+          await retryTransient(this.config.safety.transientRetryAttempts, () =>
+            this.source.transition(session.linearIssueId, "todo"),
+            { onRetry: (n, e) => this.log(`transient retry ${n}: todo revert for ${session.linearIdentifier}: ${errMsg(e)}`) },
+          );
+        } catch (err) {
+          this.log(`abandon cap: todo revert failed (ticket may be stuck): ${errMsg(err)}`);
+        }
+        await this.applyNeedsHumanTriage(session, reason, userFacingDetail(effectiveDetail));
         await this.commitMemoryBeforeHalt();
         this.store.setRunState(this.runId, "halted", capDetail);
         return HALT;
