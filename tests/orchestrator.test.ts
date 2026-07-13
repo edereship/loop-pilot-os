@@ -6334,6 +6334,88 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(sessions[0]!.state).toBe("merged");
   });
 
+  it("git clean -fd timeout in success path aborts execution and records error (ES-512 Finding 2)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns valid output with a reprioritize action
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Bump ES-1"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // Simulate git clean -fd timing out / failing in the success-path cleanup
+    h.memoryRunner.on(["git", "clean", "-fd"], { code: 1, stderr: "timeout" });
+
+    // SELECT outcome (2 issues needed to trigger the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // groom_log must record the failure as an error
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("git clean -fd");
+    expect(groomLog.actionsExecuted).toBe(0);
+
+    // No Linear reprioritize call should have been made (actions must not execute)
+    expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(0);
+
+    // Session still completed despite GROOM failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("git reset --hard timeout in success path aborts memory commit to prevent publishing Codex commits (ES-512 Finding 1)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns valid output with a reprioritize action
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Bump ES-1"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // Simulate git reset --hard timing out / failing in the success-path cleanup
+    h.memoryRunner.on(["git", "reset", "--hard"], { code: 1, stderr: "timeout" });
+
+    // SELECT outcome (2 issues needed to trigger the planner)
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
+    });
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    // groom_log must record the failure as an error
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("git reset --hard");
+    expect(groomLog.actionsExecuted).toBe(0);
+
+    // No Linear reprioritize call should have been made (actions must not execute)
+    expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(0);
+
+    // Session still completed despite GROOM failure
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions[0]!.state).toBe("merged");
+  });
+
   it("GROOM-blocked issues are excluded from SELECT eligible list (ES-457 Finding 2)", async () => {
     const planner = new FakePlanRunner();
     const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });

@@ -2083,12 +2083,50 @@ export class Orchestrator {
       // -fd (not -fdx) avoids deleting repo-root ignored files (.env, node_modules, etc.);
       // the path-scoped -fdx -- docs/memory/ cleans ignored memory files specifically.
       await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+      // Finding 2: a timeout here leaves Codex artifacts in the tree; treat failure as fatal
+      // rather than continuing as if cleanup succeeded.
+      const cleanResult = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      if (!cleanResult || cleanResult.code !== 0) {
+        this.log(`groom: git clean -fd failed or timed out; aborting to prevent Codex artifacts from leaking`);
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            summary: groomOutput.summary,
+            actionsRequested: allActions.length,
+            actionsExecuted: 0,
+            actionsRejected: rejectedCount,
+            outcome: "error",
+            errorDetail: "git clean -fd timed out or failed; aborting",
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        return { control: "continue", summary: null, blockedIds };
+      }
       await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
       // If Codex created commits and advanced HEAD, reset back to the recorded starting
       // SHA so only the memory commit is pushed (ES-457 Finding 1).
       if (startSha) {
-        await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        // Finding 1: a timeout here leaves HEAD on Codex-authored commits; treat failure as
+        // fatal so the memory commit is never pushed with those commits as ancestors.
+        const resetResult = await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!resetResult || resetResult.code !== 0) {
+          this.log(`groom: git reset --hard failed or timed out; aborting to prevent publishing Codex commits`);
+          try {
+            this.store.updateGroomLog(groomLogRow.id, {
+              endedAt: this.clock(),
+              summary: groomOutput.summary,
+              actionsRequested: allActions.length,
+              actionsExecuted: 0,
+              actionsRejected: rejectedCount,
+              outcome: "error",
+              errorDetail: "git reset --hard timed out or failed; aborting memory commit",
+            });
+          } catch (logErr) {
+            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+          }
+          return { control: "continue", summary: null, blockedIds };
+        }
       }
 
       // 6. Execute one action at a time with SIGINT check per action (D-14)
