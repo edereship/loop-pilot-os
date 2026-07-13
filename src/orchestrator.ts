@@ -272,26 +272,41 @@ export class Orchestrator {
       // Finding 6: if the prior run's commitMemoryBeforeHalt cleanup failed, the checkout
       // may still contain Codex artifacts. Clean up before rebaseGuardAndCommitMemory so
       // those artifacts are not committed as ancestors (ES-512 Codex Finding 6).
+      let startupCheckoutDirtyResetFailed = false;
       if (previousRun?.checkoutDirty) {
         this.log("warning: previous run left checkout dirty; cleaning up before memory initialization");
         const repoPath = this.config.repo.path;
-        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        const defaultBranch = this.config.repo.defaultBranch;
+        // Fetch and hard-reset to origin/<defaultBranch> before memory bootstrap: git clean
+        // alone cannot remove Codex-authored commits that a prior failed git reset --hard
+        // left on HEAD. Without this reset, rebaseGuardAndCommitMemory would replay those
+        // commits onto origin/<defaultBranch> and publish them as ancestors (ES-512 Finding 8).
+        await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
+        const startupResetRes = await this.runner.run("git", ["reset", "--hard", `origin/${defaultBranch}`], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!startupResetRes || startupResetRes.code !== 0) {
+          this.log("warning: checkout_dirty startup reset to origin/<defaultBranch> failed; skipping memory bootstrap to prevent publishing Codex commits as ancestors");
+          startupCheckoutDirtyResetFailed = true;
+        } else {
+          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        }
       }
-      try {
-        // Seed/initialize the local memory files for this run inside the rebase guard so
-        // the bootstrap commit follows the same conflict-marker protection as the halt
-        // commit (ES-452 Findings 2/3/4). initializeMemory always runs (even when the
-        // commit is skipped) so the run has memory available regardless.
-        await this.rebaseGuardAndCommitMemory(() =>
-          initializeMemory(
-            this.config.repo.path,
-            this.store,
-            this.config.digest.recentMergedCount,
-          ),
-        );
-      } catch (err: unknown) {
-        this.log(`warning: failed to initialize memory: ${err instanceof Error ? err.message : String(err)}`);
+      if (!startupCheckoutDirtyResetFailed) {
+        try {
+          // Seed/initialize the local memory files for this run inside the rebase guard so
+          // the bootstrap commit follows the same conflict-marker protection as the halt
+          // commit (ES-452 Findings 2/3/4). initializeMemory always runs (even when the
+          // commit is skipped) so the run has memory available regardless.
+          await this.rebaseGuardAndCommitMemory(() =>
+            initializeMemory(
+              this.config.repo.path,
+              this.store,
+              this.config.digest.recentMergedCount,
+            ),
+          );
+        } catch (err: unknown) {
+          this.log(`warning: failed to initialize memory: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
 
       const taskCap = this.config.safety.maxTasksPerRun;
