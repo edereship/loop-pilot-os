@@ -178,6 +178,51 @@ describe("runPreflight", () => {
     expect(errors.some((e) => e.includes("クリーンではありません"))).toBe(true);
   });
 
+  // ES-512 Finding 1: allowDirtyCheckout=true はブランチチェック・ダーティチェック両方をスキップする。
+  // checkout_dirty が設定された後の次回起動時、HEAD が detached または別ブランチである可能性があるため、
+  // orchestrator の startup cleanup（git rebase --abort + git reset --hard）が実行できるよう
+  // 両チェックをスキップしてプリフライトを通過させる。
+  it("allowDirtyCheckout=true のとき detached HEAD でもブランチエラーを出さない（ES-512 Finding 1）", async () => {
+    const r = passingRunner();
+    // Detached HEAD: rev-parse --abbrev-ref HEAD returns "HEAD"
+    r.on(["git", "-C", "/abs/repo", "rev-parse", "--abbrev-ref", "HEAD"], { code: 0, stdout: "HEAD\n", stderr: "" });
+    const errors = await runPreflight({
+      config: makeConfig(),
+      runner: r,
+      notifier: passingNotifier,
+      fetchFn: passingFetch(),
+      allowDirtyCheckout: true,
+    });
+    expect(errors.filter((e) => e.includes("default_branch") || e.includes("HEAD"))).toEqual([]);
+  });
+
+  it("allowDirtyCheckout=true のとき別ブランチでもブランチエラーを出さない（ES-512 Finding 1）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "rev-parse", "--abbrev-ref", "HEAD"], { code: 0, stdout: "some-feature-branch\n", stderr: "" });
+    const errors = await runPreflight({
+      config: makeConfig(),
+      runner: r,
+      notifier: passingNotifier,
+      fetchFn: passingFetch(),
+      allowDirtyCheckout: true,
+    });
+    expect(errors.filter((e) => e.includes("default_branch") || e.includes("some-feature-branch"))).toEqual([]);
+  });
+
+  it("allowDirtyCheckout=true のときダーティな作業ツリーでもエラーを出さない（ES-512 Finding 1）", async () => {
+    const r = passingRunner();
+    r.on(["git", "-C", "/abs/repo", "rev-parse", "--abbrev-ref", "HEAD"], { code: 0, stdout: "HEAD\n", stderr: "" });
+    r.on(["git", "-C", "/abs/repo", "status", "--porcelain"], { code: 0, stdout: " M src/a.ts\n", stderr: "" });
+    const errors = await runPreflight({
+      config: makeConfig(),
+      runner: r,
+      notifier: passingNotifier,
+      fetchFn: passingFetch(),
+      allowDirtyCheckout: true,
+    });
+    expect(errors.filter((e) => e.includes("クリーンではありません") || e.includes("default_branch"))).toEqual([]);
+  });
+
   it("remote 到達不可なら NG（仕様 §9.3）", async () => {
     const r = passingRunner();
     r.on(["git", "-C", "/abs/repo", "ls-remote", "origin", "HEAD"], { code: 128, stdout: "", stderr: "fatal: could not read from remote" });

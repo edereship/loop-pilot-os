@@ -79,6 +79,11 @@ async function checkGitClean(
   errors: string[],
   allowDirtyCheckout?: boolean,
 ): Promise<void> {
+  // When the previous run persisted checkout_dirty, the checkout may be mid-rebase or in a
+  // detached HEAD state. Skip both the branch check and the dirty-tree check so the orchestrator
+  // can start and let its startup cleanup (git rebase --abort + git reset --hard) restore the
+  // working tree and branch before any work is done (ES-512 Finding 1).
+  if (allowDirtyCheckout) return;
   try {
     const head = await runner.run("git", ["-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD"], opts);
     const current = head.stdout.trim();
@@ -87,15 +92,11 @@ async function checkGitClean(
     } else if (current !== branch) {
       errors.push(`git: 現在のブランチが '${current}' です。default_branch '${branch}' 上で起動してください`);
     }
-    // Skip dirty-tree check when the previous run persisted checkout_dirty: the orchestrator's
-    // startup cleanup will restore the working tree before any work is done (ES-512 Finding 1).
-    if (!allowDirtyCheckout) {
-      const status = await runner.run("git", ["-C", repoPath, "status", "--porcelain"], opts);
-      if (status.code !== 0) {
-        errors.push(`git: 作業ツリーの状態を取得できません（${status.stderr.trim()}）`);
-      } else if (status.stdout.trim() !== "") {
-        errors.push("git: 作業ツリーがクリーンではありません。未コミットの変更を解消してください");
-      }
+    const status = await runner.run("git", ["-C", repoPath, "status", "--porcelain"], opts);
+    if (status.code !== 0) {
+      errors.push(`git: 作業ツリーの状態を取得できません（${status.stderr.trim()}）`);
+    } else if (status.stdout.trim() !== "") {
+      errors.push("git: 作業ツリーがクリーンではありません。未コミットの変更を解消してください");
     }
   } catch (e) {
     errors.push(`git: 状態確認に失敗しました（${(e as Error).message}）`);
