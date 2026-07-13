@@ -1852,11 +1852,13 @@ export class Orchestrator {
       // product_knowledge cannot be rebuilt from the DB, so if the local bootstrap commit
       // is discarded their content would be permanently lost (ES-503 Finding 3).
       const preResetMem = readMemoryAll(repoPath);
+      let fetchSucceeded = false;
       try {
         await this.git.fetchDefaultBranch();
-        // fetchDefaultBranch resets HEAD to origin/<defaultBranch>, so any Codex commits
-        // that a prior failed cleanup left on HEAD are now gone. Safe to commit memory again.
-        this._skipMemoryCommitOnHalt = false;
+        // fetchDefaultBranch resets HEAD to origin/<defaultBranch>, removing any Codex commits
+        // that a prior failed cleanup left on HEAD. The skip guard is cleared only after the
+        // memory dir is also confirmed clean below (ES-512 Codex Finding 2).
+        fetchSucceeded = true;
       } catch (err) {
         this.log(`groom: fetch failed (non-fatal): ${errMsg(err)}`);
       }
@@ -1893,7 +1895,13 @@ export class Orchestrator {
       // without this revert a crash before the next commitIfChanged leaves git status
       // dirty and the next startup's clean-worktree preflight rejects startup (ES-503).
       await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+      const groomStartupMemClean = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      // Clear the skip guard only after BOTH HEAD (via fetchDefaultBranch) AND the memory dir
+      // (via git clean) are confirmed clean — fetchDefaultBranch removes Codex commits from HEAD
+      // but does not touch untracked files in docs/memory/ (ES-512 Codex Finding 2).
+      if (fetchSucceeded && groomStartupMemClean && groomStartupMemClean.code === 0) {
+        this._skipMemoryCommitOnHalt = false;
+      }
 
       let specContent: SpecContent | null = null;
       const specDir = this.config.product.specDir;
@@ -2181,10 +2189,16 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
-        // Stale Codex memory files remain; skip the memory commit on any halt that
-        // follows until fetchDefaultBranch() resets the checkout (ES-512 Codex Finding 4).
+        // Stale Codex memory files remain under docs/memory/. Halt instead of continuing
+        // to SELECT: selectWithPm() reads docs/memory/ and would inject those stale Codex
+        // files into the PM selection prompt (ES-512 Codex Finding 3).
         this._skipMemoryCommitOnHalt = true;
-        return { control: "continue", summary: null, blockedIds };
+        const haltDetail3 = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed; halting to prevent stale Codex memory from reaching SELECT`;
+        await this.commitMemoryBeforeHalt();
+        this.store.setRunState(this.runId, "halted", haltDetail3);
+        await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetail3 });
+        this.log(haltDetail3);
+        return { control: "halt" };
       }
       // If Codex created commits and advanced HEAD, reset back to the recorded starting
       // SHA so only the memory commit is pushed (ES-457 Finding 1).
@@ -2207,12 +2221,16 @@ export class Orchestrator {
           } catch (logErr) {
             this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
           }
-          // Skip memory commit on any subsequent halt: HEAD is still at a Codex commit,
-          // so commitMemoryBeforeHalt() would push those commits as ancestors of the memory
-          // commit. The next GROOM cycle's fetchDefaultBranch() resets HEAD to a clean state
-          // (ES-512 Codex Finding 2).
+          // HEAD is still at a Codex commit. Halt instead of continuing to SELECT:
+          // selectWithPm() reads the Codex-mutated checkout that this branch just declared
+          // unsafe (ES-512 Codex Finding 4).
           this._skipMemoryCommitOnHalt = true;
-          return { control: "continue", summary: null, blockedIds };
+          const haltDetail4 = "groom: git reset --hard timed out or failed; halting to prevent SELECT from running against Codex-mutated checkout";
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetail4);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetail4 });
+          this.log(haltDetail4);
+          return { control: "halt" };
         }
       }
 
@@ -6146,8 +6164,16 @@ export class Orchestrator {
     if (this._skipMemoryCommitOnHalt) {
       // A prior GROOM cleanup step failed: HEAD may be at a Codex commit or docs/memory/
       // may contain Codex-authored files. Skip the memory commit to avoid publishing
-      // those commits as ancestors. The next GROOM's fetchDefaultBranch() will clean up.
+      // those commits as ancestors.
       this.log("warning: skipping memory commit on halt: GROOM left checkout in an unclean state (Codex commits or dirty memory dir)");
+      // Attempt to restore the checkout to a clean state so the next startup's
+      // rebaseGuardAndCommitMemory() does not commit Codex artifacts as ancestors
+      // (ES-512 Codex Finding 1). All steps are best-effort.
+      const repoPath = this.config.repo.path;
+      const defaultBranch = this.config.repo.defaultBranch;
+      await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
+      await this.runner.run("git", ["reset", "--hard", `origin/${defaultBranch}`], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
       return;
     }
     try {
