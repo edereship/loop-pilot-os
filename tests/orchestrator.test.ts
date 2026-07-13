@@ -6334,7 +6334,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(sessions[0]!.state).toBe("merged");
   });
 
-  it("git clean -fd timeout in success path aborts execution and records error (ES-512 Finding 2)", async () => {
+  it("git clean -fd timeout in success path halts run to prevent SELECT against Codex artifacts (ES-512 Finding 4)", async () => {
     const planner = new FakePlanRunner();
     const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
     const h = makeHarness(config, { planner });
@@ -6350,15 +6350,6 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     // Simulate git clean -fd timing out / failing in the success-path cleanup
     h.memoryRunner.on(["git", "clean", "-fd"], { code: 1, stderr: "timeout" });
 
-    // SELECT outcome (2 issues needed to trigger the planner)
-    planner.outcomes.push({
-      kind: "completed",
-      text: '```json\n{"identifier":"TY-1","rationale":"pick"}\n```',
-    });
-    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
-    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
-    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
-
     await h.orch.run();
 
     // groom_log must record the failure as an error
@@ -6370,9 +6361,11 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     // No Linear reprioritize call should have been made (actions must not execute)
     expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(0);
 
-    // Session still completed despite GROOM failure
-    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
-    expect(sessions[0]!.state).toBe("merged");
+    // Run must halt; SELECT must not run against the Codex-artifact-containing checkout
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
   });
 
   it("git reset --hard timeout in success path halts run to prevent SELECT against Codex-mutated checkout (ES-512 Finding 1 / Codex Finding 4)", async () => {
