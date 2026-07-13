@@ -1648,6 +1648,16 @@ export class Orchestrator {
       .then((r) => (r.code === 0 ? r.stdout.trim() : null))
       .catch(() => null);
 
+    // If the SHA cannot be captured (git timeout / error), halt before the reviewer runs.
+    // Without a rollback anchor, any commits the reviewer creates would survive into
+    // IMPLEMENT (ES-512 Codex Finding 1).
+    if (reviewStartSha === null) {
+      const haltDetail = `designReview: failed to capture pre-review SHA; halting to prevent reviewer commits from reaching IMPLEMENT without a rollback anchor`;
+      this.log(haltDetail);
+      await this.stopSession(session, "exception", haltDetail);
+      return { control: "halt" };
+    }
+
     let outcome: PlanOutcome;
     try {
       outcome = await this.designReviewer.run({
@@ -1917,6 +1927,23 @@ export class Orchestrator {
         .then((r) => (r.code === 0 ? r.stdout.trim() : null))
         .catch(() => null);
 
+      // If the SHA cannot be captured, abort GROOM before Codex runs.  Every cleanup
+      // path below is guarded by `if (startSha)`, so running Codex without the anchor
+      // would leave any commits it creates unresettable (ES-512 Codex Finding 2).
+      if (startSha === null) {
+        this.log("groom: failed to capture pre-Codex SHA; aborting to prevent unresettable commits");
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: "failed to capture pre-Codex SHA; aborting",
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        return { control: "continue", summary: null, blockedIds };
+      }
+
       // 3. Run Codex
       let codexOutput: string;
       try {
@@ -2100,6 +2127,11 @@ export class Orchestrator {
           });
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        // Reset to startSha so any Codex-created commits do not remain on the main
+        // checkout after the clean failure (ES-512 Codex Finding 3).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
         }
         return { control: "continue", summary: null, blockedIds };
       }
@@ -6085,8 +6117,15 @@ export class Orchestrator {
       { cwd: repoPath, timeoutMs: 60_000 },
     ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
     if (rebaseRes.code !== 0) {
-      await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath, timeoutMs: 60_000 }).catch(() => {});
+      const abortRes = await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath, timeoutMs: 60_000 }).catch(() => ({ code: 1, stdout: "", stderr: "abort threw" }));
       this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
+      if (abortRes.code !== 0) {
+        // The abort also failed — the checkout may be mid-rebase or detached.
+        // Skip all memory operations to avoid seeding or committing in that state
+        // (ES-512 Codex Finding 4).
+        this.log("warning: rebase --abort also failed; skipping memory operations to avoid acting on a mid-rebase or detached checkout");
+        return;
+      }
       if (beforeCommit !== undefined) {
         // Bootstrap path: seed memory, then commit locally (no push) so files survive
         // the GROOM worktree cleanup (ES-503). Push is skipped because the rebase failed
