@@ -287,8 +287,12 @@ export class Orchestrator {
           this.log("warning: checkout_dirty startup reset to origin/<defaultBranch> failed; skipping memory bootstrap to prevent publishing Codex commits as ancestors");
           startupCheckoutDirtyResetFailed = true;
         } else {
-          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          const startupCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          const startupMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!startupCleanRes || startupCleanRes.code !== 0 || !startupMemCleanRes || startupMemCleanRes.code !== 0) {
+            this.log("warning: checkout_dirty startup git clean failed; checkout may still contain Codex artifacts");
+            startupCheckoutDirtyResetFailed = true;
+          }
         }
       }
       if (!startupCheckoutDirtyResetFailed) {
@@ -324,6 +328,13 @@ export class Orchestrator {
         kind: "run_started",
         detail: `run ${run.id} started (taskCap=${taskCap})`,
       });
+      if (startupCheckoutDirtyResetFailed) {
+        const haltDetail = "startup: checkout_dirty cleanup failed; halting to prevent SELECT/GROOM from running against unsafe checkout";
+        this.store.setRunState(this.runId, "halted", haltDetail);
+        await this.notifier.notify({ kind: "halted", reason: "startup_checkout_dirty", detail: haltDetail });
+        this.log(haltDetail);
+        return "finished";
+      }
       const recovery = await this.recoverPendingSessions();
       if (recovery.control === "continue") {
         await this.loop();
@@ -1736,6 +1747,8 @@ export class Orchestrator {
       if (catchCheckoutRes.code !== 0) {
         const haltDetail = `designReview: branch restore failed in error path for ${session.branch} (exit ${catchCheckoutRes.code}); halting to avoid IMPLEMENT on wrong branch`;
         this.log(haltDetail);
+        // Revert the ticket before stopping — this is pre-PR so recovery ignores it otherwise (ES-512 Finding 2).
+        await bestEffort(() => this.source.transition(issue.id, "todo"));
         await this.stopSession(session, "exception", haltDetail);
         return { control: "halt" };
       }
@@ -1744,6 +1757,8 @@ export class Orchestrator {
         if (catchResetRes.code !== 0) {
           const haltDetail = `designReview: reviewer reset to ${reviewStartSha} failed in error path; halting to prevent reviewer-authored commits from reaching IMPLEMENT`;
           this.log(haltDetail);
+          // Revert the ticket before stopping — this is pre-PR so recovery ignores it otherwise (ES-512 Finding 2).
+          await bestEffort(() => this.source.transition(issue.id, "todo"));
           await this.stopSession(session, "exception", haltDetail);
           return { control: "halt" };
         }
@@ -2521,8 +2536,50 @@ export class Orchestrator {
               { cwd: repoPath, timeoutMs: 120_000 },
             ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
             if (pushRes.code !== 0) {
-              await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+              const rollbackRes = await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
               const pushErr = pushRes.stderr.trim();
+              if (!rollbackRes || rollbackRes.code !== 0) {
+                // Rollback failed: HEAD remains at the unpushed memory commit. Mark
+                // update_memory results failed and halt so SELECT cannot read a memory
+                // state that was not applied (ES-512 Finding 3).
+                for (const r of executionResults) {
+                  if (r.outcome === "executed" && r.action.type === "update_memory") {
+                    r.outcome = "failed";
+                    r.error = `memory push failed and rollback also failed; HEAD may be at unpushed commit: ${pushErr}`;
+                  }
+                }
+                const rollbackFailExecuted = executionResults.filter((r) => r.outcome === "executed").length;
+                const rollbackFailDetails = validationResults.map((vr) => {
+                  const execResult = executionResults.find((er) => er.action === vr.action);
+                  return {
+                    type: vr.action.type,
+                    payload: vr.action,
+                    result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+                    reason: vr.reason ?? execResult?.error,
+                  };
+                });
+                try {
+                  this.store.updateGroomLog(groomLogRow.id, {
+                    endedAt: this.clock(),
+                    summary: groomOutput.summary,
+                    actionsRequested: allActions.length,
+                    actionsExecuted: rollbackFailExecuted,
+                    actionsRejected: rejectedCount,
+                    actionDetails: JSON.stringify(rollbackFailDetails),
+                    outcome: "error",
+                    errorDetail: `memory push failed and git reset --hard HEAD~1 timed out or failed; HEAD may be at unpushed commit`,
+                  });
+                } catch (logErr) {
+                  this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+                }
+                this._skipMemoryCommitOnHalt = true;
+                const rollbackHaltDetail = `groom: memory push failed and git reset --hard HEAD~1 timed out or failed; halting to prevent SELECT from reading unpushed memory state`;
+                await this.commitMemoryBeforeHalt();
+                this.store.setRunState(this.runId, "halted", rollbackHaltDetail);
+                await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: rollbackHaltDetail });
+                this.log(rollbackHaltDetail);
+                return { control: "halt" };
+              }
               this.log(`groom: memory push failed (rolled back): ${pushErr}`);
               // The commit was rolled back, so mark update_memory results as failed so the
               // groom_log and summaryForSelect reflect the actual outcome.
@@ -2549,6 +2606,38 @@ export class Orchestrator {
           const memCommitCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
           if (!memCommitCleanRes || memCommitCleanRes.code !== 0) {
             this.log(`groom: git clean -fdx -- ${MEMORY_DIR}/ failed in memory-commit-error path; halting to prevent dirty memory from reaching SELECT`);
+            // Persist partial results before halting so the audit trail reflects what
+            // actually ran even though cleanup failed (ES-512 Finding 4).
+            for (const r of executionResults) {
+              if (r.outcome === "executed" && r.action.type === "update_memory") {
+                r.outcome = "failed";
+                r.error = `memory commit failed: ${commitErr}`;
+              }
+            }
+            const memCleanHaltExecuted = executionResults.filter((r) => r.outcome === "executed").length;
+            const memCleanHaltDetails = validationResults.map((vr) => {
+              const execResult = executionResults.find((er) => er.action === vr.action);
+              return {
+                type: vr.action.type,
+                payload: vr.action,
+                result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+                reason: vr.reason ?? execResult?.error,
+              };
+            });
+            try {
+              this.store.updateGroomLog(groomLogRow.id, {
+                endedAt: this.clock(),
+                summary: groomOutput.summary,
+                actionsRequested: allActions.length,
+                actionsExecuted: memCleanHaltExecuted,
+                actionsRejected: rejectedCount,
+                actionDetails: JSON.stringify(memCleanHaltDetails),
+                outcome: "error",
+                errorDetail: `memory commit failed and git clean -fdx -- ${MEMORY_DIR}/ also failed; halting`,
+              });
+            } catch (logErr) {
+              this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+            }
             this._skipMemoryCommitOnHalt = true;
             const haltDetailMemClean = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in memory-commit-error path; halting to prevent dirty memory`;
             await this.commitMemoryBeforeHalt();
