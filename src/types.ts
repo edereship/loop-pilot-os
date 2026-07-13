@@ -49,6 +49,7 @@ export interface RunRow {
   haltReason: string | null;
   pauseMeta: PauseMeta | null;
   idleStartedAt: string | null;
+  checkoutDirty: number;    // 1 when commitMemoryBeforeHalt cleanup failed (ES-512 Finding 6)
 }
 
 export interface TaskSessionRow {

@@ -119,6 +119,9 @@ function makeHarness(config: Config): Harness {
   };
   const recovery = new FakeWorkflowRecovery();
   const memoryRunner = new FakeCommandRunner();
+  memoryRunner.on(["git", "fetch", "origin", "main"], { code: 0 });
+  memoryRunner.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+  memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
   memoryRunner.on(["git", "add", "-f", "docs/memory/"], { code: 0 });
   memoryRunner.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
   // Self-review pre/post-review branch verification: rev-parse --abbrev-ref returns the

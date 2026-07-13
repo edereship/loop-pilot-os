@@ -211,6 +211,11 @@ export class Orchestrator {
 
   private runId = 0;
   private interrupted = false; // SIGINT 等の停止要求（次の安全点で halt）
+  // Set to true when a GROOM cleanup step failed and HEAD or docs/memory/ may contain
+  // Codex-authored content. commitMemoryBeforeHalt() checks this flag and skips the
+  // memory commit to avoid publishing Codex commits as ancestors. Cleared when
+  // fetchDefaultBranch() resets HEAD to a known-clean state at the next GROOM cycle.
+  private _skipMemoryCommitOnHalt = false;
   private groomLoopIndex = 0;
 
   constructor(deps: OrchestratorDeps) {
@@ -261,27 +266,72 @@ export class Orchestrator {
       // commit so the push is fast-forward and not discarded by fetchDefaultBranch's
       // git reset --hard on the next PM-select phase (ES-452 Finding 2). All steps are
       // best-effort; failures are warned and skipped.
-      try {
-        // Seed/initialize the local memory files for this run inside the rebase guard so
-        // the bootstrap commit follows the same conflict-marker protection as the halt
-        // commit (ES-452 Findings 2/3/4). initializeMemory always runs (even when the
-        // commit is skipped) so the run has memory available regardless.
-        await this.rebaseGuardAndCommitMemory(() =>
-          initializeMemory(
-            this.config.repo.path,
-            this.store,
-            this.config.digest.recentMergedCount,
-          ),
-        );
-      } catch (err: unknown) {
-        this.log(`warning: failed to initialize memory: ${err instanceof Error ? err.message : String(err)}`);
+      // Read the previous run once; used both for checkout-dirty cleanup (Finding 6) and
+      // idle_started_at forwarding below.
+      const previousRun = this.store.latestRun();
+      // Finding 6: if the prior run's commitMemoryBeforeHalt cleanup failed, the checkout
+      // may still contain Codex artifacts. Clean up before rebaseGuardAndCommitMemory so
+      // those artifacts are not committed as ancestors (ES-512 Codex Finding 6).
+      let startupCheckoutDirtyResetFailed = false;
+      if (previousRun?.checkoutDirty) {
+        this.log("warning: previous run left checkout dirty; cleaning up before memory initialization");
+        const repoPath = this.config.repo.path;
+        const defaultBranch = this.config.repo.defaultBranch;
+        // Fetch and hard-reset to origin/<defaultBranch> before memory bootstrap: git clean
+        // alone cannot remove Codex-authored commits that a prior failed git reset --hard
+        // left on HEAD. Without this reset, rebaseGuardAndCommitMemory would replay those
+        // commits onto origin/<defaultBranch> and publish them as ancestors (ES-512 Finding 8).
+        // Abort any stale in-progress rebase before fetch+reset: git reset --hard does not
+        // remove .git/rebase-merge or .git/rebase-apply state directories, so without this
+        // rebaseGuardAndCommitMemory would fail with "rebase already in progress" and its
+        // subsequent --abort would undo the reset and move HEAD to the pre-rebase commit
+        // (ES-512 Finding 1).
+        const startupAbortRes = await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => ({ code: 1, stdout: "", stderr: "abort threw" }));
+        if (startupAbortRes.code !== 0 && !startupAbortRes.stderr.includes("No rebase in progress")) {
+          // The abort failed with an unexpected error — the checkout may be mid-rebase or
+          // in a corrupt state. Skip fetch+reset to avoid acting on unknown git state, and
+          // treat the cleanup as failed so the run halts (ES-512 Finding 2).
+          this.log("warning: checkout_dirty rebase --abort failed with unexpected error; halting startup cleanup to avoid acting on a potentially mid-rebase checkout");
+          startupCheckoutDirtyResetFailed = true;
+        } else {
+          await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
+          const startupResetRes = await this.runner.run("git", ["reset", "--hard", `origin/${defaultBranch}`], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!startupResetRes || startupResetRes.code !== 0) {
+            this.log("warning: checkout_dirty startup reset to origin/<defaultBranch> failed; skipping memory bootstrap to prevent publishing Codex commits as ancestors");
+            startupCheckoutDirtyResetFailed = true;
+          } else {
+            const startupCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+            const startupMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+            if (!startupCleanRes || startupCleanRes.code !== 0 || !startupMemCleanRes || startupMemCleanRes.code !== 0) {
+              this.log("warning: checkout_dirty startup git clean failed; checkout may still contain Codex artifacts");
+              startupCheckoutDirtyResetFailed = true;
+            }
+          }
+        }
+      }
+      let startupRebaseLeftCheckoutUnsafe = false;
+      if (!startupCheckoutDirtyResetFailed) {
+        try {
+          // Seed/initialize the local memory files for this run inside the rebase guard so
+          // the bootstrap commit follows the same conflict-marker protection as the halt
+          // commit (ES-452 Findings 2/3/4). initializeMemory always runs (even when the
+          // commit is skipped) so the run has memory available regardless.
+          startupRebaseLeftCheckoutUnsafe = await this.rebaseGuardAndCommitMemory(() =>
+            initializeMemory(
+              this.config.repo.path,
+              this.store,
+              this.config.digest.recentMergedCount,
+            ),
+          );
+        } catch (err: unknown) {
+          this.log(`warning: failed to initialize memory: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
 
       const taskCap = this.config.safety.maxTasksPerRun;
       // Carry idle_started_at forward only when the previous run is still idle
       // (crash/restart while idle). Halted runs retain the column but their timer is stale;
       // inheriting it would cause the new run to time-out immediately (ES-475).
-      const previousRun = this.store.latestRun();
       const previousIdleStartedAt =
         previousRun?.state === "idle" ? (previousRun.idleStartedAt ?? null) : null;
       const run = this.store.createRun(taskCap, this.clock());
@@ -293,6 +343,27 @@ export class Orchestrator {
         kind: "run_started",
         detail: `run ${run.id} started (taskCap=${taskCap})`,
       });
+      if (startupCheckoutDirtyResetFailed) {
+        const haltDetail = "startup: checkout_dirty cleanup failed; halting to prevent SELECT/GROOM from running against unsafe checkout";
+        // Persist the dirty flag on the new run so the next startup knows to re-run cleanup
+        // rather than treating this halted row as a clean baseline (ES-512 Finding 1).
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+        this.store.setRunState(this.runId, "halted", haltDetail);
+        await this.notifier.notify({ kind: "halted", reason: "startup_checkout_dirty", detail: haltDetail });
+        this.log(haltDetail);
+        return "finished";
+      }
+      // Finding 1/2 (ES-512): rebaseGuardAndCommitMemory() ran before createRun() so runId
+      // was 0 and it could not persist checkout_dirty inline. Halt now that we have a run row
+      // so the next startup knows to clean up before bootstrapping (ES-512 Findings 1/2).
+      if (startupRebaseLeftCheckoutUnsafe) {
+        const haltDetail = "startup: rebase --abort failed or post-rebase cleanup failed; checkout may be mid-rebase or detached; halting to prevent SELECT/GROOM from running against unsafe checkout";
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+        this.store.setRunState(this.runId, "halted", haltDetail);
+        await this.notifier.notify({ kind: "halted", reason: "startup_checkout_dirty", detail: haltDetail });
+        this.log(haltDetail);
+        return "finished";
+      }
       const recovery = await this.recoverPendingSessions();
       if (recovery.control === "continue") {
         await this.loop();
@@ -1604,6 +1675,40 @@ export class Orchestrator {
   }
 
   // ---- DESIGN REVIEW（ES-477: Codex ブロッキングレビュー） ----
+
+  /**
+   * Reverts an issue to Todo with retries, stops the session, and applies needs-human
+   * triage if the revert fails. Pre-PR halt paths that call stopSession with pr_number
+   * null are not picked up by startup recovery, so a failed revert leaves the ticket
+   * stuck In Progress with no retry path (ES-512 Finding 2).
+   */
+  private async haltDesignReviewWithTodoRevert(
+    session: TaskSessionRow,
+    issue: EligibleIssue,
+    haltDetail: string,
+  ): Promise<void> {
+    let revertErr: string | null = null;
+    try {
+      await retryTransient(this.config.safety.transientRetryAttempts, () =>
+        this.source.transition(issue.id, "todo"),
+        { onRetry: (n, e) => this.log(`transient retry ${n}: todo revert for ${issue.identifier}: ${errMsg(e)}`) },
+      );
+    } catch (err) {
+      revertErr = errMsg(err);
+      this.log(`designReview: todo revert failed (ticket may be stuck In Progress): ${revertErr}`);
+    }
+    // Discard the worktree and branch so repeated halt+requeue cycles do not exhaust
+    // prepareWorktree's suffix space (ES-512 Finding 4).
+    if (session.worktreePath) {
+      await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
+    }
+    const stopDetail = revertErr ? `${haltDetail}; todo revert failed: ${revertErr}` : haltDetail;
+    await this.stopSession(session, "exception", stopDetail);
+    if (revertErr !== null) {
+      await this.applyNeedsHumanTriage(session, "exception", stopDetail);
+    }
+  }
+
   private async designReview(
     session: TaskSessionRow,
     issue: EligibleIssue,
@@ -1644,9 +1749,44 @@ export class Orchestrator {
 
     // Record the starting SHA so any commits the reviewer creates can be undone before
     // the IMPLEMENT phase runs (ES-477 Finding 3).
-    const reviewStartSha = await this.runner.run("git", ["rev-parse", "HEAD"], { cwd: worktreePath })
+    const reviewStartSha = await this.runner.run("git", ["rev-parse", "HEAD"], { cwd: worktreePath, timeoutMs: 30_000 })
       .then((r) => (r.code === 0 ? r.stdout.trim() : null))
       .catch(() => null);
+
+    // If the SHA cannot be captured (git timeout / error), halt before the reviewer runs.
+    // Without a rollback anchor, any commits the reviewer creates would survive into
+    // IMPLEMENT (ES-512 Codex Finding 1).
+    if (reviewStartSha === null) {
+      const haltDetail = `designReview: failed to capture pre-review SHA; halting to prevent reviewer commits from reaching IMPLEMENT without a rollback anchor`;
+      this.log(haltDetail);
+      // Close the open review log row so it does not appear as still in-progress.
+      this.store.updateDesignReviewLog(logRow.id, {
+        endedAt: this.clock(),
+        outcome: "error",
+        errorDetail: "failed to capture pre-review SHA",
+      });
+      // Revert the claim so the ticket is not stuck In Progress with no active session
+      // and no PR — stopped no-PR sessions are not picked up by recovery passes (ES-512 Finding 1).
+      // Use retryTransient so transient network errors are retried; if the revert still fails,
+      // apply needs-human triage so operators can intervene (ES-512 Finding 1).
+      let preShaRevertErr: string | null = null;
+      try {
+        await retryTransient(this.config.safety.transientRetryAttempts, () =>
+          this.source.transition(issue.id, "todo"),
+          { onRetry: (n, e) => this.log(`transient retry ${n}: todo revert for ${issue.identifier}: ${errMsg(e)}`) },
+        );
+      } catch (err) {
+        preShaRevertErr = errMsg(err);
+        this.log(`designReview: todo revert failed (ticket may be stuck In Progress): ${preShaRevertErr}`);
+      }
+      await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath as string));
+      const preShaStopDetail = preShaRevertErr ? `${haltDetail}; todo revert failed: ${preShaRevertErr}` : haltDetail;
+      await this.stopSession(session, "exception", preShaStopDetail);
+      if (preShaRevertErr !== null) {
+        await this.applyNeedsHumanTriage(session, "exception", preShaStopDetail);
+      }
+      return { control: "halt" };
+    }
 
     let outcome: PlanOutcome;
     try {
@@ -1666,19 +1806,19 @@ export class Orchestrator {
       });
       await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
       // Restore the claimed branch in case the reviewer switched branches, then reset.
-      const catchCheckoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
+      const catchCheckoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
       if (catchCheckoutRes.code !== 0) {
         const haltDetail = `designReview: branch restore failed in error path for ${session.branch} (exit ${catchCheckoutRes.code}); halting to avoid IMPLEMENT on wrong branch`;
         this.log(haltDetail);
-        await this.stopSession(session, "exception", haltDetail);
+        await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
         return { control: "halt" };
       }
       if (reviewStartSha) {
-        const catchResetRes = await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "reset threw" }));
+        const catchResetRes = await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => ({ code: 1, stdout: "", stderr: "reset threw" }));
         if (catchResetRes.code !== 0) {
           const haltDetail = `designReview: reviewer reset to ${reviewStartSha} failed in error path; halting to prevent reviewer-authored commits from reaching IMPLEMENT`;
           this.log(haltDetail);
-          await this.stopSession(session, "exception", haltDetail);
+          await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
           return { control: "halt" };
         }
       }
@@ -1689,20 +1829,20 @@ export class Orchestrator {
     // before the implementation phase runs.
     await bestEffort(() => this.git.discardUncommittedChanges(worktreePath));
     // Restore the claimed branch in case the reviewer switched branches, then reset.
-    const checkoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
+    const checkoutRes = await this.runner.run("git", ["checkout", session.branch], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => ({ code: 1, stdout: "", stderr: "checkout threw" }));
     if (checkoutRes.code !== 0) {
       const haltDetail = `designReview: branch restore failed for ${session.branch} (exit ${checkoutRes.code}); halting to avoid IMPLEMENT on wrong branch`;
       this.log(haltDetail);
-      await this.stopSession(session, "exception", haltDetail);
+      await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
       return { control: "halt" };
     }
     // Reset to the pre-review SHA to undo any commits the reviewer created.
     if (reviewStartSha) {
-      const resetRes = await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath }).catch(() => ({ code: 1, stdout: "", stderr: "reset threw" }));
+      const resetRes = await this.runner.run("git", ["reset", "--hard", reviewStartSha], { cwd: worktreePath, timeoutMs: 30_000 }).catch(() => ({ code: 1, stdout: "", stderr: "reset threw" }));
       if (resetRes.code !== 0) {
         const haltDetail = `designReview: reviewer reset to ${reviewStartSha} failed; halting to prevent reviewer-authored commits from reaching IMPLEMENT`;
         this.log(haltDetail);
-        await this.stopSession(session, "exception", haltDetail);
+        await this.haltDesignReviewWithTodoRevert(session, issue, haltDetail);
         return { control: "halt" };
       }
     }
@@ -1831,8 +1971,13 @@ export class Orchestrator {
       // product_knowledge cannot be rebuilt from the DB, so if the local bootstrap commit
       // is discarded their content would be permanently lost (ES-503 Finding 3).
       const preResetMem = readMemoryAll(repoPath);
+      let fetchSucceeded = false;
       try {
         await this.git.fetchDefaultBranch();
+        // fetchDefaultBranch resets HEAD to origin/<defaultBranch>, removing any Codex commits
+        // that a prior failed cleanup left on HEAD. The skip guard is cleared only after the
+        // memory dir is also confirmed clean below (ES-512 Codex Finding 2).
+        fetchSucceeded = true;
       } catch (err) {
         this.log(`groom: fetch failed (non-fatal): ${errMsg(err)}`);
       }
@@ -1868,8 +2013,16 @@ export class Orchestrator {
       // initializeMemory may have rewritten tracked header-only files with real data;
       // without this revert a crash before the next commitIfChanged leaves git status
       // dirty and the next startup's clean-worktree preflight rejects startup (ES-503).
-      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      const groomStartupMemCheckout = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      const groomStartupMemClean = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      // Clear the skip guard only after HEAD (via fetchDefaultBranch), the tracked memory dir
+      // (via checkout), AND untracked memory files (via git clean) are all confirmed clean.
+      // A timeout on the checkout leaves tracked docs/memory/ content from the unsafe GROOM
+      // state, so including it in the guard prevents re-enabling the normal halt path while
+      // those files are still present (ES-512 Codex Finding 1).
+      if (fetchSucceeded && groomStartupMemCheckout && groomStartupMemCheckout.code === 0 && groomStartupMemClean && groomStartupMemClean.code === 0) {
+        this._skipMemoryCommitOnHalt = false;
+      }
 
       let specContent: SpecContent | null = null;
       const specDir = this.config.product.specDir;
@@ -1913,9 +2066,26 @@ export class Orchestrator {
 
       // Record the starting SHA before Codex runs so any commits Codex creates can be
       // undone before the memory commit is pushed (ES-457 Finding 1).
-      const startSha = await this.runner.run("git", ["rev-parse", "HEAD"], { cwd: repoPath })
+      const startSha = await this.runner.run("git", ["rev-parse", "HEAD"], { cwd: repoPath, timeoutMs: 30_000 })
         .then((r) => (r.code === 0 ? r.stdout.trim() : null))
         .catch(() => null);
+
+      // If the SHA cannot be captured, abort GROOM before Codex runs.  Every cleanup
+      // path below is guarded by `if (startSha)`, so running Codex without the anchor
+      // would leave any commits it creates unresettable (ES-512 Codex Finding 2).
+      if (startSha === null) {
+        this.log("groom: failed to capture pre-Codex SHA; aborting to prevent unresettable commits");
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            outcome: "error",
+            errorDetail: "failed to capture pre-Codex SHA; aborting",
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        return { control: "continue", summary: null, blockedIds };
+      }
 
       // 3. Run Codex
       let codexOutput: string;
@@ -1940,12 +2110,34 @@ export class Orchestrator {
           // Reset the full checkout so any files Codex wrote are discarded before
           // haltForInterrupt() calls commitMemoryBeforeHalt() (Finding 3 + 4).
           // -fd (not -fdx) avoids deleting repo-root ignored files (.env, node_modules, etc.).
-          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          // Finding 4: capture the root-clean result; a timeout here leaves untracked Codex
+          // files at repo root while commitMemoryBeforeHalt() (called by haltForInterrupt)
+          // does not clean them, so the next startup's clean-worktree preflight fails
+          // (ES-512 Codex Finding 4). Set the skip guard so commitMemoryBeforeHalt runs its
+          // own cleanup path (which does git clean -fd) rather than committing memory normally.
+          const interruptRootCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!interruptRootCleanRes || interruptRootCleanRes.code !== 0) {
+            this.log("groom: git clean -fd failed in interrupt path; memory commit will be skipped to allow cleanup on halt");
+            this._skipMemoryCommitOnHalt = true;
+          }
+          // Finding 2: a timeout here leaves Codex files under docs/memory/; they would be
+          // staged by commitMemoryBeforeHalt() unless we set the skip guard (ES-512 Finding 2).
+          const interruptMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!interruptMemCleanRes || interruptMemCleanRes.code !== 0) {
+            this.log("groom: git clean -fdx failed in interrupt path; memory commit will be skipped to prevent publishing Codex memory artifacts");
+            this._skipMemoryCommitOnHalt = true;
+          }
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
           if (startSha) {
-            await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+            const interruptResetRes = await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+            if (!interruptResetRes || interruptResetRes.code !== 0) {
+              // Reset failed; HEAD is still at a Codex commit. Mark the flag so that
+              // haltForInterrupt() → commitMemoryBeforeHalt() skips the memory commit and
+              // avoids pushing those commits as ancestors (ES-512 Codex Finding 1).
+              this.log("groom: git reset --hard failed in interrupt path; memory commit will be skipped to prevent publishing Codex commits");
+              this._skipMemoryCommitOnHalt = true;
+            }
           }
           await this.haltForInterrupt();
           return { control: "halt" };
@@ -1962,12 +2154,47 @@ export class Orchestrator {
             this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
           }
           // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
-          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          // Finding 2: treat clean failures as fatal — the success path does the same, and
+          // allowing SELECT to proceed against a dirty checkout risks injecting Codex artifacts
+          // into the PM context (ES-512 Codex Finding 2).
+          const errRootCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!errRootCleanRes || errRootCleanRes.code !== 0) {
+            this.log(`groom: git clean -fd timed out or failed in error path; halting to prevent untracked Codex artifacts from reaching SELECT`);
+            this._skipMemoryCommitOnHalt = true;
+            const haltDetailErrRootClean = "groom: git clean -fd timed out or failed in error path; halting to prevent Codex artifacts";
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", haltDetailErrRootClean);
+            await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailErrRootClean });
+            this.log(haltDetailErrRootClean);
+            return { control: "halt" };
+          }
+          const errMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!errMemCleanRes || errMemCleanRes.code !== 0) {
+            this.log(`groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in error path; halting to prevent stale Codex memory from reaching SELECT`);
+            this._skipMemoryCommitOnHalt = true;
+            const haltDetailErrMemClean = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in error path; halting to prevent Codex memory artifacts`;
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", haltDetailErrMemClean);
+            await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailErrMemClean });
+            this.log(haltDetailErrMemClean);
+            return { control: "halt" };
+          }
           // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+          // Finding 3: if reset fails, HEAD remains on Codex commits; halt so a later memory
+          // commit does not push them as ancestors (ES-512 Finding 3).
           if (startSha) {
-            await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+            const errorResetRes = await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+            if (!errorResetRes || errorResetRes.code !== 0) {
+              this.log(`groom: git reset --hard failed in error path; halting to prevent Codex commits from being published`);
+              this._skipMemoryCommitOnHalt = true;
+              const haltDetailErrReset = "groom: git reset --hard timed out or failed in error path; halting to prevent publishing Codex commits";
+              await this.commitMemoryBeforeHalt();
+              this.store.setRunState(this.runId, "halted", haltDetailErrReset);
+              await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailErrReset });
+              this.log(haltDetailErrReset);
+              return { control: "halt" };
+            }
           }
           return { control: "continue", summary: null, blockedIds };
         }
@@ -1984,12 +2211,46 @@ export class Orchestrator {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
         // Reset checkout so any files Codex may have written are discarded (Finding 3 + 4).
-        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        // Finding 3: treat clean failures as fatal — allowing SELECT to run against a
+        // Codex-artifact-containing checkout is unsafe (ES-512 Codex Finding 3).
+        const excRootCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!excRootCleanRes || excRootCleanRes.code !== 0) {
+          this.log(`groom: git clean -fd timed out or failed in exception path; halting to prevent untracked Codex artifacts from reaching SELECT`);
+          this._skipMemoryCommitOnHalt = true;
+          const haltDetailExcRootClean = "groom: git clean -fd timed out or failed in exception path; halting to prevent Codex artifacts";
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetailExcRootClean);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailExcRootClean });
+          this.log(haltDetailExcRootClean);
+          return { control: "halt" };
+        }
+        const excMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!excMemCleanRes || excMemCleanRes.code !== 0) {
+          this.log(`groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in exception path; halting to prevent stale Codex memory from reaching SELECT`);
+          this._skipMemoryCommitOnHalt = true;
+          const haltDetailExcMemClean = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in exception path; halting to prevent Codex memory artifacts`;
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetailExcMemClean);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailExcMemClean });
+          this.log(haltDetailExcMemClean);
+          return { control: "halt" };
+        }
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        // Finding 3: if reset fails, HEAD remains on Codex commits; halt so a later memory
+        // commit does not push them as ancestors (ES-512 Finding 3).
         if (startSha) {
-          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+          const excResetRes = await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!excResetRes || excResetRes.code !== 0) {
+            this.log(`groom: git reset --hard failed in exception path; halting to prevent Codex commits from being published`);
+            this._skipMemoryCommitOnHalt = true;
+            const haltDetailExcReset = "groom: git reset --hard timed out or failed in exception path; halting to prevent publishing Codex commits";
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", haltDetailExcReset);
+            await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailExcReset });
+            this.log(haltDetailExcReset);
+            return { control: "halt" };
+          }
         }
         return { control: "continue", summary: null, blockedIds };
       }
@@ -2009,12 +2270,44 @@ export class Orchestrator {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
-        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        // Finding 3: treat clean failures as fatal, same as the success path — allowing
+        // SELECT to run against a Codex-artifact-containing checkout is unsafe (ES-512 Codex Finding 3).
+        const parseErrRootCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!parseErrRootCleanRes || parseErrRootCleanRes.code !== 0) {
+          this.log(`groom: git clean -fd timed out or failed in parse-error path; halting to prevent untracked Codex artifacts from reaching SELECT`);
+          this._skipMemoryCommitOnHalt = true;
+          const haltDetailParseRootClean = "groom: git clean -fd timed out or failed in parse-error path; halting to prevent Codex artifacts";
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetailParseRootClean);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailParseRootClean });
+          this.log(haltDetailParseRootClean);
+          return { control: "halt" };
+        }
+        const parseErrMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!parseErrMemCleanRes || parseErrMemCleanRes.code !== 0) {
+          this.log(`groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in parse-error path; halting to prevent stale Codex memory from reaching SELECT`);
+          this._skipMemoryCommitOnHalt = true;
+          const haltDetailParseMemClean = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in parse-error path; halting to prevent Codex memory artifacts`;
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetailParseMemClean);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailParseMemClean });
+          this.log(haltDetailParseMemClean);
+          return { control: "halt" };
+        }
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
         if (startSha) {
-          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+          const parseErrResetRes = await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!parseErrResetRes || parseErrResetRes.code !== 0) {
+            this.log(`groom: git reset --hard failed in parse-error path; halting to prevent Codex commits from being published`);
+            this._skipMemoryCommitOnHalt = true;
+            const haltDetailParseReset = "groom: git reset --hard timed out or failed in parse-error path; halting to prevent publishing Codex commits";
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", haltDetailParseReset);
+            await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailParseReset });
+            this.log(haltDetailParseReset);
+            return { control: "halt" };
+          }
         }
         return { control: "continue", summary: null, blockedIds };
       }
@@ -2060,12 +2353,46 @@ export class Orchestrator {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
         // Reset checkout so any files Codex wrote are discarded (Finding 3 + 4).
-        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        // Finding 4: treat clean failures as fatal — allowing SELECT to run against a
+        // Codex-artifact-containing checkout is unsafe (ES-512 Codex Finding 4).
+        const valCtxRootCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!valCtxRootCleanRes || valCtxRootCleanRes.code !== 0) {
+          this.log(`groom: git clean -fd timed out or failed in validation-context-fail path; halting to prevent untracked Codex artifacts from reaching SELECT`);
+          this._skipMemoryCommitOnHalt = true;
+          const haltDetailValRootClean = "groom: git clean -fd timed out or failed in validation-context-fail path; halting to prevent Codex artifacts";
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetailValRootClean);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailValRootClean });
+          this.log(haltDetailValRootClean);
+          return { control: "halt" };
+        }
+        const valCtxMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!valCtxMemCleanRes || valCtxMemCleanRes.code !== 0) {
+          this.log(`groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in validation-context-fail path; halting to prevent stale Codex memory from reaching SELECT`);
+          this._skipMemoryCommitOnHalt = true;
+          const haltDetailValMemClean = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in validation-context-fail path; halting to prevent Codex memory artifacts`;
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetailValMemClean);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailValMemClean });
+          this.log(haltDetailValMemClean);
+          return { control: "halt" };
+        }
         // Reset to startSha so any commits Codex created are undone (ES-457 Finding 1).
+        // Finding 3: if reset fails, HEAD remains on Codex commits; halt to prevent a later
+        // memory commit from pushing them as ancestors (ES-512 Finding 3).
         if (startSha) {
-          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+          const valCtxResetRes = await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!valCtxResetRes || valCtxResetRes.code !== 0) {
+            this.log(`groom: git reset --hard failed in validation-context-fail path; halting to prevent Codex commits from being published`);
+            this._skipMemoryCommitOnHalt = true;
+            const haltDetailValReset = "groom: git reset --hard timed out or failed in validation-context-fail path; halting to prevent publishing Codex commits";
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", haltDetailValReset);
+            await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailValReset });
+            this.log(haltDetailValReset);
+            return { control: "halt" };
+          }
         }
         return { control: "continue", summary: null, blockedIds };
       }
@@ -2082,13 +2409,105 @@ export class Orchestrator {
       // files outside memory from persisting into the next SELECT preflight (Finding 3).
       // -fd (not -fdx) avoids deleting repo-root ignored files (.env, node_modules, etc.);
       // the path-scoped -fdx -- docs/memory/ cleans ignored memory files specifically.
-      await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      await this.runner.run("git", ["checkout", "HEAD", "--", "."], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+      // Finding 2: a timeout here leaves Codex artifacts in the tree; treat failure as fatal
+      // rather than continuing as if cleanup succeeded.
+      const cleanResult = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      if (!cleanResult || cleanResult.code !== 0) {
+        this.log(`groom: git clean -fd failed or timed out; aborting to prevent Codex artifacts from leaking`);
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            summary: groomOutput.summary,
+            actionsRequested: allActions.length,
+            actionsExecuted: 0,
+            actionsRejected: rejectedCount,
+            outcome: "error",
+            errorDetail: "git clean -fd timed out or failed; aborting",
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        // Reset to startSha so any Codex-created commits do not remain on the main
+        // checkout after the clean failure (ES-512 Codex Finding 3).
+        if (startSha) {
+          await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+        }
+        // Untracked Codex artifacts may remain, and if the reset above also failed HEAD
+        // may still be at a Codex commit. Halt instead of continuing to SELECT: selectWithPm()
+        // reads this.config.repo.path and a stale untracked spec file could be injected into
+        // the PM selection context (ES-512 Codex Finding 4).
+        this._skipMemoryCommitOnHalt = true;
+        const haltDetailClean = "groom: git clean -fd timed out or failed; halting to prevent Codex artifacts from reaching SELECT";
+        await this.commitMemoryBeforeHalt();
+        this.store.setRunState(this.runId, "halted", haltDetailClean);
+        await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailClean });
+        this.log(haltDetailClean);
+        return { control: "halt" };
+      }
+      // Finding 4: a timeout here leaves Codex-generated files under docs/memory/; treat
+      // failure as a skip so no actions run with stale memory files in place. Set the
+      // _skipMemoryCommitOnHalt flag so that a subsequent halt does not commit those
+      // files into the memory commit (ES-512 Codex Finding 4).
+      const memCleanResult = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      if (!memCleanResult || memCleanResult.code !== 0) {
+        this.log(`groom: git clean -fdx -- ${MEMORY_DIR}/ failed or timed out; skipping actions to prevent stale Codex memory from being committed`);
+        try {
+          this.store.updateGroomLog(groomLogRow.id, {
+            endedAt: this.clock(),
+            summary: groomOutput.summary,
+            actionsRequested: allActions.length,
+            actionsExecuted: 0,
+            actionsRejected: rejectedCount,
+            outcome: "error",
+            errorDetail: `git clean -fdx -- ${MEMORY_DIR}/ timed out or failed; skipping actions`,
+          });
+        } catch (logErr) {
+          this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+        }
+        // Stale Codex memory files remain under docs/memory/. Halt instead of continuing
+        // to SELECT: selectWithPm() reads docs/memory/ and would inject those stale Codex
+        // files into the PM selection prompt (ES-512 Codex Finding 3).
+        this._skipMemoryCommitOnHalt = true;
+        const haltDetail3 = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed; halting to prevent stale Codex memory from reaching SELECT`;
+        await this.commitMemoryBeforeHalt();
+        this.store.setRunState(this.runId, "halted", haltDetail3);
+        await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetail3 });
+        this.log(haltDetail3);
+        return { control: "halt" };
+      }
       // If Codex created commits and advanced HEAD, reset back to the recorded starting
       // SHA so only the memory commit is pushed (ES-457 Finding 1).
       if (startSha) {
-        await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath }).catch(() => {});
+        // Finding 1: a timeout here leaves HEAD on Codex-authored commits; treat failure as
+        // fatal so the memory commit is never pushed with those commits as ancestors.
+        const resetResult = await this.runner.run("git", ["reset", "--hard", startSha], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!resetResult || resetResult.code !== 0) {
+          this.log(`groom: git reset --hard failed or timed out; aborting to prevent publishing Codex commits`);
+          try {
+            this.store.updateGroomLog(groomLogRow.id, {
+              endedAt: this.clock(),
+              summary: groomOutput.summary,
+              actionsRequested: allActions.length,
+              actionsExecuted: 0,
+              actionsRejected: rejectedCount,
+              outcome: "error",
+              errorDetail: "git reset --hard timed out or failed; aborting memory commit",
+            });
+          } catch (logErr) {
+            this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+          }
+          // HEAD is still at a Codex commit. Halt instead of continuing to SELECT:
+          // selectWithPm() reads the Codex-mutated checkout that this branch just declared
+          // unsafe (ES-512 Codex Finding 4).
+          this._skipMemoryCommitOnHalt = true;
+          const haltDetail4 = "groom: git reset --hard timed out or failed; halting to prevent SELECT from running against Codex-mutated checkout";
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", haltDetail4);
+          await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetail4 });
+          this.log(haltDetail4);
+          return { control: "halt" };
+        }
       }
 
       // 6. Execute one action at a time with SIGINT check per action (D-14)
@@ -2169,11 +2588,53 @@ export class Orchestrator {
             const pushRes = await this.runner.run(
               "git",
               ["push", "origin", `HEAD:${defaultBranch}`],
-              { cwd: repoPath },
+              { cwd: repoPath, timeoutMs: 120_000 },
             ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
             if (pushRes.code !== 0) {
-              await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+              const rollbackRes = await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
               const pushErr = pushRes.stderr.trim();
+              if (!rollbackRes || rollbackRes.code !== 0) {
+                // Rollback failed: HEAD remains at the unpushed memory commit. Mark
+                // update_memory results failed and halt so SELECT cannot read a memory
+                // state that was not applied (ES-512 Finding 3).
+                for (const r of executionResults) {
+                  if (r.outcome === "executed" && r.action.type === "update_memory") {
+                    r.outcome = "failed";
+                    r.error = `memory push failed and rollback also failed; HEAD may be at unpushed commit: ${pushErr}`;
+                  }
+                }
+                const rollbackFailExecuted = executionResults.filter((r) => r.outcome === "executed").length;
+                const rollbackFailDetails = validationResults.map((vr) => {
+                  const execResult = executionResults.find((er) => er.action === vr.action);
+                  return {
+                    type: vr.action.type,
+                    payload: vr.action,
+                    result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+                    reason: vr.reason ?? execResult?.error,
+                  };
+                });
+                try {
+                  this.store.updateGroomLog(groomLogRow.id, {
+                    endedAt: this.clock(),
+                    summary: groomOutput.summary,
+                    actionsRequested: allActions.length,
+                    actionsExecuted: rollbackFailExecuted,
+                    actionsRejected: rejectedCount,
+                    actionDetails: JSON.stringify(rollbackFailDetails),
+                    outcome: "error",
+                    errorDetail: `memory push failed and git reset --hard HEAD~1 timed out or failed; HEAD may be at unpushed commit`,
+                  });
+                } catch (logErr) {
+                  this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+                }
+                this._skipMemoryCommitOnHalt = true;
+                const rollbackHaltDetail = `groom: memory push failed and git reset --hard HEAD~1 timed out or failed; halting to prevent SELECT from reading unpushed memory state`;
+                await this.commitMemoryBeforeHalt();
+                this.store.setRunState(this.runId, "halted", rollbackHaltDetail);
+                await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: rollbackHaltDetail });
+                this.log(rollbackHaltDetail);
+                return { control: "halt" };
+              }
               this.log(`groom: memory push failed (rolled back): ${pushErr}`);
               // The commit was rolled back, so mark update_memory results as failed so the
               // groom_log and summaryForSelect reflect the actual outcome.
@@ -2193,9 +2654,55 @@ export class Orchestrator {
           // dirty files would survive until fetchDefaultBranch() destroys them silently.
           // Unstage first: if git add succeeded before the failure, newly staged files
           // are not untracked and git clean would skip them without this reset.
-          await this.runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          // Finding 2: checkout failure leaves tracked memory changes dirty; treat it as
+          // fatal alongside the clean failure below (ES-512 Codex Finding 2).
+          const memCommitCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          // Finding 5: treat clean failure as fatal — dirty or staged memory surviving into
+          // SELECT contaminates the PM selection context (ES-512 Codex Finding 5).
+          const memCommitCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+          if (!memCommitCheckoutRes || memCommitCheckoutRes.code !== 0 || !memCommitCleanRes || memCommitCleanRes.code !== 0) {
+            this.log(`groom: checkout/clean of ${MEMORY_DIR}/ failed in memory-commit-error path; halting to prevent dirty memory from reaching SELECT`);
+            // Persist partial results before halting so the audit trail reflects what
+            // actually ran even though cleanup failed (ES-512 Finding 4).
+            for (const r of executionResults) {
+              if (r.outcome === "executed" && r.action.type === "update_memory") {
+                r.outcome = "failed";
+                r.error = `memory commit failed: ${commitErr}`;
+              }
+            }
+            const memCleanHaltExecuted = executionResults.filter((r) => r.outcome === "executed").length;
+            const memCleanHaltDetails = validationResults.map((vr) => {
+              const execResult = executionResults.find((er) => er.action === vr.action);
+              return {
+                type: vr.action.type,
+                payload: vr.action,
+                result: vr.result === "rejected" ? "rejected" : (execResult?.outcome ?? "skipped"),
+                reason: vr.reason ?? execResult?.error,
+              };
+            });
+            try {
+              this.store.updateGroomLog(groomLogRow.id, {
+                endedAt: this.clock(),
+                summary: groomOutput.summary,
+                actionsRequested: allActions.length,
+                actionsExecuted: memCleanHaltExecuted,
+                actionsRejected: rejectedCount,
+                actionDetails: JSON.stringify(memCleanHaltDetails),
+                outcome: "error",
+                errorDetail: `memory commit failed and checkout/clean of ${MEMORY_DIR}/ also failed; halting`,
+              });
+            } catch (logErr) {
+              this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
+            }
+            this._skipMemoryCommitOnHalt = true;
+            const haltDetailMemClean = `groom: checkout or clean of ${MEMORY_DIR}/ timed out or failed in memory-commit-error path; halting to prevent dirty memory`;
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", haltDetailMemClean);
+            await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailMemClean });
+            this.log(haltDetailMemClean);
+            return { control: "halt" };
+          }
           // The commit (or git add) failed so the memory changes were not persisted.
           // Mark the corresponding update_memory results as failed so groom_log and
           // summaryForSelect reflect the actual outcome (Finding 2).
@@ -2760,8 +3267,8 @@ export class Orchestrator {
       this.log(`select: memory read failed (non-fatal): ${selectMem.readErrors.join("; ")}`);
     }
     // Revert any tracked memory modifications so the main checkout stays clean (ES-503).
-    await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
-    await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path }).catch(() => {});
+    await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path, timeoutMs: 30_000 }).catch(() => {});
+    await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: this.config.repo.path, timeoutMs: 30_000 }).catch(() => {});
 
     const prompt = buildSelectPrompt({
       goal: this.config.product.goal ?? null,
@@ -6018,8 +6525,50 @@ export class Orchestrator {
 
   /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
   private async commitMemoryBeforeHalt(): Promise<void> {
+    if (this._skipMemoryCommitOnHalt) {
+      // A prior GROOM cleanup step failed: HEAD may be at a Codex commit or docs/memory/
+      // may contain Codex-authored files. Skip the memory commit to avoid publishing
+      // those commits as ancestors.
+      this.log("warning: skipping memory commit on halt: GROOM left checkout in an unclean state (Codex commits or dirty memory dir)");
+      // Attempt to restore the checkout to a clean state so the next startup's
+      // rebaseGuardAndCommitMemory() does not commit Codex artifacts as ancestors
+      // (ES-512 Codex Finding 1). All steps are best-effort.
+      const repoPath = this.config.repo.path;
+      const defaultBranch = this.config.repo.defaultBranch;
+      await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
+      // Finding 5: when _skipMemoryCommitOnHalt was set because root git clean -fd failed,
+      // untracked non-memory files may remain. Clean them here so the next startup's
+      // preflight git-status check does not reject the checkout (ES-512 Finding 5).
+      const haltResetRes = await this.runner.run("git", ["reset", "--hard", `origin/${defaultBranch}`], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      const haltCleanRes = await this.runner.run("git", ["clean", "-fd"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      const haltMemCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      // Finding 6: if cleanup fails here, persist the dirty state so the next startup
+      // runs cleanup before rebaseGuardAndCommitMemory(), preventing Codex artifacts
+      // from being committed as ancestors (ES-512 Codex Finding 6).
+      if (
+        !haltResetRes || haltResetRes.code !== 0 ||
+        !haltCleanRes || haltCleanRes.code !== 0 ||
+        !haltMemCleanRes || haltMemCleanRes.code !== 0
+      ) {
+        this.log("warning: commitMemoryBeforeHalt cleanup failed; persisting checkout_dirty flag for next startup");
+        if (this.runId !== 0) {
+          try {
+            this.store.setRunCheckoutDirty(this.runId);
+          } catch (storeErr) {
+            this.log(`warning: failed to persist checkout_dirty flag: ${errMsg(storeErr)}`);
+          }
+        }
+      }
+      return;
+    }
     try {
-      await this.rebaseGuardAndCommitMemory();
+      const checkoutUnsafe = await this.rebaseGuardAndCommitMemory();
+      // Finding 1/2 (ES-512): if the rebase guard left the checkout in an unsafe state
+      // (mid-rebase or unknown index after failed cleanup), persist the dirty flag so the
+      // next startup knows to run cleanup before proceeding (ES-512 Codex Findings 1/2).
+      if (checkoutUnsafe && this.runId !== 0) {
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+      }
     } catch (err) {
       this.log(`warning: failed to commit memory on halt: ${errMsg(err)}`);
     }
@@ -6034,35 +6583,57 @@ export class Orchestrator {
    * can seed/initialize memory locally for the run even when the commit itself is skipped.
    * All steps are best-effort.
    */
-  private async rebaseGuardAndCommitMemory(beforeCommit?: () => void): Promise<void> {
+  private async rebaseGuardAndCommitMemory(beforeCommit?: () => void): Promise<boolean> {
     const repoPath = this.config.repo.path;
     const defaultBranch = this.config.repo.defaultBranch;
-    await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath }).catch(() => {});
+    await this.runner.run("git", ["fetch", "origin", defaultBranch], { cwd: repoPath, timeoutMs: 120_000 }).catch(() => {});
     // Use --autostash so that dirty docs/memory files are stashed before rebasing
     // (ES-452 Finding 4). If the rebase fails despite that, abort immediately to
     // prevent staging conflict markers in the memory commit (ES-452 Finding 3).
     const rebaseRes = await this.runner.run(
       "git",
       ["rebase", "--autostash", `origin/${defaultBranch}`],
-      { cwd: repoPath },
+      { cwd: repoPath, timeoutMs: 60_000 },
     ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "rebase runner error" }));
     if (rebaseRes.code !== 0) {
-      await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath }).catch(() => {});
+      const abortRes = await this.runner.run("git", ["rebase", "--abort"], { cwd: repoPath, timeoutMs: 60_000 }).catch(() => ({ code: 1, stdout: "", stderr: "abort threw" }));
       this.log("warning: rebase failed before memory commit; skipping to avoid conflict markers");
+      if (abortRes.code !== 0) {
+        if (!abortRes.stderr.includes("No rebase in progress")) {
+          // The abort also failed and it's not because no rebase was active — the
+          // checkout may be mid-rebase or detached. Skip all memory operations to
+          // avoid seeding or committing in that state (ES-512 Codex Finding 4).
+          this.log("warning: rebase --abort also failed; skipping memory operations to avoid acting on a mid-rebase or detached checkout");
+          return true; // checkout may be mid-rebase or detached; caller must persist dirty marker
+        }
+        // "No rebase in progress" means the rebase failed before creating any rebase
+        // state; the checkout is in a clean pre-rebase state. Fall through to run
+        // beforeCommit() below so the bootstrap path still initializes memory
+        // (ES-512 Codex Finding 5).
+        this.log("warning: rebase --abort found no rebase state; checkout is clean, proceeding with memory operations");
+      }
       if (beforeCommit !== undefined) {
         // Bootstrap path: seed memory, then commit locally (no push) so files survive
         // the GROOM worktree cleanup (ES-503). Push is skipped because the rebase failed
         // — a push would be non-fast-forward. Both steps are best-effort.
         // Clean memory dir first: checkout restores tracked files to HEAD; clean removes
         // untracked stale files from a prior crashed run that initializeMemory would skip.
-        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        const rebaseSkipCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        const rebaseSkipCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!rebaseSkipCheckoutRes || rebaseSkipCheckoutRes.code !== 0 || !rebaseSkipCleanRes || rebaseSkipCleanRes.code !== 0) {
+          // Cleanup timed out or failed: docs/memory/ may still contain stale Codex-authored
+          // files. Skip beforeCommit()/commitIfChanged() to avoid committing stale artifacts
+          // as bootstrap memory; return true so the caller persists the dirty flag and halts
+          // (ES-512 Codex Finding 1 — rebase-skip cleanup guard).
+          this.log("warning: rebase-skip memory cleanup failed; skipping memory bootstrap to avoid committing stale Codex artifacts");
+          return true;
+        }
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in rebase-skip path: ${err instanceof Error ? err.message : String(err)}`);
           // Revert tracked modifications and remove untracked files so commitIfChanged
           // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
-          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
         }
         try {
           await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (rebase skipped)");
@@ -6076,32 +6647,65 @@ export class Orchestrator {
       } else {
         // Halt-path: restore any dirty docs/memory files so the clean-worktree
         // preflight on the next startup does not fail (ES-452 Finding 1).
-        await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        const haltPathCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        const haltPathCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!haltPathCheckoutRes || haltPathCheckoutRes.code !== 0 || !haltPathCleanRes || haltPathCleanRes.code !== 0) {
+          // Cleanup timed out or failed — docs/memory/ may still be dirty. Persist the
+          // flag so the next startup runs its own cleanup before bootstrapping (ES-512 Finding 3).
+          if (this.runId !== 0) {
+            try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+          }
+          return true;
+        }
       }
-      return;
+      return false;
     }
     // Even when rebase exits 0, the autostash pop may leave conflict markers in the
     // working tree. Detect unmerged files, restore them to HEAD, and skip the commit to
     // avoid staging conflict markers as memory content (ES-452 Finding 2).
     const unmergedRes = await this.runner.run(
       "git", ["ls-files", "--unmerged", "--", MEMORY_DIR + "/"],
-      { cwd: repoPath },
-    ).catch(() => ({ code: 0, stdout: "", stderr: "" }));
+      { cwd: repoPath, timeoutMs: 30_000 },
+    ).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+    if (unmergedRes.code !== 0) {
+      // Unknown state: the unmerged-file check itself failed (timeout or error). Skip
+      // the memory commit rather than acting on unknown index state; restore tracked
+      // files and remove untracked files so the next startup's clean-worktree preflight
+      // does not fail (ES-512 Codex Finding 5).
+      const unknownCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      const unknownCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      // Finding 3: if either cleanup fails, docs/memory/ may remain dirty while no
+      // checkout_dirty marker is set, so next startup would bootstrap against unknown index
+      // state. Persist the flag so next startup runs its own cleanup (ES-512 Finding 3).
+      // Finding 2 (ES-512): when runId === 0 (startup bootstrap), setRunCheckoutDirty cannot
+      // be called yet — propagate via return value so run() sets it after createRun().
+      const unknownCleanupFailed = (!unknownCheckoutRes || unknownCheckoutRes.code !== 0 || !unknownCleanRes || unknownCleanRes.code !== 0);
+      if (unknownCleanupFailed && this.runId !== 0) {
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+      }
+      this.log("warning: unmerged-file check timed out or failed; skipping memory commit to avoid acting on unknown index state");
+      return unknownCleanupFailed;
+    }
     if (unmergedRes.stdout.trim().length > 0) {
-      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+      const conflictCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
       this.log("warning: autostash pop left conflicts in memory directory; skipping memory commit");
       if (beforeCommit !== undefined) {
         // Bootstrap path: seed memory, then commit locally (ES-503).
         // checkout HEAD already ran above to clear conflict markers; untracked
         // stale files are handled by git clean so initializeMemory starts fresh.
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        const conflictCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!conflictCheckoutRes || conflictCheckoutRes.code !== 0 || !conflictCleanRes || conflictCleanRes.code !== 0) {
+          // Cleanup failed or timed out: conflicted or stale memory files may remain.
+          // Treat the bootstrap as unsafe to avoid committing stale artifacts (ES-512 Finding 4).
+          this.log("warning: conflict cleanup failed; skipping memory bootstrap to avoid committing stale artifacts");
+          return true;
+        }
         try { beforeCommit(); } catch (err: unknown) {
           this.log(`warning: initializeMemory failed in autostash-conflict path: ${err instanceof Error ? err.message : String(err)}`);
           // Revert tracked modifications and remove untracked files so commitIfChanged
           // does not stage and commit partial or incorrect memory (ES-503 Finding 3).
-          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
-          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
         }
         try {
           await commitIfChanged(this.runner, repoPath, "chore: bootstrap memory (autostash conflict)");
@@ -6113,11 +6717,20 @@ export class Orchestrator {
           this.log(`warning: bootstrap memory commit failed after autostash conflict; ${reseeded ? "files re-seeded but uncommitted" : "re-seed also failed, memory unavailable"}`);
         }
       } else {
-        // Halt-path: remove untracked files so the next startup's clean-worktree
-        // preflight does not fail.
-        await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath }).catch(() => {});
+        // Halt-path: restore tracked files and remove untracked files so the next
+        // startup's clean-worktree preflight does not fail.
+        const haltConflictCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+        if (!conflictCheckoutRes || conflictCheckoutRes.code !== 0 || !haltConflictCleanRes || haltConflictCleanRes.code !== 0) {
+          // Cleanup failed or timed out: docs/memory/ may remain dirty. Persist the
+          // flag so the next startup runs its own cleanup before bootstrapping
+          // (ES-512 Finding 3).
+          if (this.runId !== 0) {
+            try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+          }
+          return true;
+        }
       }
-      return;
+      return false;
     }
     beforeCommit?.();
     // Do not swallow commitIfChanged errors: let them propagate so the outer catch in
@@ -6129,14 +6742,14 @@ export class Orchestrator {
       const pushRes = await this.runner.run(
         "git",
         ["push", "origin", `HEAD:${defaultBranch}`],
-        { cwd: repoPath },
+        { cwd: repoPath, timeoutMs: 120_000 },
       ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
       if (pushRes.code !== 0) {
         // Roll back the local commit so the branch does not stay ahead of origin;
         // fetchDefaultBranch's git reset --hard would silently discard it (ES-452 Finding 3).
         // Use --hard to also clean the worktree; --mixed (the default) would leave the
         // memory files modified, causing the next startup's clean-worktree preflight to fail.
-        await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath }).catch(() => {});
+        await this.runner.run("git", ["reset", "--hard", "HEAD~1"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
         this.log(`warning: failed to push memory commit (rolled back): ${pushRes.stderr.trim()}`);
       }
     } else {
@@ -6150,12 +6763,12 @@ export class Orchestrator {
       // still contains the unrelated commit (ES-503 Finding 2).
       const aheadRes = await this.runner.run(
         "git", ["rev-list", "--count", `origin/${defaultBranch}..HEAD`],
-        { cwd: repoPath },
+        { cwd: repoPath, timeoutMs: 30_000 },
       ).catch((_e: unknown) => ({ code: 1, stdout: "0", stderr: "" }));
       if (aheadRes.code === 0 && parseInt(aheadRes.stdout.trim(), 10) > 0) {
         const logRes = await this.runner.run(
           "git", ["log", "--format=%H", `origin/${defaultBranch}..HEAD`],
-          { cwd: repoPath },
+          { cwd: repoPath, timeoutMs: 30_000 },
         ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
         if (logRes.code !== 0) {
           this.log("warning: could not inspect ahead commits; skipping push");
@@ -6165,7 +6778,7 @@ export class Orchestrator {
           for (const sha of aheadShas) {
             const filesRes = await this.runner.run(
               "git", ["diff-tree", "--no-commit-id", "-r", "-m", "--name-only", sha],
-              { cwd: repoPath },
+              { cwd: repoPath, timeoutMs: 30_000 },
             ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "" }));
             if (filesRes.code !== 0) {
               hasNonMemory = true;
@@ -6183,7 +6796,7 @@ export class Orchestrator {
             const pushRes = await this.runner.run(
               "git",
               ["push", "origin", `HEAD:${defaultBranch}`],
-              { cwd: repoPath },
+              { cwd: repoPath, timeoutMs: 120_000 },
             ).catch((_e: unknown) => ({ code: 1, stdout: "", stderr: "push runner error" }));
             if (pushRes.code !== 0) {
               this.log(`warning: failed to push local-only commits (non-fatal): ${pushRes.stderr.trim()}`);
@@ -6192,6 +6805,7 @@ export class Orchestrator {
         }
       }
     }
+    return false;
   }
 
   /** 停止要求による Run レベルのクリーン halt（セッションは stopped にしない）。

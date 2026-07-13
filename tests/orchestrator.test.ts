@@ -782,6 +782,7 @@ describe("Orchestrator 失敗系 — spec loading failure undoes claim", () => {
     const inlineMemoryRunner1 = new FakeCommandRunner();
     inlineMemoryRunner1.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner1.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    inlineMemoryRunner1.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
     inlineMemoryRunner1.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner1.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
@@ -3161,6 +3162,7 @@ describe("Orchestrator DESIGN phase (ES-476)", () => {
     const inlineMemoryRunner2 = new FakeCommandRunner();
     inlineMemoryRunner2.on(["git", "fetch", "origin", "main"], { code: 0 });
     inlineMemoryRunner2.on(["git", "rebase", "--autostash", "origin/main"], { code: 0 });
+    inlineMemoryRunner2.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 0, stdout: "" });
     inlineMemoryRunner2.on(["git", "add", "-f", "--"], { code: 0 });
     inlineMemoryRunner2.on(["git", "diff", "--cached", "--quiet", "--", "docs/memory/"], { code: 0 });
     const orch = new Orchestrator({
@@ -6332,6 +6334,243 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     // Session still completed despite GROOM failure
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
     expect(sessions[0]!.state).toBe("merged");
+  });
+
+  it("git clean -fd timeout in success path halts run to prevent SELECT against Codex artifacts (ES-512 Finding 4)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns valid output with a reprioritize action
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Bump ES-1"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // Simulate git clean -fd timing out / failing in the success-path cleanup
+    h.memoryRunner.on(["git", "clean", "-fd"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // groom_log must record the failure as an error
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("git clean -fd");
+    expect(groomLog.actionsExecuted).toBe(0);
+
+    // No Linear reprioritize call should have been made (actions must not execute)
+    expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(0);
+
+    // Run must halt; SELECT must not run against the Codex-artifact-containing checkout
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git reset --hard timeout in success path halts run to prevent SELECT against Codex-mutated checkout (ES-512 Finding 1 / Codex Finding 4)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns valid output with a reprioritize action
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Bump ES-1"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // Simulate git reset --hard timing out / failing in the success-path cleanup
+    h.memoryRunner.on(["git", "reset", "--hard"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // groom_log must record the failure as an error
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("git reset --hard");
+    expect(groomLog.actionsExecuted).toBe(0);
+
+    // No Linear reprioritize call should have been made (actions must not execute)
+    expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(0);
+
+    // Run must halt; SELECT must not run against the Codex-mutated checkout
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git clean -fdx docs/memory timeout in success path halts run to prevent stale memory reaching SELECT (ES-512 Codex Finding 3)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns valid output with a reprioritize action
+    planner.outcomes.push({
+      kind: "completed",
+      text: '```json\n{"actions":[{"type":"reprioritize","issueId":"ES-1","priority":2,"rationale":"urgent"}],"summary":"Bump ES-1"}\n```',
+    });
+    h.groomBoardFetcher.projectIssueIds = new Set(["ES-1"]);
+    h.groomBoardFetcher.optInIssueIds = new Set(["ES-1"]);
+
+    // Simulate git clean -fdx -- docs/memory/ timing out / failing in the success-path cleanup
+    h.memoryRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // groom_log must record the failure as an error
+    const groomLog = h.store.getGroomLog(1);
+    expect(groomLog.outcome).toBe("error");
+    expect(groomLog.errorDetail).toContain("git clean -fdx --");
+    expect(groomLog.actionsExecuted).toBe(0);
+
+    // No Linear reprioritize call should have been made (actions must not execute)
+    expect(h.groomLinearClient.calls.filter(c => c.method === "updatePriority")).toHaveLength(0);
+
+    // Run must halt; SELECT must not run with stale Codex memory files in docs/memory/
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git clean -fd timeout in error path halts run (ES-512 Codex Finding 2)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({ kind: "error", message: "codex crashed" });
+
+    // Simulate git clean -fd timing out in the error-path cleanup
+    h.memoryRunner.on(["git", "clean", "-fd"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // Run must halt; SELECT must not run against the dirty checkout
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git clean -fdx docs/memory timeout in error path halts run (ES-512 Codex Finding 2)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({ kind: "error", message: "codex crashed" });
+
+    // Simulate git clean -fdx -- docs/memory/ timing out in the error-path cleanup
+    h.memoryRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // Run must halt; SELECT must not run with stale Codex memory files
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git clean -fd timeout in parse-error path halts run (ES-512 Codex Finding 3)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({ kind: "completed", text: "not valid json at all" });
+
+    // Simulate git clean -fd timing out in the parse-error cleanup
+    h.memoryRunner.on(["git", "clean", "-fd"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // Run must halt; SELECT must not run against the dirty checkout
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git clean -fdx docs/memory timeout in parse-error path halts run (ES-512 Codex Finding 3)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({ kind: "completed", text: "not valid json at all" });
+
+    // Simulate git clean -fdx -- docs/memory/ timing out in the parse-error cleanup
+    h.memoryRunner.on(["git", "clean", "-fdx", "--", "docs/memory/"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // Run must halt; SELECT must not run with stale Codex memory files
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git reset --hard timeout in parse-error path halts run (ES-512 Codex Finding 3)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    planner.outcomes.push({ kind: "completed", text: "not valid json at all" });
+
+    // Simulate git reset --hard timing out in the parse-error cleanup
+    h.memoryRunner.on(["git", "reset", "--hard"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // Run must halt; SELECT must not run against the Codex-mutated checkout
+    const run = h.store.latestRun();
+    expect(run!.state).toBe("halted");
+    expect(h.store.sessionsForRun(run!.id)).toHaveLength(0);
+    expect(h.notifier.events.some(e => e.kind === "halted" && e.reason === "groom_cleanup_failed")).toBe(true);
+  });
+
+  it("git clean -fd timeout in interrupt path sets skip guard to prevent untracked artifacts on halt (ES-512 Codex Finding 4)", async () => {
+    const planner = new FakePlanRunner();
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const h = makeHarness(config, { planner });
+
+    // GROOM Codex returns interrupted to trigger the interrupt cleanup path
+    planner.outcomes.push({ kind: "interrupted" });
+
+    // Simulate git clean -fd timing out in the interrupt cleanup
+    h.memoryRunner.on(["git", "clean", "-fd"], { code: 1, stderr: "timeout" });
+
+    await h.orch.run();
+
+    // Run must have halted (via interrupt path)
+    expect(h.store.latestRun()!.state).toBe("halted");
+    // Skip guard must have been set: commitMemoryBeforeHalt logs the skip warning
+    expect(h.logs.some((l) => l.includes("skipping memory commit on halt"))).toBe(true);
+  });
+
+  it("git clean -fdx docs/memory after unmerged-check failure removes untracked memory files (ES-512 Codex Finding 5)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 3 });
+    const h = makeHarness(config);
+
+    // Simulate ls-files --unmerged failing (timeout or error)
+    h.memoryRunner.on(["git", "ls-files", "--unmerged", "--", "docs/memory/"], { code: 1, stderr: "timeout" });
+    h.memoryRunner.on(["git", "checkout", "HEAD", "--", "docs/memory/"], { code: 0 });
+
+    h.orch.requestStop();
+    await h.orch.run();
+
+    // git clean -fdx -- docs/memory/ must be called to remove untracked files,
+    // not just git checkout HEAD (which only reverts tracked files).
+    const cleanCalls = h.memoryRunner.calls.filter(
+      (c) => c.cmd === "git" && c.args[0] === "clean" && c.args[1] === "-fdx" &&
+             c.args.includes("--") && c.args.includes("docs/memory/"),
+    );
+    expect(cleanCalls.length).toBeGreaterThan(0);
+    expect(h.store.latestRun()!.state).toBe("halted");
   });
 
   it("GROOM-blocked issues are excluded from SELECT eligible list (ES-457 Finding 2)", async () => {
