@@ -99,6 +99,7 @@ const rawSchema = z.object({
   }).strict(),
   safety: z.object({
     max_tasks_per_run: z.number().int().positive(),
+    max_abandons_per_run: z.number().int().positive().default(3),
     max_cost_usd_per_session: z.number().positive(),
     monitor_timeout_minutes: z.number().positive().default(60),
     not_engaged_guard_minutes: z.number().positive().default(30),
@@ -257,6 +258,7 @@ export interface Config {
   };
   safety: {
     maxTasksPerRun: number;
+    maxAbandonsPerRun: number;
     maxCostUsdPerSession: number;
     monitorTimeoutMinutes: number;
     notEngagedGuardMinutes: number;
@@ -970,6 +972,7 @@ export function loadConfig(
     },
     safety: {
       maxTasksPerRun: raw.safety.max_tasks_per_run,
+      maxAbandonsPerRun: raw.safety.max_abandons_per_run,
       maxCostUsdPerSession: raw.safety.max_cost_usd_per_session,
       monitorTimeoutMinutes: raw.safety.monitor_timeout_minutes,
       notEngagedGuardMinutes: raw.safety.not_engaged_guard_minutes,

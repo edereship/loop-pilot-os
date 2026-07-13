@@ -6310,6 +6310,23 @@ export class Orchestrator {
     }
     // --- Policy: "abandon" (ES-490) ---
     if (policy === "abandon") {
+      // ES-509: per-run abandon cap — halt instead of abandoning when the limit is reached.
+      const abandonCount = this.store.countAbandons(this.runId);
+      if (abandonCount >= this.config.safety.maxAbandonsPerRun) {
+        const capDetail = `abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
+        this.log(capDetail);
+        await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
+        this.store.updateSession(session.id, {
+          state: "stopped",
+          failureReason: reason,
+          stopDetail: effectiveDetail,
+          endedAt: this.clock(),
+          ...patch,
+        });
+        await this.commitMemoryBeforeHalt();
+        this.store.setRunState(this.runId, "halted", capDetail);
+        return HALT;
+      }
       const freshAbandon = this.store.getSession(session.id);
       // Forward-looking: no current abandon-policy reason reaches here (all are
       // pre-HANDOFF, so prNumber is always null). Will be exercised when recovery

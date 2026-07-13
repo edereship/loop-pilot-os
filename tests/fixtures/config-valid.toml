@@ -42,6 +42,7 @@ max_tasks_per_run = 3
 max_cost_usd_per_session = 10.0
 monitor_timeout_minutes = 120
 not_engaged_guard_minutes = 30
+max_abandons_per_run = 3
 
 [loop]
 monitor_poll_seconds = 60

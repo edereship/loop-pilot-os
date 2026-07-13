@@ -50,6 +50,7 @@ function makeConfig(over: Partial<{
     digest: { recentMergedCount: over.recentMergedCount ?? 5, enabled: true },
     safety: {
       maxTasksPerRun: over.maxTasksPerRun ?? 3,
+      maxAbandonsPerRun: 3,
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes ?? 60,
@@ -5571,6 +5572,74 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     await h.orch.run();
 
     expect(h.store.sessionsForRun(h.store.latestRun()!.id).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("abandon cap reached → halt instead of abandon (ES-509)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 5 });
+    config.safety.maxAbandonsPerRun = 2;
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    // 3 issues: first 2 will be abandoned (agent_no_change), 3rd should trigger the cap.
+    h.source.queue = [
+      issue("issue-A", "TY-1"),
+      issue("issue-B", "TY-2"),
+      issue("issue-C", "TY-3"),
+    ];
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+      { kind: "completed", text: "## Goal\nC" },
+    ];
+    // Implement agent completes normally for all three, but the git diff is empty for
+    // each worktree — this is what drives the agent_no_change → abandon path (the diff
+    // guard fires right after implement, before self-review is ever reached).
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    h.git.commitsWithDiff.set("/wt/ty-2", false);
+    h.git.commitsWithDiff.set("/wt/ty-3", false);
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // First 2 abandoned successfully, 3rd halted at the cap instead of being abandoned.
+    const abandoned = sessions.filter((s) => s.recoveryAction === "abandon");
+    expect(abandoned).toHaveLength(2);
+    // Run halted (not completed).
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("abandon cap reached");
+    // Halt notification sent with the cap detail.
+    const halts = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(halts.length).toBeGreaterThanOrEqual(1);
+    expect(
+      halts.some((e) => (e as { detail?: string }).detail?.includes("abandon cap reached")),
+    ).toBe(true);
+  });
+
+  it("abandon count is DB-derived (survives fresh store instance) (ES-509)", async () => {
+    const store = new SqliteStore(":memory:");
+    const config = makeConfig({ maxTasksPerRun: 5 });
+    config.safety.maxAbandonsPerRun = 2;
+    const designer = new FakePlanRunner();
+    // Run 1: abandon 1 issue (only 1 issue available, cap not reached).
+    const h1 = makeHarness(config, { designer, store });
+    h1.source.queue = [issue("issue-A", "TY-1")];
+    designer.outcomes = [{ kind: "completed", text: "## Goal\nA" }];
+    h1.agent.outcomes = [{ kind: "completed", costUsd: 0.1, summary: "no changes" }];
+    h1.git.commitsWithDiff.set("/wt/ty-1", false);
+    await h1.orch.run();
+    const run1 = store.latestRun()!;
+    expect(store.countAbandons(run1.id)).toBe(1);
+
+    // "Restart": a fresh Orchestrator instance backed by the SAME store (simulates a process
+    // restart). countAbandons must still return 1 — it is derived from the DB, not an
+    // in-memory counter tied to the Orchestrator instance.
+    makeHarness(config, { designer, store });
+    expect(store.countAbandons(run1.id)).toBe(1);
   });
 
   // --- halt policy tests ---
