@@ -330,6 +330,9 @@ export class Orchestrator {
       });
       if (startupCheckoutDirtyResetFailed) {
         const haltDetail = "startup: checkout_dirty cleanup failed; halting to prevent SELECT/GROOM from running against unsafe checkout";
+        // Persist the dirty flag on the new run so the next startup knows to re-run cleanup
+        // rather than treating this halted row as a clean baseline (ES-512 Finding 1).
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
         this.store.setRunState(this.runId, "halted", haltDetail);
         await this.notifier.notify({ kind: "halted", reason: "startup_checkout_dirty", detail: haltDetail });
         this.log(haltDetail);
@@ -2600,12 +2603,14 @@ export class Orchestrator {
           // Unstage first: if git add succeeded before the failure, newly staged files
           // are not untracked and git clean would skip them without this reset.
           await this.runner.run("git", ["reset", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-          await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+          // Finding 2: checkout failure leaves tracked memory changes dirty; treat it as
+          // fatal alongside the clean failure below (ES-512 Codex Finding 2).
+          const memCommitCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
           // Finding 5: treat clean failure as fatal — dirty or staged memory surviving into
           // SELECT contaminates the PM selection context (ES-512 Codex Finding 5).
           const memCommitCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
-          if (!memCommitCleanRes || memCommitCleanRes.code !== 0) {
-            this.log(`groom: git clean -fdx -- ${MEMORY_DIR}/ failed in memory-commit-error path; halting to prevent dirty memory from reaching SELECT`);
+          if (!memCommitCheckoutRes || memCommitCheckoutRes.code !== 0 || !memCommitCleanRes || memCommitCleanRes.code !== 0) {
+            this.log(`groom: checkout/clean of ${MEMORY_DIR}/ failed in memory-commit-error path; halting to prevent dirty memory from reaching SELECT`);
             // Persist partial results before halting so the audit trail reflects what
             // actually ran even though cleanup failed (ES-512 Finding 4).
             for (const r of executionResults) {
@@ -2633,13 +2638,13 @@ export class Orchestrator {
                 actionsRejected: rejectedCount,
                 actionDetails: JSON.stringify(memCleanHaltDetails),
                 outcome: "error",
-                errorDetail: `memory commit failed and git clean -fdx -- ${MEMORY_DIR}/ also failed; halting`,
+                errorDetail: `memory commit failed and checkout/clean of ${MEMORY_DIR}/ also failed; halting`,
               });
             } catch (logErr) {
               this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
             }
             this._skipMemoryCommitOnHalt = true;
-            const haltDetailMemClean = `groom: git clean -fdx -- ${MEMORY_DIR}/ timed out or failed in memory-commit-error path; halting to prevent dirty memory`;
+            const haltDetailMemClean = `groom: checkout or clean of ${MEMORY_DIR}/ timed out or failed in memory-commit-error path; halting to prevent dirty memory`;
             await this.commitMemoryBeforeHalt();
             this.store.setRunState(this.runId, "halted", haltDetailMemClean);
             await this.notifier.notify({ kind: "halted", reason: "groom_cleanup_failed", detail: haltDetailMemClean });
@@ -6593,8 +6598,14 @@ export class Orchestrator {
       // the memory commit rather than acting on unknown index state; restore tracked
       // files and remove untracked files so the next startup's clean-worktree preflight
       // does not fail (ES-512 Codex Finding 5).
-      await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
-      await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+      const unknownCheckoutRes = await this.runner.run("git", ["checkout", "HEAD", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      const unknownCleanRes = await this.runner.run("git", ["clean", "-fdx", "--", MEMORY_DIR + "/"], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => null);
+      // Finding 3: if either cleanup fails, docs/memory/ may remain dirty while no
+      // checkout_dirty marker is set, so next startup would bootstrap against unknown index
+      // state. Persist the flag so next startup runs its own cleanup (ES-512 Finding 3).
+      if ((!unknownCheckoutRes || unknownCheckoutRes.code !== 0 || !unknownCleanRes || unknownCleanRes.code !== 0) && this.runId !== 0) {
+        try { this.store.setRunCheckoutDirty(this.runId); } catch { /* best-effort */ }
+      }
       this.log("warning: unmerged-file check timed out or failed; skipping memory commit to avoid acting on unknown index state");
       return;
     }
