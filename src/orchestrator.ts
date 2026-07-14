@@ -6311,39 +6311,12 @@ export class Orchestrator {
     // --- Policy: "abandon" (ES-490) ---
     if (policy === "abandon") {
       // ES-509: per-run abandon cap — halt instead of abandoning when the limit is reached.
+      // The cap check only sets a flag here; cleanup (worktree discard, PR close, todo
+      // revert, needs-human triage) still runs through the normal pre-PR/post-PR branches
+      // below so the halt-on-cap path gets the exact same cleanup as every other abandon
+      // (ES-509 code review: avoid duplicating cleanup logic at the wrong level).
       const abandonCount = this.store.countAbandons(this.runId);
-      if (abandonCount >= this.config.safety.maxAbandonsPerRun) {
-        const capDetail = `${session.linearIdentifier}: abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
-        this.log(capDetail);
-        await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
-        this.store.updateSession(session.id, {
-          state: "stopped",
-          failureReason: reason,
-          stopDetail: effectiveDetail,
-          endedAt: this.clock(),
-          recoveryAction: "abandon",
-          ...patch,
-        });
-        // ES-509 review: the cap-halt path must perform the same ticket cleanup as
-        // every other abandon path — discard the worktree, revert the ticket to
-        // todo, and apply the needs-human label — so the ticket doesn't stay stuck
-        // "In Progress" with no signal for a human to pick it up.
-        if (session.worktreePath) {
-          await bestEffort(() => this.git.discardWorktree(session.branch, session.worktreePath!));
-        }
-        try {
-          await retryTransient(this.config.safety.transientRetryAttempts, () =>
-            this.source.transition(session.linearIssueId, "todo"),
-            { onRetry: (n, e) => this.log(`transient retry ${n}: todo revert for ${session.linearIdentifier}: ${errMsg(e)}`) },
-          );
-        } catch (err) {
-          this.log(`abandon cap: todo revert failed (ticket may be stuck): ${errMsg(err)}`);
-        }
-        await this.applyNeedsHumanTriage(session, reason, userFacingDetail(effectiveDetail));
-        await this.commitMemoryBeforeHalt();
-        this.store.setRunState(this.runId, "halted", capDetail);
-        return HALT;
-      }
+      const abandonCapReached = abandonCount >= this.config.safety.maxAbandonsPerRun;
       const freshAbandon = this.store.getSession(session.id);
       // Forward-looking: no current abandon-policy reason reaches here (all are
       // pre-HANDOFF, so prNumber is always null). Will be exercised when recovery
@@ -6380,6 +6353,14 @@ export class Orchestrator {
           await this.applyNeedsHumanTriage(freshAbandon, reason, displayDetail);
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
+          if (abandonCapReached) {
+            const capDetail = `${session.linearIdentifier}: abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
+            this.log(capDetail);
+            await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
+            await this.commitMemoryBeforeHalt();
+            this.store.setRunState(this.runId, "halted", capDetail);
+            return HALT;
+          }
           return CONTINUE;
         }
         // executeAbandon failed — fall through to halt with failure info.
@@ -6441,6 +6422,14 @@ export class Orchestrator {
         }
         // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
         await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
+        if (abandonCapReached) {
+          const capDetail = `${session.linearIdentifier}: abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
+          this.log(capDetail);
+          await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
+          await this.commitMemoryBeforeHalt();
+          this.store.setRunState(this.runId, "halted", capDetail);
+          return HALT;
+        }
         return CONTINUE;
       }
     }

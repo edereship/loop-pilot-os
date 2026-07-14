@@ -5627,6 +5627,73 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     expect(h.source.transitions).toContainEqual({ issueId: "issue-C", state: "todo" });
   });
 
+  it("abandon cap reached on post-PR recovery exhaustion → PR closed before halt (ES-509)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 5 });
+    config.safety.maxAbandonsPerRun = 1;
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Issue A: agent_no_change → abandon (count=1, does not itself hit the cap since
+    // the count is 0 at the time issue A's own abandon-policy check runs).
+    // Issue B: ci_failed, recovery exhausted → policy=abandon → cap fires with PR open.
+    h.source.queue = [
+      issue("issue-A", "TY-1"),
+      issue("issue-B", "TY-2"),
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },              // Issue A: implement (no diff)
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },             // Issue B: implement
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },        // Issue B: self-review skip
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 1" },     // Issue B: recovery fix 1
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 2" },     // Issue B: recovery fix 2
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false); // Issue A: no diff → agent_no_change
+    // Issue B: has diff → proceeds to HANDOFF (default commitsWithDiff is true).
+    planner.outcomes = [
+      // With 2 eligible issues queued, SELECT asks the PM (this.planner) to rank them once
+      // before CLAIM — non-JSON text here deliberately fails to parse, falling back to
+      // eligible[0] (issue-A), which matches the intended processing order anyway.
+      { kind: "completed", text: "n/a (deterministic fallback expected)" },              // SELECT ranking (2 eligible)
+      { kind: "completed", text: "## Goal\nA" },                                       // Issue A: DESIGN
+      { kind: "completed", text: "## Goal\nB" },                                       // Issue B: DESIGN
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix CI"}' },      // Issue B: recovery 1
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix CI again"}' }, // Issue B: recovery 2
+    ];
+    h.git.pushPrNumber.set("looppilot/ty-2-x", 100);
+    // Issue B: monitor done → merge readiness ci_failed (every time)
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    h.git.ciLogs = "Error: test failed";
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    // Run halted due to abandon cap.
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("abandon cap reached");
+    // Issue B's PR must have been closed (the "gh pr close" call inside executeAbandon)
+    // before the halt — executeAbandon uses recoveryRunner.run("gh", ["pr", "close", ...])
+    // directly rather than GitPrManager.closePr.
+    const prCloseCalls = h.recoveryRunner.calls.filter(
+      (c) => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close",
+    );
+    expect(prCloseCalls.length).toBeGreaterThanOrEqual(1);
+    expect(prCloseCalls[0].args).toContain("100");
+    const sessions = h.store.sessionsForRun(run.id);
+    const abandoned = sessions.filter((s) => s.recoveryAction === "abandon");
+    expect(abandoned).toHaveLength(2);
+  });
+
   it("abandon count is DB-derived (survives fresh store instance) (ES-509)", async () => {
     const store = new SqliteStore(":memory:");
     const config = makeConfig({ maxTasksPerRun: 5 });
