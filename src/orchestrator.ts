@@ -1225,7 +1225,7 @@ export class Orchestrator {
         }
         groomSummary = groomResult.summary;
         groomBlockedIds = groomResult.blockedIds;
-        groomSuppliedBlockedIds = groomResult.summary !== null;
+        groomSuppliedBlockedIds = groomResult.boardFetched;
       }
 
       // 2) SELECT（仕様 §5.1 + A1 PM 選別ターン）
@@ -1922,9 +1922,9 @@ export class Orchestrator {
   }
 
   // ---- GROOM（ES-457: Board Grooming Phase） ----
-  private async groom(): Promise<{ control: "continue"; summary: string | null; blockedIds: Set<string> } | { control: "halt" }> {
+  private async groom(): Promise<{ control: "continue"; summary: string | null; blockedIds: Set<string>; boardFetched: boolean } | { control: "halt" }> {
     if (!this.config.groom.enabled || this.groomDeps === null || this.planner === null) {
-      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+      return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
     }
 
     this.groomLoopIndex++;
@@ -1937,7 +1937,7 @@ export class Orchestrator {
       });
     } catch (err) {
       this.log(`groom: failed to insert groom_log, skipping: ${errMsg(err)}`);
-      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+      return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
     }
 
     try {
@@ -1962,7 +1962,7 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
-        return { control: "continue", summary: null, blockedIds: new Set<string>() };
+        return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
       }
       // Build blocked identifier set for SELECT-time filtering (ES-457 Finding 2).
       const blockedIds = new Set<string>(boardState.blocked.map((b) => b.identifier));
@@ -2087,7 +2087,7 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       // 3. Run Codex
@@ -2199,7 +2199,7 @@ export class Orchestrator {
               return { control: "halt" };
             }
           }
-          return { control: "continue", summary: null, blockedIds };
+          return { control: "continue", summary: null, blockedIds, boardFetched: true };
         }
         codexOutput = outcome.text;
       } catch (err) {
@@ -2255,7 +2255,7 @@ export class Orchestrator {
             return { control: "halt" };
           }
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       // 4. Parse
@@ -2312,7 +2312,7 @@ export class Orchestrator {
             return { control: "halt" };
           }
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       const groomOutput = parseResult.value;
@@ -2397,7 +2397,7 @@ export class Orchestrator {
             return { control: "halt" };
           }
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       const validationResults = validateGroomActions(allActions, validationCtx);
@@ -2764,7 +2764,7 @@ export class Orchestrator {
       const summaryForSelect = (rejectedCount === 0 && failedExecutions === 0)
         ? groomOutput.summary
         : `${groomOutput.summary} [${executedCount}/${allActions.length} executed]`;
-      return { control: "continue", summary: summaryForSelect, blockedIds };
+      return { control: "continue", summary: summaryForSelect, blockedIds, boardFetched: true };
     } catch (err) {
       this.log(`groom: unexpected error, skipping: ${errMsg(err)}`);
       try {
@@ -2776,7 +2776,7 @@ export class Orchestrator {
       } catch (logErr) {
         this.log(`groom: failed to update groom_log in error handler: ${errMsg(logErr)}`);
       }
-      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+      return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
     }
   }
 
