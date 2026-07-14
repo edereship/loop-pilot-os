@@ -5606,9 +5606,12 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
 
     const run = h.store.latestRun()!;
     const sessions = h.store.sessionsForRun(run.id);
-    // First 2 abandoned successfully, 3rd halted at the cap with recoveryAction set (ES-509 fix).
+    // ES-509 v2 fix: the cap check runs AFTER the current session's abandon is persisted, so
+    // countAbandons() includes it (no off-by-one). With cap=2: issue-A's abandon brings the
+    // count to 1 (< 2, CONTINUE); issue-B's abandon brings it to 2 (>= 2, HALT). Issue-C is
+    // never processed — exactly 2 abandons complete.
     const abandoned = sessions.filter((s) => s.recoveryAction === "abandon");
-    expect(abandoned).toHaveLength(3);
+    expect(abandoned).toHaveLength(2);
     // Run halted (not completed).
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("abandon cap reached");
@@ -5619,21 +5622,25 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
       halts.some((e) => (e as { detail?: string }).detail?.includes("abandon cap reached")),
     ).toBe(true);
     expect(
-      halts.some((e) => (e as { detail?: string }).detail?.includes("TY-3")),
+      halts.some((e) => (e as { detail?: string }).detail?.includes("TY-2")),
     ).toBe(true);
     // ES-509 review: cap-halt must perform the same ticket cleanup as other abandon paths —
-    // needs-human label applied and the 3rd (halted) ticket reverted to todo.
-    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-C", labelName: config.linear.needsHumanLabel });
-    expect(h.source.transitions).toContainEqual({ issueId: "issue-C", state: "todo" });
+    // needs-human label applied and the 2nd (cap-triggering) ticket reverted to todo.
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-B", labelName: config.linear.needsHumanLabel });
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-B", state: "todo" });
   });
 
   it("abandon cap reached on post-PR recovery exhaustion → PR closed before halt (ES-509)", async () => {
     const config = makeConfig({ maxTasksPerRun: 5 });
-    config.safety.maxAbandonsPerRun = 1;
+    // ES-509 v2 fix: the cap check runs AFTER the current session's abandon is persisted.
+    // With cap=1, issue-A's own pre-PR abandon would immediately hit the cap (count=1 >= 1)
+    // and halt before issue-B is ever processed, defeating the point of this test (exercising
+    // the post-PR executeAbandon path). Use cap=2 so issue-A's abandon brings the count to 1
+    // (< 2, CONTINUE) and issue-B's post-PR abandon brings it to 2 (>= 2, HALT).
+    config.safety.maxAbandonsPerRun = 2;
     const planner = new FakePlanRunner();
     const h = makeHarness(config, { planner, designer: planner });
-    // Issue A: agent_no_change → abandon (count=1, does not itself hit the cap since
-    // the count is 0 at the time issue A's own abandon-policy check runs).
+    // Issue A: agent_no_change → abandon (count=1, below the cap).
     // Issue B: ci_failed, recovery exhausted → policy=abandon → cap fires with PR open.
     h.source.queue = [
       issue("issue-A", "TY-1"),

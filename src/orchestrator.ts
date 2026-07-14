@@ -6084,6 +6084,9 @@ export class Orchestrator {
           // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
           // Scrub raw CI log payloads before posting to Linear (ES-493 Iteration 11 Finding 2).
           await this.applyNeedsHumanTriage(session, reason, userFacingDetail(effectiveDetail));
+          // ES-509: recovery-decided abandons also count against the per-run cap.
+          const capHalt = await this.haltIfAbandonCapReached(session, reason);
+          if (capHalt !== null) return capHalt;
           return CONTINUE;
         }
         // Only record the recovery action for non-failed outcomes. A failed abandon must
@@ -6310,13 +6313,13 @@ export class Orchestrator {
     }
     // --- Policy: "abandon" (ES-490) ---
     if (policy === "abandon") {
-      // ES-509: per-run abandon cap — halt instead of abandoning when the limit is reached.
-      // The cap check only sets a flag here; cleanup (worktree discard, PR close, todo
-      // revert, needs-human triage) still runs through the normal pre-PR/post-PR branches
-      // below so the halt-on-cap path gets the exact same cleanup as every other abandon
-      // (ES-509 code review: avoid duplicating cleanup logic at the wrong level).
-      const abandonCount = this.store.countAbandons(this.runId);
-      const abandonCapReached = abandonCount >= this.config.safety.maxAbandonsPerRun;
+      // ES-509: per-run abandon cap — halt instead of continuing when the limit is reached.
+      // The check is performed via haltIfAbandonCapReached() AFTER the current session's
+      // abandon has been persisted (recoveryAction: "abandon" written) so countAbandons()
+      // includes it — avoiding the off-by-one where the in-flight abandon was excluded
+      // (ES-509 v2 review Findings 1 & 2). Cleanup (worktree discard, PR close, todo revert,
+      // needs-human triage) still runs through the normal pre-PR/post-PR branches below so
+      // the halt-on-cap path gets the exact same cleanup as every other abandon.
       const freshAbandon = this.store.getSession(session.id);
       // Forward-looking: no current abandon-policy reason reaches here (all are
       // pre-HANDOFF, so prNumber is always null). Will be exercised when recovery
@@ -6353,14 +6356,8 @@ export class Orchestrator {
           await this.applyNeedsHumanTriage(freshAbandon, reason, displayDetail);
           await this.notifier.notify({ kind: "task_skipped", identifier: session.linearIdentifier, reason, detail: skipDetail });
           this.log(skipDetail);
-          if (abandonCapReached) {
-            const capDetail = `${session.linearIdentifier}: abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
-            this.log(capDetail);
-            await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
-            await this.commitMemoryBeforeHalt();
-            this.store.setRunState(this.runId, "halted", capDetail);
-            return HALT;
-          }
+          const capHalt = await this.haltIfAbandonCapReached(session, reason);
+          if (capHalt !== null) return capHalt;
           return CONTINUE;
         }
         // executeAbandon failed — fall through to halt with failure info.
@@ -6422,14 +6419,8 @@ export class Orchestrator {
         }
         // ES-492: Add needs-human label + reason comment so SELECT filters this ticket out until a human reviews.
         await this.applyNeedsHumanTriage(session, reason, effectiveDetail);
-        if (abandonCapReached) {
-          const capDetail = `${session.linearIdentifier}: abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
-          this.log(capDetail);
-          await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
-          await this.commitMemoryBeforeHalt();
-          this.store.setRunState(this.runId, "halted", capDetail);
-          return HALT;
-        }
+        const capHalt = await this.haltIfAbandonCapReached(session, reason);
+        if (capHalt !== null) return capHalt;
         return CONTINUE;
       }
     }
@@ -6544,6 +6535,27 @@ export class Orchestrator {
     } catch (err) {
       this.log(`needs-human: postComment failed for ${session.linearIdentifier} (non-fatal): ${errMsg(err)}`);
     }
+  }
+
+  /**
+   * ES-509: per-run abandon cap — checked AFTER the current session's abandon has been
+   * persisted (recoveryAction: "abandon" written) so countAbandons() includes it. Call this
+   * at every CONTINUE return point that follows an abandon persist (recovery-turn-decided
+   * abandon, post-PR executeAbandon, and pre-PR abandon) so the cap applies uniformly
+   * across all abandon paths and does not off-by-one (ES-509 v2 review Findings 1 & 2).
+   */
+  private async haltIfAbandonCapReached(
+    session: TaskSessionRow,
+    reason: FailureReason,
+  ): Promise<RunControl | null> {
+    const abandonCount = this.store.countAbandons(this.runId);
+    if (abandonCount < this.config.safety.maxAbandonsPerRun) return null;
+    const capDetail = `${session.linearIdentifier}: abandon cap reached: ${abandonCount}/${this.config.safety.maxAbandonsPerRun} — possible systematic issue`;
+    this.log(capDetail);
+    await this.notifier.notify({ kind: "halted", reason, detail: capDetail });
+    await this.commitMemoryBeforeHalt();
+    this.store.setRunState(this.runId, "halted", capDetail);
+    return HALT;
   }
 
   /** 全 HALT 経路で共有されるメモリコミットヘルパー。失敗は警告のみ（halt を妨げない）。 */
