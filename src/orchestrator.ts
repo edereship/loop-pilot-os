@@ -1245,9 +1245,10 @@ export class Orchestrator {
         this.log(detail);
         return;
       }
-      // When GROOM was skipped due to idle timeout but SELECT found eligible tickets,
-      // fetch blocked IDs now so dependency-blocked work is not claimed (ES-475).
-      if (idleAlreadyElapsed && eligible.length > 0) {
+      // When GROOM did not supply blocked IDs (disabled, skipped due to idle timeout,
+      // or board fetch failed) but SELECT found eligible tickets, fetch blocked IDs
+      // so dependency-blocked work is not claimed (ES-475 / ES-507).
+      if (groomBlockedIds.size === 0 && eligible.length > 0) {
         groomBlockedIds = await this.fetchBlockedIds();
       }
       // Filter out GROOM-identified blocked issues so dependency-blocked work is not started
@@ -1898,10 +1899,10 @@ export class Orchestrator {
   }
 
   // ---- fetchBlockedIds（lightweight board fetch, no planner） ----
-  // Used when GROOM is skipped (idle timeout elapsed) but SELECT found eligible tickets,
-  // so that dependency-blocked work is still filtered before claiming (ES-475).
+  // Used when GROOM did not supply blocked IDs (disabled, skipped, or board fetch failed)
+  // but SELECT found eligible tickets (ES-475 / ES-507).
   private async fetchBlockedIds(): Promise<Set<string>> {
-    if (!this.config.groom.enabled || this.groomDeps === null) {
+    if (this.groomDeps === null) {
       return new Set<string>();
     }
     try {

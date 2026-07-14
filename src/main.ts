@@ -331,11 +331,11 @@ async function runLoop(configPath: string): Promise<number> {
         config,
         log: logLine,
       },
-      groomDeps: config.groom.enabled ? {
+      groomDeps: {
         boardFetcher: groomBoardFetcher,
         linearClient: groomLinearClient,
         knownLabels: linearSetup.knownLabels,
-      } : null,
+      },
       scoutDeps: scoutAgent !== null ? {
         agent: scoutAgent,
         boardFetcher: groomBoardFetcher,

@@ -239,11 +239,11 @@ function makeHarness(config: Config, opts?: { planner?: PlanRunner | null; desig
       log,
     } : null,
     runner: memoryRunner,
-    groomDeps: (config.groom.enabled && planner !== null) ? {
+    groomDeps: {
       boardFetcher: groomBoardFetcher,
       linearClient: groomLinearClient,
       knownLabels: ["looppilot-os"],
-    } : null,
+    },
     scoutDeps: opts?.scoutDeps ?? null,
     getDescendantPids: opts?.getDescendantPids,
     getReparentedPids: opts?.getReparentedPids,
@@ -5923,7 +5923,7 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
     expect(sessions[0]!.state).toBe("merged");
   });
 
-  it("groom.enabled=false skips GROOM", async () => {
+  it("groom.enabled=false skips full GROOM but still fetches blocked IDs (ES-507)", async () => {
     const planner = new FakePlanRunner();
     const config = { ...makeConfig({ maxTasksPerRun: 1 }), groom: { enabled: false } } as unknown as Config;
     const h = makeHarness(config, { planner });
@@ -5942,9 +5942,11 @@ describe("GROOM Orchestrator Integration (ES-457)", () => {
 
     await h.orch.run();
 
-    // Board fetcher was never called (GROOM never ran)
-    expect(h.groomBoardFetcher.calls).toHaveLength(0);
-    // No groom log created (GROOM skipped entirely)
+    // Full GROOM (priority updates, planner-driven review) never ran, but the lightweight
+    // fetchBlockedIds fallback still fetches the board so blocked tickets stay filtered
+    // even with groom.enabled=false (ES-507).
+    expect(h.groomBoardFetcher.calls).toContain("getBoardState");
+    // No groom log created (full GROOM phase skipped entirely)
     expect(() => h.store.getGroomLog(1)).toThrow();
     // Session still completed
     const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
@@ -7200,6 +7202,64 @@ describe("Orchestrator — アイドルタイムアウト（ES-475）", () => {
     expect(() => h.store.getGroomLog(1)).toThrow();
 
     h.store.close();
+  });
+
+  it("groom.enabled=false でも blocked チケットが SELECT から除外される（ES-507）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: false });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner });
+
+    h.groomBoardFetcher.boardState = {
+      eligible: [{ identifier: "TY-2", title: "Title for TY-2", priority: 2, labels: [] }],
+      inProgress: [],
+      recentDone: [],
+      blocked: [{ identifier: "TY-1", title: "Title for TY-1", priority: 2, labels: [], blockedBy: "ES-99" }],
+    };
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.linearIdentifier).toBe("TY-2");
+    expect(h.source.transitions.some((t) => t.issueId === "issue-A" && t.state === "in_progress")).toBe(false);
+    expect(h.groomBoardFetcher.calls).toContain("getBoardState");
+  });
+
+  it("GROOM 盤面フェッチ失敗時に fetchBlockedIds フォールバックで blocked を除外する（ES-507）", async () => {
+    const config = makeConfig({ maxTasksPerRun: 1, groomEnabled: true });
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+
+    let fetchCount = 0;
+    const origGetBoardState = h.groomBoardFetcher.getBoardState.bind(h.groomBoardFetcher);
+    h.groomBoardFetcher.getBoardState = async (active: Map<string, number | null>) => {
+      fetchCount++;
+      if (fetchCount === 1) throw new Error("Linear API timeout");
+      return origGetBoardState(active);
+    };
+
+    h.groomBoardFetcher.boardState = {
+      eligible: [{ identifier: "TY-2", title: "Title for TY-2", priority: 2, labels: [] }],
+      inProgress: [],
+      recentDone: [],
+      blocked: [{ identifier: "TY-1", title: "Title for TY-1", priority: 2, labels: [], blockedBy: "ES-99" }],
+    };
+
+    h.source.queue = [issue("issue-A", "TY-1"), issue("issue-B", "TY-2")];
+    h.agent.outcomes = [{ kind: "completed", costUsd: 1, summary: "done" }];
+    planner.outcomes = [{ kind: "completed", text: "## Plan" }];
+    h.monitor.verdicts = [{ kind: "done" }, { kind: "merged" }];
+
+    await h.orch.run();
+
+    expect(fetchCount).toBeGreaterThanOrEqual(2);
+    const sessions = h.store.sessionsForRun(h.store.latestRun()!.id);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.linearIdentifier).toBe("TY-2");
   });
 });
 
