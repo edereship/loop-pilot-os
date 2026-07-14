@@ -5606,9 +5606,9 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
 
     const run = h.store.latestRun()!;
     const sessions = h.store.sessionsForRun(run.id);
-    // First 2 abandoned successfully, 3rd halted at the cap instead of being abandoned.
+    // First 2 abandoned successfully, 3rd halted at the cap with recoveryAction set (ES-509 fix).
     const abandoned = sessions.filter((s) => s.recoveryAction === "abandon");
-    expect(abandoned).toHaveLength(2);
+    expect(abandoned).toHaveLength(3);
     // Run halted (not completed).
     expect(run.state).toBe("halted");
     expect(run.haltReason).toContain("abandon cap reached");

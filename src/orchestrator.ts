@@ -6321,6 +6321,7 @@ export class Orchestrator {
           failureReason: reason,
           stopDetail: effectiveDetail,
           endedAt: this.clock(),
+          recoveryAction: "abandon",
           ...patch,
         });
         // ES-509 review: the cap-halt path must perform the same ticket cleanup as
