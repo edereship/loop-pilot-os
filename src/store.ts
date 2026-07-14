@@ -836,6 +836,15 @@ export class SqliteStore {
     return row.c;
   }
 
+  countAbandons(runId: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM task_session WHERE run_id = ? AND recovery_action = 'abandon'`,
+      )
+      .get(runId) as { c: number };
+    return row.c;
+  }
+
   // ---- session ----
   createSession(s: {
     runId: number;

@@ -33,6 +33,7 @@ function makeConfig(over: Partial<{
     digest: { recentMergedCount: over.recentMergedCount ?? 5, enabled: true },
     safety: {
       maxTasksPerRun: over.maxTasksPerRun ?? 3,
+      maxAbandonsPerRun: 3,
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes ?? 60,

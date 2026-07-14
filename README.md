@@ -130,6 +130,7 @@ cp looppilot-os.example.toml looppilot-os.toml
 | `safety.max_cost_usd_per_verify` | VERIFY（Claude 証拠収集）セッションのコスト上限（既定 $2） |
 | `safety.verify_timeout_minutes` | VERIFY セッションのタイムアウト（既定 15 分） |
 | `safety.max_recovery_attempts` | ci_failed/merge_conflict の自動修正上限（既定 2。尽きたら abandon） |
+| `safety.max_abandons_per_run` | 1 ラン中の abandon 上限（既定 3。到達で halt — 系統的な問題の早期検知） |
 | `safety.transient_retry_attempts` | ネットワーク瞬断の操作リトライ回数（既定 2＝計 3 試行。0 で無効） |
 | `verify.enabled` | VERIFY ゲートの有効/無効（既定 `true`） |
 | `verify.run_recipe` | アプリ起動/受け入れテストコマンド（未設定なら軽量モードに縮退） |

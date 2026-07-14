@@ -50,6 +50,7 @@ function makeConfig(over: Partial<{
     digest: { recentMergedCount: over.recentMergedCount ?? 5, enabled: true },
     safety: {
       maxTasksPerRun: over.maxTasksPerRun ?? 3,
+      maxAbandonsPerRun: 3,
       maxCostUsdPerSession: over.maxCostUsdPerSession ?? 10,
       notEngagedGuardMinutes: over.notEngagedGuardMinutes ?? 30,
       monitorTimeoutMinutes: over.monitorTimeoutMinutes ?? 60,
@@ -5571,6 +5572,155 @@ describe("Orchestrator — Failure Policy Routing (ES-490)", () => {
     await h.orch.run();
 
     expect(h.store.sessionsForRun(h.store.latestRun()!.id).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("abandon cap reached → halt instead of abandon (ES-509)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 5 });
+    config.safety.maxAbandonsPerRun = 2;
+    const designer = new FakePlanRunner();
+    const h = makeHarness(config, { designer });
+    // 3 issues: first 2 will be abandoned (agent_no_change), 3rd should trigger the cap.
+    h.source.queue = [
+      issue("issue-A", "TY-1"),
+      issue("issue-B", "TY-2"),
+      issue("issue-C", "TY-3"),
+    ];
+    designer.outcomes = [
+      { kind: "completed", text: "## Goal\nA" },
+      { kind: "completed", text: "## Goal\nB" },
+      { kind: "completed", text: "## Goal\nC" },
+    ];
+    // Implement agent completes normally for all three, but the git diff is empty for
+    // each worktree — this is what drives the agent_no_change → abandon path (the diff
+    // guard fires right after implement, before self-review is ever reached).
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false);
+    h.git.commitsWithDiff.set("/wt/ty-2", false);
+    h.git.commitsWithDiff.set("/wt/ty-3", false);
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    const sessions = h.store.sessionsForRun(run.id);
+    // ES-509 v2 fix: the cap check runs AFTER the current session's abandon is persisted, so
+    // countAbandons() includes it (no off-by-one). With cap=2: issue-A's abandon brings the
+    // count to 1 (< 2, CONTINUE); issue-B's abandon brings it to 2 (>= 2, HALT). Issue-C is
+    // never processed — exactly 2 abandons complete.
+    const abandoned = sessions.filter((s) => s.recoveryAction === "abandon");
+    expect(abandoned).toHaveLength(2);
+    // Run halted (not completed).
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("abandon cap reached");
+    // Halt notification sent with the cap detail, including the triggering ticket's identifier.
+    const halts = h.notifier.events.filter((e) => e.kind === "halted");
+    expect(halts.length).toBeGreaterThanOrEqual(1);
+    expect(
+      halts.some((e) => (e as { detail?: string }).detail?.includes("abandon cap reached")),
+    ).toBe(true);
+    expect(
+      halts.some((e) => (e as { detail?: string }).detail?.includes("TY-2")),
+    ).toBe(true);
+    // ES-509 review: cap-halt must perform the same ticket cleanup as other abandon paths —
+    // needs-human label applied and the 2nd (cap-triggering) ticket reverted to todo.
+    expect(h.source.labelAdds).toContainEqual({ issueId: "issue-B", labelName: config.linear.needsHumanLabel });
+    expect(h.source.transitions).toContainEqual({ issueId: "issue-B", state: "todo" });
+  });
+
+  it("abandon cap reached on post-PR recovery exhaustion → PR closed before halt (ES-509)", async () => {
+    const config = makeConfig({ maxTasksPerRun: 5 });
+    // ES-509 v2 fix: the cap check runs AFTER the current session's abandon is persisted.
+    // With cap=1, issue-A's own pre-PR abandon would immediately hit the cap (count=1 >= 1)
+    // and halt before issue-B is ever processed, defeating the point of this test (exercising
+    // the post-PR executeAbandon path). Use cap=2 so issue-A's abandon brings the count to 1
+    // (< 2, CONTINUE) and issue-B's post-PR abandon brings it to 2 (>= 2, HALT).
+    config.safety.maxAbandonsPerRun = 2;
+    const planner = new FakePlanRunner();
+    const h = makeHarness(config, { planner, designer: planner });
+    // Issue A: agent_no_change → abandon (count=1, below the cap).
+    // Issue B: ci_failed, recovery exhausted → policy=abandon → cap fires with PR open.
+    h.source.queue = [
+      issue("issue-A", "TY-1"),
+      issue("issue-B", "TY-2"),
+    ];
+    h.agent.outcomes = [
+      { kind: "completed", costUsd: 0.1, summary: "no changes" },              // Issue A: implement (no diff)
+      { kind: "completed", costUsd: 1.0, summary: "implemented" },             // Issue B: implement
+      { kind: "error", costUsd: 0.0, message: "self-review skipped" },        // Issue B: self-review skip
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 1" },     // Issue B: recovery fix 1
+      { kind: "completed", costUsd: 0.5, summary: "fixed CI attempt 2" },     // Issue B: recovery fix 2
+    ];
+    h.git.commitsWithDiff.set("/wt/ty-1", false); // Issue A: no diff → agent_no_change
+    // Issue B: has diff → proceeds to HANDOFF (default commitsWithDiff is true).
+    planner.outcomes = [
+      // With 2 eligible issues queued, SELECT asks the PM (this.planner) to rank them once
+      // before CLAIM — non-JSON text here deliberately fails to parse, falling back to
+      // eligible[0] (issue-A), which matches the intended processing order anyway.
+      { kind: "completed", text: "n/a (deterministic fallback expected)" },              // SELECT ranking (2 eligible)
+      { kind: "completed", text: "## Goal\nA" },                                       // Issue A: DESIGN
+      { kind: "completed", text: "## Goal\nB" },                                       // Issue B: DESIGN
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix CI"}' },      // Issue B: recovery 1
+      { kind: "completed", text: '{"action":"fix_code","instruction":"Fix CI again"}' }, // Issue B: recovery 2
+    ];
+    h.git.pushPrNumber.set("looppilot/ty-2-x", 100);
+    // Issue B: monitor done → merge readiness ci_failed (every time)
+    h.monitor.verdicts = [
+      { kind: "done" },
+      { kind: "done" },
+      { kind: "done" },
+    ];
+    h.monitor.checkMergeReadiness = async (pr: number) => {
+      h.monitor.readinessCalls.push(pr);
+      return { ready: false, reason: "ci_failed" as const };
+    };
+    h.git.ciLogs = "Error: test failed";
+    h.recoveryRunner.on(["git", "-C"], (args) => {
+      if (args.includes("log")) return { code: 0, stdout: "abc fix\n" };
+      return { code: 0, stdout: "" };
+    });
+
+    await h.orch.run();
+
+    const run = h.store.latestRun()!;
+    // Run halted due to abandon cap.
+    expect(run.state).toBe("halted");
+    expect(run.haltReason).toContain("abandon cap reached");
+    // Issue B's PR must have been closed (the "gh pr close" call inside executeAbandon)
+    // before the halt — executeAbandon uses recoveryRunner.run("gh", ["pr", "close", ...])
+    // directly rather than GitPrManager.closePr.
+    const prCloseCalls = h.recoveryRunner.calls.filter(
+      (c) => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "close",
+    );
+    expect(prCloseCalls.length).toBeGreaterThanOrEqual(1);
+    expect(prCloseCalls[0].args).toContain("100");
+    const sessions = h.store.sessionsForRun(run.id);
+    const abandoned = sessions.filter((s) => s.recoveryAction === "abandon");
+    expect(abandoned).toHaveLength(2);
+  });
+
+  it("abandon count is DB-derived (survives fresh store instance) (ES-509)", async () => {
+    const store = new SqliteStore(":memory:");
+    const config = makeConfig({ maxTasksPerRun: 5 });
+    config.safety.maxAbandonsPerRun = 2;
+    const designer = new FakePlanRunner();
+    // Run 1: abandon 1 issue (only 1 issue available, cap not reached).
+    const h1 = makeHarness(config, { designer, store });
+    h1.source.queue = [issue("issue-A", "TY-1")];
+    designer.outcomes = [{ kind: "completed", text: "## Goal\nA" }];
+    h1.agent.outcomes = [{ kind: "completed", costUsd: 0.1, summary: "no changes" }];
+    h1.git.commitsWithDiff.set("/wt/ty-1", false);
+    await h1.orch.run();
+    const run1 = store.latestRun()!;
+    expect(store.countAbandons(run1.id)).toBe(1);
+
+    // "Restart": a fresh Orchestrator instance backed by the SAME store (simulates a process
+    // restart). countAbandons must still return 1 — it is derived from the DB, not an
+    // in-memory counter tied to the Orchestrator instance.
+    makeHarness(config, { designer, store });
+    expect(store.countAbandons(run1.id)).toBe(1);
   });
 
   // --- halt policy tests ---

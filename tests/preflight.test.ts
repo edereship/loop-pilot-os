@@ -33,6 +33,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     looppilot: { gateLabel: "loop-pilot", stateCommentAuthors: ["github-actions[bot]"] },
     safety: {
       maxTasksPerRun: 3,
+      maxAbandonsPerRun: 3,
       maxCostUsdPerSession: 10,
       monitorTimeoutMinutes: 60,
       notEngagedGuardMinutes: 30,

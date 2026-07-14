@@ -162,7 +162,8 @@ function makeConfig(): Config {
     product: { goal: "ship it", specDir: undefined },
     repo: { path: "/repo", remote: "owner/name", defaultBranch: "main", worktreeRoot: "/wt" },
     safety: {
-      maxTasksPerRun: 3, maxCostUsdPerSession: 10,
+      maxTasksPerRun: 3, maxAbandonsPerRun: 3,
+      maxCostUsdPerSession: 10,
       notEngagedGuardMinutes: 30, monitorTimeoutMinutes: 60,
       sessionHardTimeoutMinutes: 120, maxWorkflowFixAttempts: 2,
       maxCostUsdPerFix: 2, codexTimeoutMinutes: 30,
