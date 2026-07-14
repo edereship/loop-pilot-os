@@ -1206,6 +1206,7 @@ export class Orchestrator {
       // arrived during the idle sleep are claimed rather than dropped (ES-475).
       let groomSummary: string | null = null;
       let groomBlockedIds: Set<string> = new Set();
+      let groomSuppliedBlockedIds = false;
       const idleAlreadyElapsed = (() => {
         if (idleTimeoutMin <= 0) return false;
         const snap = this.store.getRun(this.runId);
@@ -1224,6 +1225,7 @@ export class Orchestrator {
         }
         groomSummary = groomResult.summary;
         groomBlockedIds = groomResult.blockedIds;
+        groomSuppliedBlockedIds = groomResult.summary !== null;
       }
 
       // 2) SELECT（仕様 §5.1 + A1 PM 選別ターン）
@@ -1248,7 +1250,7 @@ export class Orchestrator {
       // When GROOM did not supply blocked IDs (disabled, skipped due to idle timeout,
       // or board fetch failed) but SELECT found eligible tickets, fetch blocked IDs
       // so dependency-blocked work is not claimed (ES-475 / ES-507).
-      if (groomBlockedIds.size === 0 && eligible.length > 0) {
+      if (!groomSuppliedBlockedIds && eligible.length > 0) {
         groomBlockedIds = await this.fetchBlockedIds();
       }
       // Filter out GROOM-identified blocked issues so dependency-blocked work is not started
