@@ -1206,6 +1206,7 @@ export class Orchestrator {
       // arrived during the idle sleep are claimed rather than dropped (ES-475).
       let groomSummary: string | null = null;
       let groomBlockedIds: Set<string> = new Set();
+      let groomSuppliedBlockedIds = false;
       const idleAlreadyElapsed = (() => {
         if (idleTimeoutMin <= 0) return false;
         const snap = this.store.getRun(this.runId);
@@ -1224,6 +1225,7 @@ export class Orchestrator {
         }
         groomSummary = groomResult.summary;
         groomBlockedIds = groomResult.blockedIds;
+        groomSuppliedBlockedIds = groomResult.boardFetched;
       }
 
       // 2) SELECT（仕様 §5.1 + A1 PM 選別ターン）
@@ -1245,9 +1247,10 @@ export class Orchestrator {
         this.log(detail);
         return;
       }
-      // When GROOM was skipped due to idle timeout but SELECT found eligible tickets,
-      // fetch blocked IDs now so dependency-blocked work is not claimed (ES-475).
-      if (idleAlreadyElapsed && eligible.length > 0) {
+      // When GROOM did not supply blocked IDs (disabled, skipped due to idle timeout,
+      // or board fetch failed) but SELECT found eligible tickets, fetch blocked IDs
+      // so dependency-blocked work is not claimed (ES-475 / ES-507).
+      if (!groomSuppliedBlockedIds && eligible.length > 0) {
         groomBlockedIds = await this.fetchBlockedIds();
       }
       // Filter out GROOM-identified blocked issues so dependency-blocked work is not started
@@ -1898,10 +1901,10 @@ export class Orchestrator {
   }
 
   // ---- fetchBlockedIds（lightweight board fetch, no planner） ----
-  // Used when GROOM is skipped (idle timeout elapsed) but SELECT found eligible tickets,
-  // so that dependency-blocked work is still filtered before claiming (ES-475).
+  // Used when GROOM did not supply blocked IDs (disabled, skipped, or board fetch failed)
+  // but SELECT found eligible tickets (ES-475 / ES-507).
   private async fetchBlockedIds(): Promise<Set<string>> {
-    if (!this.config.groom.enabled || this.groomDeps === null) {
+    if (this.groomDeps === null) {
       return new Set<string>();
     }
     try {
@@ -1919,9 +1922,9 @@ export class Orchestrator {
   }
 
   // ---- GROOM（ES-457: Board Grooming Phase） ----
-  private async groom(): Promise<{ control: "continue"; summary: string | null; blockedIds: Set<string> } | { control: "halt" }> {
+  private async groom(): Promise<{ control: "continue"; summary: string | null; blockedIds: Set<string>; boardFetched: boolean } | { control: "halt" }> {
     if (!this.config.groom.enabled || this.groomDeps === null || this.planner === null) {
-      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+      return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
     }
 
     this.groomLoopIndex++;
@@ -1934,7 +1937,7 @@ export class Orchestrator {
       });
     } catch (err) {
       this.log(`groom: failed to insert groom_log, skipping: ${errMsg(err)}`);
-      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+      return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
     }
 
     try {
@@ -1959,7 +1962,7 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
-        return { control: "continue", summary: null, blockedIds: new Set<string>() };
+        return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
       }
       // Build blocked identifier set for SELECT-time filtering (ES-457 Finding 2).
       const blockedIds = new Set<string>(boardState.blocked.map((b) => b.identifier));
@@ -2084,7 +2087,7 @@ export class Orchestrator {
         } catch (logErr) {
           this.log(`groom: failed to update groom_log: ${errMsg(logErr)}`);
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       // 3. Run Codex
@@ -2196,7 +2199,7 @@ export class Orchestrator {
               return { control: "halt" };
             }
           }
-          return { control: "continue", summary: null, blockedIds };
+          return { control: "continue", summary: null, blockedIds, boardFetched: true };
         }
         codexOutput = outcome.text;
       } catch (err) {
@@ -2252,7 +2255,7 @@ export class Orchestrator {
             return { control: "halt" };
           }
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       // 4. Parse
@@ -2309,7 +2312,7 @@ export class Orchestrator {
             return { control: "halt" };
           }
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       const groomOutput = parseResult.value;
@@ -2394,7 +2397,7 @@ export class Orchestrator {
             return { control: "halt" };
           }
         }
-        return { control: "continue", summary: null, blockedIds };
+        return { control: "continue", summary: null, blockedIds, boardFetched: true };
       }
 
       const validationResults = validateGroomActions(allActions, validationCtx);
@@ -2761,7 +2764,7 @@ export class Orchestrator {
       const summaryForSelect = (rejectedCount === 0 && failedExecutions === 0)
         ? groomOutput.summary
         : `${groomOutput.summary} [${executedCount}/${allActions.length} executed]`;
-      return { control: "continue", summary: summaryForSelect, blockedIds };
+      return { control: "continue", summary: summaryForSelect, blockedIds, boardFetched: true };
     } catch (err) {
       this.log(`groom: unexpected error, skipping: ${errMsg(err)}`);
       try {
@@ -2773,7 +2776,7 @@ export class Orchestrator {
       } catch (logErr) {
         this.log(`groom: failed to update groom_log in error handler: ${errMsg(logErr)}`);
       }
-      return { control: "continue", summary: null, blockedIds: new Set<string>() };
+      return { control: "continue", summary: null, blockedIds: new Set<string>(), boardFetched: false };
     }
   }
 
